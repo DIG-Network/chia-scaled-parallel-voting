@@ -138,13 +138,13 @@ struct Args {
     ///
     /// Mainnet's typical mempool fee policy is ~5 mojos per CLVM
     /// cost unit. Our finalize singleton spend has ~88M CLVM cost
-    /// (Groth16 pairing + BLS pairing identity dominate), so a
-    /// fee of ~100M mojos (~1 mojo / cost) is comfortably above
-    /// the bare-minimum admission threshold while staying tiny
-    /// in absolute XCH terms (~0.0001 XCH). Bump higher only if
-    /// your wallet has plenty of XCH and you're racing against
-    /// other mempool traffic for inclusion in the very next block.
-    #[arg(long, default_value_t = 100_000_000)]
+    /// (Groth16 pairing + BLS pairing identity dominate). The
+    /// observed mempool ADMISSION threshold is far below that —
+    /// a fee of ~10M mojos (~0.1 mojo / cost) reliably gets the
+    /// bundle in. Bump higher only if your wallet has plenty of
+    /// XCH and you're racing against other mempool traffic for
+    /// inclusion in the very next block.
+    #[arg(long, default_value_t = 10_000_000)]
     finalize_fee: u64,
 
     /// Election window, in L1 blocks. Mainnet blocks are ~52s.
@@ -1862,10 +1862,42 @@ async fn phase_oracle(
     // Build the spend up-front so we can log the announcement variant
     // BEFORE broadcasting (useful for operator visibility and for
     // downstream tools that want to display the announcement id).
-    let oracle_spend = oracle
-        .build_oracle_spend()
-        .await
-        .map_err(|e| anyhow::anyhow!("Oracle::build_oracle_spend: {e:?}"))?;
+    //
+    // PROPAGATION-AWARE RETRY: `Oracle::build_oracle_spend` walks the
+    // chain via `find_current_singleton`. Coinset's index can briefly
+    // report an OLDER coin (e.g., the eve) as still unspent — the
+    // walker takes the bait, builds against that stale tip, and the
+    // node rejects with DOUBLE_SPEND because the coin is actually
+    // spent. We retry until the assembled spend reflects the actual
+    // post-finalize state (finalized == true; the only state phase 5
+    // can leave the singleton in).
+    let started = std::time::Instant::now();
+    let max_wait = Duration::from_secs(args.confirmation_timeout_secs.max(600));
+    let poll = Duration::from_secs(args.poll_interval_secs.max(15));
+    let oracle_spend = loop {
+        let attempt = oracle
+            .build_oracle_spend()
+            .await
+            .map_err(|e| anyhow::anyhow!("Oracle::build_oracle_spend: {e:?}"))?;
+        if attempt.announcement.is_finalized() {
+            break attempt;
+        }
+        if started.elapsed() >= max_wait {
+            return Err(anyhow::anyhow!(
+                "phase_oracle: chain view never advanced to post-finalize state \
+                 within {}s; oracle would emit `oracle_unfinalized` instead of \
+                 `oracle_finalized` (singleton tip stuck at {} per coinset)",
+                started.elapsed().as_secs(),
+                hex::encode(attempt.singleton_coin_id()),
+            ));
+        }
+        tracing::info!(
+            singleton_coin_id = %hex::encode(attempt.singleton_coin_id()),
+            elapsed_secs = started.elapsed().as_secs(),
+            "oracle: chain still reports pre-finalize tip — retrying"
+        );
+        tokio::time::sleep(poll).await;
+    };
     let singleton_id = oracle_spend.singleton_coin_id();
     let announcement_id = oracle_spend.announcement_id;
     let announcement_msg = oracle_spend.announcement.message();
@@ -1881,11 +1913,19 @@ async fn phase_oracle(
         "oracle spend assembled"
     );
 
-    // Wrap into a SpendBundle (BLS identity signature — no AggSig conditions).
-    let bundle = oracle
-        .build_oracle_bundle()
-        .await
-        .map_err(|e| anyhow::anyhow!("Oracle::build_oracle_bundle: {e:?}"))?;
+    // Wrap into a SpendBundle. The oracle action emits NO AggSig
+    // conditions, so the aggregated signature is the BLS identity.
+    // We construct directly from the spend we already validated above
+    // (rather than calling `build_oracle_bundle`, which would re-walk
+    // the chain and might pick up a different tip than what we logged).
+    let coin_spends = vec![oracle_spend.coin_spend.clone()];
+    let agg_sig = chip_voting_sdk::actors::deployer::sign_bundle_signature(
+        &coin_spends,
+        &[],
+        network,
+    )
+    .map_err(|e| anyhow::anyhow!("oracle: sign_bundle_signature: {e:?}"))?;
+    let bundle = SpendBundle::new(coin_spends, agg_sig);
     verify_bundle_locally(&bundle, network)?;
 
     push_tx(chain, &bundle, "oracle").await?;
