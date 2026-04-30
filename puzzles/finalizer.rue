@@ -1,0 +1,41 @@
+// finalizer.rue
+// Finalizer types for the CHIP-0050 action layer.
+//
+// The action layer (action.rue) runs zero or more actions, each of which
+// returns (StateTruth, conditions). The finalizer is then called with
+// the final state truth and the accumulated conditions, and is
+// responsible for emitting the final list of conditions — typically
+// including the singleton recreation CreateCoin.
+//
+// Adapted from yakuhito's slot-machine implementation of CHIP-0050.
+
+export struct FinalizerTruths {
+    Merkle_Root: Bytes32,
+    ...State: Any,
+}
+
+export type Finalizer<S> = fn(
+    truths: FinalizerTruths,
+    run_action_output: (S, List<List<Condition>>),
+    ...finalizer_solution: Any
+) -> List<Condition>;
+
+/// Flatten a list of condition lists into a single condition list.
+/// Used by every finalizer to merge the conditions emitted by each
+/// individual action in the spend.
+export fn flatten_list(list: List<List<Condition>>) -> List<Condition> {
+    inline let (first_thing, the_rest) = unchecked_cast::<(List<Condition>, List<List<Condition>>)>(list);
+
+    if first_thing is nil {
+        if the_rest is nil {
+            nil
+        } else {
+            flatten_list(the_rest)
+        }
+    } else {
+        (
+            first_thing.first,
+            flatten_list((first_thing.rest, the_rest))
+        )
+    }
+}

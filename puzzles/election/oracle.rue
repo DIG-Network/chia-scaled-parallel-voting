@@ -1,0 +1,68 @@
+// election/oracle.rue
+// Oracle action for the Election Singleton.
+//
+// Permissionless action, valid in BOTH finalized and unfinalized
+// states. Emits a CreateCoinAnnouncement carrying enough state
+// information for any external puzzle to assert it in the same
+// spend bundle and read the (un)finalized vote result on-chain.
+//
+// Two announcement variants:
+//
+//   * State.finalized == true:
+//       sha256("oracle_finalized"
+//              || vote_outcome
+//              || count_be8
+//              || registration_merkle_root)
+//
+//   * State.finalized == false:
+//       sha256("oracle_unfinalized"
+//              || count_be8
+//              || registration_merkle_root)
+//
+// The DISTINCT prefixes guarantee external puzzles can pattern-match
+// on which variant they're consuming — an "unfinalized" announcement
+// can never be replayed as a "finalized" one (and vice-versa) because
+// the SHA-256 preimages start with different ASCII bytes.
+//
+// AssertCoinAnnouncement contract (CRITICAL):
+//   The on-chain `AssertCoinAnnouncement` opcode validates against
+//   the FULL announcement_id = sha256(announcer_coin_id || message),
+//   where `announcer_coin_id` is the Election Singleton's CURRENT
+//   coin id (which changes on every spend). External puzzles that
+//   want to assert against this oracle must therefore receive the
+//   singleton's coin id via THEIR OWN solution and recompute the
+//   id locally — same pattern `registration_coin/release.rue` uses
+//   to assert `announce_finalization`.
+//
+// State is unchanged — the election finalizer recreates the
+// singleton with the same state (and amount = 1 + accumulated_fees,
+// which is just `1` once the singleton has been finalized).
+
+import shared::*;
+
+fn main(
+    Truth: ElectionStateTruth,
+    // No solution params.
+) -> (ElectionStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    let msg: Bytes32 = if State.finalized {
+        oracle_finalized_announcement_msg(
+            State.vote_outcome,
+            State.registration_count,
+            State.registration_merkle_root,
+        )
+    } else {
+        oracle_unfinalized_announcement_msg(
+            State.registration_count,
+            State.registration_merkle_root,
+        )
+    };
+
+    let announce = CreateCoinAnnouncement {
+        message: msg,
+    };
+
+    // State unchanged.
+    (Truth, [announce])
+}

@@ -1,0 +1,35 @@
+// election/announce_finalization.rue
+// Announce-finalization action for the Election Singleton.
+//
+// Permissionless action, only valid AFTER the singleton has been
+// finalized. Re-emits the finalization announcement so that voters can
+// pair this spend with their Registration Coin's release action in the
+// same spend bundle and have the registration coin assert the
+// announcement.
+//
+// State is unchanged; the election finalizer recreates the singleton
+// with the same state (and amount=1, since accumulated_fees=0
+// post-finalization).
+
+import shared::*;
+
+fn main(
+    Truth: ElectionStateTruth,
+    // No solution params.
+) -> (ElectionStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    // Only valid after finalization.
+    assert State.finalized == true;
+
+    let announce = CreateCoinAnnouncement {
+        message: finalization_announcement_msg(
+            State.vote_outcome,
+            State.registration_count,
+            State.registration_merkle_root,
+        ),
+    };
+
+    // State unchanged.
+    (Truth, [announce])
+}

@@ -1,0 +1,104 @@
+[package]
+name        = "chip-voting-cli"
+version     = "0.1.0"
+description = "Production CLI for the Chia voting CHIP — drives Deployer, Voter, Aggregator, Indexer, and MPC ceremony actors against any Chia network."
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+# Primary binary: `chip-voting`. Verbs are subcommands.
+[[bin]]
+name = "chip-voting"
+path = "src/main.rs"
+
+# Live integration test binary: drives the FULL election lifecycle
+# (deploy → register × N → wait window → vote × N → finalize →
+# release × N) against a live Chia network. Loads its wallet keys
+# from a `.test-credentials` file (path overridable via flag) and
+# uses `chia_query::ChiaQuery::wait_for_confirmation` between every
+# phase to gate on real on-chain confirmations. Excluded from the
+# default `cargo run` (use `cargo run --bin chip-voting-live-test`)
+# so accidental invocation doesn't broadcast to mainnet.
+[[bin]]
+name = "chip-voting-live-test"
+path = "src/bin/live_integration_test.rs"
+
+# Diagnostic binary: replays a `push-tx-failed-*.json` bundle dump
+# through `chia_consensus::validate_clvm_and_signature` to surface
+# the actual `ErrorCode` (`AssertHeightRelativeFailed`, etc.) that
+# the full node's `status=FAILED` ack opaquely returned. See the
+# binary header for usage.
+[[bin]]
+name = "chip-voting-diagnose-bundle"
+path = "src/bin/diagnose-bundle.rs"
+
+[dependencies]
+# Our SDK — every actor flow is implemented or stubbed here. The CLI
+# is pure orchestration: arg parsing, persistence, RPC wiring,
+# pretty/JSON output. No on-chain logic in the CLI itself.
+chip-voting-sdk = { path = "../sdk" }
+
+# CLI parsing + REPL niceties.
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+console = "0.15"
+
+# Wire-format Chia primitives so callers can construct typed args
+# (puzzle hashes, coin ids) without depending on the SDK directly.
+chia-protocol.workspace = true
+chia-bls.workspace      = true
+
+# Chain I/O. ChiaQuery handles peer discovery, mainnet/testnet11
+# selection, and falls back to coinset.org when peers are slow. The
+# CLI is the only place we directly construct one — actors take it as
+# a `ChainReader` trait.
+chia-query.workspace    = true
+dig-l1-wallet.workspace = true
+
+# Async runtime. We use `tokio` because chia-query is async; clap
+# subcommands fan out into either sync (ceremony, wallet keygen) or
+# async (anything that touches the chain) handlers.
+tokio.workspace         = true
+
+# Serialisation + persistence. Election context, ceremony transcripts,
+# spend bundles all serialise to JSON. The CLI never persists secrets
+# in plain JSON — wallet keys live in dig-l1-wallet's encrypted
+# keystore; voter BLS secrets are read from a separately-encrypted
+# file (or env var) at command time.
+serde.workspace      = true
+serde_json.workspace = true
+
+# Error handling. anyhow at the CLI boundary (rich context); the SDK
+# uses `thiserror` for typed errors that we map to anyhow at the
+# command handler.
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging. Default level INFO; --verbose bumps to DEBUG, --trace to
+# TRACE. Output goes to stderr so stdout stays parseable for `--json`.
+tracing.workspace          = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Misc utility used across commands.
+hex.workspace        = true
+sha2.workspace       = true
+async-trait.workspace = true
+chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
+
+# RNG for the ceremony's local entropy (NEVER used as the only source
+# in production — the CLI also accepts --entropy-file for hardware-RNG
+# mixes). See `ceremony contribute` for the threat model notes.
+rand = "0.8"
+getrandom = "0.2"
+
+# Arkworks types — needed by `aggregator build-finalize` to
+# deserialize a `ProvingKey<Bls12_381>` from a binary file.
+ark-bls12-381 = { version = "0.4", default-features = false, features = ["std", "curve"] }
+ark-groth16   = { version = "0.4", default-features = false, features = ["std"] }
+ark-serialize = { version = "0.4", default-features = false, features = ["std"] }
+ark-std       = { version = "0.4", default-features = false, features = ["std"] }
+
+# Live integration test only: BIP39 mnemonic parsing for loading
+# wallet keys from `.test-credentials`. Mnemonic → seed → master
+# BLS SK uses Chia's empty-passphrase convention (matches
+# `dig_l1_wallet::keystore::mnemonic`).
+bip39 = "2.0"

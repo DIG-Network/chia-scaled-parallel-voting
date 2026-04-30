@@ -1,0 +1,78 @@
+[package]
+name        = "chip-voting-sdk"
+version     = "0.1.0"
+edition     = "2021"
+description = "Reference Rust driver for the Chia voting CHIP (Election Singleton + CAT-collateralized Registration Coin + Groth16 finalization)."
+license     = "MIT"
+
+[dependencies]
+# ── Low-level Chia primitives (0.26 line, matching dig-l1-wallet) ───
+chia              = "0.26"
+chia-protocol     = "0.26"
+chia-puzzles      = "0.20"   # compiled standard puzzle bytecode + tree hashes (CAT_PUZZLE_HASH, etc.)
+chia-puzzle-types = "0.26"   # CatArgs, SingletonStruct, StandardArgs
+chia-bls          = "0.26"
+chia-consensus    = "0.26"   # validate_clvm_and_signature — surfaces actual mempool ErrorCode locally instead of opaque "FAILED" from full nodes
+clvm-traits       = "0.26"
+clvm-utils        = "0.26"   # CurriedProgram, ToTreeHash, tree_hash_atom, tree_hash_pair
+clvmr             = "0.14"   # NOTE: clvmr 0.14 (what chia-sdk-driver 0.30 transitively requires) does NOT enforce the mempool-mode `DISABLE_OP` guard on `op_modpow` (60). Mainnet does — `op_modpow` is rejected at mempool admission with `GENERATOR_RUNTIME_ERROR`. Avoid `modpow` in on-chain puzzles; use `%` (op_mod, 61) instead, which is mempool-safe.
+
+# ── chia-wallet-sdk umbrella + sub-crates ──────────────────────────
+# Drivers (SpendContext, Launcher, Cat, CatSpend, StandardLayer, Singleton,
+# ActionLayer/ActionLayerSolution, Spends, Spend) + signing + types.
+chia-wallet-sdk = { version = "0.30", default-features = false, features = ["action-layer", "native-tls"] }
+chia-sdk-driver = "0.30"     # SpendContext, Layer, Primitive, ActionLayer, etc.
+chia-sdk-signer = "0.30"     # RequiredSignature::from_coin_spends — walks AGG_SIG_* conditions
+chia-sdk-types  = "0.30"     # Conditions enum, MerkleTree, MerkleProof, run_puzzle helper
+chia-sdk-utils  = "0.30"     # Address (bech32m), select_coins (knapsack)
+
+# ── Chain I/O + wallet ───────────────────────────────────────────────
+chia-query    = "0.2"        # decentralised peers + coinset.org HTTP fallback
+dig-l1-wallet = "0.1"        # XCH + CAT wallet (encrypted keystore, BIP39, coin selection)
+
+# ── Groth16 + curve (off-chain prover; on-chain verify is in CLVM) ─
+# `std` enables the standard library backed implementations needed for
+# the prover. ark-bls12-381 needs the `curve` feature for full
+# arithmetic. ark-groth16 needs `parallel` to enable
+# `Groth16::generate_parameters_with_reduction` etc.
+ark-groth16           = { version = "0.4", default-features = false, features = ["std"] }
+ark-bls12-381         = { version = "0.4", default-features = false, features = ["std", "curve"] }
+ark-r1cs-std          = { version = "0.4", default-features = false, features = ["std"] }
+ark-relations         = { version = "0.4", default-features = false, features = ["std"] }
+ark-ff                = { version = "0.4", default-features = false, features = ["std"] }
+ark-ec                = { version = "0.4", default-features = false, features = ["std"] }
+ark-std               = { version = "0.4", default-features = false, features = ["std"] }
+ark-serialize         = { version = "0.4", default-features = false, features = ["std"] }
+ark-crypto-primitives = { version = "0.4", default-features = false, features = ["std", "crh", "r1cs"] }
+ark-snark             = { version = "0.4", default-features = false }
+
+# BLS aggregation (off-chain) — augmented signing matches on-chain bls_verify.
+blst = "0.3"
+
+# ── Standard utility ────────────────────────────────────────────────
+hex          = "0.4"
+sha2         = "0.10"
+serde        = { version = "1.0", features = ["derive"] }
+serde_json   = "1.0"
+thiserror    = "2.0"
+tracing      = "0.1"
+async-trait  = "0.1"
+indexmap     = "2"
+hex-literal  = "0.4"
+tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[build-dependencies]
+hex = "0.4"
+
+[dev-dependencies]
+# Wallet simulator for in-process end-to-end tests. Provides a fake
+# Chia node that accepts SpendBundles, runs CLVM, advances height, and
+# exposes coin_state / coin_spend lookups — same harness chia-sdk-driver
+# uses for its own integration tests. Optional dep so prod builds can
+# omit it; enabled automatically as a dev-dep below.
+chia-sdk-test = "0.30"
+tokio-test = "0.4"
+tracing-subscriber = "0.3"
+anyhow = "1"
+rand = "0.8"
+indexmap = "2"

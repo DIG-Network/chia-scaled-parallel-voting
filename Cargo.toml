@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "sdk",
+    "cli",
+]
+
+# Hoist common dependency versions here so the SDK and CLI stay in
+# lock-step. Both crates `[dependencies]` use `.workspace = true` for
+# anything that crosses the boundary; per-crate-only deps stay local.
+[workspace.package]
+edition     = "2021"
+license     = "MIT"
+repository  = "https://github.com/dig-network/CHIP"
+
+[workspace.dependencies]
+# Core Chia primitives — same line as dig-l1-wallet 0.1.
+chia              = "0.26"
+chia-protocol     = "0.26"
+chia-bls          = "0.26"
+chia-puzzles      = "0.20"
+chia-puzzle-types = "0.26"
+clvm-traits       = "0.26"
+clvm-utils        = "0.26"
+clvmr             = "0.14"
+
+# chia-wallet-sdk umbrella + sub-crates.
+chia-wallet-sdk = { version = "0.30", default-features = false, features = ["action-layer", "native-tls"] }
+chia-sdk-driver = "0.30"
+chia-sdk-signer = "0.30"
+chia-sdk-types  = "0.30"
+chia-sdk-utils  = "0.30"
+
+# Chain I/O + wallet.
+chia-query    = "0.2"
+dig-l1-wallet = "0.1"
+
+# Standard utility shared across crates.
+hex          = "0.4"
+sha2         = "0.10"
+serde        = { version = "1.0", features = ["derive"] }
+serde_json   = "1.0"
+thiserror    = "2.0"
+tracing      = "0.1"
+async-trait  = "0.1"
+tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow       = "1"

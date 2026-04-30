@@ -1,0 +1,17 @@
+// common_types.rue
+// Shared structs used across multiple puzzles in the CHIP.
+
+/// Recursive cons pair for walking Merkle sibling lists used by the
+/// sparse Merkle tree (depth 32).
+export struct HashCons {
+    head: Bytes32,
+    ...tail: HashCons,
+}
+
+/// Compact coin proof (parent_info + inner_puzzle_hash + amount) used
+/// by some helper puzzles to reconstruct a coin id.
+export struct CompactCoinProof {
+    parent_info: Bytes32,
+    inner_puzzle_hash: Bytes32,
+    ...amount: Int,
+}

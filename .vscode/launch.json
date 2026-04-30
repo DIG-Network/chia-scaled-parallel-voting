@@ -1,0 +1,56 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug chip-voting-live-test",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=chip-voting-live-test",
+          "--package=chip-voting-cli"
+        ],
+        "filter": {
+          "kind": "bin",
+          "name": "chip-voting-live-test"
+        }
+      },
+      "args": [
+        "--credentials",
+        "${workspaceFolder}/.test-credentials",
+        "--yes",
+        "--verbose"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {},
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug chip-voting-live-test (local full node)",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=chip-voting-live-test",
+          "--package=chip-voting-cli"
+        ],
+        "filter": {
+          "kind": "bin",
+          "name": "chip-voting-live-test"
+        }
+      },
+      "args": [
+        "--credentials",
+        "${workspaceFolder}/.test-credentials",
+        "--yes",
+        "--verbose",
+        "--trusted-fullnode",
+        "127.0.0.1"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}

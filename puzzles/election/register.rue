@@ -1,0 +1,259 @@
+// election/register.rue
+// Register action for the Election Singleton.
+//
+// A voter joins the registered set. The action:
+//   1. Asserts the singleton is not yet finalized.
+//   2. Verifies the voter's slot index is the canonical slot derived
+//      from their pubkey (sha256(pubkey) prefix).
+//   3. Verifies an emptiness proof for that slot against the current
+//      SPT root.
+//   4. Computes the new SPT root with sha256(pubkey) inserted at the
+//      slot.
+//   5. Computes the expected CAT-wrapped Registration Coin puzzle hash
+//      and asserts a CreateCoinAnnouncement from the parent CAT spend
+//      confirming the Registration Coin was created with that puzzle
+//      hash and COLLATERAL_AMOUNT. This binds the on-chain CAT lockup
+//      to the registration so the voter cannot under-collateralize.
+//   6. Updates state: increments registration_count, accumulates
+//      REGISTRATION_FEE into accumulated_fees, stores the new SPT root.
+//      The election finalizer translates the new accumulated_fees into
+//      the next singleton coin's amount.
+//   7. Requires AggSigMe from the registering voter pubkey.
+//
+// The Registration Coin puzzle hash that must be created is:
+//
+//   CAT(CAT_TAIL_HASH,
+//       action_layer(
+//           registration_finalizer_full_hash(HINT),
+//           REGISTRATION_MERKLE_ROOT,                     // constant for this election
+//           initial_RegistrationState(voter_pubkey, election_id),
+//       )
+//   )
+//
+// where HINT = sha256("CHIP/onchain/voter_hint/v1/" ||
+//                     election_launcher_id ||
+//                     cat_tail_hash ||
+//                     voter_pubkey).
+//
+// The voter's spend bundle must include:
+//   - A CAT spend that creates the Registration Coin at this exact
+//     puzzle hash with COLLATERAL_AMOUNT, emitting the matching
+//     "create_reg" CreateCoinAnnouncement.
+//   - An XCH coin contributing REGISTRATION_FEE so the Election
+//     Singleton's recreated coin balances (its amount grows by
+//     REGISTRATION_FEE on register).
+
+import super::common_types::*;
+import super::registration_coin::shared::*;
+import shared::*;
+
+inline fn slot_from_pubkey(pubkey: PublicKey) -> Int {
+    let pk_hash_b: Bytes = sha256(pubkey as Bytes) as Bytes;
+    let prefix: Bytes = substr(pk_hash_b, 0, 4);
+    let unsigned_bytes: Bytes = 0x00 as Bytes + prefix;
+    unsigned_bytes as Int
+}
+
+fn compute_root(
+    node: Bytes32,
+    index: Int,
+    remaining: HashCons,
+    depth_remaining: Int,
+) -> Bytes32 {
+    if depth_remaining == 0 {
+        node
+    } else {
+        let sibling: Bytes32 = remaining.head;
+        let node_b: Bytes = node as Bytes;
+        let sibling_b: Bytes = sibling as Bytes;
+        let parent: Bytes32 = if index % 2 == 0 {
+            sha256(node_b + sibling_b)
+        } else {
+            sha256(sibling_b + node_b)
+        };
+        compute_root(parent, index / 2, remaining.tail, depth_remaining - 1)
+    }
+}
+
+/// Compute the CAT-wrapped puzzle hash of the freshly registered
+/// (HAS_VOTED=false, vote_data=0) Registration Coin for this voter.
+fn fresh_registration_coin_puzzle_hash(
+    cat_mod_hash: Bytes32,
+    cat_tail_hash: Bytes32,
+    action_layer_mod_hash: Bytes32,
+    registration_finalizer_mod_hash: Bytes32,
+    registration_merkle_root: Bytes32,
+    voter_pubkey: PublicKey,
+    election_launcher_id: Bytes32,
+) -> Bytes32 {
+    // Per-voter hint baked into the finalizer's curry — gives off-chain
+    // indexers a stable lookup key for this voter's registration coin
+    // lineage across vote / release spends. Binds launcher, CAT asset,
+    // and voter so hinted coins cannot collide across elections or tails.
+    let hint: Bytes32 = sha256(
+        "CHIP/onchain/voter_hint/v1/"
+        + (election_launcher_id as Bytes)
+        + (cat_tail_hash as Bytes)
+        + (voter_pubkey as Bytes)
+    );
+
+    // Initial state: not voted, empty vote_data, no release destination.
+    let initial_state = RegistrationState {
+        voter_pubkey: voter_pubkey,
+        election_launcher_id: election_launcher_id,
+        has_voted: false,
+        vote_data: 0x0000000000000000000000000000000000000000000000000000000000000000,
+        release_destination: nil,
+    };
+
+    // Finalizer: 1st curry binds (ACTION_LAYER_MOD_HASH, HINT); 2nd
+    // curry binds the finalizer's own first-curry hash (the standard
+    // "self-hash" pattern from CHIP-0050).
+    let finalizer_first_curry_hash: Bytes32 = curry_tree_hash(
+        registration_finalizer_mod_hash,
+        [
+            tree_hash_atom(action_layer_mod_hash),
+            tree_hash_atom(hint),
+        ],
+    );
+    let finalizer_full_hash: Bytes32 = curry_tree_hash(
+        finalizer_first_curry_hash,
+        [
+            tree_hash_atom(finalizer_first_curry_hash),
+        ],
+    );
+
+    // Action layer: curry(action_layer, [finalizer_full_hash, MERKLE_ROOT, STATE])
+    //
+    // Curry-arg convention (matches yakuhito's slot-machine):
+    //   * Atom values are wrapped with `tree_hash_atom(...)`.
+    //   * Already-tree-hashed values (the result of another
+    //     `curry_tree_hash`) are passed DIRECTLY — they already
+    //     represent `tree_hash(program)`, so pre-wrapping with
+    //     `tree_hash_atom` would double-hash and mis-predict the
+    //     puzzle hash.
+    let action_layer_inner_hash: Bytes32 = curry_tree_hash(
+        action_layer_mod_hash,
+        [
+            finalizer_full_hash,                     // already tree-hashed
+            tree_hash_atom(registration_merkle_root),
+            tree_hash(initial_state),
+        ],
+    );
+
+    // CAT outer: curry(cat_mod, [cat_mod_hash, cat_tail_hash, action_layer_inner_hash])
+    // `action_layer_inner_hash` is already a tree hash → pass directly.
+    curry_tree_hash(
+        cat_mod_hash,
+        [
+            tree_hash_atom(cat_mod_hash),
+            tree_hash_atom(cat_tail_hash),
+            action_layer_inner_hash,
+        ],
+    )
+}
+
+fn main(
+    // ── Curried (action-specific config) ────────────────────────────
+    TREE_DEPTH: Int,
+    EMPTY_LEAF_HASH: Bytes32,
+    CAT_MOD_HASH: Bytes32,
+    CAT_TAIL_HASH: Bytes32,
+    ACTION_LAYER_MOD_HASH: Bytes32,
+    REGISTRATION_FINALIZER_MOD_HASH: Bytes32,
+    REGISTRATION_MERKLE_ROOT: Bytes32,
+    COLLATERAL_AMOUNT: Int,
+    REGISTRATION_FEE: Int,
+    ELECTION_LAUNCHER_ID: Bytes32,
+    Truth: ElectionStateTruth,
+    // ── Solution ────────────────────────────────────────────────────
+    new_voter_pubkey: PublicKey,
+    register_leaf_index: Int,
+    register_siblings: HashCons,
+    ...cat_parent_coin_id: Bytes32,
+) -> (ElectionStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    // Cannot register after finalization.
+    assert State.finalized == false;
+
+    // Slot integrity: index MUST be the canonical slot for this pubkey.
+    let computed_slot: Int = slot_from_pubkey(new_voter_pubkey);
+    assert register_leaf_index == computed_slot;
+
+    // Verify the slot is currently empty against the current root.
+    let pre_root: Bytes32 = compute_root(
+        EMPTY_LEAF_HASH, register_leaf_index, register_siblings, TREE_DEPTH,
+    );
+    assert pre_root == State.registration_merkle_root;
+
+    // Compute the new root with sha256(pubkey) inserted at the slot.
+    let pk_b: Bytes = new_voter_pubkey as Bytes;
+    let active_leaf: Bytes32 = sha256(pk_b);
+    let new_root: Bytes32 = compute_root(
+        active_leaf, register_leaf_index, register_siblings, TREE_DEPTH,
+    );
+
+    // Compute the expected CAT-wrapped Registration Coin puzzle hash.
+    let reg_full_hash: Bytes32 = fresh_registration_coin_puzzle_hash(
+        CAT_MOD_HASH,
+        CAT_TAIL_HASH,
+        ACTION_LAYER_MOD_HASH,
+        REGISTRATION_FINALIZER_MOD_HASH,
+        REGISTRATION_MERKLE_ROOT,
+        new_voter_pubkey,
+        ELECTION_LAUNCHER_ID,
+    );
+
+    // The CAT parent must emit this exact CreateCoinAnnouncement,
+    // confirming it has created the Registration Coin with the expected
+    // puzzle hash and amount.
+    let bbl_b: Bytes = ELECTION_LAUNCHER_ID as Bytes;
+    let create_reg_msg: Bytes32 = sha256(
+        "create_reg"
+        + bbl_b
+        + pk_b
+        + (reg_full_hash as Bytes)
+        + int_to_8_bytes_be(COLLATERAL_AMOUNT)
+    );
+    let assert_cat_creation = AssertCoinAnnouncement {
+        id: sha256((cat_parent_coin_id as Bytes) + (create_reg_msg as Bytes)),
+    };
+
+    // Voter's signature over a registration message bound to this election.
+    let registration_message: Bytes32 = sha256("register" + pk_b + bbl_b);
+    let agg_sig_register = AggSigMe {
+        public_key: new_voter_pubkey,
+        message: registration_message,
+    };
+
+    // Indexer / aggregator announcement.
+    let announce_register = CreateCoinAnnouncement {
+        message: sha256(
+            "registered"
+            + (new_root as Bytes)
+            + int_to_8_bytes_be(State.registration_count + 1)
+            + pk_b
+        ),
+    };
+
+    let new_state = ElectionState {
+        registration_merkle_root: new_root,
+        registration_count: State.registration_count + 1,
+        accumulated_fees: State.accumulated_fees + REGISTRATION_FEE,
+        finalized: false,
+        vote_outcome: 0x0000000000000000000000000000000000000000000000000000000000000000,
+    };
+
+    (
+        ElectionStateTruth {
+            Ephemeral_State: Truth.Ephemeral_State,
+            State: new_state,
+        },
+        [
+            assert_cat_creation,
+            agg_sig_register,
+            announce_register,
+        ],
+    )
+}

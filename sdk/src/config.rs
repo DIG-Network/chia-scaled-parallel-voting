@@ -1,0 +1,362 @@
+// ============================================================================
+// config.rs — immutable per-election configuration constants
+// ============================================================================
+//
+// MODULE: config
+// PURPOSE: Hold the deployment-time parameters that get curried into
+//          the Election Singleton's puzzle hash, plus protocol-wide
+//          constants (TREE_DEPTH, MAX_SIGNERS, EMPTY_LEAF_HASH).
+//
+// SHARED MODEL: every participant (deployer, voter, aggregator,
+//               indexer) loads an identical `ElectionConfig` JSON.
+//               The config is public information — no secrets.
+//
+// SERDE STRATEGY: chia-protocol's `Bytes32` and `chia-bls::PublicKey`
+//                 don't expose serde derives, so all 32-byte fields are
+//                 stored as hex strings (`*_hex`) with typed accessors
+//                 (`*_bytes32()`) that parse on demand.
+
+use chia_protocol::Bytes32;
+use serde::{Deserialize, Serialize};
+
+/// FN: parse_bytes32 (file-private)
+/// WHAT: hex string → `Bytes32` with sane error reporting.
+/// TRIM: strips surrounding whitespace for ergonomic JSON.
+fn parse_bytes32(s: &str) -> Result<Bytes32, &'static str> {
+    let bytes = hex::decode(s.trim()).map_err(|_| "invalid hex")?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| "expected 32 bytes")?;
+    Ok(Bytes32::new(arr))
+}
+
+/// CONST: TREE_DEPTH
+/// WHAT: SPT depth (= ceil(log2(MAX_VOTERS))). Fixed at 32 → ~4B slots.
+/// MIRROR: must equal the curried `TREE_DEPTH` in
+///         `puzzles/election/register.rue` and the Groth16 circuit.
+pub const TREE_DEPTH: u32 = 32;
+
+/// CONST: MAX_SIGNERS
+/// WHAT: hard cap on how many BLS signatures the Groth16 circuit can
+///       aggregate per `finalize` proof.
+/// IMMUTABLE: baked into the trusted setup. Changing it requires a
+///            full new MPC ceremony + redeployment.
+pub const MAX_SIGNERS: usize = 20_000;
+
+/// CONST: PUBLIC_INPUT_COUNT
+/// WHAT: number of public inputs to the Groth16 circuit. Each input
+///       contributes one IC point to the verification key.
+/// ORDER: registration_merkle_root, registration_count, agg_signers,
+///        vote_message — must match `prover/circuit.rs::Scalars`.
+pub const PUBLIC_INPUT_COUNT: usize = 4;
+
+/// CONST: EMPTY_LEAF_HASH
+/// WHAT: SHA256(0x00 ⨯ 48) — the canonical empty-leaf marker for the
+///       SPT. This is what `sha256(zero_pubkey)` would yield, so the
+///       Rue side and SDK side agree on what "no voter here" hashes to.
+/// USAGE: passed to the deployer as the curried `EMPTY_LEAF_HASH` arg
+///        of `puzzles/election/register.rue`.
+pub const EMPTY_LEAF_HASH: [u8; 32] = hex_literal::hex!(
+    "17b0761f87b081d5cf10757ccc89f12be355c70e2e29df288b65b30710dcbcd1"
+);
+
+/// FN: cat_mod_hash
+/// WHAT: standard CAT v2 outer puzzle hash.
+/// SOURCE: `chia_puzzles::CAT_PUZZLE_HASH` — the same constant the
+///         rest of the Chia ecosystem uses.
+pub fn cat_mod_hash() -> chia_protocol::Bytes32 {
+    chia_protocol::Bytes32::new(chia_puzzles::CAT_PUZZLE_HASH)
+}
+
+/// STRUCT: ElectionConfig
+/// PURPOSE: serialisable election parameters. One file per election.
+/// LIFECYCLE: written by the deployer at launch, distributed to all
+///            participants, then immutable for the life of the
+///            election.
+/// SERDE: hex-string fields are serde-friendly; use the typed
+///        accessors (`election_launcher_id`, `cat_tail_hash`) for
+///        chia-protocol APIs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElectionConfig {
+    /// Singleton launcher ID. Identifies this election uniquely
+    /// across the chain — used in voter hints and AggSigMe messages.
+    pub election_launcher_id_hex: String,
+
+    /// CAT TAIL hash of the governance token. Every Registration Coin
+    /// is CAT-wrapped with this asset ID, so the tail enforces the
+    /// asset's supply rules independent of our SDK.
+    pub cat_tail_hash_hex: String,
+
+    /// Per-voter collateral, in CAT mojos.
+    pub collateral_amount: u64,
+
+    /// Per-voter registration fee, in XCH mojos. Aggregated in the
+    /// singleton until `finalize`, then paid out to the finalizer as
+    /// economic incentive to actually run the proof.
+    pub registration_fee: u64,
+
+    /// Minimum L1 blocks between deployment and finalize. Enforced
+    /// on-chain via `ASSERT_HEIGHT_RELATIVE`. Mitigates the
+    /// "bootstrap attack" where the first registrant tries to
+    /// finalize immediately with a 1-voter quorum.
+    pub election_length_blocks: u64,
+
+    /// Must equal `TREE_DEPTH`. Stored explicitly for self-validation.
+    pub tree_depth: u32,
+
+    /// Must equal `MAX_SIGNERS`. Stored explicitly for self-validation.
+    pub max_signers: usize,
+
+    /// Hex-encoded Groth16 verification key (576 bytes for our
+    /// 4-input circuit). Produced by the MPC ceremony.
+    pub verification_key_hex: String,
+
+    /// Optional UI label.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+impl ElectionConfig {
+    /// FN: to_json
+    /// WHAT: pretty-JSON serialisation for sharing with participants.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).expect("ElectionConfig is always serialisable")
+    }
+
+    /// FN: from_json
+    /// WHAT: parse a JSON config produced by `to_json`. Round-trip safe.
+    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+
+    /// FN: election_launcher_id
+    /// WHAT: typed accessor for the launcher ID.
+    /// ERRORS: hex-decode or length errors in the underlying field.
+    pub fn election_launcher_id(&self) -> Result<Bytes32, &'static str> {
+        parse_bytes32(&self.election_launcher_id_hex)
+    }
+
+    /// FN: cat_tail_hash
+    /// WHAT: typed accessor for the CAT TAIL hash.
+    pub fn cat_tail_hash(&self) -> Result<Bytes32, &'static str> {
+        parse_bytes32(&self.cat_tail_hash_hex)
+    }
+
+    /// FN: validate
+    /// WHAT: structural sanity check before using the config.
+    /// CHECKS:
+    ///   * tree_depth + max_signers match SDK constants (else our
+    ///     compiled puzzles / circuit can't even verify the proofs)
+    ///   * launcher / tail hex are decodable Bytes32
+    ///   * verification key has the exact length our circuit needs
+    ///     (576 bytes = 336 base + 5 * 48 IC)
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.tree_depth != TREE_DEPTH {
+            return Err("ElectionConfig.tree_depth must equal TREE_DEPTH (32)");
+        }
+        if self.max_signers != MAX_SIGNERS {
+            return Err("ElectionConfig.max_signers must equal MAX_SIGNERS (20000)");
+        }
+        let _ = self.election_launcher_id()?;
+        let _ = self.cat_tail_hash()?;
+        let expected_vk_bytes = 336 + (PUBLIC_INPUT_COUNT + 1) * 48;
+        let vk_bytes = self.verification_key_hex.len() / 2;
+        if vk_bytes != expected_vk_bytes {
+            return Err(
+                "ElectionConfig.verification_key_hex has unexpected length for our circuit",
+            );
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn good_config() -> ElectionConfig {
+        ElectionConfig {
+            election_launcher_id_hex: "11".repeat(32),
+            cat_tail_hash_hex: "22".repeat(32),
+            collateral_amount: 1_000,
+            registration_fee: 10,
+            election_length_blocks: 4_608,
+            tree_depth: TREE_DEPTH,
+            max_signers: MAX_SIGNERS,
+            verification_key_hex: "00".repeat(336 + (PUBLIC_INPUT_COUNT + 1) * 48),
+            label: Some("test".into()),
+        }
+    }
+
+    /// WHAT: a fully-populated, well-formed config passes
+    ///       `.validate()`.
+    /// HOW:  build the canonical `good_config()` (using SDK
+    ///       constants) and call `.validate().unwrap()`.
+    /// WHY:  validates the validator itself — if the canonical good
+    ///       case ever started rejecting, every other test below
+    ///       (which mutates from this baseline) would be meaningless.
+    #[test]
+    fn validate_good_config_succeeds() {
+        good_config().validate().unwrap();
+    }
+
+    /// WHAT: `.validate()` rejects a config whose `tree_depth` is
+    ///       not the SDK-pinned value (32).
+    /// HOW:  start from `good_config`, set tree_depth = 16, expect
+    ///       an `Err`.
+    /// WHY:  TREE_DEPTH must match the compiled puzzle; loading a
+    ///       config with a different depth would silently produce
+    ///       wrong puzzle hashes downstream.
+    #[test]
+    fn validate_rejects_wrong_tree_depth() {
+        let mut c = good_config();
+        c.tree_depth = 16;
+        assert!(c.validate().is_err());
+    }
+
+    /// WHAT: `.validate()` rejects a config whose `max_signers` is
+    ///       not the SDK-pinned value (20000).
+    /// HOW:  set max_signers = 100, expect an `Err`.
+    /// WHY:  MAX_SIGNERS is baked into the trusted setup; mismatches
+    ///       would make every Groth16 verification on-chain reject.
+    #[test]
+    fn validate_rejects_wrong_max_signers() {
+        let mut c = good_config();
+        c.max_signers = 100;
+        assert!(c.validate().is_err());
+    }
+
+    /// WHAT: `.validate()` rejects a non-hex launcher id.
+    /// HOW:  set election_launcher_id_hex to literal "not-hex" and
+    ///       expect an `Err`.
+    /// WHY:  one of the most common manual-edit mistakes in the
+    ///       config JSON; failing fast here avoids cryptic errors
+    ///       when the typed accessor is later called.
+    #[test]
+    fn validate_rejects_bad_launcher_hex() {
+        let mut c = good_config();
+        c.election_launcher_id_hex = "not-hex".into();
+        assert!(c.validate().is_err());
+    }
+
+    /// WHAT: `.validate()` rejects a launcher id whose hex length
+    ///       isn't exactly 64 chars (32 bytes).
+    /// HOW:  set election_launcher_id_hex to a 32-char string,
+    ///       expect an `Err`.
+    /// WHY:  size mismatches sneak past hex-decode but corrupt all
+    ///       downstream `Bytes32` arithmetic — must reject early.
+    #[test]
+    fn validate_rejects_short_launcher_hex() {
+        let mut c = good_config();
+        c.election_launcher_id_hex = "11".repeat(16);
+        assert!(c.validate().is_err());
+    }
+
+    /// WHAT: `.validate()` rejects a verification key whose byte
+    ///       length doesn't match the circuit's expected layout
+    ///       (576 = 336 base + 5 IC * 48 bytes).
+    /// HOW:  set verification_key_hex to 100-byte zero-buffer, expect
+    ///       an `Err`.
+    /// WHY:  passing the wrong-size VK to the on-chain finalize
+    ///       action would corrupt every Groth16 verification; we
+    ///       must catch it at config-load time.
+    #[test]
+    fn validate_rejects_wrong_vk_length() {
+        let mut c = good_config();
+        c.verification_key_hex = "00".repeat(100);
+        assert!(c.validate().is_err());
+    }
+
+    /// WHAT: `to_json` → `from_json` is a lossless round-trip for
+    ///       every field of the config.
+    /// HOW:  serialise a populated good_config, parse it back, and
+    ///       compare every public field individually.
+    /// WHY:  the config travels between machines as JSON; field-by-
+    ///       field comparison catches accidental field drops or
+    ///       rename-induced silent data loss.
+    #[test]
+    fn json_roundtrip_preserves_all_fields() {
+        let c = good_config();
+        let json = c.to_json();
+        let parsed = ElectionConfig::from_json(&json).unwrap();
+        assert_eq!(parsed.election_launcher_id_hex, c.election_launcher_id_hex);
+        assert_eq!(parsed.cat_tail_hash_hex, c.cat_tail_hash_hex);
+        assert_eq!(parsed.collateral_amount, c.collateral_amount);
+        assert_eq!(parsed.registration_fee, c.registration_fee);
+        assert_eq!(parsed.election_length_blocks, c.election_length_blocks);
+        assert_eq!(parsed.tree_depth, c.tree_depth);
+        assert_eq!(parsed.max_signers, c.max_signers);
+        assert_eq!(parsed.verification_key_hex, c.verification_key_hex);
+        assert_eq!(parsed.label, c.label);
+    }
+
+    /// WHAT: `election_launcher_id()` and `cat_tail_hash()` return
+    ///       byte-exact `Bytes32` values matching the hex source.
+    /// HOW:  good_config uses `0x11..11` and `0x22..22` as fixed
+    ///       hex strings; assert the typed accessors yield the
+    ///       expected `[0x11; 32]` and `[0x22; 32]`.
+    /// WHY:  these accessors are how every downstream consumer
+    ///       converts JSON → typed Chia primitives. A subtle
+    ///       endianness or trim bug would break currying.
+    #[test]
+    fn typed_accessors_return_correct_bytes32() {
+        let c = good_config();
+        assert_eq!(c.election_launcher_id().unwrap(), Bytes32::new([0x11; 32]));
+        assert_eq!(c.cat_tail_hash().unwrap(), Bytes32::new([0x22; 32]));
+    }
+
+    /// WHAT: a config JSON that omits the `label` field still parses
+    ///       successfully (label defaults to `None`).
+    /// HOW:  hand-craft a minimal JSON without a `label` key, parse,
+    ///       assert `label == None`.
+    /// WHY:  label is purely cosmetic; parsing must not require it
+    ///       so older / programmatically-generated configs work.
+    #[test]
+    fn label_is_optional_in_json() {
+        let json = format!(
+            r#"{{
+                "election_launcher_id_hex": "{}",
+                "cat_tail_hash_hex": "{}",
+                "collateral_amount": 1,
+                "registration_fee": 1,
+                "election_length_blocks": 1,
+                "tree_depth": {TREE_DEPTH},
+                "max_signers": {MAX_SIGNERS},
+                "verification_key_hex": "{}"
+            }}"#,
+            "11".repeat(32),
+            "22".repeat(32),
+            "00".repeat(336 + (PUBLIC_INPUT_COUNT + 1) * 48),
+        );
+        let parsed = ElectionConfig::from_json(&json).unwrap();
+        assert_eq!(parsed.label, None);
+    }
+
+    /// WHAT: `cat_mod_hash()` is identical to
+    ///       `chia_puzzles::CAT_PUZZLE_HASH`.
+    /// HOW:  direct equality assertion.
+    /// WHY:  one source of truth for the CAT v2 outer puzzle hash,
+    ///       across our SDK and every other Chia tool.
+    #[test]
+    fn cat_mod_hash_matches_upstream() {
+        assert_eq!(cat_mod_hash(), Bytes32::new(chia_puzzles::CAT_PUZZLE_HASH));
+    }
+
+    /// WHAT: `EMPTY_LEAF_HASH` actually equals `sha256(0x00 ⨯ 48)`.
+    /// HOW:  recompute the sha256 inline and assert equality with
+    ///       the const.
+    /// WHY:  this is the single most safety-critical constant in the
+    ///       SDK — it's what the on-chain register action uses to
+    ///       check empty-slot proofs. A previous iteration shipped
+    ///       a wrong value here; this test catches that regression.
+    #[test]
+    fn empty_leaf_hash_is_sha256_of_48_zero_bytes() {
+        use sha2::{Digest, Sha256};
+        let zero_pk = [0u8; 48];
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&Sha256::digest(zero_pk));
+        assert_eq!(arr, EMPTY_LEAF_HASH);
+    }
+}

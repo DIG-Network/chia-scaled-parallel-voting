@@ -1,0 +1,59 @@
+// registration_coin/shared.rue
+// State and types shared by all Registration Coin actions.
+//
+// The Registration Coin is a CAT-wrapped puzzle. The CAT outer (curried
+// with the governance asset's TAIL hash) holds the voter's collateral;
+// the inner puzzle is the CHIP-0050 action layer running these actions:
+//
+//   - vote     — records the voter's vote (recreates the coin with
+//                has_voted=true and vote_data committed to state)
+//   - release  — sends the CAT collateral to a destination (only valid
+//                after the Election Singleton has been finalized)
+//
+// State semantics:
+//   voter_pubkey         — BLS G1 pubkey of the voter. Lives in state
+//                          (rather than being curried into the action
+//                          puzzles) so the vote / release action puzzle
+//                          hashes are deployment-wide constants and the
+//                          Election Singleton can hold a single
+//                          REGISTRATION_MERKLE_ROOT for all voters.
+//   election_launcher_id — Singleton launcher ID of the election. Same
+//                          rationale as above — kept in state, not
+//                          curried into the actions.
+//   has_voted            — true after the vote action runs.
+//   vote_data            — 0x00..00 until voted; the voter's choice
+//                          (32-byte payload) once voted. Curried into
+//                          the post-vote puzzle hash, giving an
+//                          on-chain tamper-proof commitment to the vote.
+//   release_destination  — nil while the coin is "live"; set to the
+//                          destination puzzle hash when the release
+//                          action runs. The registration_coin finalizer
+//                          reads this to decide between recreating the
+//                          coin and sending its CAT to the destination.
+
+export struct RegistrationState {
+    voter_pubkey: PublicKey,
+    election_launcher_id: Bytes32,
+    has_voted: Bool,
+    vote_data: Bytes32,
+    ...release_destination: Bytes32 | nil,
+}
+
+export struct RegistrationStateTruth {
+    Ephemeral_State: Any,
+    ...State: RegistrationState,
+}
+
+/// Ephemeral state set by the vote action and read by the finalizer to
+/// populate the recreated coin's memos with vote_data + signature.
+export struct EphemeralVote {
+    vote_data: Bytes32,
+    ...vote_signature: Signature,
+}
+
+/// Encode an integer as exactly 8 big-endian bytes.
+export inline fn int_to_8_bytes_be(n: Int) -> Bytes {
+    let sentinel: Int = 0x010000000000000000 as Int;
+    let padded_bytes: Bytes = (n + sentinel) as Bytes;
+    substr(padded_bytes, 1, 9)
+}

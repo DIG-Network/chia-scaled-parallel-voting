@@ -1,0 +1,48 @@
+# --- Rust / Cargo ---
+target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is committed for binary crates (this workspace ships a CLI).
+# If this becomes a library-only workspace, uncomment the next line:
+# Cargo.lock
+
+# --- Build / coverage / profiling artifacts ---
+*.profraw
+*.profdata
+tarpaulin-report.html
+cobertura.xml
+coverage/
+flamegraph.svg
+perf.data*
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Project-specific dumps & credentials ---
+.test-credentials
+.env
+.env.*
+!.env.example
+debug-dumps/
+dump/
+
+# --- Editor / IDE ---
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/

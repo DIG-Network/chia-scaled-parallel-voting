@@ -1,0 +1,104 @@
+// registration_coin/release.rue
+// Release-collateral action for the Registration Coin.
+//
+// Only valid AFTER the Election Singleton has been finalized. The voter
+// pairs this spend with the Election Singleton's announce_finalization
+// action in the same spend bundle so this action can assert the
+// finalization announcement.
+//
+// Reads voter_pubkey and election_launcher_id from state (rather than
+// from a curry), so this action's puzzle hash is a deployment-wide
+// constant that lives in the Registration Coin's MERKLE_ROOT.
+//
+// State transition:
+//   release_destination → collateral_destination (provided in solution)
+//
+// The registration_coin finalizer reads the new state and, because
+// release_destination is now non-nil, sends the CAT collateral to that
+// destination instead of recreating the registration coin. The
+// registration coin lineage ends here.
+//
+// Both has_voted=true and has_voted=false coins can release — voters
+// who registered but never voted still recover their collateral.
+//
+// AssertCoinAnnouncement contract (CRITICAL):
+//   The on-chain `AssertCoinAnnouncement` opcode validates against
+//   the FULL announcement_id = sha256(announcer_coin_id || message).
+//   Because the Election Singleton's coin_id is not knowable at
+//   curry time (it changes on every spend), the spender supplies it
+//   via the `singleton_coin_id` solution parameter. The puzzle then
+//   computes the proper announcement_id locally. Consensus's
+//   AssertCoinAnnouncement validator only accepts spends paired
+//   with a real CreateCoinAnnouncement whose computed id matches —
+//   so a malicious voter cannot lie about singleton_coin_id (the
+//   assertion would simply not match any real announcement).
+
+import shared::*;
+
+fn main(
+    Truth: RegistrationStateTruth,
+    collateral_destination: Bytes32,
+    singleton_coin_id: Bytes32,
+    finalized_outcome: Bytes32,
+    finalized_count: Int,
+    ...finalized_root: Bytes32,
+) -> (RegistrationStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    // Cannot release twice.
+    assert State.release_destination is nil;
+
+    let pk_b: Bytes = State.voter_pubkey as Bytes;
+    let el_b: Bytes = State.election_launcher_id as Bytes;
+    let dest_b: Bytes = collateral_destination as Bytes;
+
+    // Build the finalization announcement message that the Election
+    // Singleton's finalize / announce_finalization actions emit:
+    //   sha256("finalized" || vote_outcome || count_be8 || merkle_root)
+    let finalization_message: Bytes32 = sha256(
+        "finalized"
+        + (finalized_outcome as Bytes)
+        + int_to_8_bytes_be(finalized_count)
+        + (finalized_root as Bytes)
+    );
+
+    // Compute the FULL announcement_id the consensus runner expects:
+    //   announcement_id = sha256(announcer_coin_id || message)
+    let announcement_id: Bytes32 = sha256(
+        (singleton_coin_id as Bytes)
+        + (finalization_message as Bytes)
+    );
+
+    let assert_finalized = AssertCoinAnnouncement {
+        id: announcement_id,
+    };
+
+    // Voter authorises the destination via AggSigMe. Message binds
+    // (pubkey, election_id, destination) so a signature for one
+    // destination can't be replayed for another.
+    let release_message: Bytes32 = sha256(
+        "release" + el_b + pk_b + dest_b
+    );
+    let agg_sig_release = AggSigMe {
+        public_key: State.voter_pubkey,
+        message: release_message,
+    };
+
+    let new_state = RegistrationState {
+        voter_pubkey: State.voter_pubkey,
+        election_launcher_id: State.election_launcher_id,
+        has_voted: State.has_voted,
+        vote_data: State.vote_data,
+        release_destination: collateral_destination,
+    };
+
+    (
+        RegistrationStateTruth {
+            // Release does not write any vote ephemeral state — finalizer
+            // will leave vote info out of the destination coin's memos.
+            Ephemeral_State: nil,
+            State: new_state,
+        },
+        [assert_finalized, agg_sig_release],
+    )
+}
