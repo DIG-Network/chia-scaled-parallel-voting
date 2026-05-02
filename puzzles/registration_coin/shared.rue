@@ -1,30 +1,33 @@
 // registration_coin/shared.rue
 // State and types shared by all Registration Coin actions.
+
+import super::common_types::*;
+
 //
 // The Registration Coin is a CAT-wrapped puzzle. The CAT outer (curried
 // with the governance asset's TAIL hash) holds the voter's collateral;
-// the inner puzzle is the CHIP-0050 action layer running these actions:
+// the inner puzzle is the CHIP-0050 action layer.
 //
-//   - vote     — records the voter's vote (recreates the coin with
-//                has_voted=true and vote_data committed to state)
-//   - release  — sends the CAT collateral to a destination (only valid
-//                after the Election Singleton has been finalized)
+// In the multi-ballot architecture the Registration Coin no longer
+// holds a single vote — votes are recorded on Ballot Coins via Voting
+// Coins. The Registration Coin instead tracks a Merkle root over all
+// ballots this voter has voted on (`voted_ballots_root`). Voting on a
+// new ballot proves the leaf at the canonical slot for that ballot is
+// currently empty (EMPTY_BALLOT_LEAF_HASH) and replaces it with a
+// committed leaf, mirroring the Election Singleton's SPT pattern but
+// keyed per-ballot.
 //
 // State semantics:
 //   voter_pubkey         — BLS G1 pubkey of the voter. Lives in state
 //                          (rather than being curried into the action
-//                          puzzles) so the vote / release action puzzle
-//                          hashes are deployment-wide constants and the
-//                          Election Singleton can hold a single
-//                          REGISTRATION_MERKLE_ROOT for all voters.
-//   election_launcher_id — Singleton launcher ID of the election. Same
-//                          rationale as above — kept in state, not
-//                          curried into the actions.
-//   has_voted            — true after the vote action runs.
-//   vote_data            — 0x00..00 until voted; the voter's choice
-//                          (32-byte payload) once voted. Curried into
-//                          the post-vote puzzle hash, giving an
-//                          on-chain tamper-proof commitment to the vote.
+//                          puzzles) so the action puzzle hashes are
+//                          deployment-wide constants.
+//   election_launcher_id — Singleton launcher ID of the election the
+//                          voter is registered in.
+//   voted_ballots_root   — SPT root over the ballots this voter has
+//                          voted on. Initialised to the all-empty root
+//                          at registration time and updated by the
+//                          vote action.
 //   release_destination  — nil while the coin is "live"; set to the
 //                          destination puzzle hash when the release
 //                          action runs. The registration_coin finalizer
@@ -34,8 +37,7 @@
 export struct RegistrationState {
     voter_pubkey: PublicKey,
     election_launcher_id: Bytes32,
-    has_voted: Bool,
-    vote_data: Bytes32,
+    voted_ballots_root: Bytes32,
     ...release_destination: Bytes32 | nil,
 }
 
@@ -44,12 +46,28 @@ export struct RegistrationStateTruth {
     ...State: RegistrationState,
 }
 
-/// Ephemeral state set by the vote action and read by the finalizer to
-/// populate the recreated coin's memos with vote_data + signature.
-export struct EphemeralVote {
-    vote_data: Bytes32,
-    ...vote_signature: Signature,
+/// Membership witness for a Ballot in the voter's `voted_ballots_root`
+/// SPT. The SPT is depth `BALLOT_TREE_DEPTH` (32), keyed by
+/// `ballot_launcher_id` (specifically: a 4-byte prefix of
+/// sha256(ballot_launcher_id), matching the per-pubkey slot pattern
+/// used by the Election Singleton's registration SPT). `siblings` is a
+/// length-32 cons list of sibling node hashes; the empty leaf value at
+/// every level is `EMPTY_BALLOT_LEAF_HASH`.
+export struct BallotMembership {
+    ballot_launcher_id: Bytes32,
+    ...siblings: HashCons,
 }
+
+/// Empty-leaf sentinel for the voted-ballots SPT. A leaf at this value
+/// means "this voter has not voted on this ballot". The vote action
+/// proves emptiness against this sentinel and replaces the slot with
+/// the committed vote leaf.
+export const EMPTY_BALLOT_LEAF_HASH: Bytes32 =
+    0x0000000000000000000000000000000000000000000000000000000000000000;
+
+/// Depth of the voted-ballots SPT. Matches the registration SPT depth
+/// so the same `compute_root` recursion shape is reusable.
+export const BALLOT_TREE_DEPTH: Int = 32;
 
 /// Encode an integer as exactly 8 big-endian bytes.
 export inline fn int_to_8_bytes_be(n: Int) -> Bytes {

@@ -1,26 +1,33 @@
 // election/shared.rue
 // State and types shared by all Election Singleton actions.
 //
-// The Election Singleton uses the CHIP-0050 action layer with three
-// actions: register, finalize, announce_finalization. All three actions
-// take an ElectionStateTruth and return a new ElectionStateTruth plus
-// conditions.
+// The Election Singleton uses the CHIP-0050 action layer with actions
+// that operate on an ElectionStateTruth and return a new
+// ElectionStateTruth plus conditions.
 //
 // State semantics:
 //   registration_merkle_root  — SPT root of registered voter pubkeys
 //   registration_count        — total registered voters
-//   accumulated_fees          — XCH (mojos) collected from registration fees
-//                               (paid out to the finalizer when finalize runs)
-//   finalized                 — false until the finalize action runs once
-//   vote_outcome              — zero until finalized; the committed
-//                               outcome bytes after finalization
+//   registration_vote_weight  — total vote weight contributed by
+//                               registered voters (sum of CAT collateral
+//                               amounts; used by ballots to weight votes)
+//   election_start_height     — block height at which this election was
+//                               launched. Curried-equivalent constants
+//                               (epoch lengths, etc.) are computed
+//                               relative to this anchor.
+//
+// In the multi-ballot architecture, the election singleton no longer
+// tracks finalization or a single vote_outcome — those move to
+// per-ballot Ballot Coins. Fees are no longer accumulated on the
+// singleton (registration fees are routed elsewhere or omitted in this
+// rev). A voter who deregisters is announced by the
+// `deregister_announcement_msg` so downstream parties can react.
 
 export struct ElectionState {
     registration_merkle_root: Bytes32,
     registration_count: Int,
-    accumulated_fees: Int,
-    finalized: Bool,
-    ...vote_outcome: Bytes32,
+    registration_vote_weight: Int,
+    ...election_start_height: Int,
 }
 
 export struct ElectionStateTruth {
@@ -36,64 +43,17 @@ export inline fn int_to_8_bytes_be(n: Int) -> Bytes {
     substr(padded_bytes, 1, 9)
 }
 
-/// Compute the finalization announcement message.
+/// Compute the deregistration announcement message.
 ///
-/// Asserted by Registration Coins (release action) when releasing
-/// collateral. Centralised here so the finalize and
-/// announce_finalization actions emit byte-identical messages.
-export inline fn finalization_announcement_msg(
-    vote_outcome: Bytes32,
-    count: Int,
-    merkle_root: Bytes32,
+/// Emitted by the Election Singleton's deregister action and asserted
+/// by external observers (or by a Registration Coin's release path) so
+/// the act of removing a voter from the registered set is observable
+/// on-chain in a single canonical form.
+export inline fn deregister_announcement_msg(
+    voter_pubkey: PublicKey,
 ) -> Bytes32 {
     sha256(
-        "finalized"
-        + (vote_outcome as Bytes)
-        + int_to_8_bytes_be(count)
-        + (merkle_root as Bytes)
-    )
-}
-
-/// Compute the oracle announcement message for a FINALIZED election.
-///
-/// Emitted by the `oracle` action when `State.finalized == true`.
-/// Distinct prefix from `finalization_announcement_msg` so external
-/// puzzles can opt into "oracle" semantics without colliding with
-/// the registration-coin release flow.
-///
-/// External callers pair the oracle spend with their own spend in
-/// the same bundle and emit `AssertCoinAnnouncement` over
-/// `sha256(oracle_singleton_coin_id || this_message)` to read the
-/// finalized outcome on-chain.
-export inline fn oracle_finalized_announcement_msg(
-    vote_outcome: Bytes32,
-    count: Int,
-    merkle_root: Bytes32,
-) -> Bytes32 {
-    sha256(
-        "oracle_finalized"
-        + (vote_outcome as Bytes)
-        + int_to_8_bytes_be(count)
-        + (merkle_root as Bytes)
-    )
-}
-
-/// Compute the oracle announcement message for an UNFINALIZED
-/// election.
-///
-/// Emitted by the `oracle` action when `State.finalized == false`.
-/// Carries the current registration set (count + root) so external
-/// puzzles can reason about the in-progress election (e.g., gate a
-/// downstream action on a minimum registered count) without ever
-/// being able to mistake it for a finalized outcome — the prefix
-/// bytes diverge.
-export inline fn oracle_unfinalized_announcement_msg(
-    count: Int,
-    merkle_root: Bytes32,
-) -> Bytes32 {
-    sha256(
-        "oracle_unfinalized"
-        + int_to_8_bytes_be(count)
-        + (merkle_root as Bytes)
+        "deregister"
+        + (voter_pubkey as Bytes)
     )
 }

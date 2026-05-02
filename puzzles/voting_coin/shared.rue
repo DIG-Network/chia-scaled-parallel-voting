@@ -1,0 +1,64 @@
+// voting_coin/shared.rue
+// State and types shared by all Voting Coin actions.
+//
+// A Voting Coin is the ephemeral bridge between a Registration Coin
+// and a Ballot Coin. It carries the voter's signed vote message into a
+// single spend bundle that simultaneously:
+//   * Updates the Registration Coin's `voted_ballots_root` to record
+//     the new vote (preventing double-vote on this ballot).
+//   * Updates the Ballot Coin's tally with the voter's choice.
+// The Voting Coin is created by the Registration Coin's vote action,
+// curried with the fields below, and is consumed in the same bundle by
+// the Ballot Coin's vote action — its state is therefore a one-shot
+// commitment rather than a long-lived stateful coin.
+//
+// State semantics:
+//   voter_pubkey         — BLS G1 pubkey of the voter casting the vote.
+//                          Required so the Ballot Coin can verify the
+//                          AggSig over `vote_message(...)` matches a
+//                          registered voter (membership proven via the
+//                          Registration Coin's spend in the same
+//                          bundle).
+//   ballot_launcher_id   — Singleton launcher ID of the Ballot Coin
+//                          this vote targets. Curried so the
+//                          on-chain coin id is unforgeably bound to a
+//                          specific ballot.
+//   vote_data            — 32-byte committed vote payload (e.g., the
+//                          outcome bytes the voter is endorsing).
+//   registration_coin_id — Coin id of the spending Registration Coin.
+//                          Lets the Ballot Coin assert that the
+//                          Registration Coin participated in the
+//                          bundle without re-deriving its puzzle hash.
+
+export struct VotingCoinState {
+    voter_pubkey: PublicKey,
+    ballot_launcher_id: Bytes32,
+    vote_data: Bytes32,
+    ...registration_coin_id: Bytes32,
+}
+
+export struct VotingCoinStateTruth {
+    Ephemeral_State: Any,
+    ...State: VotingCoinState,
+}
+
+/// Canonical preimage of the voter's signature.
+///
+/// The voter signs `vote_message(vote_outcome, ballot_launcher_id,
+/// election_launcher_id)` with their BLS key; the Ballot Coin's vote
+/// action verifies an AggSigMe over this digest. Binding all three
+/// ids into a single hash domain-separates votes across ballots and
+/// elections (the same outcome bytes against a different ballot or
+/// election produces a different message and therefore an invalid
+/// signature).
+export inline fn vote_message(
+    vote_outcome: Bytes32,
+    ballot_launcher_id: Bytes32,
+    election_launcher_id: Bytes32,
+) -> Bytes32 {
+    sha256(
+        (vote_outcome as Bytes)
+        + (ballot_launcher_id as Bytes)
+        + (election_launcher_id as Bytes)
+    )
+}

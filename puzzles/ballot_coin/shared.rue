@@ -1,0 +1,92 @@
+// ballot_coin/shared.rue
+// State and types shared by all Ballot Coin actions.
+//
+// In the multi-ballot architecture, each ballot is a singleton-like
+// coin with the CHIP-0050 action layer running ballot-specific actions
+// (vote, finalize, oracle). The Ballot Coin holds the running tally
+// and, after finalization, the committed outcome plus the aggregated
+// signer set that endorsed it.
+//
+// State semantics:
+//   finalized    — false until the finalize action runs; true after.
+//   vote_outcome — zero (32 bytes of 0x00) until finalized; the
+//                  committed outcome bytes once finalized.
+//   agg_signers  — zero until finalized; the BLS-G1-aggregate (or
+//                  Merkle root) of the public keys that endorsed the
+//                  finalized outcome. Hashed alongside `vote_outcome`
+//                  in the finalization announcement so observers can
+//                  reproduce the signer set verification off-chain.
+
+export struct BallotState {
+    finalized: Bool,
+    vote_outcome: Bytes32,
+    ...agg_signers: Bytes32,
+}
+
+export struct BallotStateTruth {
+    Ephemeral_State: Any,
+    ...State: BallotState,
+}
+
+/// Encode an integer as exactly 8 big-endian bytes.
+/// Re-used by the oracle action (which hashes a height).
+export inline fn int_to_8_bytes_be(n: Int) -> Bytes {
+    let sentinel: Int = 0x010000000000000000 as Int;
+    let padded_bytes: Bytes = (n + sentinel) as Bytes;
+    substr(padded_bytes, 1, 9)
+}
+
+/// Compute the ballot finalization announcement message.
+///
+/// Emitted by the Ballot Coin's finalize action and asserted by any
+/// downstream consumer (e.g., a Registration Coin recording a vote
+/// against a finalized ballot, or an external puzzle gating on the
+/// outcome).
+export inline fn ballot_finalization_msg(
+    ballot_launcher_id: Bytes32,
+    vote_outcome: Bytes32,
+    agg_signers: Bytes32,
+) -> Bytes32 {
+    sha256(
+        "ballot_finalized"
+        + (ballot_launcher_id as Bytes)
+        + (vote_outcome as Bytes)
+        + (agg_signers as Bytes)
+    )
+}
+
+/// Compute the oracle announcement message for an OPEN (not yet
+/// finalized) Ballot Coin.
+///
+/// Emitted by the ballot's oracle action when `State.finalized ==
+/// false`. Carries the current block height so observers can verify
+/// the ballot is still open as of a specific height (rather than just
+/// "was open at some point"). Distinct prefix from
+/// `ballot_oracle_closed_msg` so the two cases never collide.
+export inline fn ballot_oracle_open_msg(
+    ballot_launcher_id: Bytes32,
+    current_height: Int,
+) -> Bytes32 {
+    sha256(
+        "ballot_open"
+        + (ballot_launcher_id as Bytes)
+        + int_to_8_bytes_be(current_height)
+    )
+}
+
+/// Compute the oracle announcement message for a CLOSED (finalized)
+/// Ballot Coin.
+///
+/// Emitted by the ballot's oracle action when `State.finalized ==
+/// true`. The finalization announcement (`ballot_finalization_msg`)
+/// already carries the outcome and signer set; this message exists so
+/// observers can cheaply confirm closed-ness without re-hashing the
+/// outcome payload.
+export inline fn ballot_oracle_closed_msg(
+    ballot_launcher_id: Bytes32,
+) -> Bytes32 {
+    sha256(
+        "ballot_closed"
+        + (ballot_launcher_id as Bytes)
+    )
+}
