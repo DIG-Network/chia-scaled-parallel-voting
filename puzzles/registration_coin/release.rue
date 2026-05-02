@@ -1,10 +1,10 @@
 // registration_coin/release.rue
 // Release-collateral action for the Registration Coin.
 //
-// Only valid AFTER the Election Singleton has been finalized. The voter
-// pairs this spend with the Election Singleton's announce_finalization
-// action in the same spend bundle so this action can assert the
-// finalization announcement.
+// Per CHIP rev 2026-05-02, release is gated by the Election
+// Singleton's `deregister` action — NOT by ballot finalization. The
+// voter pairs this spend with a singleton `deregister` spend in the
+// same bundle so this action can assert the deregister announcement.
 //
 // Reads voter_pubkey and election_launcher_id from state (rather than
 // from a curry), so this action's puzzle hash is a deployment-wide
@@ -18,30 +18,30 @@
 // destination instead of recreating the registration coin. The
 // registration coin lineage ends here.
 //
-// Both has_voted=true and has_voted=false coins can release — voters
-// who registered but never voted still recover their collateral.
+// Voters can release whether or not they have minted Voting Coins for
+// any ballot. Existing Voting Coins remain on chain after the parent
+// Registration Coin releases — they were already cast, signed, and
+// will continue to be aggregable for ballots opened during the
+// registration's active window.
 //
 // AssertCoinAnnouncement contract (CRITICAL):
 //   The on-chain `AssertCoinAnnouncement` opcode validates against
 //   the FULL announcement_id = sha256(announcer_coin_id || message).
-//   Because the Election Singleton's coin_id is not knowable at
-//   curry time (it changes on every spend), the spender supplies it
-//   via the `singleton_coin_id` solution parameter. The puzzle then
-//   computes the proper announcement_id locally. Consensus's
-//   AssertCoinAnnouncement validator only accepts spends paired
-//   with a real CreateCoinAnnouncement whose computed id matches —
-//   so a malicious voter cannot lie about singleton_coin_id (the
-//   assertion would simply not match any real announcement).
+//   The singleton's coin_id is not knowable at curry time (changes
+//   per spend), so the spender supplies it via the
+//   `singleton_coin_id` solution parameter. The puzzle then computes
+//   the announcement_id locally. Consensus's AssertCoinAnnouncement
+//   validator only accepts spends paired with a real
+//   CreateCoinAnnouncement whose computed id matches — so a
+//   malicious voter cannot lie about singleton_coin_id.
 
+import super::common_types::*;
 import shared::*;
 
 fn main(
     Truth: RegistrationStateTruth,
     collateral_destination: Bytes32,
-    singleton_coin_id: Bytes32,
-    finalized_outcome: Bytes32,
-    finalized_count: Int,
-    ...finalized_root: Bytes32,
+    ...singleton_coin_id: Bytes32,
 ) -> (RegistrationStateTruth, List<Condition>) {
     inline let State = Truth.State;
 
@@ -52,24 +52,23 @@ fn main(
     let el_b: Bytes = State.election_launcher_id as Bytes;
     let dest_b: Bytes = collateral_destination as Bytes;
 
-    // Build the finalization announcement message that the Election
-    // Singleton's finalize / announce_finalization actions emit:
-    //   sha256("finalized" || vote_outcome || count_be8 || merkle_root)
-    let finalization_message: Bytes32 = sha256(
-        "finalized"
-        + (finalized_outcome as Bytes)
-        + int_to_8_bytes_be(finalized_count)
-        + (finalized_root as Bytes)
+    // Build the deregister announcement message the singleton's
+    // `deregister` action emits:
+    //   sha256("deregister" || voter_pubkey)
+    // Inlined here rather than imported from election/shared to keep
+    // registration_coin/ self-contained (no cross-coin imports).
+    let deregister_message: Bytes32 = sha256(
+        "deregister" + pk_b
     );
 
-    // Compute the FULL announcement_id the consensus runner expects:
+    // Compute the FULL announcement_id consensus expects:
     //   announcement_id = sha256(announcer_coin_id || message)
     let announcement_id: Bytes32 = sha256(
         (singleton_coin_id as Bytes)
-        + (finalization_message as Bytes)
+        + (deregister_message as Bytes)
     );
 
-    let assert_finalized = AssertCoinAnnouncement {
+    let assert_deregistered = AssertCoinAnnouncement {
         id: announcement_id,
     };
 
@@ -87,18 +86,15 @@ fn main(
     let new_state = RegistrationState {
         voter_pubkey: State.voter_pubkey,
         election_launcher_id: State.election_launcher_id,
-        has_voted: State.has_voted,
-        vote_data: State.vote_data,
+        voted_ballots_root: State.voted_ballots_root,
         release_destination: collateral_destination,
     };
 
     (
         RegistrationStateTruth {
-            // Release does not write any vote ephemeral state — finalizer
-            // will leave vote info out of the destination coin's memos.
             Ephemeral_State: nil,
             State: new_state,
         },
-        [assert_finalized, agg_sig_release],
+        [assert_deregistered, agg_sig_release],
     )
 }

@@ -1,0 +1,250 @@
+// registration_coin/mint_voting_coin.rue
+// Mint Voting Coin action for the Registration Coin.
+//
+// Creates a fresh Voting Coin lineage representing this voter's vote
+// on the targeted ballot. The action:
+//   1. Asserts the Ballot Coin's `oracle` open announcement, which
+//      pins (ballot_launcher_id, vote_close_height) on-chain — this
+//      is the only mechanism that prevents an attacker from currying
+//      a malicious vote_close_height into the Voting Coin.
+//   2. Proves NON-membership of `ballot_launcher_id` in
+//      `state.voted_ballots_root` (single-vote-per-ballot
+//      enforcement) and inserts it.
+//   3. Mints the Voting Coin (CAT-wrapped at the same TAIL as the
+//      Registration Coin) with curried state binding the voter
+//      pubkey, ballot id, election id, vote_close_height, parent
+//      registration coin id, and the initial vote_data.
+//   4. Emits the voter's BLS signature over `vote_message` as a memo
+//      so off-chain aggregators can collect it without coordinating
+//      with the voter.
+//   5. Recreates the Registration Coin with `voted_ballots_root`
+//      updated.
+//
+// Companion spends required in the same bundle:
+//   * Election Singleton is NOT spent. (This is the whole point of
+//     moving votes off the singleton lane.)
+//   * The target Ballot Coin runs its `oracle` action emitting the
+//     "ballot_oracle_open" announcement that matches
+//     ballot_oracle_announcement_id below.
+
+import super::common_types::*;
+import shared::*;
+
+inline fn ballot_slot_from_id(ballot_launcher_id: Bytes32) -> Int {
+    let h: Bytes = sha256(ballot_launcher_id as Bytes) as Bytes;
+    let prefix: Bytes = substr(h, 0, 4);
+    let unsigned: Bytes = 0x00 as Bytes + prefix;
+    unsigned as Int
+}
+
+fn compute_ballot_root(
+    node: Bytes32,
+    index: Int,
+    remaining: HashCons,
+    depth_remaining: Int,
+) -> Bytes32 {
+    if depth_remaining == 0 {
+        node
+    } else {
+        let sibling: Bytes32 = remaining.head;
+        let node_b: Bytes = node as Bytes;
+        let sibling_b: Bytes = sibling as Bytes;
+        let parent: Bytes32 = if index % 2 == 0 {
+            sha256(node_b + sibling_b)
+        } else {
+            sha256(sibling_b + node_b)
+        };
+        compute_ballot_root(parent, index / 2, remaining.tail, depth_remaining - 1)
+    }
+}
+
+fn main(
+    // ── Curried (action-specific config) ────────────────────────────
+    CAT_MOD_HASH: Bytes32,
+    CAT_TAIL_HASH: Bytes32,
+    ACTION_LAYER_MOD_HASH: Bytes32,
+    VOTING_COIN_FINALIZER_MOD_HASH: Bytes32,
+    VOTING_COIN_ACTIONS_MERKLE_ROOT: Bytes32,
+    Truth: RegistrationStateTruth,
+    // ── Solution ────────────────────────────────────────────────────
+    ballot_launcher_id: Bytes32,
+    vote_close_height: Int,
+    vote_data: Bytes32,
+    ballot_coin_id: Bytes32,
+    registration_coin_id: Bytes32,
+    initial_signature: Signature,
+    ballot_membership_witness: BallotMembership,
+    ...voting_coin_amount: Int,
+) -> (RegistrationStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    // Cannot mint after release has been authorised.
+    assert State.release_destination is nil;
+
+    // ─── 1. Assert Ballot Coin oracle open announcement ─────────────
+    //
+    // The Ballot Coin's `oracle` action emits, when finalized==false:
+    //   sha256("ballot_oracle_open" || ballot_launcher_id || vote_close_height_be8)
+    //
+    // Asserting it here pins both the ballot's identity and its close
+    // height to on-chain truth (the Ballot Coin's curried values).
+    let ballot_b: Bytes = ballot_launcher_id as Bytes;
+    let oracle_message: Bytes32 = sha256(
+        "ballot_oracle_open"
+        + ballot_b
+        + int_to_8_bytes_be(vote_close_height)
+    );
+    let oracle_announcement_id: Bytes32 = sha256(
+        (ballot_coin_id as Bytes)
+        + (oracle_message as Bytes)
+    );
+    let assert_ballot_open = AssertCoinAnnouncement {
+        id: oracle_announcement_id,
+    };
+
+    // ─── 2. Non-membership in voted_ballots_root, then insert ───────
+    //
+    // Slot = first 4 bytes of sha256(ballot_launcher_id), prefixed
+    // with 0x00 to force unsigned interpretation. Same convention as
+    // the registration SPT slot derivation in election/register.rue.
+    assert ballot_membership_witness.ballot_launcher_id == ballot_launcher_id;
+
+    let computed_slot: Int = ballot_slot_from_id(ballot_launcher_id);
+
+    // Empty-leaf proof against current root.
+    let pre_root: Bytes32 = compute_ballot_root(
+        EMPTY_BALLOT_LEAF_HASH,
+        computed_slot,
+        ballot_membership_witness.siblings,
+        BALLOT_TREE_DEPTH,
+    );
+    assert pre_root == State.voted_ballots_root;
+
+    // New root with sha256(ballot_launcher_id) inserted at the slot.
+    let occupied_leaf: Bytes32 = sha256(ballot_b);
+    let new_voted_ballots_root: Bytes32 = compute_ballot_root(
+        occupied_leaf,
+        computed_slot,
+        ballot_membership_witness.siblings,
+        BALLOT_TREE_DEPTH,
+    );
+
+    // ─── 3. Mint the Voting Coin ────────────────────────────────────
+    //
+    // Voting Coin is CAT-wrapped at the same TAIL as the Registration
+    // Coin (so the CAT layer's CREATE_COIN restrictions are satisfied
+    // automatically). Initial state binds voter pubkey, ballot, vote_data,
+    // and parent registration coin id. The vote_close_height is curried
+    // (not in state) so update_vote can ASSERT_HEIGHT_ABSOLUTE locally
+    // without relying on Ballot Coin co-spends every edit.
+    let initial_voting_state = VotingCoinState {
+        voter_pubkey: State.voter_pubkey,
+        ballot_launcher_id: ballot_launcher_id,
+        vote_data: vote_data,
+        registration_coin_id: registration_coin_id,
+    };
+
+    // Hint: stable lookup key for indexers — same convention as the
+    // Registration Coin's voter_hint, extended with ballot id so each
+    // (registration, ballot) pair is independently discoverable.
+    let voting_coin_hint: Bytes32 = sha256(
+        "CHIP/onchain/voting_coin_hint/v1/"
+        + (State.election_launcher_id as Bytes)
+        + (CAT_TAIL_HASH as Bytes)
+        + (State.voter_pubkey as Bytes)
+        + ballot_b
+    );
+
+    // Voting Coin finalizer curries (ACTION_LAYER_MOD_HASH, hint).
+    let vc_finalizer_first_curry: Bytes32 = curry_tree_hash(
+        VOTING_COIN_FINALIZER_MOD_HASH,
+        [
+            tree_hash_atom(ACTION_LAYER_MOD_HASH),
+            tree_hash_atom(voting_coin_hint),
+        ],
+    );
+    let vc_finalizer_full_hash: Bytes32 = curry_tree_hash(
+        vc_finalizer_first_curry,
+        [
+            tree_hash_atom(vc_finalizer_first_curry),
+        ],
+    );
+
+    // Voting Coin action-layer hash:
+    //   curry(action_layer, [vc_finalizer_full_hash, VC_ACTIONS_ROOT, initial_voting_state])
+    let vc_action_layer_hash: Bytes32 = curry_tree_hash(
+        ACTION_LAYER_MOD_HASH,
+        [
+            vc_finalizer_full_hash,
+            tree_hash_atom(VOTING_COIN_ACTIONS_MERKLE_ROOT),
+            tree_hash(initial_voting_state),
+        ],
+    );
+
+    // CAT outer wrap.
+    let voting_coin_full_hash: Bytes32 = curry_tree_hash(
+        CAT_MOD_HASH,
+        [
+            tree_hash_atom(CAT_MOD_HASH),
+            tree_hash_atom(CAT_TAIL_HASH),
+            vc_action_layer_hash,
+        ],
+    );
+
+    let mint_vc = CreateCoin {
+        puzzle_hash: voting_coin_full_hash,
+        amount: voting_coin_amount,
+        memos: Memos {
+            value: [voting_coin_hint],
+        },
+    };
+
+    // ─── 4. Voter signature over canonical vote_message ─────────────
+    //
+    // vote_message = sha256(vote_outcome || ballot_launcher_id || election_launcher_id)
+    // (canonical preimage from CHIP rev 2026-05-02). Signed AggSigMe so
+    // the bundle binds to this Registration Coin's parent context.
+    let vm: Bytes32 = vote_message(
+        vote_data,
+        ballot_launcher_id,
+        State.election_launcher_id,
+    );
+    let agg_sig_vote = AggSigMe {
+        public_key: State.voter_pubkey,
+        message: vm,
+    };
+
+    // Aggregator-facing announcement carrying the BLS signature so
+    // off-chain enumerators can collect it without re-running the
+    // signing voter.
+    let announce_vote = CreateCoinAnnouncement {
+        message: sha256(
+            "vote_cast"
+            + ballot_b
+            + (State.voter_pubkey as Bytes)
+            + (vote_data as Bytes)
+            + (initial_signature as Bytes)
+        ),
+    };
+
+    // ─── 5. Recreate Registration Coin with updated SPT root ────────
+    let new_state = RegistrationState {
+        voter_pubkey: State.voter_pubkey,
+        election_launcher_id: State.election_launcher_id,
+        voted_ballots_root: new_voted_ballots_root,
+        release_destination: nil,
+    };
+
+    (
+        RegistrationStateTruth {
+            Ephemeral_State: nil,
+            State: new_state,
+        },
+        [
+            assert_ballot_open,
+            mint_vc,
+            agg_sig_vote,
+            announce_vote,
+        ],
+    )
+}

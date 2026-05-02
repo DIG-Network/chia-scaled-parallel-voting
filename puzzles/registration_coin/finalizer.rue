@@ -15,32 +15,32 @@
 //      We don't need to curry / hard-code the amount because the CAT
 //      outer enforces amount preservation (sum of CAT output amounts
 //      must equal sum of CAT input amounts). Since this finalizer
-//      always emits exactly one CreateCoin, the only `my_amount` that
-//      will pass the CAT outer's check is the actual input amount —
-//      any lie causes the spend to fail.
+//      always emits exactly one CreateCoin for the recreated parent,
+//      the only `my_amount` that will pass the CAT outer's check is
+//      the actual input amount — any lie causes the spend to fail.
 //
 //      The initial CAT amount (COLLATERAL_AMOUNT) is bound at
 //      registration time by the Election Singleton's `register` action,
 //      which asserts a CreateCoinAnnouncement from the parent CAT spend
-//      that commits to the expected amount. Every subsequent spend's
-//      amount is then enforced inductively by CAT preservation.
+//      that commits to the expected amount.
 //
-//   2. Behaviour depends on the new state and on ephemeral state:
+//   2. Two branches:
 //        - If `release_destination` is set → emit a CreateCoin sending
-//          the CAT to `release_destination`. The registration coin
-//          lineage ends here. Memos = [HINT].
-//        - Else if `Ephemeral_State` is non-nil (vote action just ran)
-//          → recreate the action layer inner with the new state, and
-//          write `(vote_data, vote_signature)` from EphemeralVote into
-//          the recreated coin's memos so off-chain aggregators can
-//          extract them with one coin-record lookup. Memos =
-//          [HINT, vote_data, vote_signature].
-//        - Else (e.g., a no-op spend, never expected in normal use)
-//          → recreate with just [HINT] in memos.
+//          the CAT collateral to `release_destination`. The
+//          registration coin lineage ends here. Memos = [HINT].
+//        - Else → recreate the action-layer-wrapped Registration Coin
+//          at `my_amount` with the new state. Memos = [HINT].
 //
-// Hint: stays stable across the vote-recreation lineage so off-chain
-// indexers can keep tracking the voter's registration coin even after
-// the puzzle hash changes from has_voted=false to has_voted=true.
+// Per CHIP rev 2026-05-02 the Registration Coin no longer carries
+// `vote_data` / `vote_signature` directly — those live on the
+// Voting Coin minted by `mint_voting_coin`. Aggregators collect
+// signatures via the announcement that `mint_voting_coin` (and
+// `voting_coin/update_vote`) emit, NOT via Registration Coin memos.
+// Hence: no EphemeralVote handling here.
+//
+// Hint: stays stable across the registration-coin lineage (mints,
+// re-mints across ballots) so off-chain indexers can keep tracking
+// the voter's collateral coin.
 
 import super::action::StateTruth;
 import super::finalizer::*;
@@ -58,7 +58,6 @@ fn main(
     ...my_amount: Int,
 ) -> List<Condition> {
     let new_state = unchecked_cast::<RegistrationState>(last_action_output.first.actual_state);
-    let ephemeral = last_action_output.first.ephemeral_state;
 
     let output_coin = if !(new_state.release_destination is nil) {
         // Release branch: send the CAT collateral to the destination.
@@ -87,26 +86,11 @@ fn main(
             ]
         );
 
-        if ephemeral is nil {
-            // No vote ran — recreate with just the indexer hint.
-            CreateCoin {
-                puzzle_hash: recreated_puzzle_hash,
-                amount: my_amount,
-                memos: Memos {
-                    value: [HINT],
-                }
-            }
-        } else {
-            // Vote action ran. Write (vote_data, vote_signature) into
-            // memos so the off-chain aggregator can read them by
-            // fetching this coin's parent spend.
-            let ev = unchecked_cast::<EphemeralVote>(ephemeral);
-            CreateCoin {
-                puzzle_hash: recreated_puzzle_hash,
-                amount: my_amount,
-                memos: Memos {
-                    value: [HINT, ev.vote_data, ev.vote_signature],
-                }
+        CreateCoin {
+            puzzle_hash: recreated_puzzle_hash,
+            amount: my_amount,
+            memos: Memos {
+                value: [HINT],
             }
         }
     };
