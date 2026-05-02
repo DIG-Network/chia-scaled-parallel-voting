@@ -15,3 +15,12 @@ export struct CompactCoinProof {
     inner_puzzle_hash: Bytes32,
     ...amount: Int,
 }
+
+/// Encode an integer as exactly 8 big-endian bytes.
+/// Re-used by every action that hashes a count, height, or epoch
+/// value. Single source of truth — do not re-define locally.
+export inline fn int_to_8_bytes_be(n: Int) -> Bytes {
+    let sentinel: Int = 0x010000000000000000 as Int;
+    let padded_bytes: Bytes = (n + sentinel) as Bytes;
+    substr(padded_bytes, 1, 9)
+}

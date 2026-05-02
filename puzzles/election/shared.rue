@@ -1,5 +1,8 @@
 // election/shared.rue
 // State and types shared by all Election Singleton actions.
+
+import super::common_types::*;
+
 //
 // The Election Singleton uses the CHIP-0050 action layer with actions
 // that operate on an ElectionStateTruth and return a new
@@ -35,13 +38,7 @@ export struct ElectionStateTruth {
     ...State: ElectionState,
 }
 
-/// Encode an integer as exactly 8 big-endian bytes.
-/// Re-used by every action that hashes a count or epoch value.
-export inline fn int_to_8_bytes_be(n: Int) -> Bytes {
-    let sentinel: Int = 0x010000000000000000 as Int;
-    let padded_bytes: Bytes = (n + sentinel) as Bytes;
-    substr(padded_bytes, 1, 9)
-}
+// `int_to_8_bytes_be` is provided by `common_types.rue` (imported above).
 
 /// Compute the deregistration announcement message.
 ///

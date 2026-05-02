@@ -23,8 +23,15 @@
 //                          this vote targets. Curried so the
 //                          on-chain coin id is unforgeably bound to a
 //                          specific ballot.
-//   vote_data            — 32-byte committed vote payload (e.g., the
-//                          outcome bytes the voter is endorsing).
+//   vote_data            — The 32-byte hash the voter commits to.
+//                          **Synonymous with `vote_outcome`** in
+//                          `vote_message(...)` and the Groth16 public
+//                          input `s4`. The two names are kept because
+//                          the voter-side stores it as `vote_data`
+//                          while the cryptographic and ballot-side
+//                          context uses `vote_outcome`; they are
+//                          byte-equal. Do not rename — the dual naming
+//                          is intentional per CHIP.md.
 //   registration_coin_id — Coin id of the spending Registration Coin.
 //                          Lets the Ballot Coin assert that the
 //                          Registration Coin participated in the

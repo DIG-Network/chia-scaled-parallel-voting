@@ -1,5 +1,8 @@
 // ballot_coin/shared.rue
 // State and types shared by all Ballot Coin actions.
+
+import super::common_types::*;
+
 //
 // In the multi-ballot architecture, each ballot is a singleton-like
 // coin with the CHIP-0050 action layer running ballot-specific actions
@@ -11,11 +14,18 @@
 //   finalized    — false until the finalize action runs; true after.
 //   vote_outcome — zero (32 bytes of 0x00) until finalized; the
 //                  committed outcome bytes once finalized.
-//   agg_signers  — zero until finalized; the BLS-G1-aggregate (or
-//                  Merkle root) of the public keys that endorsed the
-//                  finalized outcome. Hashed alongside `vote_outcome`
-//                  in the finalization announcement so observers can
-//                  reproduce the signer set verification off-chain.
+//   agg_signers  — zero until finalized; a *commitment to the set of
+//                  registered voters* who contributed to the aggregate
+//                  signature for this ballot (e.g. a packed-bitvector
+//                  hash, or a Merkle root over signer pubkeys — the
+//                  exact encoding MUST match `circuit.rs` and
+//                  `ballot_coin/finalize.rue`). This is Groth16 public
+//                  input #3, NOT the BLS aggregate signature itself:
+//                  the aggregate signature (`agg_sig`) is a separate
+//                  value verified off-chain via `bls_verify`. Hashed
+//                  alongside `vote_outcome` in the finalization
+//                  announcement so observers can reproduce the
+//                  signer-set verification off-chain.
 
 export struct BallotState {
     finalized: Bool,
@@ -28,13 +38,7 @@ export struct BallotStateTruth {
     ...State: BallotState,
 }
 
-/// Encode an integer as exactly 8 big-endian bytes.
-/// Re-used by the oracle action (which hashes a height).
-export inline fn int_to_8_bytes_be(n: Int) -> Bytes {
-    let sentinel: Int = 0x010000000000000000 as Int;
-    let padded_bytes: Bytes = (n + sentinel) as Bytes;
-    substr(padded_bytes, 1, 9)
-}
+// `int_to_8_bytes_be` is provided by `common_types.rue` (imported above).
 
 /// Compute the ballot finalization announcement message.
 ///

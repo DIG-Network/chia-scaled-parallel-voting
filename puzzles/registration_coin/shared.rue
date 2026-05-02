@@ -69,9 +69,4 @@ export const EMPTY_BALLOT_LEAF_HASH: Bytes32 =
 /// so the same `compute_root` recursion shape is reusable.
 export const BALLOT_TREE_DEPTH: Int = 32;
 
-/// Encode an integer as exactly 8 big-endian bytes.
-export inline fn int_to_8_bytes_be(n: Int) -> Bytes {
-    let sentinel: Int = 0x010000000000000000 as Int;
-    let padded_bytes: Bytes = (n + sentinel) as Bytes;
-    substr(padded_bytes, 1, 9)
-}
+// `int_to_8_bytes_be` is provided by `common_types.rue` (imported above).
