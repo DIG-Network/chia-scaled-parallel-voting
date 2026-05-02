@@ -15,7 +15,6 @@
 //   | [`Voter`]            | register, vote, release_collateral                    |
 //   | [`Aggregator`]       | sync state, collect votes, build Groth16 proof, finalize |
 //   | [`Indexer`]          | read-only state queries                               |
-//   | [`Oracle`]           | permissionless oracle-action spend for the (un)finalized vote result |
 //
 // SHARED CONTRACT:
 //   * NO BROADCAST — every mutating method returns a SpendBundle for
@@ -33,11 +32,9 @@
 pub mod aggregator;
 pub mod deployer;
 pub mod indexer;
-pub mod oracle;
 pub mod voter;
 
 pub use aggregator::Aggregator;
 pub use deployer::{DeploymentArtifacts, ElectionDeployer};
 pub use indexer::Indexer;
-pub use oracle::{announcement_for_state, Oracle, OracleAnnouncement, OracleSpend};
 pub use voter::Voter;

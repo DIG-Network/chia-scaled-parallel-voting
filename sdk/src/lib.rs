@@ -60,9 +60,8 @@ pub mod state;
 
 // ── Public re-exports ─────────────────────────────────────────────────
 
-pub use actors::{Aggregator, ElectionDeployer, Indexer, Oracle, Voter};
+pub use actors::{Aggregator, ElectionDeployer, Indexer, Voter};
 pub use actors::deployer::{DeployParams, DeploymentArtifacts};
-pub use actors::oracle::{announcement_for_state, OracleAnnouncement, OracleSpend};
 pub use actors::voter::VoterKeys;
 pub use config::{ElectionConfig, MAX_SIGNERS, PUBLIC_INPUT_COUNT, TREE_DEPTH};
 pub use error::{VotingError, VotingResult};
