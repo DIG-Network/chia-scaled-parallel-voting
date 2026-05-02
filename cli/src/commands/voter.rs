@@ -316,11 +316,7 @@ fn build_voter_keys(secret: &VoterSecretArgs) -> Result<VoterKeys> {
     Ok(VoterKeys::new(sk))
 }
 
-fn status(
-    config_path: PathBuf,
-    secret: VoterSecretArgs,
-    ctx: &Context,
-) -> Result<()> {
+fn status(config_path: PathBuf, secret: VoterSecretArgs, ctx: &Context) -> Result<()> {
     let config = config_file::load_election_config(&config_path)?;
     let keys = build_voter_keys(&secret)?;
     let pk_hex = format!("0x{}", hex::encode(keys.pubkey.to_bytes()));
@@ -401,16 +397,9 @@ async fn register(
 
     // Sync to recover the latest SPT (so the register action can
     // produce the correct empty-slot Merkle proof).
-    let chain = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
-    let mut agg = chip_voting_sdk::Aggregator::new(
-        voter.config.clone(),
-        chain,
-        ctx.network,
-    );
+    let chain =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
+    let mut agg = chip_voting_sdk::Aggregator::new(voter.config.clone(), chain, ctx.network);
     agg.sync()
         .await
         .map_err(|e| anyhow::anyhow!("sync (for SPT): {e:?}"))?;
@@ -420,11 +409,8 @@ async fn register(
         .clone();
 
     // Independent chain client for the build_bundle path.
-    let chain2 = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
+    let chain2 =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     let bundle = voter
         .register(&smt, cat_parent_spend, &chain2)
         .await
@@ -489,11 +475,8 @@ async fn cast_vote(
     let blid = parse_b32(&ballot_launcher_id, "ballot_launcher_id")?;
     let vd = parse_b32(&vote_data, "vote_data")?;
     let voter = Voter::new(config, keys, ctx.network);
-    let chain = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
+    let chain =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     let params = chip_voting_sdk::actors::voter::CastVoteParams {
         ballot_launcher_id: blid,
         vote_data: vd,
@@ -505,7 +488,14 @@ async fn cast_vote(
         .cast_vote(&chain, params)
         .await
         .map_err(|e| anyhow::anyhow!("Voter::cast_vote: {e:?}"))?;
-    finalize_voter_action("cast_vote", result.spend_bundle, bundle_output, overwrite, ctx).await
+    finalize_voter_action(
+        "cast_vote",
+        result.spend_bundle,
+        bundle_output,
+        overwrite,
+        ctx,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -523,11 +513,8 @@ async fn update_vote(
     let vc_id = parse_b32(&voting_coin_id, "voting_coin_id")?;
     let new_vd = parse_b32(&new_vote_data, "new_vote_data")?;
     let voter = Voter::new(config, keys, ctx.network);
-    let chain = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
+    let chain =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     // STUB: `Voter::update_vote` is stubbed pending Phase 6. Same
     // shape as cast_vote — we propagate the SDK's stubbed error.
     let bundle = voter
@@ -552,11 +539,8 @@ async fn release(
     let reg_id = parse_b32(&registration_coin_id, "registration_coin_id")?;
     let dest = parse_b32(&destination, "destination")?;
     let voter = Voter::new(config, keys, ctx.network);
-    let chain = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
+    let chain =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     // STUB: `Voter::release_collateral` is stubbed pending Phase 6
     // (the new release flow co-spends the singleton's `deregister`
     // action with the registration coin's `release` action).
@@ -585,11 +569,8 @@ async fn finalize_voter_action(
         }))?;
         return Ok(());
     }
-    let chain = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
+    let chain =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     let push = rpc::broadcast(&chain, &bundle).await?;
     ctx.print(&serde_json::json!({
         "broadcast":   push,

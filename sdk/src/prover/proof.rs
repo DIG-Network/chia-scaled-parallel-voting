@@ -186,7 +186,14 @@ impl Scalars {
             vote_threshold_den,
         ));
         let s6 = sha256_mod_r(ballot_launcher_id.as_ref());
-        Self { s1, s2, s3, s4, s5, s6 }
+        Self {
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+            s6,
+        }
     }
 
     /// FN: as_array
@@ -284,7 +291,9 @@ mod tests {
         master_to_wallet_unhardened(&root.public_key(), i).derive_synthetic()
     }
 
-    fn b32(byte: u8) -> Bytes32 { Bytes32::new([byte; 32]) }
+    fn b32(byte: u8) -> Bytes32 {
+        Bytes32::new([byte; 32])
+    }
 
     /// WHAT: `Scalars::compute` is deterministic.
     /// HOW:  call twice with the same inputs, assert equality.
@@ -355,8 +364,7 @@ mod tests {
     #[test]
     fn s2_uses_be8_encoding_of_vote_weight() {
         let pk = pk_at(0);
-        let scalars =
-            Scalars::compute(b32(0), 1234567890u64, &pk, b32(0), 1, 2, b32(0));
+        let scalars = Scalars::compute(b32(0), 1234567890u64, &pk, b32(0), 1, 2, b32(0));
 
         // s2 = mod_r(sha256(weight_be8)) per the on-chain
         // CLVM-compatible scalar encoding (see Scalars::compute
@@ -367,8 +375,7 @@ mod tests {
         sha_out.copy_from_slice(&h.finalize());
         let raw = Bytes32::new(sha_out);
         let fr = crate::prover::conversions::bytes32_to_fr(&raw);
-        let expected_mod_r =
-            Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&fr));
+        let expected_mod_r = Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&fr));
         assert_eq!(scalars.s2, expected_mod_r);
     }
 
@@ -391,8 +398,7 @@ mod tests {
         sha_out.copy_from_slice(&h.finalize());
         let raw = Bytes32::new(sha_out);
         let fr = crate::prover::conversions::bytes32_to_fr(&raw);
-        let expected_mod_r =
-            Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&fr));
+        let expected_mod_r = Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&fr));
         assert_eq!(scalars.s3, expected_mod_r);
     }
 
@@ -407,8 +413,7 @@ mod tests {
     #[test]
     fn s5_uses_threshold_pack_bytes() {
         let pk = pk_at(0);
-        let scalars =
-            Scalars::compute(b32(0), 0, &pk, b32(0), 2, 3, b32(0));
+        let scalars = Scalars::compute(b32(0), 0, &pk, b32(0), 2, 3, b32(0));
         let mut h = Sha256::new();
         let mut pack = [0u8; 16];
         pack[..8].copy_from_slice(&2u64.to_be_bytes());
@@ -418,8 +423,7 @@ mod tests {
         sha_out.copy_from_slice(&h.finalize());
         let raw = Bytes32::new(sha_out);
         let fr = crate::prover::conversions::bytes32_to_fr(&raw);
-        let expected_mod_r =
-            Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&fr));
+        let expected_mod_r = Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&fr));
         assert_eq!(scalars.s5, expected_mod_r);
     }
 

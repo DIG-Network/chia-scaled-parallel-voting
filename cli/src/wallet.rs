@@ -40,9 +40,9 @@ pub fn load_secret_key(
 ) -> Result<SecretKey> {
     let raw = match (secret_hex, secret_env, secret_file) {
         (Some(s), None, None) => s.to_string(),
-        (None, Some(env), None) => std::env::var(env).with_context(|| {
-            format!("reading secret from env var ${env}")
-        })?,
+        (None, Some(env), None) => {
+            std::env::var(env).with_context(|| format!("reading secret from env var ${env}"))?
+        }
         (None, None, Some(p)) => std::fs::read_to_string(p)
             .with_context(|| format!("reading secret from {}", p.display()))?
             .trim()
@@ -60,8 +60,7 @@ pub fn load_secret_key(
     let arr: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("BLS secret must be exactly 32 bytes"))?;
-    SecretKey::from_bytes(&arr)
-        .map_err(|e| anyhow::anyhow!("not a valid BLS secret key: {e:?}"))
+    SecretKey::from_bytes(&arr).map_err(|e| anyhow::anyhow!("not a valid BLS secret key: {e:?}"))
 }
 
 /// Generate a fresh BLS key from `getrandom`. ONLY for the

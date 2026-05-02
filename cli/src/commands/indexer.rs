@@ -94,9 +94,7 @@ pub async fn run(cmd: IndexerCmd, ctx: &Context) -> Result<()> {
             election_config,
             voter_pubkey,
         } => puzzle_hashes(election_config, voter_pubkey, ctx).await,
-        IndexerCmd::IsFinalized { election_config } => {
-            is_finalized_cmd(election_config, ctx).await
-        }
+        IndexerCmd::IsFinalized { election_config } => is_finalized_cmd(election_config, ctx).await,
         IndexerCmd::IsRegistered {
             election_config,
             voter_pubkey,
@@ -107,11 +105,8 @@ pub async fn run(cmd: IndexerCmd, ctx: &Context) -> Result<()> {
 
 async fn make_indexer(config_path: PathBuf, ctx: &Context) -> Result<Indexer> {
     let config = config_file::load_election_config(&config_path)?;
-    let chain = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
+    let chain =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     Ok(Indexer::new(config, chain))
 }
 
@@ -300,6 +295,5 @@ fn parse_pk(s: &str) -> Result<chia_bls::PublicKey> {
     let arr: [u8; 48] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("voter_pubkey: must be exactly 48 bytes"))?;
-    chia_bls::PublicKey::from_bytes(&arr)
-        .map_err(|e| anyhow::anyhow!("voter_pubkey: {e:?}"))
+    chia_bls::PublicKey::from_bytes(&arr).map_err(|e| anyhow::anyhow!("voter_pubkey: {e:?}"))
 }

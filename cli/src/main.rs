@@ -171,8 +171,8 @@ fn init_logging(verbose: bool, trace: bool) {
     } else {
         "info"
     };
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     fmt()
         .with_writer(std::io::stderr)
         .with_target(false)

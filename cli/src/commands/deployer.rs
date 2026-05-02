@@ -235,11 +235,7 @@ fn build_deployer(args: &DeployParamsArgs) -> Result<ElectionDeployer> {
     }))
 }
 
-fn predict(
-    params: DeployParamsArgs,
-    parent_coin_id: String,
-    ctx: &Context,
-) -> Result<()> {
+fn predict(params: DeployParamsArgs, parent_coin_id: String, ctx: &Context) -> Result<()> {
     let deployer = build_deployer(&params)?;
     let parent_id = parse_b32(&parent_coin_id, "parent_coin_id")?;
     let launcher_id = chip_voting_sdk::actors::deployer::derive_launcher_id(parent_id, 1);
@@ -340,11 +336,8 @@ async fn deploy(
         anyhow::bail!("user declined broadcast");
     }
 
-    let chain = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
+    let chain =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     let push_result = rpc::broadcast(&chain, &artifacts.spend_bundle).await?;
 
     config_file::save_election_config(&config_output, &artifacts.config, overwrite)?;
@@ -401,13 +394,12 @@ fn parse_b32(s: &str, name: &str) -> Result<Bytes32> {
 }
 
 fn parse_pk(s: &str) -> Result<chia_bls::PublicKey> {
-    let bytes = hex::decode(s.trim().trim_start_matches("0x"))
-        .context("public key: must be hex")?;
+    let bytes =
+        hex::decode(s.trim().trim_start_matches("0x")).context("public key: must be hex")?;
     let arr: [u8; 48] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("public key: must be exactly 48 bytes"))?;
-    chia_bls::PublicKey::from_bytes(&arr)
-        .map_err(|e| anyhow::anyhow!("public key parse: {e:?}"))
+    chia_bls::PublicKey::from_bytes(&arr).map_err(|e| anyhow::anyhow!("public key parse: {e:?}"))
 }
 
 fn hex_b32(b: Bytes32) -> String {

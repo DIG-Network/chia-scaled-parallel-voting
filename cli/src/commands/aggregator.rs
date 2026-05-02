@@ -228,11 +228,8 @@ pub async fn run(cmd: AggregatorCmd, ctx: &Context) -> Result<()> {
 
 async fn make_aggregator(config_path: PathBuf, ctx: &Context) -> Result<Aggregator> {
     let config = config_file::load_election_config(&config_path)?;
-    let chain = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
+    let chain =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     Ok(Aggregator::new(config, chain, ctx.network))
 }
 
@@ -242,9 +239,7 @@ async fn sync(config_path: PathBuf, ctx: &Context) -> Result<()> {
         .sync()
         .await
         .map_err(|e| anyhow::anyhow!("aggregator sync: {e:?}"))?;
-    let _ = agg
-        .state()
-        .map_err(|e| anyhow::anyhow!("state: {e:?}"))?;
+    let _ = agg.state().map_err(|e| anyhow::anyhow!("state: {e:?}"))?;
     ctx.print(&serde_json::json!({
         "election_launcher_id":     agg.config.election_launcher_id_hex,
         "registration_count":       snapshot.voter_set.registration_count,
@@ -276,8 +271,12 @@ async fn voter_set_cmd(config_path: PathBuf, ctx: &Context) -> Result<()> {
     agg.sync()
         .await
         .map_err(|e| anyhow::anyhow!("aggregator sync: {e:?}"))?;
-    let set = agg.voter_set().map_err(|e| anyhow::anyhow!("voter_set: {e:?}"))?;
-    let smt = agg.merkle_tree().map_err(|e| anyhow::anyhow!("merkle_tree: {e:?}"))?;
+    let set = agg
+        .voter_set()
+        .map_err(|e| anyhow::anyhow!("voter_set: {e:?}"))?;
+    let smt = agg
+        .merkle_tree()
+        .map_err(|e| anyhow::anyhow!("merkle_tree: {e:?}"))?;
     let voters: Vec<_> = set
         .voters
         .iter()
@@ -397,11 +396,8 @@ async fn finalize(
     if !ctx.confirm("Broadcast the finalize bundle?")? {
         anyhow::bail!("user declined broadcast");
     }
-    let chain = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
+    let chain =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     let push = rpc::broadcast(&chain, &bundle).await?;
     ctx.print(&serde_json::json!({
         "broadcast":    push,
@@ -460,11 +456,8 @@ async fn build_finalize_cmd(
     if !ctx.confirm("Broadcast the build-finalize bundle?")? {
         anyhow::bail!("user declined broadcast");
     }
-    let chain = wallet_helpers::make_independent_chain(
-        ctx.network,
-        ctx.rpc_override.as_deref(),
-    )
-    .await?;
+    let chain =
+        wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     let push = rpc::broadcast(&chain, &bundle).await?;
     ctx.print(&serde_json::json!({
         "broadcast":   push,
@@ -472,9 +465,7 @@ async fn build_finalize_cmd(
     }))
 }
 
-fn load_votes(
-    path: &std::path::Path,
-) -> Result<Vec<chip_voting_sdk::VoteRecord>> {
+fn load_votes(path: &std::path::Path) -> Result<Vec<chip_voting_sdk::VoteRecord>> {
     #[derive(serde::Deserialize)]
     struct Wire {
         voter_pubkey_hex: String,
@@ -499,7 +490,11 @@ fn load_votes(
             Ok(chip_voting_sdk::VoteRecord {
                 voter_pubkey: pk,
                 vote_data: Bytes32::new(vd_arr),
-                vote_signature_hex: w.vote_signature_hex.trim().trim_start_matches("0x").to_string(),
+                vote_signature_hex: w
+                    .vote_signature_hex
+                    .trim()
+                    .trim_start_matches("0x")
+                    .to_string(),
                 // For witness-prep flows, the registration coin id
                 // isn't required by the prover — supply zeros.
                 // `aggregator collect-votes` populates it correctly

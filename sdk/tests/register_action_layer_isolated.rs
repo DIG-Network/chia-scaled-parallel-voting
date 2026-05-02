@@ -117,7 +117,8 @@ fn register_action_layer_executes_on_simulator_without_singleton() {
     sim.insert_coin(coin);
 
     // ── 5. Build the register action (curried) ───────────────
-    let register_program_node = load_action_puzzle(&mut ctx, puzzles::ELECTION_REGISTER_HEX).unwrap();
+    let register_program_node =
+        load_action_puzzle(&mut ctx, puzzles::ELECTION_REGISTER_HEX).unwrap();
     let register_curried = CurriedProgram {
         program: register_program_node,
         args: clvm_curried_args!(
@@ -137,17 +138,10 @@ fn register_action_layer_executes_on_simulator_without_singleton() {
     .unwrap();
 
     // ── 6. Build a fake CAT parent that emits the announcement ──
-    let reg_outer_ph = puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash,
-        &voter_pk,
-        launcher_id,
-    );
-    let create_reg_msg = compute_create_reg_msg(
-        launcher_id,
-        &voter_pk,
-        reg_outer_ph,
-        collateral_amount,
-    );
+    let reg_outer_ph =
+        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id);
+    let create_reg_msg =
+        compute_create_reg_msg(launcher_id, &voter_pk, reg_outer_ph, collateral_amount);
     // (q . ((60 create_reg_msg)))
     let condition: (u8, (Bytes32, ())) = (60u8, (create_reg_msg, ()));
     let conditions_list: ((u8, (Bytes32, ())), ()) = (condition, ());
@@ -158,22 +152,16 @@ fn register_action_layer_executes_on_simulator_without_singleton() {
     sim.insert_coin(announcer_coin);
     let announcer_id = announcer_coin.coin_id();
     let announcer_solution = ().to_clvm(&mut *ctx).unwrap();
-    let announcer_spend = common::coin_spend_from_nodes(
-        &ctx,
-        announcer_coin,
-        announcer_node,
-        announcer_solution,
-    );
+    let announcer_spend =
+        common::coin_spend_from_nodes(&ctx, announcer_coin, announcer_node, announcer_solution);
 
     // ── 7. Build the register action solution ────────────────
     // Per register.rue: (new_voter_pubkey, slot, siblings, ...cat_parent_coin_id)
     let slot = SparseMerkleTree::slot_for_pubkey(&voter_pk);
     let siblings: Vec<Bytes32> = smt.prove(slot);
     let voter_pk_bytes = Bytes::new(voter_pk.to_bytes().to_vec());
-    let register_solution_value: (Bytes, (u64, (Vec<Bytes32>, Bytes32))) = (
-        voter_pk_bytes,
-        (slot as u64, (siblings, announcer_id)),
-    );
+    let register_solution_value: (Bytes, (u64, (Vec<Bytes32>, Bytes32))) =
+        (voter_pk_bytes, (slot as u64, (siblings, announcer_id)));
     let register_solution = register_solution_value.to_clvm(&mut *ctx).unwrap();
 
     // ── 8. Wrap as ActionSpend, build action-layer solution ──
@@ -209,7 +197,10 @@ fn register_action_layer_executes_on_simulator_without_singleton() {
         );
     });
     assert!(
-        sim.coin_state(coin.coin_id()).unwrap().spent_height.is_some(),
+        sim.coin_state(coin.coin_id())
+            .unwrap()
+            .spent_height
+            .is_some(),
         "action-layer coin must be spent"
     );
 }
@@ -284,7 +275,8 @@ fn register_action_layer_with_singleton_outer_executes_on_simulator() {
     sim.insert_coin(eve_coin);
 
     // Build the action-layer solution exactly as before.
-    let register_program_node = load_action_puzzle(&mut ctx, puzzles::ELECTION_REGISTER_HEX).unwrap();
+    let register_program_node =
+        load_action_puzzle(&mut ctx, puzzles::ELECTION_REGISTER_HEX).unwrap();
     let register_curried = CurriedProgram {
         program: register_program_node,
         args: clvm_curried_args!(
@@ -303,17 +295,10 @@ fn register_action_layer_with_singleton_outer_executes_on_simulator() {
     .to_clvm(&mut *ctx)
     .unwrap();
 
-    let reg_outer_ph = puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash,
-        &voter_pk,
-        launcher_id,
-    );
-    let create_reg_msg = compute_create_reg_msg(
-        launcher_id,
-        &voter_pk,
-        reg_outer_ph,
-        collateral_amount,
-    );
+    let reg_outer_ph =
+        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id);
+    let create_reg_msg =
+        compute_create_reg_msg(launcher_id, &voter_pk, reg_outer_ph, collateral_amount);
     let condition: (u8, (Bytes32, ())) = (60u8, (create_reg_msg, ()));
     let conditions_list: ((u8, (Bytes32, ())), ()) = (condition, ());
     let announcer_puzzle: (u8, ((u8, (Bytes32, ())), ())) = (1u8, conditions_list);
@@ -323,20 +308,14 @@ fn register_action_layer_with_singleton_outer_executes_on_simulator() {
     sim.insert_coin(announcer_coin);
     let announcer_id = announcer_coin.coin_id();
     let announcer_solution = ().to_clvm(&mut *ctx).unwrap();
-    let announcer_spend = common::coin_spend_from_nodes(
-        &ctx,
-        announcer_coin,
-        announcer_node,
-        announcer_solution,
-    );
+    let announcer_spend =
+        common::coin_spend_from_nodes(&ctx, announcer_coin, announcer_node, announcer_solution);
 
     let slot = SparseMerkleTree::slot_for_pubkey(&voter_pk);
     let siblings: Vec<Bytes32> = smt.prove(slot);
     let voter_pk_bytes = Bytes::new(voter_pk.to_bytes().to_vec());
-    let register_solution_value: (Bytes, (u64, (Vec<Bytes32>, Bytes32))) = (
-        voter_pk_bytes,
-        (slot as u64, (siblings, announcer_id)),
-    );
+    let register_solution_value: (Bytes, (u64, (Vec<Bytes32>, Bytes32))) =
+        (voter_pk_bytes, (slot as u64, (siblings, announcer_id)));
     let register_solution = register_solution_value.to_clvm(&mut *ctx).unwrap();
 
     let action_spends = vec![ActionSpend {
@@ -378,7 +357,10 @@ fn register_action_layer_with_singleton_outer_executes_on_simulator() {
         );
     });
     assert!(
-        sim.coin_state(eve_coin.coin_id()).unwrap().spent_height.is_some(),
+        sim.coin_state(eve_coin.coin_id())
+            .unwrap()
+            .spent_height
+            .is_some(),
         "eve singleton coin must be spent"
     );
 }

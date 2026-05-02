@@ -58,12 +58,14 @@ fn main() -> Result<()> {
 
     let raw = std::fs::read_to_string(&args.dump)
         .with_context(|| format!("read {}", args.dump.display()))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&raw).context("dump file is not JSON")?;
+    let json: serde_json::Value = serde_json::from_str(&raw).context("dump file is not JSON")?;
 
     let label = json["label"].as_str().unwrap_or("(unknown)");
     let status = json["status"].as_str().unwrap_or("(unknown)");
-    println!("loaded {} (label={label}, status={status})", args.dump.display());
+    println!(
+        "loaded {} (label={label}, status={status})",
+        args.dump.display()
+    );
 
     let coin_spends_json = json["coin_spends"]
         .as_array()
@@ -79,8 +81,9 @@ fn main() -> Result<()> {
                 .as_u64()
                 .ok_or_else(|| anyhow!("coin[{i}].amount not a u64"))?,
         );
-        let puzzle_reveal =
-            chia_protocol::Program::from(parse_hex(cs_json["puzzle_reveal_hex"].as_str().unwrap())?);
+        let puzzle_reveal = chia_protocol::Program::from(parse_hex(
+            cs_json["puzzle_reveal_hex"].as_str().unwrap(),
+        )?);
         let solution =
             chia_protocol::Program::from(parse_hex(cs_json["solution_hex"].as_str().unwrap())?);
         coin_spends.push(CoinSpend::new(coin, puzzle_reveal, solution));
@@ -115,7 +118,10 @@ fn main() -> Result<()> {
 
     match validate_bundle_for_consensus(&bundle, args.height) {
         Ok(cost) => {
-            println!("✓ bundle PASSES consensus validation at height {} (cost={cost})", args.height);
+            println!(
+                "✓ bundle PASSES consensus validation at height {} (cost={cost})",
+                args.height
+            );
             println!(
                 "  the node-side `status=FAILED` was likely caused by something OUTSIDE the \
                  deterministic consensus path — e.g. the singleton coin was already spent, the \

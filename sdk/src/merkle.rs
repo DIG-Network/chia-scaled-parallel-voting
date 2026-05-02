@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn proof_for_empty_slot_verifies_with_empty_leaf() {
         let mut tree = SparseMerkleTree::new();
-        tree.insert(&pk_at(0)).unwrap();        // someone else
+        tree.insert(&pk_at(0)).unwrap(); // someone else
         let unregistered_slot = SparseMerkleTree::slot_for_pubkey(&pk_at(99));
         let proof = tree.prove(unregistered_slot);
         let root = tree.root();

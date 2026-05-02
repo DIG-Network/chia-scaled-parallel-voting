@@ -64,10 +64,8 @@ use sha2::{Digest, Sha256};
 ///   * verifies each selected action's hash is in `MERKLE_ROOT`
 ///   * runs them in sequence, threading `StateTruth` between them
 ///   * hands the final state + accumulated conditions to `FINALIZER`
-pub const ACTION_LAYER_HEX: &str =
-    include_str!("../../puzzles/compiled/action.rue.hex");
-pub const ACTION_LAYER_HASH_HEX: &str =
-    include_str!("../../puzzles/compiled/action.rue.hash");
+pub const ACTION_LAYER_HEX: &str = include_str!("../../puzzles/compiled/action.rue.hex");
+pub const ACTION_LAYER_HASH_HEX: &str = include_str!("../../puzzles/compiled/action.rue.hash");
 
 // ── Election Singleton (orchestration lane) ───────────────────────────
 
@@ -215,7 +213,9 @@ pub const BALLOT_TREE_DEPTH: usize = 32;
 pub fn decode_hash(hex_str: &str) -> Bytes32 {
     let trimmed = hex_str.trim().trim_start_matches("0x");
     let bytes = hex::decode(trimmed).expect("embedded puzzle hash must be valid hex");
-    let arr: [u8; 32] = bytes.try_into().expect("embedded puzzle hash must be 32 bytes");
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .expect("embedded puzzle hash must be 32 bytes");
     Bytes32::new(arr)
 }
 
@@ -227,37 +227,63 @@ pub fn decode_hash(hex_str: &str) -> Bytes32 {
 pub struct PuzzleHashes;
 
 impl PuzzleHashes {
-    pub fn action_layer() -> Bytes32 { decode_hash(ACTION_LAYER_HASH_HEX) }
+    pub fn action_layer() -> Bytes32 {
+        decode_hash(ACTION_LAYER_HASH_HEX)
+    }
 
     // Election Singleton
-    pub fn election_finalizer() -> Bytes32 { decode_hash(ELECTION_FINALIZER_HASH_HEX) }
-    pub fn election_register() -> Bytes32 { decode_hash(ELECTION_REGISTER_HASH_HEX) }
-    pub fn election_create_ballot() -> Bytes32 { decode_hash(ELECTION_CREATE_BALLOT_HASH_HEX) }
-    pub fn election_deregister() -> Bytes32 { decode_hash(ELECTION_DEREGISTER_HASH_HEX) }
+    pub fn election_finalizer() -> Bytes32 {
+        decode_hash(ELECTION_FINALIZER_HASH_HEX)
+    }
+    pub fn election_register() -> Bytes32 {
+        decode_hash(ELECTION_REGISTER_HASH_HEX)
+    }
+    pub fn election_create_ballot() -> Bytes32 {
+        decode_hash(ELECTION_CREATE_BALLOT_HASH_HEX)
+    }
+    pub fn election_deregister() -> Bytes32 {
+        decode_hash(ELECTION_DEREGISTER_HASH_HEX)
+    }
 
     // Ballot Coin
-    pub fn ballot_coin_finalizer() -> Bytes32 { decode_hash(BALLOT_COIN_FINALIZER_HASH_HEX) }
-    pub fn ballot_coin_finalize() -> Bytes32 { decode_hash(BALLOT_COIN_FINALIZE_HASH_HEX) }
-    pub fn ballot_coin_oracle() -> Bytes32 { decode_hash(BALLOT_COIN_ORACLE_HASH_HEX) }
+    pub fn ballot_coin_finalizer() -> Bytes32 {
+        decode_hash(BALLOT_COIN_FINALIZER_HASH_HEX)
+    }
+    pub fn ballot_coin_finalize() -> Bytes32 {
+        decode_hash(BALLOT_COIN_FINALIZE_HASH_HEX)
+    }
+    pub fn ballot_coin_oracle() -> Bytes32 {
+        decode_hash(BALLOT_COIN_ORACLE_HASH_HEX)
+    }
     pub fn ballot_coin_announce_finalization() -> Bytes32 {
         decode_hash(BALLOT_COIN_ANNOUNCE_FINALIZATION_HASH_HEX)
     }
 
     // Registration Coin
-    pub fn registration_finalizer() -> Bytes32 { decode_hash(REGISTRATION_FINALIZER_HASH_HEX) }
+    pub fn registration_finalizer() -> Bytes32 {
+        decode_hash(REGISTRATION_FINALIZER_HASH_HEX)
+    }
     pub fn registration_mint_voting_coin() -> Bytes32 {
         decode_hash(REGISTRATION_MINT_VOTING_COIN_HASH_HEX)
     }
-    pub fn registration_release() -> Bytes32 { decode_hash(REGISTRATION_RELEASE_HASH_HEX) }
+    pub fn registration_release() -> Bytes32 {
+        decode_hash(REGISTRATION_RELEASE_HASH_HEX)
+    }
 
     // Voting Coin
-    pub fn voting_coin_finalizer() -> Bytes32 { decode_hash(VOTING_COIN_FINALIZER_HASH_HEX) }
-    pub fn voting_coin_update_vote() -> Bytes32 { decode_hash(VOTING_COIN_UPDATE_VOTE_HASH_HEX) }
+    pub fn voting_coin_finalizer() -> Bytes32 {
+        decode_hash(VOTING_COIN_FINALIZER_HASH_HEX)
+    }
+    pub fn voting_coin_update_vote() -> Bytes32 {
+        decode_hash(VOTING_COIN_UPDATE_VOTE_HASH_HEX)
+    }
 
     /// Standard CAT v2 outer puzzle tree hash. Sourced from
     /// `chia_puzzles::CAT_PUZZLE_HASH` so version drift between our
     /// SDK and the rest of the Chia ecosystem is impossible.
-    pub fn cat_outer() -> Bytes32 { Bytes32::new(CAT_PUZZLE_HASH) }
+    pub fn cat_outer() -> Bytes32 {
+        Bytes32::new(CAT_PUZZLE_HASH)
+    }
 }
 
 // ── CLVM tree-hash primitives (thin wrappers over clvm_utils) ─────────
@@ -480,8 +506,7 @@ pub fn fresh_registration_inner_hash(
     // Finalizer 2nd curry: bind self-hash (CHIP-0050 finalizer pattern).
     // `finalizer_first` is the *atom* the puzzle curries in (the hash
     // value, not the program), so wrap it with `hash_atom_b32`.
-    let finalizer_full =
-        curry_tree_hash(finalizer_first, &[hash_atom_b32(&finalizer_first)]);
+    let finalizer_full = curry_tree_hash(finalizer_first, &[hash_atom_b32(&finalizer_first)]);
 
     // Action layer curry: (FINALIZER, MERKLE_ROOT, STATE)
     //
@@ -654,11 +679,7 @@ pub fn ballot_action_root_leaves() -> Vec<Bytes32> {
         PuzzleHashes::ballot_coin_oracle(),
         PuzzleHashes::ballot_coin_announce_finalization(),
     ];
-    leaves.sort_by(|a, b| {
-        hash_atom_b32(a)
-            .as_ref()
-            .cmp(hash_atom_b32(b).as_ref())
-    });
+    leaves.sort_by(|a, b| hash_atom_b32(a).as_ref().cmp(hash_atom_b32(b).as_ref()));
     leaves
 }
 
@@ -719,10 +740,7 @@ pub fn deregister_announcement_msg(voter_pubkey: &PublicKey) -> Bytes32 {
 ///        `CoinAnnouncement` with this preimage to pin the Ballot
 ///        Coin's actual curried close height (defends against a
 ///        malicious mint having lied about close height).
-pub fn ballot_oracle_open_msg(
-    ballot_launcher_id: Bytes32,
-    vote_close_height: u64,
-) -> Bytes32 {
+pub fn ballot_oracle_open_msg(ballot_launcher_id: Bytes32, vote_close_height: u64) -> Bytes32 {
     let mut h = Sha256::new();
     h.update(b"ballot_oracle_open");
     h.update(ballot_launcher_id.as_ref());
@@ -850,8 +868,7 @@ fn voting_coin_inner_hash(
         &[hash_atom_b32(&action_layer_mod_hash), hash_atom_b32(&hint)],
     );
     // Finalizer 2nd curry: bind self-hash (CHIP-0050 finalizer pattern).
-    let finalizer_full =
-        curry_tree_hash(finalizer_first, &[hash_atom_b32(&finalizer_first)]);
+    let finalizer_full = curry_tree_hash(finalizer_first, &[hash_atom_b32(&finalizer_first)]);
 
     // Action layer curry: (FINALIZER, MERKLE_ROOT, STATE)
     curry_tree_hash(
@@ -969,8 +986,7 @@ fn ballot_coin_inner_hash(
             hash_atom_b32(&ballot_launcher_id),
         ],
     );
-    let finalizer_full =
-        curry_tree_hash(finalizer_first, &[hash_atom_b32(&finalizer_first)]);
+    let finalizer_full = curry_tree_hash(finalizer_first, &[hash_atom_b32(&finalizer_first)]);
 
     curry_tree_hash(
         action_layer_mod_hash,
@@ -1061,11 +1077,8 @@ pub fn ballot_coin_puzzle_hash(
     );
 
     // Genesis BallotState: finalized=false, vote_outcome=0, agg_signers=0.
-    let initial_state_hash = ballot_coin_state_tree_hash(
-        false,
-        Bytes32::default(),
-        Bytes32::default(),
-    );
+    let initial_state_hash =
+        ballot_coin_state_tree_hash(false, Bytes32::default(), Bytes32::default());
 
     let inner_hash = ballot_coin_inner_hash(
         action_layer_mod_hash,
@@ -1123,7 +1136,9 @@ mod tests {
         master_to_wallet_unhardened(&root_sk.public_key(), 0).derive_synthetic()
     }
 
-    fn b32(byte: u8) -> Bytes32 { Bytes32::new([byte; 32]) }
+    fn b32(byte: u8) -> Bytes32 {
+        Bytes32::new([byte; 32])
+    }
 
     /// WHAT: every embedded `.rue.hash` artefact is well-formed
     ///       (exactly 32 bytes of valid hex).
@@ -1184,7 +1199,10 @@ mod tests {
         let r = b32(2);
         let lt = TreeHash::new(l.to_bytes());
         let rt = TreeHash::new(r.to_bytes());
-        assert_eq!(hash_pair(l, r), Bytes32::new(tree_hash_pair(lt, rt).to_bytes()));
+        assert_eq!(
+            hash_pair(l, r),
+            Bytes32::new(tree_hash_pair(lt, rt).to_bytes())
+        );
     }
 
     /// WHAT: our `curry_tree_hash` matches the upstream
@@ -1374,11 +1392,7 @@ mod tests {
         let c = b32(0xC3);
 
         let mut leaves = vec![a, b, c];
-        leaves.sort_by(|x, y| {
-            hash_atom_b32(x)
-                .as_ref()
-                .cmp(hash_atom_b32(y).as_ref())
-        });
+        leaves.sort_by(|x, y| hash_atom_b32(x).as_ref().cmp(hash_atom_b32(y).as_ref()));
         let upstream_root = MerkleTree::new(&leaves).root();
 
         let our_root = election_actions_merkle_root(a, b, c);
@@ -1416,9 +1430,7 @@ mod tests {
 
         let inner = fresh_registration_inner_hash(&pk, election_id, tail_hash);
         let inner_th = TreeHash::new(inner.to_bytes());
-        let expected = Bytes32::new(
-            CatArgs::curry_tree_hash(tail_hash, inner_th).to_bytes(),
-        );
+        let expected = Bytes32::new(CatArgs::curry_tree_hash(tail_hash, inner_th).to_bytes());
 
         assert_eq!(
             fresh_registration_coin_puzzle_hash(tail_hash, &pk, election_id),
@@ -1483,7 +1495,10 @@ mod tests {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&h.finalize());
 
-        assert_eq!(ballot_oracle_open_msg(ballot_id, close_h), Bytes32::new(arr));
+        assert_eq!(
+            ballot_oracle_open_msg(ballot_id, close_h),
+            Bytes32::new(arr)
+        );
     }
 
     /// WHAT: `ballot_oracle_closed_msg` byte-exact matches its preimage.
@@ -1517,12 +1532,8 @@ mod tests {
         let ballot_id = b32(0xBB);
         let close_h: u64 = 99;
         let m_open = ballot_oracle_open_msg(ballot_id, close_h);
-        let m_closed = ballot_oracle_closed_msg(
-            ballot_id,
-            close_h,
-            Bytes32::default(),
-            Bytes32::default(),
-        );
+        let m_closed =
+            ballot_oracle_closed_msg(ballot_id, close_h, Bytes32::default(), Bytes32::default());
         assert_ne!(
             m_open, m_closed,
             "ballot_oracle open vs closed messages must NEVER collide",
@@ -1576,9 +1587,8 @@ mod tests {
         let launcher_id = b32(0xAB);
         let inner_ph = b32(0xCD);
         let inner_th = TreeHash::new(inner_ph.to_bytes());
-        let expected = Bytes32::new(
-            SingletonArgs::curry_tree_hash(launcher_id, inner_th).to_bytes(),
-        );
+        let expected =
+            Bytes32::new(SingletonArgs::curry_tree_hash(launcher_id, inner_th).to_bytes());
         assert_eq!(
             election_singleton_puzzle_hash(launcher_id, inner_ph),
             expected,

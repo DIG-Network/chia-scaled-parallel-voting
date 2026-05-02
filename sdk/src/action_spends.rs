@@ -444,11 +444,13 @@ pub fn load_action_puzzle(ctx: &mut SpendContext, hex_str: &str) -> VotingResult
 #[cfg(test)]
 mod inner_hash_regression_tests {
     use super::*;
-    use chia_bls::{PublicKey, SecretKey, master_to_wallet_unhardened};
+    use chia_bls::{master_to_wallet_unhardened, PublicKey, SecretKey};
     use chia_puzzle_types::DeriveSynthetic;
     use hex_literal::hex;
 
-    use crate::puzzles::{fresh_registration_inner_hash, registration_actions_merkle_root, voter_hint};
+    use crate::puzzles::{
+        fresh_registration_inner_hash, registration_actions_merkle_root, voter_hint,
+    };
 
     fn synthetic_test_pubkey() -> PublicKey {
         let root_sk = SecretKey::from_bytes(&hex!(
@@ -470,10 +472,7 @@ mod inner_hash_regression_tests {
         let reg_finalizer = build_registration_finalizer_full(&mut ctx, hint).unwrap();
 
         let pk_bytes = Bytes::new(pk.to_bytes().to_vec());
-        let state_node = (
-            pk_bytes,
-            (election_id, ((), (Bytes32::default(), ()))),
-        )
+        let state_node = (pk_bytes, (election_id, ((), (Bytes32::default(), ()))))
             .to_clvm(&mut *ctx)
             .unwrap();
 

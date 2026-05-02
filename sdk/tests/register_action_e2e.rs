@@ -48,7 +48,7 @@ use chia_protocol::{Bytes, Bytes32, Coin, Program};
 use chia_sdk_test::Simulator;
 use chip_voting_sdk::config::{EMPTY_LEAF_HASH, TREE_DEPTH};
 use chip_voting_sdk::merkle::SparseMerkleTree;
-use chip_voting_sdk::puzzles::{self, ELECTION_REGISTER_HEX, PuzzleHashes};
+use chip_voting_sdk::puzzles::{self, PuzzleHashes, ELECTION_REGISTER_HEX};
 use clvm_traits::{clvm_curried_args, ToClvm};
 use clvm_utils::{tree_hash, CurriedProgram};
 use clvmr::{Allocator, NodePtr};
@@ -81,8 +81,7 @@ fn build_register_wrapper(
     allocator: &mut Allocator,
     curried_args: &RegisterCurriedArgs,
 ) -> NodePtr {
-    let action_bytes =
-        hex::decode(ELECTION_REGISTER_HEX.trim().trim_start_matches("0x")).unwrap();
+    let action_bytes = hex::decode(ELECTION_REGISTER_HEX.trim().trim_start_matches("0x")).unwrap();
     let action_program = Program::from(action_bytes);
     let action_node = action_program.to_clvm(allocator).unwrap();
     let curried_register = CurriedProgram {
@@ -120,10 +119,7 @@ fn build_register_wrapper(
 /// CLVM source: `(q . ((60 <message>)))` where `q` = opcode 1
 /// (quote). Quote returns its cdr literally, so this puzzle ignores
 /// its solution and ALWAYS returns the same conditions list.
-fn build_announcer_puzzle_for_message(
-    allocator: &mut Allocator,
-    message: Bytes32,
-) -> NodePtr {
+fn build_announcer_puzzle_for_message(allocator: &mut Allocator, message: Bytes32) -> NodePtr {
     type Condition60 = (u8, (Bytes32, ()));
     type ConditionsList = (Condition60, ());
     type QuotedPuzzle = (u8, ConditionsList);
@@ -157,16 +153,20 @@ fn bare_announcer_emits_valid_create_coin_announcement() {
 
     let mut allocator = Allocator::new();
     let announcer_node = build_announcer_puzzle_for_message(&mut allocator, message);
-    let announcer_hash =
-        Bytes32::new(tree_hash(&allocator, announcer_node).to_bytes());
+    let announcer_hash = Bytes32::new(tree_hash(&allocator, announcer_node).to_bytes());
     let coin = Coin::new(Bytes32::new([0xDD; 32]), announcer_hash, 1);
     sim.insert_coin(coin);
 
     let solution_node = ().to_clvm(&mut allocator).unwrap();
     let spend = common::coin_spend_from_nodes(&allocator, coin, announcer_node, solution_node);
     let bundle = common::make_bundle(vec![spend], Signature::default());
-    sim.new_transaction(bundle).expect("announcer spend must succeed");
-    assert!(sim.coin_state(coin.coin_id()).unwrap().spent_height.is_some());
+    sim.new_transaction(bundle)
+        .expect("announcer spend must succeed");
+    assert!(sim
+        .coin_state(coin.coin_id())
+        .unwrap()
+        .spent_height
+        .is_some());
 }
 
 /// WHAT: a `register` action wrapped in our adapter (no paired
@@ -207,8 +207,7 @@ fn register_with_valid_inputs_traps_only_at_announcement_assertion() {
 
     let mut allocator = Allocator::new();
     let register_puzzle_node = build_register_wrapper(&mut allocator, &curried_args);
-    let register_puzzle_hash =
-        Bytes32::new(tree_hash(&allocator, register_puzzle_node).to_bytes());
+    let register_puzzle_hash = Bytes32::new(tree_hash(&allocator, register_puzzle_node).to_bytes());
     let register_coin = Coin::new(Bytes32::new([0xCE; 32]), register_puzzle_hash, 1);
     sim.insert_coin(register_coin);
 
@@ -223,7 +222,10 @@ fn register_with_valid_inputs_traps_only_at_announcement_assertion() {
         truth,
         (
             voter_pk_bytes,
-            (slot as u64, (siblings, Bytes32::default() /* no announcer */)),
+            (
+                slot as u64,
+                (siblings, Bytes32::default() /* no announcer */),
+            ),
         ),
     );
     let register_solution_node = register_solution.to_clvm(&mut allocator).unwrap();
@@ -271,8 +273,7 @@ fn register_rejects_wrong_slot_index() {
 
     let mut allocator = Allocator::new();
     let register_puzzle_node = build_register_wrapper(&mut allocator, &curried_args);
-    let register_puzzle_hash =
-        Bytes32::new(tree_hash(&allocator, register_puzzle_node).to_bytes());
+    let register_puzzle_hash = Bytes32::new(tree_hash(&allocator, register_puzzle_node).to_bytes());
     let register_coin = Coin::new(Bytes32::new([0xCD; 32]), register_puzzle_hash, 1);
     sim.insert_coin(register_coin);
 

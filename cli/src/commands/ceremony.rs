@@ -187,12 +187,7 @@ pub async fn run(cmd: CeremonyCmd, ctx: &Context) -> Result<()> {
     }
 }
 
-fn init(
-    circuit_id: String,
-    output: PathBuf,
-    overwrite: bool,
-    ctx: &Context,
-) -> Result<()> {
+fn init(circuit_id: String, output: PathBuf, overwrite: bool, ctx: &Context) -> Result<()> {
     let mut coord = CeremonyCoordinator::new(Box::new(SimulatedBackend));
     coord
         .start(circuit_id.clone())
@@ -220,8 +215,11 @@ fn contribute(
 ) -> Result<()> {
     let previous: Transcript = config_file::load_json(&input)?;
     let entropy = load_entropy(entropy_file.as_ref())?;
-    let participant =
-        CeremonyParticipant::new(Box::new(SimulatedBackend), participant_name.clone(), message);
+    let participant = CeremonyParticipant::new(
+        Box::new(SimulatedBackend),
+        participant_name.clone(),
+        message,
+    );
     let output_data = participant
         .contribute(&previous, entropy)
         .map_err(|e| anyhow::anyhow!("contribute: {e:?}"))?;
@@ -288,12 +286,7 @@ fn verify(input: PathBuf, ctx: &Context) -> Result<()> {
     }))
 }
 
-fn finalize(
-    input: PathBuf,
-    vk_output: PathBuf,
-    overwrite: bool,
-    ctx: &Context,
-) -> Result<()> {
+fn finalize(input: PathBuf, vk_output: PathBuf, overwrite: bool, ctx: &Context) -> Result<()> {
     let transcript: Transcript = config_file::load_json(&input)?;
     if transcript.attestations.is_empty() {
         anyhow::bail!(

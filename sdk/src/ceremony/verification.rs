@@ -46,7 +46,9 @@ impl VerificationKey {
     }
 
     pub fn from_hex(hex_str: &str) -> Result<Self, hex::FromHexError> {
-        Ok(Self { raw_bytes: hex::decode(hex_str)? })
+        Ok(Self {
+            raw_bytes: hex::decode(hex_str)?,
+        })
     }
 
     pub fn to_hex(&self) -> String {

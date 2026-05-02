@@ -31,9 +31,7 @@
 
 use std::path::PathBuf;
 
-use chip_voting_sdk::ceremony::{
-    CeremonyCoordinator, CeremonyParticipant, SimulatedBackend,
-};
+use chip_voting_sdk::ceremony::{CeremonyCoordinator, CeremonyParticipant, SimulatedBackend};
 use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -82,10 +82,7 @@ pub trait ChainReader: Send + Sync {
     /// USAGE: walk a voter's lineage. Voter hints are stable across
     ///        register / vote / release spends so this returns the
     ///        full history.
-    async fn coin_records_by_hint(
-        &self,
-        hint: Bytes32,
-    ) -> VotingResult<Vec<ChainCoinRecord>>;
+    async fn coin_records_by_hint(&self, hint: Bytes32) -> VotingResult<Vec<ChainCoinRecord>>;
 
     /// FN: puzzle_and_solution
     /// WHAT: return the puzzle + solution that were used to spend
@@ -126,10 +123,7 @@ pub trait ChainReader: Send + Sync {
     /// USAGE: Voter / Aggregator lineage-proof reconstruction —
     ///        given a singleton's `parent_coin_info`, fetch the
     ///        launcher coin record directly.
-    async fn coin_record_by_id(
-        &self,
-        coin_id: Bytes32,
-    ) -> VotingResult<Option<ChainCoinRecord>>;
+    async fn coin_record_by_id(&self, coin_id: Bytes32) -> VotingResult<Option<ChainCoinRecord>>;
 
     /// FN: peak_height
     /// WHAT: current chain peak height the backend can see. Used
@@ -206,10 +200,7 @@ pub async fn wait_for_unspent_coin_at_puzzle_hash<C: ChainReader>(
         }
 
         let records = chain.coin_records_by_puzzle_hash(puzzle_hash).await?;
-        let unspent: Vec<_> = records
-            .into_iter()
-            .filter(|r| r.is_unspent())
-            .collect();
+        let unspent: Vec<_> = records.into_iter().filter(|r| r.is_unspent()).collect();
         if unspent.len() >= expected_min {
             tracing::info!(
                 label,
@@ -273,10 +264,7 @@ impl ChainReader for chia_query::ChiaQuery {
             .collect::<Result<Vec<_>, _>>()
     }
 
-    async fn coin_records_by_hint(
-        &self,
-        hint: Bytes32,
-    ) -> VotingResult<Vec<ChainCoinRecord>> {
+    async fn coin_records_by_hint(&self, hint: Bytes32) -> VotingResult<Vec<ChainCoinRecord>> {
         let hint_hex = format!("0x{}", hex::encode(hint));
         // include_spent_coins=true to get the FULL voter lineage.
         let records = self
@@ -326,10 +314,7 @@ impl ChainReader for chia_query::ChiaQuery {
         records.iter().map(adapt_record).collect()
     }
 
-    async fn coin_record_by_id(
-        &self,
-        coin_id: Bytes32,
-    ) -> VotingResult<Option<ChainCoinRecord>> {
+    async fn coin_record_by_id(&self, coin_id: Bytes32) -> VotingResult<Option<ChainCoinRecord>> {
         let id_hex = format!("0x{}", hex::encode(coin_id));
         // chia_query returns Err for "not found"; we treat that as
         // `Ok(None)` so callers can branch on absence vs RPC error.
@@ -391,10 +376,7 @@ impl ChainReader for chia_query::coinset::CoinsetClient {
         records.iter().map(adapt_record).collect()
     }
 
-    async fn coin_records_by_hint(
-        &self,
-        hint: Bytes32,
-    ) -> VotingResult<Vec<ChainCoinRecord>> {
+    async fn coin_records_by_hint(&self, hint: Bytes32) -> VotingResult<Vec<ChainCoinRecord>> {
         let hint_hex = format!("0x{}", hex::encode(hint));
         let records = self
             .get_coin_records_by_hint(&hint_hex, None, None, true)
@@ -433,10 +415,7 @@ impl ChainReader for chia_query::coinset::CoinsetClient {
         records.iter().map(adapt_record).collect()
     }
 
-    async fn coin_record_by_id(
-        &self,
-        coin_id: Bytes32,
-    ) -> VotingResult<Option<ChainCoinRecord>> {
+    async fn coin_record_by_id(&self, coin_id: Bytes32) -> VotingResult<Option<ChainCoinRecord>> {
         let id_hex = format!("0x{}", hex::encode(coin_id));
         match self.get_coin_record_by_name(&id_hex).await {
             Ok(rec) => adapt_record(&rec).map(Some),
@@ -521,10 +500,7 @@ mod simulator_impl {
                 .collect())
         }
 
-        async fn coin_records_by_hint(
-            &self,
-            hint: Bytes32,
-        ) -> VotingResult<Vec<ChainCoinRecord>> {
+        async fn coin_records_by_hint(&self, hint: Bytes32) -> VotingResult<Vec<ChainCoinRecord>> {
             let guard = self.0.lock().expect("simulator mutex poisoned");
             let sim: &Simulator = unsafe { &**guard };
             let coin_ids = sim.hinted_coins(hint);
@@ -609,20 +585,24 @@ fn adapt_coin(c: &chia_query::Coin) -> VotingResult<Coin> {
 
 fn parse_hex32(s: &str) -> VotingResult<Bytes32> {
     let trimmed = s.trim().trim_start_matches("0x");
-    let bytes = hex::decode(trimmed)
-        .map_err(|e| VotingError::Other(anyhow_compat::Error(format!(
-            "hex decode {s}: {e}").into())))?;
+    let bytes = hex::decode(trimmed).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(format!("hex decode {s}: {e}").into()))
+    })?;
     let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-        VotingError::Other(anyhow_compat::Error(format!("expected 32 bytes from {s}").into()))
+        VotingError::Other(anyhow_compat::Error(
+            format!("expected 32 bytes from {s}").into(),
+        ))
     })?;
     Ok(Bytes32::new(arr))
 }
 
 fn parse_program(hex_str: &str) -> VotingResult<Program> {
     let trimmed = hex_str.trim().trim_start_matches("0x");
-    let bytes = hex::decode(trimmed)
-        .map_err(|e| VotingError::Other(anyhow_compat::Error(format!(
-            "hex decode {hex_str}: {e}").into())))?;
+    let bytes = hex::decode(trimmed).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("hex decode {hex_str}: {e}").into(),
+        ))
+    })?;
     Ok(Program::from(bytes))
 }
 

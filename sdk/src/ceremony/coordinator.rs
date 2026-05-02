@@ -92,11 +92,11 @@ impl CeremonyCoordinator {
 
     /// Get the current transcript — send this to the next participant.
     pub fn current_transcript(&self) -> VotingResult<&Transcript> {
-        self.transcript
-            .as_ref()
-            .ok_or_else(|| VotingError::Other(crate::error::anyhow_compat::Error(
+        self.transcript.as_ref().ok_or_else(|| {
+            VotingError::Other(crate::error::anyhow_compat::Error(
                 "CeremonyCoordinator: not started".into(),
-            )))
+            ))
+        })
     }
 
     /// Accept a participant's contribution. The new transcript replaces
@@ -143,7 +143,9 @@ impl CeremonyCoordinator {
 
     /// Get a snapshot of the published audit chain for posting to
     /// GitHub / a website.
-    pub fn published_attestations(&self) -> VotingResult<Vec<super::transcript::ContributionAttestation>> {
+    pub fn published_attestations(
+        &self,
+    ) -> VotingResult<Vec<super::transcript::ContributionAttestation>> {
         Ok(self.current_transcript()?.attestations.clone())
     }
 }
@@ -218,16 +220,8 @@ mod tests {
         let mut c = coord();
         c.start("chip-voting-v1".into()).unwrap();
 
-        let alice = CeremonyParticipant::new(
-            Box::new(SimulatedBackend),
-            "alice".into(),
-            None,
-        );
-        let bob = CeremonyParticipant::new(
-            Box::new(SimulatedBackend),
-            "bob".into(),
-            None,
-        );
+        let alice = CeremonyParticipant::new(Box::new(SimulatedBackend), "alice".into(), None);
+        let bob = CeremonyParticipant::new(Box::new(SimulatedBackend), "bob".into(), None);
 
         let t1 = c.current_transcript().unwrap().clone();
         let alice_out = alice.contribute(&t1, [0xAAu8; 32]).unwrap();
@@ -256,11 +250,7 @@ mod tests {
         let mut c = coord();
         c.start("chip-voting-v1".into()).unwrap();
 
-        let alice = CeremonyParticipant::new(
-            Box::new(SimulatedBackend),
-            "alice".into(),
-            None,
-        );
+        let alice = CeremonyParticipant::new(Box::new(SimulatedBackend), "alice".into(), None);
         let t = c.current_transcript().unwrap().clone();
         let mut out = alice.contribute(&t, [0xAAu8; 32]).unwrap();
         // Tamper with the chain link.
@@ -284,11 +274,7 @@ mod tests {
     fn resume_round_trips_through_disk_persistence() {
         let mut a = coord();
         a.start("chip-voting-v1".into()).unwrap();
-        let alice = CeremonyParticipant::new(
-            Box::new(SimulatedBackend),
-            "alice".into(),
-            None,
-        );
+        let alice = CeremonyParticipant::new(Box::new(SimulatedBackend), "alice".into(), None);
         let t1 = a.current_transcript().unwrap().clone();
         let alice_out = alice.contribute(&t1, [0xAAu8; 32]).unwrap();
         a.accept_contribution(alice_out.transcript).unwrap();
@@ -300,11 +286,7 @@ mod tests {
         b.resume(snapshot).unwrap();
         assert_eq!(b.contribution_count(), 1);
 
-        let bob = CeremonyParticipant::new(
-            Box::new(SimulatedBackend),
-            "bob".into(),
-            None,
-        );
+        let bob = CeremonyParticipant::new(Box::new(SimulatedBackend), "bob".into(), None);
         let t2 = b.current_transcript().unwrap().clone();
         let bob_out = bob.contribute(&t2, [0xBBu8; 32]).unwrap();
         b.accept_contribution(bob_out.transcript).unwrap();
@@ -327,11 +309,7 @@ mod tests {
     fn resume_rejects_tampered_transcript() {
         let mut a = coord();
         a.start("chip-voting-v1".into()).unwrap();
-        let alice = CeremonyParticipant::new(
-            Box::new(SimulatedBackend),
-            "alice".into(),
-            None,
-        );
+        let alice = CeremonyParticipant::new(Box::new(SimulatedBackend), "alice".into(), None);
         let t1 = a.current_transcript().unwrap().clone();
         let alice_out = alice.contribute(&t1, [0xAAu8; 32]).unwrap();
         a.accept_contribution(alice_out.transcript).unwrap();

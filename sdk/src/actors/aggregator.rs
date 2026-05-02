@@ -116,7 +116,9 @@ impl<C: ChainReader> Aggregator<C> {
 
     /// Shared reference to the underlying chain reader. Use for
     /// custom queries that fall outside the actor's API.
-    pub fn chain(&self) -> &C { &self.chain }
+    pub fn chain(&self) -> &C {
+        &self.chain
+    }
 
     /// FN: sync
     /// WHAT: refresh the in-memory cache (`state`, `voter_set`, `smt`)
@@ -186,9 +188,7 @@ impl<C: ChainReader> Aggregator<C> {
     /// (indexer); for now `sync()` returns an empty Vec and the real
     /// per-ballot lineage walk is stubbed.
     pub fn ballots(&self) -> VotingResult<&[BallotCoinSnapshot]> {
-        self.ballots
-            .as_deref()
-            .ok_or(VotingError::NotDeployed)
+        self.ballots.as_deref().ok_or(VotingError::NotDeployed)
     }
 
     /// FN: collect_votes
@@ -313,7 +313,9 @@ impl<C: ChainReader> Aggregator<C> {
             .map(|v| {
                 let bytes = hex::decode(&v.vote_signature_hex)
                     .map_err(|_| VotingError::InvalidSignature)?;
-                let arr: [u8; 96] = bytes.try_into().map_err(|_| VotingError::InvalidSignature)?;
+                let arr: [u8; 96] = bytes
+                    .try_into()
+                    .map_err(|_| VotingError::InvalidSignature)?;
                 Signature::from_bytes(&arr).map_err(|_| VotingError::InvalidSignature)
             })
             .collect::<VotingResult<Vec<_>>>()?;
@@ -349,11 +351,11 @@ impl<C: ChainReader> Aggregator<C> {
         //       (collected by the aggregator into `vote_signature_hex`)
         // We hash (b) here. Callers who supply (a) by mistake will
         // see the on-chain Groth16 verification reject the bundle.
-        let election_id = self.config.election_launcher_id().map_err(|e| {
-            VotingError::Other(anyhow_compat::Error(format!("config: {e}").into()))
-        })?;
-        let vote_message =
-            canonical_vote_message(vote_outcome, ballot_launcher_id, election_id);
+        let election_id = self
+            .config
+            .election_launcher_id()
+            .map_err(|e| VotingError::Other(anyhow_compat::Error(format!("config: {e}").into())))?;
+        let vote_message = canonical_vote_message(vote_outcome, ballot_launcher_id, election_id);
 
         // Pre-check 6: PoP-style BLS aggregate verify off-chain
         // — mirrors the EXACT pairing identity the on-chain
@@ -758,16 +760,15 @@ pub async fn sync_with_chain<C: ChainReader>(
         }
         // Parse this spend's emitted conditions and update state.
         let coin_id = current.coin.coin_id();
-        let (puzzle, solution) =
-            chain.puzzle_and_solution(coin_id).await?.ok_or_else(|| {
-                VotingError::Other(anyhow_compat::Error(
-                    format!(
-                        "expected puzzle_and_solution for spent singleton {}",
-                        hex::encode(coin_id)
-                    )
-                    .into(),
-                ))
-            })?;
+        let (puzzle, solution) = chain.puzzle_and_solution(coin_id).await?.ok_or_else(|| {
+            VotingError::Other(anyhow_compat::Error(
+                format!(
+                    "expected puzzle_and_solution for spent singleton {}",
+                    hex::encode(coin_id)
+                )
+                .into(),
+            ))
+        })?;
         apply_singleton_spend(
             &puzzle,
             &solution,
@@ -778,9 +779,7 @@ pub async fn sync_with_chain<C: ChainReader>(
         )?;
 
         // Find the child of this coin (the next singleton).
-        let children = chain
-            .coin_records_by_parent_ids(&[coin_id])
-            .await?;
+        let children = chain.coin_records_by_parent_ids(&[coin_id]).await?;
         // The singleton always recreates itself as exactly one child
         // (the action layer's finalizer emits a single CreateCoin).
         // We look for the non-launcher child — odd-amount filter is a
@@ -992,15 +991,12 @@ pub async fn find_current_singleton<C: ChainReader>(
         //   2. Running the puzzle to update `smt`/`voters`/`state`.
         //   3. Looking up the singleton child coin.
         let coin_id = current.coin.coin_id();
-        let (puzzle, solution) = chain
-            .puzzle_and_solution(coin_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow_other(format!(
-                    "find_current_singleton: missing puzzle_and_solution for spent singleton {}",
-                    hex::encode(coin_id)
-                ))
-            })?;
+        let (puzzle, solution) = chain.puzzle_and_solution(coin_id).await?.ok_or_else(|| {
+            anyhow_other(format!(
+                "find_current_singleton: missing puzzle_and_solution for spent singleton {}",
+                hex::encode(coin_id)
+            ))
+        })?;
         prev = Some((current.coin, state.clone()));
         apply_singleton_spend(
             &puzzle,
@@ -1161,18 +1157,18 @@ fn apply_singleton_spend(
     // Walk the SOLUTION tree to find candidate pubkeys (48-byte BLS
     // G1 atoms) AND candidate vote outcomes (32-byte atoms — see
     // `collect_bytes32_atoms`).
-    let solution_node = solution.to_clvm(&mut allocator).map_err(|e| {
-        anyhow_other(format!("apply_singleton_spend: solution to_clvm: {e}"))
-    })?;
+    let solution_node = solution
+        .to_clvm(&mut allocator)
+        .map_err(|e| anyhow_other(format!("apply_singleton_spend: solution to_clvm: {e}")))?;
     let mut candidate_pubkeys: Vec<chia_bls::PublicKey> = Vec::new();
     collect_pubkey_candidates(&allocator, solution_node, &mut candidate_pubkeys);
     let mut candidate_outcomes: Vec<[u8; 32]> = Vec::new();
     collect_bytes32_atoms(&allocator, solution_node, &mut candidate_outcomes);
 
     // Run the puzzle to extract emitted conditions.
-    let puzzle_node = puzzle.to_clvm(&mut allocator).map_err(|e| {
-        anyhow_other(format!("apply_singleton_spend: puzzle to_clvm: {e}"))
-    })?;
+    let puzzle_node = puzzle
+        .to_clvm(&mut allocator)
+        .map_err(|e| anyhow_other(format!("apply_singleton_spend: puzzle to_clvm: {e}")))?;
     let dialect = ChiaDialect::new(0);
     let conds_root = match run_program(
         &mut allocator,
@@ -1204,13 +1200,17 @@ fn apply_singleton_spend(
     let mut node = conds_root;
     while let Some((cond, rest)) = allocator.next(node) {
         node = rest;
-        let Some((opcode_node, args_node)) = allocator.next(cond) else { continue };
+        let Some((opcode_node, args_node)) = allocator.next(cond) else {
+            continue;
+        };
         let opcode_bytes = allocator.atom(opcode_node);
         // CreateCoinAnnouncement = opcode 60.
         if opcode_bytes.as_ref() != [60] {
             continue;
         }
-        let Some((msg_node, _)) = allocator.next(args_node) else { continue };
+        let Some((msg_node, _)) = allocator.next(args_node) else {
+            continue;
+        };
         let msg = allocator.atom(msg_node);
         if msg.as_ref().len() == 32 {
             let mut buf = [0u8; 32];
@@ -1387,12 +1387,14 @@ pub async fn extract_votes<C: ChainReader>(
     if voter_set.voters.is_empty() {
         return Ok(vec![]);
     }
-    let election_id = config
-        .election_launcher_id()
-        .map_err(|e| VotingError::Other(anyhow_compat::Error(format!("election_launcher_id: {e}").into())))?;
-    let cat_tail_hash = config
-        .cat_tail_hash()
-        .map_err(|e| VotingError::Other(anyhow_compat::Error(format!("cat_tail_hash: {e}").into())))?;
+    let election_id = config.election_launcher_id().map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("election_launcher_id: {e}").into(),
+        ))
+    })?;
+    let cat_tail_hash = config.cat_tail_hash().map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(format!("cat_tail_hash: {e}").into()))
+    })?;
 
     let mut out: Vec<VoteRecord> = Vec::new();
     for pk in &voter_set.voters {
@@ -1407,7 +1409,9 @@ pub async fn extract_votes<C: ChainReader>(
             .iter()
             .filter(|r| r.is_unspent() && r.coin.puzzle_hash != fresh_ph)
             .max_by_key(|r| r.confirmed_height);
-        let Some(post_vote_record) = post_vote else { continue };
+        let Some(post_vote_record) = post_vote else {
+            continue;
+        };
 
         // Fetch the parent spend.
         let parent_id = post_vote_record.coin.parent_coin_info;
@@ -1419,7 +1423,11 @@ pub async fn extract_votes<C: ChainReader>(
         // Run the parent spend in CLVM and find the CreateCoin
         // condition that produced our post_vote_record. Its memos
         // carry [HINT, vote_data, vote_signature].
-        let memos = match extract_create_coin_memos(&puzzle, &solution, post_vote_record.coin.puzzle_hash) {
+        let memos = match extract_create_coin_memos(
+            &puzzle,
+            &solution,
+            post_vote_record.coin.puzzle_hash,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "extract_votes: failed to extract memos");
@@ -1428,7 +1436,10 @@ pub async fn extract_votes<C: ChainReader>(
         };
         // memos = [HINT(32), vote_data(32), vote_signature(96)]
         if memos.len() < 3 {
-            tracing::warn!(memo_count = memos.len(), "extract_votes: memos missing vote_data + signature");
+            tracing::warn!(
+                memo_count = memos.len(),
+                "extract_votes: memos missing vote_data + signature"
+            );
             continue;
         }
         let vote_data_bytes = &memos[1];
@@ -1488,31 +1499,47 @@ pub(crate) fn extract_create_coin_memos(
     use clvmr::{reduction::Reduction, run_program, Allocator, ChiaDialect};
 
     let mut allocator = Allocator::new();
-    let puzzle_node = puzzle.to_clvm(&mut allocator).map_err(|e| format!("puzzle to_clvm: {e}"))?;
-    let solution_node = solution.to_clvm(&mut allocator).map_err(|e| format!("solution to_clvm: {e}"))?;
+    let puzzle_node = puzzle
+        .to_clvm(&mut allocator)
+        .map_err(|e| format!("puzzle to_clvm: {e}"))?;
+    let solution_node = solution
+        .to_clvm(&mut allocator)
+        .map_err(|e| format!("solution to_clvm: {e}"))?;
     let dialect = ChiaDialect::new(0);
-    let Reduction(_, output) = run_program(&mut allocator, &dialect, puzzle_node, solution_node, 11_000_000_000)
-        .map_err(|e| format!("run_program: {e:?}"))?;
+    let Reduction(_, output) = run_program(
+        &mut allocator,
+        &dialect,
+        puzzle_node,
+        solution_node,
+        11_000_000_000,
+    )
+    .map_err(|e| format!("run_program: {e:?}"))?;
 
     // Walk the conditions list; for each CreateCoin (opcode 51),
     // check if the target puzzle hash matches.
     let mut node = output;
     while let Some((cond_node, rest)) = allocator.next(node) {
         node = rest;
-        let Some((opcode_node, args_node)) = allocator.next(cond_node) else { continue };
+        let Some((opcode_node, args_node)) = allocator.next(cond_node) else {
+            continue;
+        };
         let opcode_atom = allocator.atom(opcode_node);
         let opcode_bytes = opcode_atom.as_ref();
         if opcode_bytes != [51] {
             continue;
         }
         // CreateCoin args: (puzzle_hash, amount, memos_or_nil)
-        let Some((ph_node, after_ph)) = allocator.next(args_node) else { continue };
+        let Some((ph_node, after_ph)) = allocator.next(args_node) else {
+            continue;
+        };
         let ph_atom = allocator.atom(ph_node);
         if ph_atom.as_ref() != target_puzzle_hash.as_ref() {
             continue;
         }
         // Skip amount.
-        let Some((_amount_node, after_amount)) = allocator.next(after_ph) else { continue };
+        let Some((_amount_node, after_amount)) = allocator.next(after_ph) else {
+            continue;
+        };
         // Memos slot: typically a list of byte strings. For our
         // finalizer the shape is `(memos . ())` where memos is the
         // list `[HINT, vote_data, vote_signature]`.
@@ -1548,9 +1575,7 @@ fn walk_atom_list(
 ///       a matching root, and call `.proof(leaf)` to get the proof
 ///       for any selected action.
 pub fn compute_election_action_root_leaves(config: &ElectionConfig) -> Vec<Bytes32> {
-    let launcher_id = config
-        .election_launcher_id()
-        .expect("config validated");
+    let launcher_id = config.election_launcher_id().expect("config validated");
     let cat_tail_hash = config.cat_tail_hash().expect("config validated");
 
     let [register_leaf, create_ballot_leaf, deregister_leaf] =
@@ -1691,8 +1716,7 @@ pub fn compute_eve_singleton_puzzle_hash(
 
     // Step 3: genesis state tree hash via the source-of-truth helper.
     let empty_root = crate::merkle::SparseMerkleTree::new().root();
-    let state_hash =
-        ElectionState::genesis(empty_root, election_start_height).clvm_tree_hash();
+    let state_hash = ElectionState::genesis(empty_root, election_start_height).clvm_tree_hash();
 
     // See `compute_eve_inner_puzzle_hash` above for the curry-arg
     // convention rationale: finalizer_full is a tree hash of a
@@ -1766,8 +1790,7 @@ fn election_action_leaves(
 
     // ── create_ballot ────────────────────────────────────────────
     // CURRY ORDER: (SINGLETON_LAUNCHER_PUZZLE_HASH, ELECTION_LAUNCHER_ID).
-    let singleton_launcher_ph =
-        Bytes32::from(chia_puzzles::SINGLETON_LAUNCHER_HASH);
+    let singleton_launcher_ph = Bytes32::from(chia_puzzles::SINGLETON_LAUNCHER_HASH);
     let create_ballot_full = puzzles::curry_tree_hash(
         PuzzleHashes::election_create_ballot(),
         &[
@@ -1866,8 +1889,9 @@ mod tests {
         let mut sim = Simulator::new();
         let funder = sim.bls(1);
         let deployer = ElectionDeployer::new(dummy_deploy_params());
-        let (coin_spends, config) =
-            deployer.build_deploy_bundle(funder.coin, funder.pk).unwrap();
+        let (coin_spends, config) = deployer
+            .build_deploy_bundle(funder.coin, funder.pk)
+            .unwrap();
         sim.spend_coins(coin_spends, &[funder.sk])
             .expect("simulator accepts deploy bundle");
         (config, sim)
@@ -1933,7 +1957,8 @@ mod tests {
             max_signers: crate::config::MAX_SIGNERS,
             verification_key_hex: hex::encode(vec![
                 0u8;
-                336 + (crate::config::PUBLIC_INPUT_COUNT + 1) * 48
+                336 + (crate::config::PUBLIC_INPUT_COUNT + 1)
+                    * 48
             ]),
             label: None,
         };
@@ -1961,14 +1986,18 @@ mod tests {
         let mut sim = Simulator::new();
         let funder = sim.bls(1);
         let deployer = ElectionDeployer::new(dummy_deploy_params());
-        let (_spends, config) =
-            deployer.build_deploy_bundle(funder.coin, funder.pk).unwrap();
+        let (_spends, config) = deployer
+            .build_deploy_bundle(funder.coin, funder.pk)
+            .unwrap();
 
         let launcher_id = derive_launcher_id(funder.coin.coin_id(), 1);
         let inner = deployer.genesis_inner_puzzle_hash(launcher_id);
         let expected = puzzles::election_singleton_puzzle_hash(launcher_id, inner);
 
-        assert_eq!(compute_eve_singleton_puzzle_hash(&config, TEST_ELECTION_START_HEIGHT), expected);
+        assert_eq!(
+            compute_eve_singleton_puzzle_hash(&config, TEST_ELECTION_START_HEIGHT),
+            expected
+        );
     }
 
     /// WHAT: calling `state()`, `voter_set()`, or `merkle_tree()`
@@ -2037,12 +2066,7 @@ mod tests {
 
         let pk = stub_proving_key();
         let res = agg
-            .build_finalize(
-                Bytes32::new([0x42; 32]),
-                &[],
-                Bytes32::new([0x55; 32]),
-                &pk,
-            )
+            .build_finalize(Bytes32::new([0x42; 32]), &[], Bytes32::new([0x55; 32]), &pk)
             .await;
         assert!(matches!(res, Err(VotingError::NotDeployed)));
     }
@@ -2177,7 +2201,11 @@ mod tests {
                 master_to_wallet_unhardened(&root.public_key(), i).derive_synthetic()
             })
             .collect();
-        agg.voter_set.as_mut().unwrap().voters.extend(pks.iter().copied());
+        agg.voter_set
+            .as_mut()
+            .unwrap()
+            .voters
+            .extend(pks.iter().copied());
         agg.voter_set.as_mut().unwrap().registration_count = 3;
 
         // Only 1 vote out of 3 → fails strict-majority check.
@@ -2324,7 +2352,10 @@ mod tests {
         config: ElectionConfig,
         chain: SharedSimulator,
         n_voters: u32,
-    ) -> (Aggregator<SharedSimulator>, Vec<(chia_bls::SecretKey, PublicKey)>) {
+    ) -> (
+        Aggregator<SharedSimulator>,
+        Vec<(chia_bls::SecretKey, PublicKey)>,
+    ) {
         let mut agg = Aggregator::new(config, chain, NetworkType::Mainnet);
         agg.sync().await.unwrap();
         let voters: Vec<_> = (0..n_voters).map(test_voter).collect();
@@ -2335,10 +2366,8 @@ mod tests {
             agg.smt.as_mut().unwrap().insert(pk).unwrap();
         }
         agg.voter_set.as_mut().unwrap().registration_count = n_voters as u64;
-        agg.voter_set.as_mut().unwrap().registration_merkle_root =
-            agg.smt.as_ref().unwrap().root();
-        agg.state.as_mut().unwrap().registration_merkle_root =
-            agg.smt.as_ref().unwrap().root();
+        agg.voter_set.as_mut().unwrap().registration_merkle_root = agg.smt.as_ref().unwrap().root();
+        agg.state.as_mut().unwrap().registration_merkle_root = agg.smt.as_ref().unwrap().root();
         agg.state.as_mut().unwrap().registration_count = n_voters as u64;
         (agg, voters)
     }
@@ -2390,7 +2419,10 @@ mod tests {
         assert_eq!(w.signer_pubkeys.len(), 2);
         assert_eq!(w.merkle_proofs.len(), 2);
         assert_eq!(w.registration_count, 3);
-        assert_eq!(w.registration_merkle_root, agg.merkle_tree().unwrap().root());
+        assert_eq!(
+            w.registration_merkle_root,
+            agg.merkle_tree().unwrap().root()
+        );
 
         // agg_signers must equal the G1 sum of the signer pubkeys.
         let expected_agg_pk = aggregate_pubkeys(&[voters[0].1, voters[1].1]);
@@ -2552,11 +2584,7 @@ mod tests {
             })
             .collect();
 
-        let res = agg.prepare_finalize_witness(
-            Bytes32::default(),
-            placeholder_ballot_id(),
-            &votes,
-        );
+        let res = agg.prepare_finalize_witness(Bytes32::default(), placeholder_ballot_id(), &votes);
         assert!(matches!(res, Err(VotingError::InvalidSignature)));
     }
 
@@ -2583,8 +2611,7 @@ mod tests {
         let wrong_outcome = Bytes32::new([0xBB; 32]);
         let election_id = config.election_launcher_id().unwrap();
         // Voters mistakenly sign the wrong outcome.
-        let wrong_msg =
-            canonical_vote_message(wrong_outcome, placeholder_ballot_id(), election_id);
+        let wrong_msg = canonical_vote_message(wrong_outcome, placeholder_ballot_id(), election_id);
 
         let votes: Vec<_> = voters[..2]
             .iter()
@@ -2600,11 +2627,7 @@ mod tests {
         // We pass the REAL outcome to prepare_finalize_witness, but
         // the signatures are over the WRONG message. aggregate_verify
         // catches this.
-        let res = agg.prepare_finalize_witness(
-            real_outcome,
-            placeholder_ballot_id(),
-            &votes,
-        );
+        let res = agg.prepare_finalize_witness(real_outcome, placeholder_ballot_id(), &votes);
         assert!(matches!(res, Err(VotingError::InvalidSignature)));
     }
 
@@ -2632,11 +2655,7 @@ mod tests {
             })
             .collect();
 
-        let res = agg.prepare_finalize_witness(
-            Bytes32::default(),
-            placeholder_ballot_id(),
-            &votes,
-        );
+        let res = agg.prepare_finalize_witness(Bytes32::default(), placeholder_ballot_id(), &votes);
         assert!(matches!(res, Err(VotingError::InvalidSignature)));
     }
 
@@ -2690,11 +2709,11 @@ mod tests {
                 re-enable in Phase 6 against the Ballot Coin's \
                 finalize action curry shape"]
     fn finalize_leaf_uses_struct_curry_matching_spender() {
+        use crate::puzzles as p;
         use chia_protocol::Bytes;
         use clvm_traits::{clvm_curried_args, ToClvm};
         use clvm_utils::CurriedProgram;
         use clvmr::Allocator;
-        use crate::puzzles as p;
 
         let (cfg, _) = deploy_into_sim();
         let leaves = compute_election_action_root_leaves(&cfg);

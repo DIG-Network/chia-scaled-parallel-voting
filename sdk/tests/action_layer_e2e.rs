@@ -31,8 +31,8 @@ use chia_protocol::{Bytes, Bytes32, Coin};
 use chia_sdk_driver::SpendContext;
 use chia_sdk_test::Simulator;
 use chip_voting_sdk::action_spends::{
-    build_action_layer_puzzle, build_action_layer_solution,
-    build_registration_finalizer_full, load_action_puzzle, ActionSpend,
+    build_action_layer_puzzle, build_action_layer_solution, build_registration_finalizer_full,
+    load_action_puzzle, ActionSpend,
 };
 use chip_voting_sdk::puzzles::{self, registration_action_root_leaves};
 
@@ -121,7 +121,8 @@ fn voter_vote_through_full_action_layer_executes_on_simulator() {
     // AggSigUnsafe in our vote.rue uses chia_bls::sign (augmented).
     let vote_sig = chia_bls::sign(&voter_sk, vote_msg.as_ref());
 
-    let vote_action = load_action_puzzle(&mut ctx, legacy_puzzle_aliases::REGISTRATION_VOTE_HEX).unwrap();
+    let vote_action =
+        load_action_puzzle(&mut ctx, legacy_puzzle_aliases::REGISTRATION_VOTE_HEX).unwrap();
     let vote_sig_bytes = Bytes::new(vote_sig.to_bytes().to_vec());
     let vote_solution_value = (vote_data, vote_sig_bytes);
     let vote_solution = vote_solution_value.to_clvm(&mut *ctx).unwrap();
@@ -136,8 +137,7 @@ fn voter_vote_through_full_action_layer_executes_on_simulator() {
     let finalizer_solution = coin_amount.to_clvm(&mut *ctx).unwrap();
     let leaves = registration_action_root_leaves();
     let action_layer_solution =
-        build_action_layer_solution(&mut ctx, &leaves, &action_spends, finalizer_solution)
-            .unwrap();
+        build_action_layer_solution(&mut ctx, &leaves, &action_spends, finalizer_solution).unwrap();
 
     let spend = common::coin_spend_from_nodes(&ctx, coin, action_layer_node, action_layer_solution);
     let bundle = common::make_bundle(vec![spend], vote_sig);
@@ -228,18 +228,13 @@ fn voter_release_through_full_action_layer_executes_on_simulator() {
     sim.insert_coin(announcer_coin);
     let announcer_id = announcer_coin.coin_id();
     let announcer_solution = ().to_clvm(&mut *ctx).unwrap();
-    let announcer_spend = common::coin_spend_from_nodes(
-        &ctx,
-        announcer_coin,
-        announcer_node,
-        announcer_solution,
-    );
+    let announcer_spend =
+        common::coin_spend_from_nodes(&ctx, announcer_coin, announcer_node, announcer_solution);
 
     // ── Build the release action spend (action-layer wrapped) ──
     let release_action = load_action_puzzle(&mut ctx, puzzles::REGISTRATION_RELEASE_HEX).unwrap();
     // Solution: (dest, announcer_id, outcome, count, ...root)
-    let release_solution_value =
-        (dest, (announcer_id, (outcome, (count, root))));
+    let release_solution_value = (dest, (announcer_id, (outcome, (count, root))));
     let release_solution = release_solution_value.to_clvm(&mut *ctx).unwrap();
     let action_spends = vec![ActionSpend {
         puzzle: release_action,
@@ -248,8 +243,7 @@ fn voter_release_through_full_action_layer_executes_on_simulator() {
     let finalizer_solution = coin_amount.to_clvm(&mut *ctx).unwrap();
     let leaves = registration_action_root_leaves();
     let action_layer_solution =
-        build_action_layer_solution(&mut ctx, &leaves, &action_spends, finalizer_solution)
-            .unwrap();
+        build_action_layer_solution(&mut ctx, &leaves, &action_spends, finalizer_solution).unwrap();
     let release_spend =
         common::coin_spend_from_nodes(&ctx, reg_coin, reg_action_layer, action_layer_solution);
 
@@ -400,13 +394,9 @@ fn finalize_action_through_full_action_layer_executes_on_simulator() {
     // ── 6. Build the action layer ───────────────────────────
     use chia_sdk_types::MerkleTree;
     let single_action_root = MerkleTree::new(&action_leaves).root();
-    let action_layer_node = build_action_layer_puzzle(
-        &mut ctx,
-        election_finalizer,
-        single_action_root,
-        state_node,
-    )
-    .unwrap();
+    let action_layer_node =
+        build_action_layer_puzzle(&mut ctx, election_finalizer, single_action_root, state_node)
+            .unwrap();
     let inner_ph = Bytes32::new(tree_hash(&ctx, action_layer_node).to_bytes());
 
     // ── 7. Insert a coin at the inner puzzle hash ───────────

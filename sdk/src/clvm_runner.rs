@@ -80,10 +80,11 @@ impl PuzzleRunner {
     where
         S: ToClvm<Allocator>,
     {
-        let solution_node = solution
-            .to_clvm(&mut self.allocator)
-            .map_err(|e| VotingError::Other(anyhow_compat::Error(format!(
-                "solution serialise: {e}").into())))?;
+        let solution_node = solution.to_clvm(&mut self.allocator).map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("solution serialise: {e}").into(),
+            ))
+        })?;
         run_puzzle(&mut self.allocator, self.puzzle, solution_node)
             .map_err(eval_err_to_voting_error)
     }
@@ -124,9 +125,8 @@ impl PuzzleRunner {
     where
         T: FromClvm<Allocator>,
     {
-        T::from_clvm(&self.allocator, ptr).map_err(|e| {
-            VotingError::Other(anyhow_compat::Error(format!("extract: {e}").into()))
-        })
+        T::from_clvm(&self.allocator, ptr)
+            .map_err(|e| VotingError::Other(anyhow_compat::Error(format!("extract: {e}").into())))
     }
 
     /// FN: tree_hash
@@ -175,9 +175,9 @@ impl PuzzleRunner {
 // ── Internal helpers ──────────────────────────────────────────────────
 
 fn node_from_program(allocator: &mut Allocator, program: &Program) -> VotingResult<NodePtr> {
-    program.to_clvm(allocator).map_err(|e| {
-        VotingError::Other(anyhow_compat::Error(format!("program load: {e}").into()))
-    })
+    program
+        .to_clvm(allocator)
+        .map_err(|e| VotingError::Other(anyhow_compat::Error(format!("program load: {e}").into())))
 }
 
 fn node_to_bytes(allocator: &Allocator, node: NodePtr) -> VotingResult<Vec<u8>> {
@@ -188,7 +188,6 @@ fn node_to_bytes(allocator: &Allocator, node: NodePtr) -> VotingResult<Vec<u8>> 
 fn eval_err_to_voting_error(e: EvalErr) -> VotingError {
     VotingError::Other(anyhow_compat::Error(format!("CLVM eval: {e}").into()))
 }
-
 
 // ============================================================================
 // Tests
@@ -471,8 +470,7 @@ mod tests {
         let truth: ElectionStateTruthClvm = ((), state);
         let solution: ActionSolution = (truth, ());
 
-        let mut runner =
-            PuzzleRunner::from_hex(crate::puzzles::BALLOT_COIN_ORACLE_HEX).unwrap();
+        let mut runner = PuzzleRunner::from_hex(crate::puzzles::BALLOT_COIN_ORACLE_HEX).unwrap();
         let output = runner.run(&solution).expect("oracle should execute");
 
         let (_truth_out, conds): (ElectionStateTruthClvm, Vec<Condition<NodePtr>>) =
@@ -524,15 +522,14 @@ mod tests {
         let state = build_election_state(
             Bytes32::new(root_bytes),
             count,
-            123,                  // accumulated_fees doesn't affect the message
-            false,                // ← NOT finalized
-            Bytes32::default(),   // vote_outcome is zero pre-finalization
+            123,                // accumulated_fees doesn't affect the message
+            false,              // ← NOT finalized
+            Bytes32::default(), // vote_outcome is zero pre-finalization
         );
         let truth: ElectionStateTruthClvm = ((), state);
         let solution: ActionSolution = (truth, ());
 
-        let mut runner =
-            PuzzleRunner::from_hex(crate::puzzles::BALLOT_COIN_ORACLE_HEX).unwrap();
+        let mut runner = PuzzleRunner::from_hex(crate::puzzles::BALLOT_COIN_ORACLE_HEX).unwrap();
         let output = runner.run(&solution).expect("oracle should execute");
 
         let (_truth_out, conds): (ElectionStateTruthClvm, Vec<Condition<NodePtr>>) =
@@ -590,8 +587,7 @@ mod tests {
             other => panic!("unexpected condition: {other:?}"),
         };
 
-        let mut runner_un =
-            PuzzleRunner::from_hex(crate::puzzles::BALLOT_COIN_ORACLE_HEX).unwrap();
+        let mut runner_un = PuzzleRunner::from_hex(crate::puzzles::BALLOT_COIN_ORACLE_HEX).unwrap();
         let out_un = runner_un.run(&solution_un).unwrap();
         let (_truth, conds_un): (ElectionStateTruthClvm, Vec<Condition<NodePtr>>) =
             runner_un.extract(out_un).unwrap();
@@ -628,8 +624,7 @@ mod tests {
         let truth_in: ElectionStateTruthClvm = ((), state_in);
         let solution: ActionSolution = (truth_in, ());
 
-        let mut runner =
-            PuzzleRunner::from_hex(crate::puzzles::BALLOT_COIN_ORACLE_HEX).unwrap();
+        let mut runner = PuzzleRunner::from_hex(crate::puzzles::BALLOT_COIN_ORACLE_HEX).unwrap();
         let output = runner.run(&solution).unwrap();
         let (truth_out, _): (ElectionStateTruthClvm, Vec<Condition<NodePtr>>) =
             runner.extract(output).unwrap();
@@ -731,7 +726,8 @@ mod tests {
         // id matches sha256(this || finalization_message).
         let singleton_coin_id = Bytes32::new([0x42; 32]);
 
-        let state = build_registration_state_pre_release(&voter, election_id, false, Bytes32::default());
+        let state =
+            build_registration_state_pre_release(&voter, election_id, false, Bytes32::default());
         let truth: RegistrationStateTruthClvm<(), ()> = ((), state);
         let solution: ReleaseSolution<()> =
             (truth, (dest, (singleton_coin_id, (outcome, (count, root)))));
@@ -795,7 +791,10 @@ mod tests {
                 other => panic!("unexpected condition: {other:?}"),
             }
         }
-        assert!(saw_assert && saw_sig, "expected both AssertCoinAnnouncement and AggSigMe");
+        assert!(
+            saw_assert && saw_sig,
+            "expected both AssertCoinAnnouncement and AggSigMe"
+        );
     }
 
     /// WHAT: with a state whose `release_destination` is already set
@@ -875,11 +874,13 @@ mod tests {
         let vote_data = Bytes32::new([0x42; 32]);
         let fake_signature = Bytes::new(vec![0xCCu8; 96]);
 
-        let state = build_registration_state_pre_release(&voter, election_id, false, Bytes32::default());
+        let state =
+            build_registration_state_pre_release(&voter, election_id, false, Bytes32::default());
         let truth: RegistrationStateTruthClvm<(), ()> = ((), state);
         let solution: VoteSolution<()> = (truth, (vote_data, fake_signature));
 
-        let mut runner = PuzzleRunner::from_hex(crate::puzzles::REGISTRATION_MINT_VOTING_COIN_HEX).unwrap();
+        let mut runner =
+            PuzzleRunner::from_hex(crate::puzzles::REGISTRATION_MINT_VOTING_COIN_HEX).unwrap();
         let output = runner.run(&solution).expect("vote should execute");
 
         // Parse output. The vote action sets ephemeral to
@@ -925,11 +926,13 @@ mod tests {
         let vote_data = Bytes32::new([0xCC; 32]);
         let fake_signature = Bytes::new(vec![0u8; 96]);
 
-        let state = build_registration_state_pre_release(&voter, election_id, false, Bytes32::default());
+        let state =
+            build_registration_state_pre_release(&voter, election_id, false, Bytes32::default());
         let truth: RegistrationStateTruthClvm<(), ()> = ((), state);
         let solution: VoteSolution<()> = (truth, (vote_data, fake_signature));
 
-        let mut runner = PuzzleRunner::from_hex(crate::puzzles::REGISTRATION_MINT_VOTING_COIN_HEX).unwrap();
+        let mut runner =
+            PuzzleRunner::from_hex(crate::puzzles::REGISTRATION_MINT_VOTING_COIN_HEX).unwrap();
         let output = runner.run(&solution).unwrap();
         let (new_truth, _conds): (
             RegistrationStateTruthClvm<EphemeralVoteClvm, ()>,
@@ -956,14 +959,18 @@ mod tests {
     fn vote_traps_when_already_voted() {
         let voter = deterministic_voter();
         let election_id = Bytes32::new([0xAB; 32]);
-        let state = build_registration_state_pre_release(&voter, election_id, true, Bytes32::new([0x42; 32]));
-        let truth: RegistrationStateTruthClvm<(), ()> = ((), state);
-        let solution: VoteSolution<()> = (
-            truth,
-            (Bytes32::new([0x99; 32]), Bytes::new(vec![0u8; 96])),
+        let state = build_registration_state_pre_release(
+            &voter,
+            election_id,
+            true,
+            Bytes32::new([0x42; 32]),
         );
+        let truth: RegistrationStateTruthClvm<(), ()> = ((), state);
+        let solution: VoteSolution<()> =
+            (truth, (Bytes32::new([0x99; 32]), Bytes::new(vec![0u8; 96])));
 
-        let mut runner = PuzzleRunner::from_hex(crate::puzzles::REGISTRATION_MINT_VOTING_COIN_HEX).unwrap();
+        let mut runner =
+            PuzzleRunner::from_hex(crate::puzzles::REGISTRATION_MINT_VOTING_COIN_HEX).unwrap();
         runner
             .run_expecting_failure(&solution)
             .expect("must trap when has_voted already true");
@@ -1012,12 +1019,11 @@ mod tests {
             ),
         );
         let truth: RegistrationStateTruthClvm<(), Bytes32> = ((), post_release_state);
-        let solution: VoteSolution<Bytes32> = (
-            truth,
-            (Bytes32::default(), Bytes::new(vec![0u8; 96])),
-        );
+        let solution: VoteSolution<Bytes32> =
+            (truth, (Bytes32::default(), Bytes::new(vec![0u8; 96])));
 
-        let mut runner = PuzzleRunner::from_hex(crate::puzzles::REGISTRATION_MINT_VOTING_COIN_HEX).unwrap();
+        let mut runner =
+            PuzzleRunner::from_hex(crate::puzzles::REGISTRATION_MINT_VOTING_COIN_HEX).unwrap();
         runner
             .run_expecting_failure(&solution)
             .expect("must trap when release_destination is non-nil");
@@ -1039,7 +1045,12 @@ mod tests {
         let election_id = Bytes32::new([0xAB; 32]);
         let dest = Bytes32::new([0xEE; 32]);
 
-        let state = build_registration_state_pre_release(&voter, election_id, true, Bytes32::new([0x42; 32]));
+        let state = build_registration_state_pre_release(
+            &voter,
+            election_id,
+            true,
+            Bytes32::new([0x42; 32]),
+        );
         let truth: RegistrationStateTruthClvm<(), ()> = ((), state);
         let solution: ReleaseSolution<()> = (
             truth,
@@ -1054,8 +1065,10 @@ mod tests {
 
         let mut runner = PuzzleRunner::from_hex(crate::puzzles::REGISTRATION_RELEASE_HEX).unwrap();
         let output = runner.run(&solution).unwrap();
-        let (new_truth, _conds): (RegistrationStateTruthClvm<(), Bytes32>, Vec<Condition<NodePtr>>) =
-            runner.extract(output).unwrap();
+        let (new_truth, _conds): (
+            RegistrationStateTruthClvm<(), Bytes32>,
+            Vec<Condition<NodePtr>>,
+        ) = runner.extract(output).unwrap();
 
         let (_eph, new_state) = new_truth;
         let (pk_out, (eid_out, (hv_out, (vd_out, release_out)))) = new_state;
@@ -1063,6 +1076,9 @@ mod tests {
         assert_eq!(eid_out, election_id);
         assert_eq!(hv_out, 1, "has_voted is preserved");
         assert_eq!(vd_out, Bytes32::new([0x42; 32]), "vote_data is preserved");
-        assert_eq!(release_out, dest, "release_destination is set to supplied dest");
+        assert_eq!(
+            release_out, dest,
+            "release_destination is set to supplied dest"
+        );
     }
 }

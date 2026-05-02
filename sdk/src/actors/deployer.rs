@@ -145,10 +145,11 @@ impl ElectionDeployer {
         // 1. Launcher coin spend (creates the eve singleton with our
         //    inner puzzle hash committed).
         let launcher = Launcher::new(parent_coin.coin_id(), 1);
-        let (launch_conditions, _eve) = launcher
-            .spend(&mut ctx, inner_ph, ())
-            .map_err(|e| VotingError::Other(anyhow_compat::Error(format!(
-                "ElectionDeployer: launcher.spend failed: {e}").into())))?;
+        let (launch_conditions, _eve) = launcher.spend(&mut ctx, inner_ph, ()).map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("ElectionDeployer: launcher.spend failed: {e}").into(),
+            ))
+        })?;
 
         // 2. Standard p2 spend of the parent coin → launcher (1 mojo)
         //    + CHANGE coin back to parent's standard p2 puzzle hash
@@ -159,12 +160,16 @@ impl ElectionDeployer {
         let mut conditions: Conditions = launch_conditions;
         if parent_coin.amount > 1 {
             let change = parent_coin.amount - 1;
-            conditions = conditions.create_coin(parent_p2_ph, change, chia_puzzle_types::Memos::None);
+            conditions =
+                conditions.create_coin(parent_p2_ph, change, chia_puzzle_types::Memos::None);
         }
         StandardLayer::new(parent_pk)
             .spend(&mut ctx, parent_coin, conditions)
-            .map_err(|e| VotingError::Other(anyhow_compat::Error(format!(
-                "ElectionDeployer: standard layer spend failed: {e}").into())))?;
+            .map_err(|e| {
+                VotingError::Other(anyhow_compat::Error(
+                    format!("ElectionDeployer: standard layer spend failed: {e}").into(),
+                ))
+            })?;
 
         Ok((ctx.take(), config))
     }
@@ -189,7 +194,10 @@ impl ElectionDeployer {
         let (coin_spends, config) = self.build_deploy_bundle(parent_coin, parent_pk)?;
         let signature = sign_bundle_signature(&coin_spends, secret_keys, network)?;
         let spend_bundle = assemble_spend_bundle(coin_spends, signature);
-        Ok(DeploymentArtifacts { spend_bundle, config })
+        Ok(DeploymentArtifacts {
+            spend_bundle,
+            config,
+        })
     }
 
     /// FN: config_for_launcher
@@ -229,10 +237,8 @@ impl ElectionDeployer {
             ],
         );
         // Finalizer 2nd curry: bind self-hash
-        let finalizer_full = puzzles::curry_tree_hash(
-            finalizer_first,
-            &[puzzles::hash_atom_b32(&finalizer_first)],
-        );
+        let finalizer_full =
+            puzzles::curry_tree_hash(finalizer_first, &[puzzles::hash_atom_b32(&finalizer_first)]);
 
         let merkle_root = self.election_actions_merkle_root(launcher_id);
         // The genesis State.registration_merkle_root is the SMT
@@ -276,11 +282,7 @@ impl ElectionDeployer {
         let register_full = self.election_register_action_hash(launcher_id);
         let create_ballot_full = self.election_create_ballot_action_hash(launcher_id);
         let deregister_full = self.election_deregister_action_hash();
-        puzzles::election_actions_merkle_root(
-            register_full,
-            create_ballot_full,
-            deregister_full,
-        )
+        puzzles::election_actions_merkle_root(register_full, create_ballot_full, deregister_full)
     }
 
     /// Tree hash of the genesis `ElectionState` cons tree.
@@ -413,7 +415,9 @@ mod tests {
     use crate::ceremony::VerificationKey;
     use crate::config::PUBLIC_INPUT_COUNT;
 
-    fn b32(byte: u8) -> Bytes32 { Bytes32::new([byte; 32]) }
+    fn b32(byte: u8) -> Bytes32 {
+        Bytes32::new([byte; 32])
+    }
 
     fn test_params() -> DeployParams {
         DeployParams {
@@ -466,7 +470,9 @@ mod tests {
     fn config_for_launcher_round_trips_through_validate() {
         let d = ElectionDeployer::new(test_params());
         let config = d.config_for_launcher(b32(0xAB));
-        config.validate().expect("config_for_launcher must produce valid configs");
+        config
+            .validate()
+            .expect("config_for_launcher must produce valid configs");
     }
 
     /// WHAT: `config_for_launcher` correctly hex-encodes the
@@ -496,7 +502,10 @@ mod tests {
     fn genesis_inner_puzzle_hash_is_deterministic() {
         let d = ElectionDeployer::new(test_params());
         let l = b32(0xAB);
-        assert_eq!(d.genesis_inner_puzzle_hash(l), d.genesis_inner_puzzle_hash(l));
+        assert_eq!(
+            d.genesis_inner_puzzle_hash(l),
+            d.genesis_inner_puzzle_hash(l)
+        );
     }
 
     /// WHAT: `genesis_inner_puzzle_hash` is sensitive to the
@@ -634,8 +643,7 @@ mod tests {
         }
         .to_clvm(&mut *ctx2)
         .unwrap();
-        let actual_first_th =
-            Bytes32::new(tree_hash(&ctx2, actual_first_curry).to_bytes());
+        let actual_first_th = Bytes32::new(tree_hash(&ctx2, actual_first_curry).to_bytes());
         let predicted_first = puzzles::curry_tree_hash(
             PuzzleHashes::election_finalizer(),
             &[
@@ -644,18 +652,18 @@ mod tests {
             ],
         );
         assert_eq!(
-            actual_first_th, predicted_first,
+            actual_first_th,
+            predicted_first,
             "FIRST-CURRY MISMATCH: actual {} vs predicted {}",
             hex::encode(actual_first_th),
             hex::encode(predicted_first),
         );
 
-        let predicted_finalizer_full = puzzles::curry_tree_hash(
-            predicted_first,
-            &[puzzles::hash_atom_b32(&predicted_first)],
-        );
+        let predicted_finalizer_full =
+            puzzles::curry_tree_hash(predicted_first, &[puzzles::hash_atom_b32(&predicted_first)]);
         assert_eq!(
-            actual_finalizer_th, predicted_finalizer_full,
+            actual_finalizer_th,
+            predicted_finalizer_full,
             "SECOND-CURRY (full finalizer) MISMATCH: actual {} vs predicted {}",
             hex::encode(actual_finalizer_th),
             hex::encode(predicted_finalizer_full),
@@ -672,10 +680,7 @@ mod tests {
         // against the same value built by encoding the genesis tuple
         // through clvm_traits::ToClvm and tree-hashing the result.
         let empty_root = crate::merkle::SparseMerkleTree::new().root();
-        let state_value = (
-            empty_root,
-            (0u64, (0u64, d.params.election_start_height)),
-        );
+        let state_value = (empty_root, (0u64, (0u64, d.params.election_start_height)));
         let state_node = state_value.to_clvm(&mut *ctx).unwrap();
         let actual_state_th = Bytes32::new(tree_hash(&ctx, state_node).to_bytes());
         let predicted_state_th = d.genesis_state_tree_hash(empty_root);
@@ -704,7 +709,8 @@ mod tests {
         let predicted = d.genesis_inner_puzzle_hash(launcher_id);
 
         assert_eq!(
-            actual, predicted,
+            actual,
+            predicted,
             "ACTION_LAYER HASH MISMATCH: tree_hash(action_layer_node) != \
              genesis_inner_puzzle_hash(launcher_id)\n  finalizer_th: {}\n  state_th: {}\n  \
              merkle_root: {}",

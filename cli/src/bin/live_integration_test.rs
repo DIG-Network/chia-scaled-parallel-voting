@@ -71,8 +71,8 @@ use chip_voting_sdk::{
     puzzles, verify_bundle_signatures, wait_for_current_singleton, Aggregator, Bytes32, Cat,
     CatArgs, CatSpend, Coin, CoinSpend, CoinsetClient, Conditions, DeployParams, DeriveSynthetic,
     ElectionConfig, ElectionDeployer, Memos, NetworkType, PublicKey, Puzzle, SecretKey,
-    SpendBundle, SpendContext, SpendWithConditions, StandardArgs, StandardLayer,
-    VerificationKey, Voter, VoterKeys,
+    SpendBundle, SpendContext, SpendWithConditions, StandardArgs, StandardLayer, VerificationKey,
+    Voter, VoterKeys,
 };
 use clap::Parser;
 use std::collections::HashMap;
@@ -196,7 +196,6 @@ struct Args {
     /// Trace-level logging (debug → trace).
     #[arg(long)]
     trace: bool,
-
     // NOTE: legacy chia_query peer-pool args (`--trusted-fullnode`,
     // `--peer-connect-timeout-secs`, `--max-peers`) were removed when
     // the live test switched to using `CoinsetClient` exclusively for
@@ -272,7 +271,9 @@ fn parse_credentials(path: &std::path::Path) -> Result<Credentials> {
         if line.starts_with('#') {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         let value = value.trim().trim_matches('"').to_string();
 
@@ -341,7 +342,11 @@ fn parse_credentials(path: &std::path::Path) -> Result<Credentials> {
         }
     }
 
-    Ok(Credentials { funding, validator1, validator2 })
+    Ok(Credentials {
+        funding,
+        validator1,
+        validator2,
+    })
 }
 
 // ============================================================================
@@ -389,7 +394,10 @@ fn derive_wallet_keys(
         let expected_bytes = hex::decode(expected_hex.trim().trim_start_matches("0x"))
             .with_context(|| "expected pubkey is not valid hex")?;
         if expected_bytes.len() != 48 {
-            bail!("expected pubkey is not 48 bytes: got {}", expected_bytes.len());
+            bail!(
+                "expected pubkey is not 48 bytes: got {}",
+                expected_bytes.len()
+            );
         }
         let derived = account_pk.to_bytes();
         if derived.as_slice() != expected_bytes.as_slice() {
@@ -474,8 +482,7 @@ async fn wait_for_spend(
     label: &str,
 ) -> Result<u32> {
     let coin_id_hex = format!("0x{}", hex::encode(coin_id));
-    let deadline =
-        std::time::Instant::now() + Duration::from_secs(args.confirmation_timeout_secs);
+    let deadline = std::time::Instant::now() + Duration::from_secs(args.confirmation_timeout_secs);
     let mut last_log = std::time::Instant::now();
     info!(
         coin_id = %coin_id_hex,
@@ -660,8 +667,9 @@ async fn find_cat_coin(
 ) -> Result<Cat> {
     use chip_voting_sdk::clvm_utils::TreeHash;
 
-    let cat_outer_ph =
-        Bytes32::from(CatArgs::curry_tree_hash(asset_id, TreeHash::from(p2_puzzle_hash)).to_bytes());
+    let cat_outer_ph = Bytes32::from(
+        CatArgs::curry_tree_hash(asset_id, TreeHash::from(p2_puzzle_hash)).to_bytes(),
+    );
     let ph_hex = format!("0x{}", hex::encode(cat_outer_ph));
 
     let records = chain
@@ -805,11 +813,8 @@ fn build_cat_collateral_spend(
     // INNER hash here lands at the correct CAT-wrapped puzzle hash.
     let reg_inner_ph =
         puzzles::fresh_registration_inner_hash(voter_pk, election_launcher_id, cat_tail_hash);
-    let reg_outer_ph = puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash,
-        voter_pk,
-        election_launcher_id,
-    );
+    let reg_outer_ph =
+        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, voter_pk, election_launcher_id);
     info!(
         reg_inner = %hex::encode(reg_inner_ph),
         reg_outer = %hex::encode(reg_outer_ph),
@@ -848,14 +853,14 @@ fn build_cat_collateral_spend(
         .create_coin(reg_inner_ph, collateral_amount, voter_hint_memos)
         .create_coin_announcement(Bytes32_to_bytes(create_reg_msg));
     if change_amount > 0 {
-        inner_conditions = inner_conditions.create_coin(validator_p2_ph, change_amount, Memos::None);
+        inner_conditions =
+            inner_conditions.create_coin(validator_p2_ph, change_amount, Memos::None);
     }
     let inner_spend = StandardLayer::new(validator_synthetic_pk)
         .spend_with_conditions(&mut ctx, inner_conditions)
         .context("StandardLayer::spend_with_conditions for CAT inner failed")?;
     let cat_spend = CatSpend::new(cat_input, inner_spend);
-    let cat_children = Cat::spend_all(&mut ctx, &[cat_spend])
-        .context("Cat::spend_all failed")?;
+    let cat_children = Cat::spend_all(&mut ctx, &[cat_spend]).context("Cat::spend_all failed")?;
 
     // We expect exactly one of the children to be the registration
     // coin; the others (if any) are change. Find and log it.
@@ -918,8 +923,9 @@ async fn cat_balance(
     p2_puzzle_hash: Bytes32,
 ) -> Result<u64> {
     use chip_voting_sdk::clvm_utils::TreeHash;
-    let cat_outer_ph =
-        Bytes32::from(CatArgs::curry_tree_hash(asset_id, TreeHash::from(p2_puzzle_hash)).to_bytes());
+    let cat_outer_ph = Bytes32::from(
+        CatArgs::curry_tree_hash(asset_id, TreeHash::from(p2_puzzle_hash)).to_bytes(),
+    );
     let ph_hex = format!("0x{}", hex::encode(cat_outer_ph));
     let records = chain
         .get_coin_records_by_puzzle_hash(&ph_hex, None, None, false)
@@ -1070,14 +1076,14 @@ fn reconstruct_typed_vk(wire: &VerificationKey) -> Result<ArkVerifyingKey> {
         bail!("VK wire bytes too short: {}", bytes.len());
     }
 
-    let alpha_g1 = G1Affine::deserialize_compressed(&bytes[0..48])
-        .context("deserialize alpha_g1")?;
-    let beta_g2 = G2Affine::deserialize_compressed(&bytes[48..144])
-        .context("deserialize beta_g2")?;
-    let gamma_g2 = G2Affine::deserialize_compressed(&bytes[144..240])
-        .context("deserialize gamma_g2")?;
-    let delta_g2 = G2Affine::deserialize_compressed(&bytes[240..336])
-        .context("deserialize delta_g2")?;
+    let alpha_g1 =
+        G1Affine::deserialize_compressed(&bytes[0..48]).context("deserialize alpha_g1")?;
+    let beta_g2 =
+        G2Affine::deserialize_compressed(&bytes[48..144]).context("deserialize beta_g2")?;
+    let gamma_g2 =
+        G2Affine::deserialize_compressed(&bytes[144..240]).context("deserialize gamma_g2")?;
+    let delta_g2 =
+        G2Affine::deserialize_compressed(&bytes[240..336]).context("deserialize delta_g2")?;
     // 6-public-input circuit (CHIP rev 2026-05-02): IC has
     // `PUBLIC_INPUT_COUNT + 1 = 7` G1 points (ic0 + ic1..ic6).
     let ic_count = chip_voting_sdk::config::PUBLIC_INPUT_COUNT + 1;
@@ -1136,7 +1142,10 @@ async fn phase_deploy(
         // election_start_height; placeholder 0 here since the live
         // test orchestrator is not yet wired through Phase 6.
         election_start_height: 0,
-        label: Some(format!("live-test-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))),
+        label: Some(format!(
+            "live-test-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S")
+        )),
     });
     let artifacts = deployer
         .deploy_signed(
@@ -1232,7 +1241,11 @@ async fn phase_topup_validators(
         info!(label, balance_mojos = bal, "validator CAT balance");
         if bal < args.collateral_amount {
             let need = args.collateral_amount - bal;
-            info!(label, need_mojos = need, "validator under-funded — will top up");
+            info!(
+                label,
+                need_mojos = need,
+                "validator under-funded — will top up"
+            );
             targets.push((keys.p2_puzzle_hash, need, label));
         } else {
             info!(label, "validator already has enough DIG");
@@ -1259,8 +1272,7 @@ async fn phase_topup_validators(
             let input_id: Bytes32 = funding_cat.coin.coin_id().into();
             info!(
                 funding_balance = funding_cat.coin.amount,
-                total_out,
-                "funding CAT covers all deficits — single multi-output top-up",
+                total_out, "funding CAT covers all deficits — single multi-output top-up",
             );
             let coin_spends = build_cat_topup_spend(
                 funding_cat,
@@ -1279,13 +1291,7 @@ async fn phase_topup_validators(
             let bundle = SpendBundle::new(coin_spends, signature);
             verify_bundle_locally(&bundle, network)?;
             push_tx(chain, &bundle, "validator topup (multi-output)").await?;
-            wait_for_spend(
-                chain,
-                input_id,
-                args,
-                "topup CAT input (multi-output)",
-            )
-            .await?;
+            wait_for_spend(chain, input_id, args, "topup CAT input (multi-output)").await?;
         }
         Err(e_agg) => {
             info!(
@@ -1294,21 +1300,16 @@ async fn phase_topup_validators(
                 "no single CAT covers total — sequential top-up txs (re-select coins after each spend)",
             );
             for (target_ph, amt, label) in &targets {
-                let fc = find_cat_coin(
-                    chain,
-                    cat_tail_hash,
-                    funding_keys.p2_puzzle_hash,
-                    *amt,
-                    &[],
-                )
-                .await
-                .with_context(|| {
-                    format!(
+                let fc =
+                    find_cat_coin(chain, cat_tail_hash, funding_keys.p2_puzzle_hash, *amt, &[])
+                        .await
+                        .with_context(|| {
+                            format!(
                         "phase_topup: funding wallet has no spendable CAT ≥ {amt} mojos for \
                          validator `{label}` (aggregate ≥ {total_out} unavailable). \
                          Consolidate DIG or add funds."
                     )
-                })?;
+                        })?;
                 let input_id: Bytes32 = fc.coin.coin_id().into();
                 info!(
                     label,
@@ -1317,11 +1318,8 @@ async fn phase_topup_validators(
                     coin_id=%hex::encode(input_id),
                     "funding CAT chosen for sequential top-up (post-confirmation selection)",
                 );
-                let coin_spends = build_cat_topup_spend(
-                    fc,
-                    funding_keys.synthetic_pk,
-                    &[(*target_ph, *amt)],
-                )?;
+                let coin_spends =
+                    build_cat_topup_spend(fc, funding_keys.synthetic_pk, &[(*target_ph, *amt)])?;
                 let signature = sign_bundle_signature(
                     &coin_spends,
                     std::slice::from_ref(&funding_keys.synthetic_sk),
@@ -1331,13 +1329,8 @@ async fn phase_topup_validators(
                 let bundle = SpendBundle::new(coin_spends, signature);
                 verify_bundle_locally(&bundle, network)?;
                 push_tx(chain, &bundle, &format!("validator topup ({label})")).await?;
-                wait_for_spend(
-                    chain,
-                    input_id,
-                    args,
-                    &format!("topup CAT input ({label})"),
-                )
-                .await?;
+                wait_for_spend(chain, input_id, args, &format!("topup CAT input ({label})"))
+                    .await?;
             }
         }
     }
@@ -1401,11 +1394,7 @@ async fn phase_register_voter(
     // proof. For the FIRST voter the SMT is empty; for the second,
     // the first voter's pubkey must be inserted.
     let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network);
-    let mut agg = Aggregator::new(
-        deploy.config.clone(),
-        make_independent_chain()?,
-        network,
-    );
+    let mut agg = Aggregator::new(deploy.config.clone(), make_independent_chain()?, network);
     sync_aggregator_with_retry(
         &mut agg,
         &format!("phase_register_voter[{voter_label}] SPT"),
@@ -1460,9 +1449,8 @@ async fn phase_register_voter(
     if validator_keys.synthetic_sk.to_bytes() != voter_keys.secret.to_bytes() {
         signing_keys.push(validator_keys.synthetic_sk.clone());
     }
-    let combined_sig =
-        sign_bundle_signature(&voter_bundle.coin_spends, &signing_keys, network)
-            .map_err(|e| anyhow::anyhow!("re-sign register bundle: {e:?}"))?;
+    let combined_sig = sign_bundle_signature(&voter_bundle.coin_spends, &signing_keys, network)
+        .map_err(|e| anyhow::anyhow!("re-sign register bundle: {e:?}"))?;
     let combined_bundle = SpendBundle::new(voter_bundle.coin_spends.clone(), combined_sig);
 
     // Sanity: every required signature in the bundle must be
@@ -1488,13 +1476,15 @@ async fn phase_register_voter(
         election_launcher_id,
     );
     let cat_input_parent_id: Bytes32 = cat_collateral.parent_spend.coin.coin_id().into();
-    let reg_coin = Coin::new(
-        cat_input_parent_id,
-        reg_outer_ph,
-        args.collateral_amount,
-    );
+    let reg_coin = Coin::new(cat_input_parent_id, reg_outer_ph, args.collateral_amount);
     let reg_id = reg_coin.coin_id();
-    wait_for_confirmation(chain, reg_id, args, &format!("{voter_label} registration coin")).await?;
+    wait_for_confirmation(
+        chain,
+        reg_id,
+        args,
+        &format!("{voter_label} registration coin"),
+    )
+    .await?;
 
     info!(
         voter_label,
@@ -1523,8 +1513,7 @@ async fn phase_wait_window(
     );
     // Generous timeout: each block is ~52s on mainnet, ~18s on
     // testnet11, plus farmer queue. Cap at 60min for safety.
-    let timeout_secs =
-        ((args.election_length_blocks + 2) * 90).max(args.confirmation_timeout_secs);
+    let timeout_secs = ((args.election_length_blocks + 2) * 90).max(args.confirmation_timeout_secs);
     wait_for_block_height(chain, target, args.poll_interval_secs, timeout_secs).await?;
     Ok(())
 }
@@ -1562,7 +1551,13 @@ async fn phase_vote(
     let bundle = cast_result.spend_bundle;
     verify_bundle_locally(&bundle, network)?;
     push_tx(chain, &bundle, &format!("{voter_label} vote")).await?;
-    wait_for_spend(chain, reg_coin_id, args, &format!("{voter_label} vote (pre-vote reg coin)")).await?;
+    wait_for_spend(
+        chain,
+        reg_coin_id,
+        args,
+        &format!("{voter_label} vote (pre-vote reg coin)"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1594,11 +1589,7 @@ async fn phase_finalize(
     info!("=== PHASE 5: aggregate votes + finalize ===");
     confirm_or_bail(args, "Broadcast the finalize bundle (runs Groth16 prover)?")?;
 
-    let mut agg = Aggregator::new(
-        deploy.config.clone(),
-        make_independent_chain()?,
-        network,
-    );
+    let mut agg = Aggregator::new(deploy.config.clone(), make_independent_chain()?, network);
     sync_aggregator_with_retry(
         &mut agg,
         "phase_finalize",
@@ -1673,7 +1664,13 @@ async fn phase_finalize(
         .coin_id()
         .into();
     push_tx(chain, &bundle, "finalize").await?;
-    wait_for_spend(chain, singleton_spent_id, args, "Election Singleton (finalize)").await?;
+    wait_for_spend(
+        chain,
+        singleton_spent_id,
+        args,
+        "Election Singleton (finalize)",
+    )
+    .await?;
     Ok(())
 }
 
@@ -1709,14 +1706,13 @@ async fn attach_finalize_fee(
     let mut ctx = SpendContext::new();
     let funding_p2_ph =
         Bytes32::new(StandardArgs::curry_tree_hash(funding_keys.synthetic_pk).to_bytes());
-    let change = fee_parent
-        .amount
-        .checked_sub(fee)
-        .ok_or_else(|| anyhow::anyhow!(
+    let change = fee_parent.amount.checked_sub(fee).ok_or_else(|| {
+        anyhow::anyhow!(
             "attach_finalize_fee: selected XCH coin {} mojos < fee {} mojos",
             fee_parent.amount,
             fee,
-        ))?;
+        )
+    })?;
     let mut conditions = Conditions::new().reserve_fee(fee);
     if change > 0 {
         conditions = conditions.create_coin(funding_p2_ph, change, Memos::None);
@@ -1887,11 +1883,8 @@ async fn phase_oracle(
     info!("=== PHASE 7: oracle (publish announcement of finalized result) ===");
     confirm_or_bail(args, "Broadcast the oracle bundle?")?;
 
-    let oracle = chip_voting_sdk::Oracle::new(
-        deploy.config.clone(),
-        make_independent_chain()?,
-        network,
-    );
+    let oracle =
+        chip_voting_sdk::Oracle::new(deploy.config.clone(), make_independent_chain()?, network);
 
     // Build the spend up-front so we can log the announcement variant
     // BEFORE broadcasting (useful for operator visibility and for
@@ -1953,23 +1946,15 @@ async fn phase_oracle(
     // (rather than calling `build_oracle_bundle`, which would re-walk
     // the chain and might pick up a different tip than what we logged).
     let coin_spends = vec![oracle_spend.coin_spend.clone()];
-    let agg_sig = chip_voting_sdk::actors::deployer::sign_bundle_signature(
-        &coin_spends,
-        &[],
-        network,
-    )
-    .map_err(|e| anyhow::anyhow!("oracle: sign_bundle_signature: {e:?}"))?;
+    let agg_sig =
+        chip_voting_sdk::actors::deployer::sign_bundle_signature(&coin_spends, &[], network)
+            .map_err(|e| anyhow::anyhow!("oracle: sign_bundle_signature: {e:?}"))?;
     let bundle = SpendBundle::new(coin_spends, agg_sig);
     verify_bundle_locally(&bundle, network)?;
 
     push_tx(chain, &bundle, "oracle").await?;
-    let spent_height = wait_for_spend(
-        chain,
-        singleton_id,
-        args,
-        "Election Singleton (oracle)",
-    )
-    .await?;
+    let spent_height =
+        wait_for_spend(chain, singleton_id, args, "Election Singleton (oracle)").await?;
     info!(
         singleton_coin_id = %hex::encode(singleton_id),
         spent_height,
@@ -2095,7 +2080,10 @@ async fn push_tx(chain: &CoinsetClient, bundle: &SpendBundle, label: &str) -> Re
         }
     }
 
-    let status = chia_query::TxStatus { status: last_status, success: false };
+    let status = chia_query::TxStatus {
+        status: last_status,
+        success: false,
+    };
     info!(status = %status.status, "{label} bundle accepted by node");
     if status.status.eq_ignore_ascii_case("FAILED") {
         // Dump the rejected bundle so the operator can replay it
@@ -2157,10 +2145,7 @@ fn to_query_bundle(b: &SpendBundle) -> chia_query::SpendBundle {
                 solution: format!("0x{}", hex::encode(cs.solution.as_ref())),
             })
             .collect(),
-        aggregated_signature: format!(
-            "0x{}",
-            hex::encode(b.aggregated_signature.to_bytes())
-        ),
+        aggregated_signature: format!("0x{}", hex::encode(b.aggregated_signature.to_bytes())),
     }
 }
 
@@ -2554,8 +2539,28 @@ async fn main() -> Result<()> {
 
     // ── Phase 4: Cast votes ────────────────────────────────────────
     let vote_data = Bytes32::new([0x42u8; 32]);
-    phase_vote(&chain, network, &args, &deploy, "voter1", &voter1_keys, vote_data, reg1).await?;
-    phase_vote(&chain, network, &args, &deploy, "voter2", &voter2_keys, vote_data, reg2).await?;
+    phase_vote(
+        &chain,
+        network,
+        &args,
+        &deploy,
+        "voter1",
+        &voter1_keys,
+        vote_data,
+        reg1,
+    )
+    .await?;
+    phase_vote(
+        &chain,
+        network,
+        &args,
+        &deploy,
+        "voter2",
+        &voter2_keys,
+        vote_data,
+        reg2,
+    )
+    .await?;
 
     // ── Phase 5: Finalize ──────────────────────────────────────────
     let vote_outcome = vote_data; // both voters vote the same way for the test
@@ -2623,8 +2628,7 @@ fn init_logging(verbose: bool, trace: bool) {
     } else {
         "info,chia_query=warn,tower_http=warn,hyper=warn,rustls=warn,tungstenite=warn"
     };
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     fmt()
         .with_writer(std::io::stderr)
         .with_target(false)
@@ -2690,10 +2694,20 @@ VALIDATOR2_PUBKEY=0x94823178b7023a44aa8fb9d6941733d0072dc082ce8ac727222829d7da02
                 "0x86706950292c1940a1b3eefd029c41d5fd66f230ef49175a02f8e91dd2440972215e3227cc2d2b53dd648c60727e2531"
             )
         );
-        assert!(creds.validator1.mnemonic.as_ref().unwrap().contains("legal"));
+        assert!(creds
+            .validator1
+            .mnemonic
+            .as_ref()
+            .unwrap()
+            .contains("legal"));
 
         assert_eq!(creds.validator2.name, "validator2");
-        assert!(creds.validator2.mnemonic.as_ref().unwrap().contains("letter"));
+        assert!(creds
+            .validator2
+            .mnemonic
+            .as_ref()
+            .unwrap()
+            .contains("letter"));
     }
 
     /// WHAT: `parse_credentials` rejects a file missing a Mnemonic
@@ -2710,7 +2724,10 @@ VALIDATOR2_PUBKEY=0x94823178b7023a44aa8fb9d6941733d0072dc082ce8ac727222829d7da02
         std::fs::write(&path, raw).unwrap();
         let err = parse_credentials(&path).expect_err("must reject missing mnemonic");
         let msg = format!("{err:#}");
-        assert!(msg.contains("Mnemonic"), "expected mnemonic error, got: {msg}");
+        assert!(
+            msg.contains("Mnemonic"),
+            "expected mnemonic error, got: {msg}"
+        );
     }
 
     /// WHAT: `derive_wallet_keys` produces a deterministic
@@ -2777,15 +2794,17 @@ VALIDATOR2_PUBKEY=0x94823178b7023a44aa8fb9d6941733d0072dc082ce8ac727222829d7da02
             // PUBKEY (it isn't curried into any puzzle), so only
             // assert validator entries match if they advertise it.
             if let Some(expected_hex) = &entry.pubkey {
-                let expected = hex::decode(expected_hex.trim_start_matches("0x"))
-                    .expect("hex decode pubkey");
-                let derived_account_pk =
-                    master_to_wallet_unhardened(&SecretKey::from_seed(
+                let expected =
+                    hex::decode(expected_hex.trim_start_matches("0x")).expect("hex decode pubkey");
+                let derived_account_pk = master_to_wallet_unhardened(
+                    &SecretKey::from_seed(
                         &Mnemonic::parse_in_normalized(Language::English, mnemonic)
                             .unwrap()
                             .to_seed(""),
-                    ), 0)
-                    .public_key();
+                    ),
+                    0,
+                )
+                .public_key();
                 assert_eq!(
                     derived_account_pk.to_bytes().as_slice(),
                     expected.as_slice(),
@@ -2835,6 +2854,3 @@ VALIDATOR2_PUBKEY=0x94823178b7023a44aa8fb9d6941733d0072dc082ce8ac727222829d7da02
         assert_eq!(actual, Bytes32::new(arr));
     }
 }
-
-
-

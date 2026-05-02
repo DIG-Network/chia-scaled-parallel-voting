@@ -34,11 +34,7 @@ pub fn load_election_config(path: &Path) -> Result<ElectionConfig> {
 /// Save an `ElectionConfig` to a JSON file. Creates parent dirs as
 /// needed; refuses to overwrite an existing file unless `overwrite`
 /// is true.
-pub fn save_election_config(
-    path: &Path,
-    cfg: &ElectionConfig,
-    overwrite: bool,
-) -> Result<()> {
+pub fn save_election_config(path: &Path, cfg: &ElectionConfig, overwrite: bool) -> Result<()> {
     if path.exists() && !overwrite {
         anyhow::bail!(
             "refusing to overwrite existing config at {} — pass --overwrite to replace",
@@ -46,9 +42,8 @@ pub fn save_election_config(
         );
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating parent directory for {}", path.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory for {}", path.display()))?;
     }
     let json = cfg.to_json();
     std::fs::write(path, json)
@@ -58,11 +53,7 @@ pub fn save_election_config(
 
 /// Save an arbitrary JSON-serialisable artefact (spend bundle, ceremony
 /// transcript, …). Same overwrite semantics as `save_election_config`.
-pub fn save_json<T: serde::Serialize>(
-    path: &Path,
-    value: &T,
-    overwrite: bool,
-) -> Result<()> {
+pub fn save_json<T: serde::Serialize>(path: &Path, value: &T, overwrite: bool) -> Result<()> {
     if path.exists() && !overwrite {
         anyhow::bail!(
             "refusing to overwrite existing file at {} — pass --overwrite to replace",
@@ -70,13 +61,11 @@ pub fn save_json<T: serde::Serialize>(
         );
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating parent directory for {}", path.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory for {}", path.display()))?;
     }
     let pretty = serde_json::to_string_pretty(value)?;
-    std::fs::write(path, pretty)
-        .with_context(|| format!("writing JSON to {}", path.display()))?;
+    std::fs::write(path, pretty).with_context(|| format!("writing JSON to {}", path.display()))?;
     Ok(())
 }
 

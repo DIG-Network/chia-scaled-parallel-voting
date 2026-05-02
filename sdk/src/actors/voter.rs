@@ -47,9 +47,8 @@ use clvm_traits::ToClvm;
 use dig_l1_wallet::NetworkType;
 
 use crate::action_spends::{
-    build_action_layer_puzzle, build_action_layer_solution,
-    build_election_finalizer_full, build_singleton_spend, load_action_puzzle,
-    ActionSpend,
+    build_action_layer_puzzle, build_action_layer_solution, build_election_finalizer_full,
+    build_singleton_spend, load_action_puzzle, ActionSpend,
 };
 use crate::actors::deployer::sign_bundle_signature;
 use crate::chain::ChainReader;
@@ -142,7 +141,11 @@ pub struct CastVoteResult {
 
 impl Voter {
     pub fn new(config: ElectionConfig, keys: VoterKeys, network: NetworkType) -> Self {
-        Self { config, keys, network }
+        Self {
+            config,
+            keys,
+            network,
+        }
     }
 
     /// FN: slot
@@ -190,7 +193,11 @@ impl Voter {
             .config
             .cat_tail_hash()
             .map_err(|e| voting_other(format!("cat_tail_hash: {e}")))?;
-        Ok(puzzles::voter_hint(election_id, cat_tail_hash, &self.keys.pubkey))
+        Ok(puzzles::voter_hint(
+            election_id,
+            cat_tail_hash,
+            &self.keys.pubkey,
+        ))
     }
 
     /// FN: voter_hint_hex
@@ -281,12 +288,8 @@ impl Voter {
             )));
         }
         let election_state_node = self.election_state_node(&mut ctx, &on_chain_state)?;
-        let action_layer_node = build_action_layer_puzzle(
-            &mut ctx,
-            elect_finalizer,
-            merkle_root,
-            election_state_node,
-        )?;
+        let action_layer_node =
+            build_action_layer_puzzle(&mut ctx, elect_finalizer, merkle_root, election_state_node)?;
 
         // ── 3. Build the curried register action puzzle ─────────
         // CURRY ORDER (post-CHIP rev 2026-05-02):
@@ -295,8 +298,7 @@ impl Voter {
         //    REGISTRATION_MERKLE_ROOT, COLLATERAL_AMOUNT,
         //    ELECTION_LAUNCHER_ID, EMPTY_BALLOT_ROOT)
         // (No `registration_fee` — fees were dropped in this revision.)
-        let register_program_node =
-            load_action_puzzle(&mut ctx, puzzles::ELECTION_REGISTER_HEX)?;
+        let register_program_node = load_action_puzzle(&mut ctx, puzzles::ELECTION_REGISTER_HEX)?;
         let register_curried = CurriedProgram {
             program: register_program_node,
             args: clvm_curried_args!(
@@ -334,10 +336,8 @@ impl Voter {
             buf.extend_from_slice(&slot.to_be_bytes());
             chia_protocol::Bytes::new(buf)
         };
-        let register_solution_value = (
-            voter_pk_bytes,
-            (slot_bytes, (siblings, cat_parent_coin_id)),
-        );
+        let register_solution_value =
+            (voter_pk_bytes, (slot_bytes, (siblings, cat_parent_coin_id)));
         let register_solution = register_solution_value
             .to_clvm(&mut *ctx)
             .map_err(driver_err)?;
@@ -518,19 +518,14 @@ impl Voter {
         use clvmr::Allocator;
 
         let parent_id = cat_coin.parent_coin_info;
-        let parent_record = chain
-            .coin_record_by_id(parent_id)
-            .await?
-            .ok_or_else(|| {
-                voting_other(format!(
-                    "Voter::reconstruct_cat_lineage: parent coin {} not found on chain",
-                    hex::encode(parent_id),
-                ))
-            })?;
-        let (puzzle_program, solution_program) = chain
-            .puzzle_and_solution(parent_id)
-            .await?
-            .ok_or_else(|| {
+        let parent_record = chain.coin_record_by_id(parent_id).await?.ok_or_else(|| {
+            voting_other(format!(
+                "Voter::reconstruct_cat_lineage: parent coin {} not found on chain",
+                hex::encode(parent_id),
+            ))
+        })?;
+        let (puzzle_program, solution_program) =
+            chain.puzzle_and_solution(parent_id).await?.ok_or_else(|| {
                 voting_other(format!(
                     "Voter::reconstruct_cat_lineage: parent coin {} is unspent — \
                      cannot derive lineage proof until it has been spent",
@@ -539,16 +534,16 @@ impl Voter {
             })?;
 
         let mut allocator = Allocator::new();
-        let parent_puzzle_node = puzzle_program
-            .to_clvm(&mut allocator)
-            .map_err(|e| voting_other(format!(
+        let parent_puzzle_node = puzzle_program.to_clvm(&mut allocator).map_err(|e| {
+            voting_other(format!(
                 "reconstruct_cat_lineage: parent puzzle to_clvm: {e}",
-            )))?;
-        let parent_solution_node = solution_program
-            .to_clvm(&mut allocator)
-            .map_err(|e| voting_other(format!(
+            ))
+        })?;
+        let parent_solution_node = solution_program.to_clvm(&mut allocator).map_err(|e| {
+            voting_other(format!(
                 "reconstruct_cat_lineage: parent solution to_clvm: {e}",
-            )))?;
+            ))
+        })?;
         let parent_puzzle = Puzzle::parse(&allocator, parent_puzzle_node);
 
         let children = DriverCat::parse_children(
@@ -557,10 +552,12 @@ impl Voter {
             parent_puzzle,
             parent_solution_node,
         )
-        .map_err(|e| voting_other(format!(
-            "reconstruct_cat_lineage: Cat::parse_children failed for parent {}: {e:?}",
-            hex::encode(parent_id),
-        )))?
+        .map_err(|e| {
+            voting_other(format!(
+                "reconstruct_cat_lineage: Cat::parse_children failed for parent {}: {e:?}",
+                hex::encode(parent_id),
+            ))
+        })?
         .ok_or_else(|| {
             voting_other(format!(
                 "reconstruct_cat_lineage: parent coin {} is not a CAT spend — \
@@ -605,10 +602,7 @@ impl Voter {
             state.registration_merkle_root,
             (
                 state.registration_count,
-                (
-                    state.registration_vote_weight,
-                    state.election_start_height,
-                ),
+                (state.registration_vote_weight, state.election_start_height),
             ),
         );
         value.to_clvm(&mut **ctx).map_err(driver_err)
@@ -641,7 +635,10 @@ impl Voter {
     /// singleton's deregister announcement) changed.
     pub fn release_message(&self, destination: Bytes32) -> Bytes32 {
         use sha2::{Digest, Sha256};
-        let election_id = self.config.election_launcher_id().expect("config validated");
+        let election_id = self
+            .config
+            .election_launcher_id()
+            .expect("config validated");
         let mut h = Sha256::new();
         h.update(b"release");
         h.update(election_id.as_ref());
@@ -687,7 +684,11 @@ fn driver_err<E: std::fmt::Debug>(e: E) -> VotingError {
 pub fn convert_coin(c: &chia_query::Coin) -> VotingResult<chia_protocol::Coin> {
     let parent_coin_info = parse_hex32(&c.parent_coin_info)?;
     let puzzle_hash = parse_hex32(&c.puzzle_hash)?;
-    Ok(chia_protocol::Coin::new(parent_coin_info, puzzle_hash, c.amount))
+    Ok(chia_protocol::Coin::new(
+        parent_coin_info,
+        puzzle_hash,
+        c.amount,
+    ))
 }
 
 /// FN: parse_hex32 (file-private)
@@ -696,11 +697,13 @@ pub fn convert_coin(c: &chia_query::Coin) -> VotingResult<chia_protocol::Coin> {
 ///       so callers can propagate without unwrapping.
 fn parse_hex32(s: &str) -> VotingResult<Bytes32> {
     let trimmed = s.trim().trim_start_matches("0x");
-    let bytes = hex::decode(trimmed)
-        .map_err(|e| VotingError::Other(anyhow_compat::Error(format!(
-            "hex decode {s}: {e}").into())))?;
+    let bytes = hex::decode(trimmed).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(format!("hex decode {s}: {e}").into()))
+    })?;
     let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-        VotingError::Other(anyhow_compat::Error(format!("expected 32 bytes from {s}").into()))
+        VotingError::Other(anyhow_compat::Error(
+            format!("expected 32 bytes from {s}").into(),
+        ))
     })?;
     Ok(Bytes32::new(arr))
 }
@@ -738,9 +741,7 @@ mod tests {
             collateral_amount: 1_000,
             tree_depth: crate::config::TREE_DEPTH,
             max_signers: crate::config::MAX_SIGNERS,
-            verification_key_hex: "00".repeat(
-                336 + (crate::config::PUBLIC_INPUT_COUNT + 1) * 48,
-            ),
+            verification_key_hex: "00".repeat(336 + (crate::config::PUBLIC_INPUT_COUNT + 1) * 48),
             label: None,
         }
     }

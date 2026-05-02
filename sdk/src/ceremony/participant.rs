@@ -72,7 +72,11 @@ pub struct CeremonyParticipant {
 
 impl CeremonyParticipant {
     pub fn new(backend: Box<dyn MpcBackend>, name: String, message: Option<String>) -> Self {
-        Self { backend, name, message }
+        Self {
+            backend,
+            name,
+            message,
+        }
     }
 
     /// Mix this participant's entropy into the previous transcript and
@@ -83,12 +87,9 @@ impl CeremonyParticipant {
         previous: &Transcript,
         entropy: [u8; 32],
     ) -> VotingResult<ContributionOutput> {
-        let next = self.backend.contribute(
-            previous,
-            self.name.clone(),
-            entropy,
-            self.message.clone(),
-        )?;
+        let next =
+            self.backend
+                .contribute(previous, self.name.clone(), entropy, self.message.clone())?;
         let attestation = next
             .attestations
             .last()

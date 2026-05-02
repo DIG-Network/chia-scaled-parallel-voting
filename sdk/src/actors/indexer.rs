@@ -98,7 +98,9 @@ impl<C: ChainReader> Indexer<C> {
     }
 
     /// Shared reference to the underlying chain reader.
-    pub fn chain(&self) -> &C { &self.chain }
+    pub fn chain(&self) -> &C {
+        &self.chain
+    }
 
     /// FN: sync
     /// WHAT: refresh the cache from the chain.
@@ -241,10 +243,7 @@ impl<C: ChainReader> Indexer<C> {
     /// WHAT: per-ballot replacement for the removed global
     ///       `is_finalized()` accessor.
     /// STATUS: STUB pending Phase 6.
-    pub async fn is_finalized_for(
-        &self,
-        _ballot_launcher_id: Bytes32,
-    ) -> VotingResult<bool> {
+    pub async fn is_finalized_for(&self, _ballot_launcher_id: Bytes32) -> VotingResult<bool> {
         Err(VotingError::Other(crate::error::anyhow_compat::Error(
             "Indexer::is_finalized_for stubbed pending Phase 6"
                 .to_string()
@@ -280,12 +279,7 @@ impl<C: ChainReader> Indexer<C> {
     ///       state).
     pub async fn vote_records(&self) -> VotingResult<Vec<VoteRecord>> {
         let voter_set = self.voter_set_ref()?;
-        crate::actors::aggregator::extract_votes(
-            &self.chain,
-            &self.config,
-            voter_set,
-        )
-        .await
+        crate::actors::aggregator::extract_votes(&self.chain, &self.config, voter_set).await
     }
 
     /// Last-synced SPT.

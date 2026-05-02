@@ -86,7 +86,11 @@ fn deployer_build_deploy_bundle_produces_two_spends_and_config() {
     let (coin_spends, config) = deployer
         .build_deploy_bundle(funder.coin, funder.pk)
         .expect("build_deploy_bundle");
-    assert_eq!(coin_spends.len(), 2, "deploy bundle has launcher + parent spends");
+    assert_eq!(
+        coin_spends.len(),
+        2,
+        "deploy bundle has launcher + parent spends"
+    );
     config.validate().expect("config self-validates");
     assert_eq!(config.tree_depth, chip_voting_sdk::config::TREE_DEPTH);
 }
@@ -130,8 +134,14 @@ fn deployer_genesis_inner_puzzle_hash_is_deterministic() {
     let deployer = ElectionDeployer::new(common::dummy_deploy_params());
     let l1 = Bytes32::new([0xAB; 32]);
     let l2 = Bytes32::new([0xCD; 32]);
-    assert_eq!(deployer.genesis_inner_puzzle_hash(l1), deployer.genesis_inner_puzzle_hash(l1));
-    assert_ne!(deployer.genesis_inner_puzzle_hash(l1), deployer.genesis_inner_puzzle_hash(l2));
+    assert_eq!(
+        deployer.genesis_inner_puzzle_hash(l1),
+        deployer.genesis_inner_puzzle_hash(l1)
+    );
+    assert_ne!(
+        deployer.genesis_inner_puzzle_hash(l1),
+        deployer.genesis_inner_puzzle_hash(l2)
+    );
 }
 
 /// WHAT: `election_actions_merkle_root` is deterministic for a
@@ -174,7 +184,10 @@ fn build_voter_for_test() -> Voter {
 #[test]
 fn voter_slot_matches_smt_canonical_derivation() {
     let voter = build_voter_for_test();
-    assert_eq!(voter.slot(), SparseMerkleTree::slot_for_pubkey(&voter.keys.pubkey));
+    assert_eq!(
+        voter.slot(),
+        SparseMerkleTree::slot_for_pubkey(&voter.keys.pubkey)
+    );
 }
 
 /// WHAT: `Voter::registration_coin_puzzle_hash` is deterministic
@@ -203,11 +216,8 @@ fn voter_voter_hint_matches_sha256_concat() {
     let hint = voter.voter_hint().unwrap();
     let election_id = voter.config.election_launcher_id().unwrap();
     let cat_tail_hash = voter.config.cat_tail_hash().unwrap();
-    let expected = chip_voting_sdk::puzzles::voter_hint(
-        election_id,
-        cat_tail_hash,
-        &voter.keys.pubkey,
-    );
+    let expected =
+        chip_voting_sdk::puzzles::voter_hint(election_id, cat_tail_hash, &voter.keys.pubkey);
     assert_eq!(hint, expected);
 }
 
@@ -220,7 +230,10 @@ fn voter_voter_hint_hex_is_prefixed_hex_form() {
     assert!(hex.starts_with("0x"));
     let bytes = hex::decode(hex.trim_start_matches("0x")).unwrap();
     assert_eq!(bytes.len(), 32);
-    assert_eq!(Bytes32::new(bytes.try_into().unwrap()), voter.voter_hint().unwrap());
+    assert_eq!(
+        Bytes32::new(bytes.try_into().unwrap()),
+        voter.voter_hint().unwrap()
+    );
 }
 
 /// WHAT: `puzzles::vote_message` is sha256(vote_outcome ||
@@ -561,8 +574,7 @@ async fn indexer_merkle_tree_returns_empty_smt_after_eve_sync() {
 fn test_proving_key() -> chip_voting_sdk::prover::circuit::ArkProvingKey {
     use ark_std::rand::SeedableRng;
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xBEEF);
-    let (pk, _vk) =
-        chip_voting_sdk::prover::circuit::generate_test_setup(&mut rng).unwrap();
+    let (pk, _vk) = chip_voting_sdk::prover::circuit::generate_test_setup(&mut rng).unwrap();
     pk
 }
 

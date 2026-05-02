@@ -107,11 +107,8 @@ async fn voter_register_against_simulator_full_flow() {
         "regression seed 0x03 must produce a high-bit-clear slot; got 0x{:08x}",
         slot
     );
-    let reg_outer_ph = puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash,
-        &voter_pk,
-        launcher_id,
-    );
+    let reg_outer_ph =
+        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id);
     let create_reg_msg =
         compute_create_reg_msg(launcher_id, &voter_pk, reg_outer_ph, collateral_amount);
 
@@ -124,12 +121,8 @@ async fn voter_register_against_simulator_full_flow() {
     let announcer_coin = Coin::new(Bytes32::new([0xBB; 32]), announcer_ph, 1);
     sim.insert_coin(announcer_coin);
     let announcer_solution = ().to_clvm(&mut *ctx).unwrap();
-    let cat_parent_spend = common::coin_spend_from_nodes(
-        &ctx,
-        announcer_coin,
-        announcer_node,
-        announcer_solution,
-    );
+    let cat_parent_spend =
+        common::coin_spend_from_nodes(&ctx, announcer_coin, announcer_node, announcer_solution);
     let _ = ctx; // we hand the spends off to Voter::register
 
     // ── 3. Sanity: predicted eve_ph matches what's on chain ──
@@ -140,12 +133,20 @@ async fn voter_register_against_simulator_full_flow() {
         chip_voting_sdk::actors::aggregator::compute_eve_singleton_puzzle_hash(&config, 0);
     let predicted_inner =
         chip_voting_sdk::actors::aggregator::compute_eve_inner_puzzle_hash(&config, 0);
-    let predicted_singleton =
-        puzzles::election_singleton_puzzle_hash(launcher_id, predicted_inner);
-    println!("predicted eve_ph (compute_eve_singleton_puzzle_hash): {}", hex::encode(predicted_eve_ph));
+    let predicted_singleton = puzzles::election_singleton_puzzle_hash(launcher_id, predicted_inner);
+    println!(
+        "predicted eve_ph (compute_eve_singleton_puzzle_hash): {}",
+        hex::encode(predicted_eve_ph)
+    );
     println!("predicted inner_ph: {}", hex::encode(predicted_inner));
-    println!("predicted singleton via inner: {}", hex::encode(predicted_singleton));
-    println!("deployer genesis_inner_puzzle_hash: {}", hex::encode(deployer.genesis_inner_puzzle_hash(launcher_id)));
+    println!(
+        "predicted singleton via inner: {}",
+        hex::encode(predicted_singleton)
+    );
+    println!(
+        "deployer genesis_inner_puzzle_hash: {}",
+        hex::encode(deployer.genesis_inner_puzzle_hash(launcher_id))
+    );
 
     // Find the singleton coin on chain.
     let coin_records: Vec<_> = sim
@@ -155,7 +156,11 @@ async fn voter_register_against_simulator_full_flow() {
         .collect();
     println!("coins at predicted eve_ph: {}", coin_records.len());
     for cs in &coin_records {
-        println!("  coin {}, ph {}", hex::encode(cs.coin.coin_id()), hex::encode(cs.coin.puzzle_hash));
+        println!(
+            "  coin {}, ph {}",
+            hex::encode(cs.coin.coin_id()),
+            hex::encode(cs.coin.puzzle_hash)
+        );
     }
 
     // ── 4. Build voter + chain reader ─────────────────────────

@@ -12,8 +12,8 @@
 //            * sanity-checking a freshly-built CLI binary.
 // CHAIN: none — entirely offline.
 
-use clap::Subcommand;
 use chip_voting_sdk::puzzles::{self, PuzzleHashes};
+use clap::Subcommand;
 
 use crate::output::Context;
 

@@ -14,8 +14,8 @@
 // `--key-path` to the relevant subcommands.
 
 use anyhow::{Context as _, Result};
-use chia_query::{ChiaQuery, ChiaQueryConfig};
 use chia_protocol::SpendBundle;
+use chia_query::{ChiaQuery, ChiaQueryConfig};
 use dig_l1_wallet::NetworkType;
 
 /// Construct a `ChiaQuery` for the given network.
@@ -38,14 +38,12 @@ pub async fn make_chain_client(
         tracing::info!(rpc = url, "using user-supplied coinset URL");
         cfg.coinset_base_url = url.to_string();
     }
-    ChiaQuery::new(cfg)
-        .await
-        .with_context(|| {
-            format!(
-                "constructing ChiaQuery for {:?} (peer discovery + TLS init)",
-                network
-            )
-        })
+    ChiaQuery::new(cfg).await.with_context(|| {
+        format!(
+            "constructing ChiaQuery for {:?} (peer discovery + TLS init)",
+            network
+        )
+    })
 }
 
 /// Broadcast a spend bundle and return a JSON summary of the result.
@@ -57,10 +55,7 @@ pub async fn make_chain_client(
 /// On success returns the `status` string from the node ("SUCCESS",
 /// "PENDING", "FAILED") plus the bundle's coin spends. Callers
 /// typically print this through `Context::print`.
-pub async fn broadcast(
-    chain: &ChiaQuery,
-    bundle: &SpendBundle,
-) -> Result<serde_json::Value> {
+pub async fn broadcast(chain: &ChiaQuery, bundle: &SpendBundle) -> Result<serde_json::Value> {
     let wire = to_query_bundle(bundle);
     let status = chain
         .push_tx(&wire)

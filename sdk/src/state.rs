@@ -229,8 +229,8 @@ impl RegistrationStateWire {
             .try_into()
             .map_err(|_| "election_launcher_id must be 32 bytes")?;
 
-        let vbr = hex::decode(&self.voted_ballots_root_hex)
-            .map_err(|_| "bad voted_ballots_root hex")?;
+        let vbr =
+            hex::decode(&self.voted_ballots_root_hex).map_err(|_| "bad voted_ballots_root hex")?;
         let vbr_arr: [u8; 32] = vbr
             .try_into()
             .map_err(|_| "voted_ballots_root must be 32 bytes")?;

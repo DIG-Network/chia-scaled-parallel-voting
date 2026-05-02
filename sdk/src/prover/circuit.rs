@@ -295,8 +295,7 @@ impl ConstraintSynthesizer<Fr> for VotingCircuit {
         let raw_count_var =
             cs.new_witness_variable(|| Ok(Fr::from(self.registration_vote_weight)))?;
         let signer_count = self.signers.len() as u64;
-        let signer_count_var =
-            cs.new_witness_variable(|| Ok(Fr::from(signer_count)))?;
+        let signer_count_var = cs.new_witness_variable(|| Ok(Fr::from(signer_count)))?;
 
         // (A) Enforce 2 * signer_count >= registration_vote_weight + 1
         //     (equivalently: strict majority `2k > n`).
@@ -401,9 +400,7 @@ impl ArkVerifyingKey {
             &g2_compressed_bytes(&vk.delta_g2).map_err(|e| voting_err("delta_g2", &e))?,
         );
         for ic in &vk.gamma_abc_g1 {
-            out.extend_from_slice(
-                &g1_compressed_bytes(ic).map_err(|e| voting_err("ic", &e))?,
-            );
+            out.extend_from_slice(&g1_compressed_bytes(ic).map_err(|e| voting_err("ic", &e))?);
         }
         Ok(out)
     }
@@ -658,7 +655,11 @@ mod tests {
         let mut rng = deterministic_rng();
         let (_pk, vk) = generate_test_setup(&mut rng).unwrap();
         let bytes = vk.chia_chunked_bytes().unwrap();
-        assert_eq!(bytes.len(), 672, "expected layout: alpha_g1+beta_g2+gamma_g2+delta_g2+7*ic");
+        assert_eq!(
+            bytes.len(),
+            672,
+            "expected layout: alpha_g1+beta_g2+gamma_g2+delta_g2+7*ic"
+        );
     }
 
     /// WHAT: VK round-trips through `serialize_compressed` /

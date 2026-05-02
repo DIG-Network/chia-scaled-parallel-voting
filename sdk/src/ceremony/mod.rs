@@ -91,5 +91,5 @@ pub mod verification;
 pub use backend::{MpcBackend, SimulatedBackend};
 pub use coordinator::CeremonyCoordinator;
 pub use participant::CeremonyParticipant;
-pub use transcript::{Transcript, ContributionAttestation};
-pub use verification::{verify_transcript, VerificationKey, ProvingKey};
+pub use transcript::{ContributionAttestation, Transcript};
+pub use verification::{verify_transcript, ProvingKey, VerificationKey};

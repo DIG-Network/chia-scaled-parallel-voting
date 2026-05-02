@@ -69,11 +69,7 @@ impl Context {
 /// Recursive human-readable renderer for `serde_json::Value`. Keeps
 /// objects aligned by indent level; arrays render with `- ` prefixes;
 /// scalars render inline.
-fn render_human<W: Write>(
-    w: &mut W,
-    v: &serde_json::Value,
-    depth: usize,
-) -> anyhow::Result<()> {
+fn render_human<W: Write>(w: &mut W, v: &serde_json::Value, depth: usize) -> anyhow::Result<()> {
     let pad = "  ".repeat(depth);
     match v {
         serde_json::Value::Object(map) => {

@@ -60,10 +60,10 @@ pub mod state;
 
 // ── Public re-exports ─────────────────────────────────────────────────
 
-pub use actors::{Aggregator, ElectionDeployer, Indexer, Voter};
 pub use actors::ballot::{BallotIssuer, BallotReader, CreateBallotParams, CreatedBallot};
 pub use actors::deployer::{DeployParams, DeploymentArtifacts};
 pub use actors::voter::VoterKeys;
+pub use actors::{Aggregator, ElectionDeployer, Indexer, Voter};
 pub use config::{ElectionConfig, MAX_SIGNERS, PUBLIC_INPUT_COUNT, TREE_DEPTH};
 pub use error::{VotingError, VotingResult};
 pub use state::{ElectionState, RegistrationState, VoteRecord, VoterSet};
@@ -97,9 +97,7 @@ pub use actors::deployer::sign_bundle_signature;
 /// USAGE: pre-broadcast diagnostic — much more useful than the
 ///        opaque `clvm raise` errors that come back from
 ///        `RequiredSignature::from_coin_spends`.
-pub fn dry_run_coin_spends(
-    coin_spends: &[chia_protocol::CoinSpend],
-) -> error::VotingResult<()> {
+pub fn dry_run_coin_spends(coin_spends: &[chia_protocol::CoinSpend]) -> error::VotingResult<()> {
     use clvm_traits::ToClvm;
     use clvmr::{run_program, Allocator, ChiaDialect};
 
@@ -207,14 +205,9 @@ pub fn validate_bundle_for_consensus(
     let max_cost = TEST_CONSTANTS.max_block_cost_clvm;
     match validate_clvm_and_signature(bundle, max_cost, &TEST_CONSTANTS, height) {
         Ok((conds, _pairs, _dur)) => Ok(conds.cost),
-        Err(error_code) => Err(error::VotingError::Other(
-            error::anyhow_compat::Error(
-                format!(
-                    "consensus pre-flight rejected at height {height}: {error_code:?}",
-                )
-                .into(),
-            ),
-        )),
+        Err(error_code) => Err(error::VotingError::Other(error::anyhow_compat::Error(
+            format!("consensus pre-flight rejected at height {height}: {error_code:?}",).into(),
+        ))),
     }
 }
 
@@ -245,17 +238,17 @@ pub fn verify_bundle_signatures(
     let mut allocator = Allocator::new();
     let required = RequiredSignature::from_coin_spends(&mut allocator, &bundle.coin_spends, &agg)
         .map_err(|e| {
-            error::VotingError::Other(error::anyhow_compat::Error(
-                format!("RequiredSignature::from_coin_spends: {e}").into(),
-            ))
-        })?;
+        error::VotingError::Other(error::anyhow_compat::Error(
+            format!("RequiredSignature::from_coin_spends: {e}").into(),
+        ))
+    })?;
     let pairs: Vec<(chia_bls::PublicKey, Vec<u8>)> = required
         .into_iter()
         .map(|sig| match sig {
             RequiredSignature::Bls(b) => (b.public_key, b.message()),
-            other => panic!(
-                "verify_bundle_signatures: unexpected non-BLS signature variant: {other:?}"
-            ),
+            other => {
+                panic!("verify_bundle_signatures: unexpected non-BLS signature variant: {other:?}")
+            }
         })
         .collect();
     let pairs_ref: Vec<(&chia_bls::PublicKey, &[u8])> =
@@ -274,8 +267,8 @@ pub use chia_bls::{PublicKey, SecretKey, Signature};
 pub use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 
 // Re-export recommended ecosystem types for ergonomic top-level use.
-pub use chain::wait_for_unspent_coin_at_puzzle_hash;
 pub use actors::aggregator::wait_for_current_singleton;
+pub use chain::wait_for_unspent_coin_at_puzzle_hash;
 pub use chia_query::{ChiaQuery, ChiaQueryConfig, NetworkType};
 // Re-export the coinset.org HTTP client. `chia_query`'s router does
 // peer → peer-retry → coinset, returning the FIRST peer's TxStatus
@@ -285,20 +278,18 @@ pub use chia_query::{ChiaQuery, ChiaQueryConfig, NetworkType};
 // stale peer's FAILED ack would otherwise block a perfectly valid
 // bundle), callers can construct a `CoinsetClient` directly and
 // bypass the peer pool entirely.
-pub use chia_query::coinset::CoinsetClient;
-pub use chia_sdk_driver::{
-    Cat, CatInfo, CatSpend, Launcher, Puzzle, SingleCatSpend, Spend, SpendContext, Spends,
-    SpendWithConditions, StandardLayer,
-};
-pub use chia_sdk_signer::{
-    AggSigConstants, RequiredBlsSignature, RequiredSignature,
-};
-pub use chia_sdk_types::Conditions;
+pub use chia_bls::master_to_wallet_unhardened;
 pub use chia_puzzle_types::{
     cat::CatArgs, standard::StandardArgs, DeriveSynthetic, LineageProof, Memos, Proof,
 };
 pub use chia_puzzles::SINGLETON_LAUNCHER_HASH;
-pub use chia_bls::master_to_wallet_unhardened;
+pub use chia_query::coinset::CoinsetClient;
+pub use chia_sdk_driver::{
+    Cat, CatInfo, CatSpend, Launcher, Puzzle, SingleCatSpend, Spend, SpendContext,
+    SpendWithConditions, Spends, StandardLayer,
+};
+pub use chia_sdk_signer::{AggSigConstants, RequiredBlsSignature, RequiredSignature};
+pub use chia_sdk_types::Conditions;
 pub use clvm_traits;
 pub use clvm_utils;
 pub use clvmr;

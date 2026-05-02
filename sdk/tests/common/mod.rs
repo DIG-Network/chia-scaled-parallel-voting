@@ -74,10 +74,7 @@ impl ChainReader for SharedSim {
             .collect())
     }
 
-    async fn coin_records_by_hint(
-        &self,
-        hint: Bytes32,
-    ) -> VotingResult<Vec<ChainCoinRecord>> {
+    async fn coin_records_by_hint(&self, hint: Bytes32) -> VotingResult<Vec<ChainCoinRecord>> {
         let guard = self.0.lock().expect("simulator mutex poisoned");
         let sim: &Simulator = unsafe { &**guard };
         let coin_ids = sim.hinted_coins(hint);
@@ -101,10 +98,7 @@ impl ChainReader for SharedSim {
         Ok(sim.puzzle_and_solution(coin_id))
     }
 
-    async fn coin_record_by_id(
-        &self,
-        coin_id: Bytes32,
-    ) -> VotingResult<Option<ChainCoinRecord>> {
+    async fn coin_record_by_id(&self, coin_id: Bytes32) -> VotingResult<Option<ChainCoinRecord>> {
         let guard = self.0.lock().expect("simulator mutex poisoned");
         let sim: &Simulator = unsafe { &**guard };
         Ok(sim.coin_state(coin_id).map(|cs| ChainCoinRecord {
@@ -155,10 +149,7 @@ pub type ReleaseSolution<R> = (
 
 /// Solution shape for the `vote` action puzzle:
 ///   (Truth, vote_data, ...vote_signature)
-pub type VoteSolution<R> = (
-    RegistrationStateTruthClvm<(), R>,
-    (Bytes32, Bytes),
-);
+pub type VoteSolution<R> = (RegistrationStateTruthClvm<(), R>, (Bytes32, Bytes));
 
 /// Build an ElectionState as a CLVM-encoded tuple.
 pub fn build_election_state(
@@ -208,14 +199,19 @@ pub fn dummy_deploy_params() -> DeployParams {
 /// `generate_test_setup` VK so the finalize action's curried VK
 /// matches a known ProvingKey. Returns BOTH the params and the
 /// matching ProvingKey for end-to-end finalize tests.
-pub fn real_deploy_params_with_pk() -> (DeployParams, chip_voting_sdk::prover::circuit::ArkProvingKey) {
+pub fn real_deploy_params_with_pk() -> (
+    DeployParams,
+    chip_voting_sdk::prover::circuit::ArkProvingKey,
+) {
     use ark_std::rand::SeedableRng;
     use chip_voting_sdk::prover::circuit::generate_test_setup;
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
     let (pk, vk) = generate_test_setup(&mut rng).expect("generate_test_setup");
     let vk_bytes = vk.chia_chunked_bytes().expect("vk chunked bytes");
     let params = DeployParams {
-        verification_key: VerificationKey { raw_bytes: vk_bytes },
+        verification_key: VerificationKey {
+            raw_bytes: vk_bytes,
+        },
         cat_tail_hash: Bytes32::new([0x77; 32]),
         collateral_amount: 1_000,
         // CHIP rev 2026-05-02: registration_fee + election_length_blocks dropped.
@@ -242,8 +238,11 @@ pub fn deploy_into_sim() -> (ElectionConfig, Simulator) {
 /// Deploy with a real test VK + return the matching ProvingKey.
 /// Used by green-path finalize tests that need to actually run
 /// the prover and have its VK match the on-chain curried VK.
-pub fn deploy_with_real_pk_into_sim()
--> (ElectionConfig, Simulator, chip_voting_sdk::prover::circuit::ArkProvingKey) {
+pub fn deploy_with_real_pk_into_sim() -> (
+    ElectionConfig,
+    Simulator,
+    chip_voting_sdk::prover::circuit::ArkProvingKey,
+) {
     let (params, pk) = real_deploy_params_with_pk();
     let mut sim = Simulator::new();
     let funder = sim.bls(1);

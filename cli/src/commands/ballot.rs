@@ -64,23 +64,17 @@ pub enum BallotCmd {
 
 pub async fn run(cmd: BallotCmd, ctx: &Context) -> Result<()> {
     match cmd {
-        BallotCmd::Create { .. } => {
-            ctx.print(&serde_json::json!({
-                "status": "stub",
-                "todo":   "ballot create — pending Phase 6 (BallotIssuer::create_ballot)",
-            }))
-        }
-        BallotCmd::List { .. } => {
-            ctx.print(&serde_json::json!({
-                "status": "stub",
-                "todo":   "ballot list — pending Phase 6 (BallotReader::list_ballots)",
-            }))
-        }
-        BallotCmd::State { .. } => {
-            ctx.print(&serde_json::json!({
-                "status": "stub",
-                "todo":   "ballot state — pending Phase 6 (BallotReader::get_ballot)",
-            }))
-        }
+        BallotCmd::Create { .. } => ctx.print(&serde_json::json!({
+            "status": "stub",
+            "todo":   "ballot create — pending Phase 6 (BallotIssuer::create_ballot)",
+        })),
+        BallotCmd::List { .. } => ctx.print(&serde_json::json!({
+            "status": "stub",
+            "todo":   "ballot list — pending Phase 6 (BallotReader::list_ballots)",
+        })),
+        BallotCmd::State { .. } => ctx.print(&serde_json::json!({
+            "status": "stub",
+            "todo":   "ballot state — pending Phase 6 (BallotReader::get_ballot)",
+        })),
     }
 }

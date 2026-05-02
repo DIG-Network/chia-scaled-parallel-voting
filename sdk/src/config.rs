@@ -59,9 +59,8 @@ pub const PUBLIC_INPUT_COUNT: usize = 6;
 ///       Rue side and SDK side agree on what "no voter here" hashes to.
 /// USAGE: passed to the deployer as the curried `EMPTY_LEAF_HASH` arg
 ///        of `puzzles/election/register.rue`.
-pub const EMPTY_LEAF_HASH: [u8; 32] = hex_literal::hex!(
-    "17b0761f87b081d5cf10757ccc89f12be355c70e2e29df288b65b30710dcbcd1"
-);
+pub const EMPTY_LEAF_HASH: [u8; 32] =
+    hex_literal::hex!("17b0761f87b081d5cf10757ccc89f12be355c70e2e29df288b65b30710dcbcd1");
 
 /// FN: cat_mod_hash
 /// WHAT: standard CAT v2 outer puzzle hash.

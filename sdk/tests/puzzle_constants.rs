@@ -17,8 +17,8 @@
 //      `clvm_utils::tree_hash` walker, and compare against
 //      `decode_hash(*_HASH_HEX)`.
 
-use chip_voting_sdk::puzzles::*;
 use chia_protocol::Program;
+use chip_voting_sdk::puzzles::*;
 use clvm_traits::ToClvm;
 use clvm_utils::tree_hash;
 use clvmr::Allocator;

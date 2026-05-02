@@ -38,8 +38,7 @@ use chia_sdk_test::Simulator;
 // until they're rewritten in Phase 6 against the new puzzles.
 use chip_voting_sdk::puzzles::{
     BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX as ELECTION_ANNOUNCE_FINALIZATION_HEX,
-    REGISTRATION_MINT_VOTING_COIN_HEX as REGISTRATION_VOTE_HEX,
-    REGISTRATION_RELEASE_HEX,
+    REGISTRATION_MINT_VOTING_COIN_HEX as REGISTRATION_VOTE_HEX, REGISTRATION_RELEASE_HEX,
 };
 use clvm_traits::ToClvm;
 use clvmr::Allocator;
@@ -72,11 +71,10 @@ fn vote_action_executes_on_simulator_with_valid_signature() {
     // Wrap the vote action puzzle (multi-arg adapter — vote takes
     // Truth + vote_data + ...vote_signature).
     let mut allocator = Allocator::new();
-    let puzzle_node = common::build_action_wrapper_multi_node(&mut allocator, REGISTRATION_VOTE_HEX);
-    let puzzle_hash = common::build_action_wrapper_multi_hash(
-        &mut Allocator::new(),
-        REGISTRATION_VOTE_HEX,
-    );
+    let puzzle_node =
+        common::build_action_wrapper_multi_node(&mut allocator, REGISTRATION_VOTE_HEX);
+    let puzzle_hash =
+        common::build_action_wrapper_multi_hash(&mut Allocator::new(), REGISTRATION_VOTE_HEX);
     let coin = Coin::new(Bytes32::new([0xCC; 32]), puzzle_hash, 1);
     sim.insert_coin(coin);
 
@@ -124,11 +122,10 @@ fn vote_action_rejects_wrong_signature() {
     let wrong_data = Bytes32::new([0xFF; 32]);
 
     let mut allocator = Allocator::new();
-    let puzzle_node = common::build_action_wrapper_multi_node(&mut allocator, REGISTRATION_VOTE_HEX);
-    let puzzle_hash = common::build_action_wrapper_multi_hash(
-        &mut Allocator::new(),
-        REGISTRATION_VOTE_HEX,
-    );
+    let puzzle_node =
+        common::build_action_wrapper_multi_node(&mut allocator, REGISTRATION_VOTE_HEX);
+    let puzzle_hash =
+        common::build_action_wrapper_multi_hash(&mut Allocator::new(), REGISTRATION_VOTE_HEX);
     let coin = Coin::new(Bytes32::new([0xDD; 32]), puzzle_hash, 1);
     sim.insert_coin(coin);
 
@@ -139,8 +136,7 @@ fn vote_action_rejects_wrong_signature() {
         Bytes32::default(),
     );
     let truth: common::RegistrationStateTruthClvm<(), ()> = ((), state);
-    let solution: common::VoteSolution<()> =
-        (truth, (vote_data, Bytes::new(vec![0u8; 96])));
+    let solution: common::VoteSolution<()> = (truth, (vote_data, Bytes::new(vec![0u8; 96])));
     let solution_node = solution.to_clvm(&mut allocator).unwrap();
     let coin_spend = common::coin_spend_from_nodes(&allocator, coin, puzzle_node, solution_node);
 
@@ -230,10 +226,8 @@ fn release_paired_with_announce_finalization_executes_on_simulator() {
     // release takes (Truth, dest, outcome, count, ...root) — multi-arg.
     let rel_puzzle_node =
         common::build_action_wrapper_multi_node(&mut allocator, REGISTRATION_RELEASE_HEX);
-    let rel_puzzle_hash = common::build_action_wrapper_multi_hash(
-        &mut Allocator::new(),
-        REGISTRATION_RELEASE_HEX,
-    );
+    let rel_puzzle_hash =
+        common::build_action_wrapper_multi_hash(&mut Allocator::new(), REGISTRATION_RELEASE_HEX);
     let rel_coin = Coin::new(Bytes32::new([0x02; 32]), rel_puzzle_hash, 1);
     sim.insert_coin(rel_coin);
 
@@ -270,8 +264,16 @@ fn release_paired_with_announce_finalization_executes_on_simulator() {
     });
 
     // Both coins should now be spent.
-    assert!(sim.coin_state(ann_coin.coin_id()).unwrap().spent_height.is_some());
-    assert!(sim.coin_state(rel_coin.coin_id()).unwrap().spent_height.is_some());
+    assert!(sim
+        .coin_state(ann_coin.coin_id())
+        .unwrap()
+        .spent_height
+        .is_some());
+    assert!(sim
+        .coin_state(rel_coin.coin_id())
+        .unwrap()
+        .spent_height
+        .is_some());
 }
 
 /// WHAT: a release spend (with NO paired emitter) is REJECTED by
@@ -299,10 +301,8 @@ fn release_alone_rejected_without_finalization_announcement() {
     let mut allocator = Allocator::new();
     let rel_puzzle_node =
         common::build_action_wrapper_multi_node(&mut allocator, REGISTRATION_RELEASE_HEX);
-    let rel_puzzle_hash = common::build_action_wrapper_multi_hash(
-        &mut Allocator::new(),
-        REGISTRATION_RELEASE_HEX,
-    );
+    let rel_puzzle_hash =
+        common::build_action_wrapper_multi_hash(&mut Allocator::new(), REGISTRATION_RELEASE_HEX);
     let rel_coin = Coin::new(Bytes32::new([0x99; 32]), rel_puzzle_hash, 1);
     sim.insert_coin(rel_coin);
 
@@ -380,10 +380,8 @@ fn release_rejects_mismatched_finalization_outcome() {
     // release asserts WRONG outcome → assertion mismatch.
     let rel_puzzle_node =
         common::build_action_wrapper_multi_node(&mut allocator, REGISTRATION_RELEASE_HEX);
-    let rel_puzzle_hash = common::build_action_wrapper_multi_hash(
-        &mut Allocator::new(),
-        REGISTRATION_RELEASE_HEX,
-    );
+    let rel_puzzle_hash =
+        common::build_action_wrapper_multi_hash(&mut Allocator::new(), REGISTRATION_RELEASE_HEX);
     let rel_coin = Coin::new(Bytes32::new([0x04; 32]), rel_puzzle_hash, 1);
     sim.insert_coin(rel_coin);
     let rel_state = common::build_registration_state_pre_release(
@@ -395,10 +393,7 @@ fn release_rejects_mismatched_finalization_outcome() {
     let rel_truth: common::RegistrationStateTruthClvm<(), ()> = ((), rel_state);
     let rel_solution: common::ReleaseSolution<()> = (
         rel_truth,
-        (
-            dest,
-            (ann_coin.coin_id(), (wrong_outcome, (count, root))),
-        ),
+        (dest, (ann_coin.coin_id(), (wrong_outcome, (count, root)))),
     );
     let rel_solution_node = rel_solution.to_clvm(&mut allocator).unwrap();
     let rel_spend =

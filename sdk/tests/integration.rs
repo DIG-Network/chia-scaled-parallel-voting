@@ -36,12 +36,12 @@
 //   * WHY  — why this invariant matters for the SDK / on-chain
 //             correctness (what breaks if it ever stops holding)
 
+use chia_protocol::Bytes32;
+use chia_sdk_test::Simulator;
 use chip_voting_sdk::actors::deployer::{derive_launcher_id, DeployParams, ElectionDeployer};
 use chip_voting_sdk::ceremony::VerificationKey;
 use chip_voting_sdk::config::{PUBLIC_INPUT_COUNT, TREE_DEPTH};
 use chip_voting_sdk::puzzles::{election_singleton_puzzle_hash, PuzzleHashes};
-use chia_protocol::Bytes32;
-use chia_sdk_test::Simulator;
 
 /// Build a deterministic, validation-ready DeployParams. The
 /// verification_key is all-zeros — sufficient for puzzle-hash math
@@ -109,8 +109,7 @@ fn deploy_creates_eve_singleton_at_predicted_puzzle_hash() {
         "config.election_launcher_id_hex must match the predicted launcher id",
     );
     let predicted_inner = deployer.genesis_inner_puzzle_hash(predicted_launcher_id);
-    let predicted_eve_ph =
-        election_singleton_puzzle_hash(predicted_launcher_id, predicted_inner);
+    let predicted_eve_ph = election_singleton_puzzle_hash(predicted_launcher_id, predicted_inner);
 
     // Submit to the simulator. spend_coins signs internally with our sk.
     sim.spend_coins(coin_spends, &[funder.sk])
@@ -128,13 +127,19 @@ fn deploy_creates_eve_singleton_at_predicted_puzzle_hash() {
                 "expected an eve singleton at {} as a child of launcher {}, found {:?}",
                 hex::encode(predicted_eve_ph),
                 hex::encode(launcher_coin_id),
-                children.iter().map(|c| hex::encode(c.coin.puzzle_hash)).collect::<Vec<_>>(),
+                children
+                    .iter()
+                    .map(|c| hex::encode(c.coin.puzzle_hash))
+                    .collect::<Vec<_>>(),
             );
         });
 
     // Eve singleton amount must be odd (singleton invariant). Since
     // genesis state has accumulated_fees=0, the eve amount is 1.
-    assert_eq!(eve.coin.amount, 1, "eve singleton amount must be 1 at genesis");
+    assert_eq!(
+        eve.coin.amount, 1,
+        "eve singleton amount must be 1 at genesis"
+    );
 }
 
 /// WHAT: two deploys from different funder coins produce different
@@ -279,10 +284,7 @@ fn build_action_wrapper(
 /// produces the proper CLVM curry envelope — the arg is wrapped in
 /// `(c (q . arg) 1)` so the user solution is preserved as the
 /// remainder of the env at run time.
-fn build_action_wrapper_node(
-    allocator: &mut Allocator,
-    action_puzzle_hex: &str,
-) -> clvmr::NodePtr {
+fn build_action_wrapper_node(allocator: &mut Allocator, action_puzzle_hex: &str) -> clvmr::NodePtr {
     // (r (a 2 (c 5 ()))) serialised: see comment above for derivation.
     let bytecode = hex::decode("ff06ffff02ff02ffff04ff05ff80808080").unwrap();
     let wrapper_program = chia_protocol::Program::from(bytecode);
@@ -325,9 +327,7 @@ fn announce_finalization_executes_on_simulator() {
     // Build the wrapper-curried puzzle and its hash.
     let mut allocator = Allocator::new();
     let puzzle_node = build_action_wrapper_node(&mut allocator, ELECTION_ANNOUNCE_FINALIZATION_HEX);
-    let puzzle_hash = chia_protocol::Bytes32::new(
-        tree_hash(&allocator, puzzle_node).to_bytes(),
-    );
+    let puzzle_hash = chia_protocol::Bytes32::new(tree_hash(&allocator, puzzle_node).to_bytes());
     // Sanity: the hash matches what `build_action_wrapper` predicts
     // when called with a fresh allocator.
     let predicted_hash = {
@@ -357,7 +357,10 @@ fn announce_finalization_executes_on_simulator() {
     type Sol = (ElectionStateTruthClvm, ());
     let state: ElectionStateClvm = (
         chia_protocol::Bytes32::new(root_bytes),
-        (count, (fees, (1u8, chia_protocol::Bytes32::new(outcome_bytes)))),
+        (
+            count,
+            (fees, (1u8, chia_protocol::Bytes32::new(outcome_bytes))),
+        ),
     );
     let truth: ElectionStateTruthClvm = ((), state);
     let solution: Sol = (truth, ());
@@ -414,9 +417,7 @@ fn announce_finalization_on_simulator_rejects_non_finalized() {
     let mut sim = Simulator::new();
     let mut allocator = Allocator::new();
     let puzzle_node = build_action_wrapper_node(&mut allocator, ELECTION_ANNOUNCE_FINALIZATION_HEX);
-    let puzzle_hash = chia_protocol::Bytes32::new(
-        tree_hash(&allocator, puzzle_node).to_bytes(),
-    );
+    let puzzle_hash = chia_protocol::Bytes32::new(tree_hash(&allocator, puzzle_node).to_bytes());
     let coin = Coin::new(chia_protocol::Bytes32::new([0x99; 32]), puzzle_hash, 1);
     sim.insert_coin(coin);
 
@@ -428,7 +429,16 @@ fn announce_finalization_on_simulator_rejects_non_finalized() {
     type Sol = (ElectionStateTruthClvm, ());
     let state: ElectionStateClvm = (
         chia_protocol::Bytes32::default(),
-        (0u64, (0u64, (0u8 /* finalized = false */, chia_protocol::Bytes32::default()))),
+        (
+            0u64,
+            (
+                0u64,
+                (
+                    0u8, /* finalized = false */
+                    chia_protocol::Bytes32::default(),
+                ),
+            ),
+        ),
     );
     let truth: ElectionStateTruthClvm = ((), state);
     let solution: Sol = (truth, ());
@@ -556,15 +566,27 @@ fn groth16_proof_accepted_by_clvm_pairing_identity_opcode() {
     let neg = |p: G1Affine| -> G1Affine { (-G1Projective::from(p)).into_affine() };
 
     let proof_a = chip_voting_sdk::prover::conversions::g1_from_compressed_bytes(
-        hex::decode(&proof.a_hex).unwrap().as_slice().try_into().unwrap(),
+        hex::decode(&proof.a_hex)
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap(),
     )
     .unwrap();
     let proof_b = chip_voting_sdk::prover::conversions::g2_from_compressed_bytes(
-        hex::decode(&proof.b_hex).unwrap().as_slice().try_into().unwrap(),
+        hex::decode(&proof.b_hex)
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap(),
     )
     .unwrap();
     let proof_c = chip_voting_sdk::prover::conversions::g1_from_compressed_bytes(
-        hex::decode(&proof.c_hex).unwrap().as_slice().try_into().unwrap(),
+        hex::decode(&proof.c_hex)
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap(),
     )
     .unwrap();
 
@@ -580,8 +602,12 @@ fn groth16_proof_accepted_by_clvm_pairing_identity_opcode() {
     // Each becomes a `Bytes` atom in the solution list.
     let mut atoms: Vec<Bytes> = Vec::with_capacity(8);
     for i in 0..4 {
-        atoms.push(Bytes::new(g1_compressed_bytes(&g1_points[i]).unwrap().to_vec()));
-        atoms.push(Bytes::new(g2_compressed_bytes(&g2_points[i]).unwrap().to_vec()));
+        atoms.push(Bytes::new(
+            g1_compressed_bytes(&g1_points[i]).unwrap().to_vec(),
+        ));
+        atoms.push(Bytes::new(
+            g2_compressed_bytes(&g2_points[i]).unwrap().to_vec(),
+        ));
     }
 
     // ── Step 5: build the puzzle `(58 2 5 11 23 47 95 191 383)` ──
@@ -694,15 +720,27 @@ fn tampered_groth16_proof_rejected_by_clvm_pairing_identity() {
     };
 
     let proof_a = chip_voting_sdk::prover::conversions::g1_from_compressed_bytes(
-        hex::decode(&proof.a_hex).unwrap().as_slice().try_into().unwrap(),
+        hex::decode(&proof.a_hex)
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap(),
     )
     .unwrap();
     let proof_b = chip_voting_sdk::prover::conversions::g2_from_compressed_bytes(
-        hex::decode(&proof.b_hex).unwrap().as_slice().try_into().unwrap(),
+        hex::decode(&proof.b_hex)
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap(),
     )
     .unwrap();
     let proof_c = chip_voting_sdk::prover::conversions::g1_from_compressed_bytes(
-        hex::decode(&proof.c_hex).unwrap().as_slice().try_into().unwrap(),
+        hex::decode(&proof.c_hex)
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap(),
     )
     .unwrap();
     let g1_points = [
@@ -725,7 +763,9 @@ fn tampered_groth16_proof_rejected_by_clvm_pairing_identity() {
             g1[47] ^= 0x01;
         }
         atoms.push(Bytes::new(g1));
-        atoms.push(Bytes::new(g2_compressed_bytes(&g2_points[i]).unwrap().to_vec()));
+        atoms.push(Bytes::new(
+            g2_compressed_bytes(&g2_points[i]).unwrap().to_vec(),
+        ));
     }
 
     let mut allocator = Allocator::new();

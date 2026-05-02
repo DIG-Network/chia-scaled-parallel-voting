@@ -75,7 +75,9 @@ pub struct SimulatedBackend;
 
 #[async_trait::async_trait]
 impl MpcBackend for SimulatedBackend {
-    fn backend_id(&self) -> &'static str { "simulated" }
+    fn backend_id(&self) -> &'static str {
+        "simulated"
+    }
 
     fn initial_transcript(&self) -> VotingResult<Transcript> {
         Ok(Transcript {
@@ -109,13 +111,14 @@ impl MpcBackend for SimulatedBackend {
         let prev_hash_hex = previous.hash_hex();
         let mut next = previous.clone();
         next.raw_transcript_hex = new_raw_hex;
-        next.attestations.push(super::transcript::ContributionAttestation {
-            index: (previous.attestations.len() as u32) + 1,
-            participant_name,
-            transcript_hash_hex: new_hash_hex,
-            previous_transcript_hash_hex: prev_hash_hex,
-            message,
-        });
+        next.attestations
+            .push(super::transcript::ContributionAttestation {
+                index: (previous.attestations.len() as u32) + 1,
+                participant_name,
+                transcript_hash_hex: new_hash_hex,
+                previous_transcript_hash_hex: prev_hash_hex,
+                message,
+            });
         Ok(next)
     }
 
@@ -179,14 +182,16 @@ impl MpcBackend for SimulatedBackend {
         ark_pk
             .0
             .serialize_compressed(&mut pk_bytes)
-            .map_err(|e| {
-                crate::VotingError::ProvingError(format!("serialize PK: {e}"))
-            })?;
+            .map_err(|e| crate::VotingError::ProvingError(format!("serialize PK: {e}")))?;
         let vk_bytes = ark_vk.chia_chunked_bytes()?;
 
         Ok((
-            ProvingKey { raw_bytes: pk_bytes },
-            VerificationKey { raw_bytes: vk_bytes },
+            ProvingKey {
+                raw_bytes: pk_bytes,
+            },
+            VerificationKey {
+                raw_bytes: vk_bytes,
+            },
         ))
     }
 }
