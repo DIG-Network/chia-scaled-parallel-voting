@@ -45,8 +45,13 @@ pub const MAX_SIGNERS: usize = 20_000;
 /// WHAT: number of public inputs to the Groth16 circuit. Each input
 ///       contributes one IC point to the verification key.
 /// ORDER: registration_merkle_root, registration_count, agg_signers,
-///        vote_message — must match `prover/circuit.rs::Scalars`.
-pub const PUBLIC_INPUT_COUNT: usize = 4;
+///        vote_message, threshold_pack, ballot_launcher_id — must match
+///        `prover/circuit.rs::Scalars`. The 6th input
+///        (`ballot_launcher_id`) was added under CHIP rev 2026-05-02
+///        so finalize proofs are bound to a specific Ballot Coin;
+///        threshold_pack stays as input #5 so the on-chain threshold
+///        check is preserved.
+pub const PUBLIC_INPUT_COUNT: usize = 6;
 
 /// CONST: EMPTY_LEAF_HASH
 /// WHAT: SHA256(0x00 ⨯ 48) — the canonical empty-leaf marker for the
@@ -88,25 +93,15 @@ pub struct ElectionConfig {
     /// Per-voter collateral, in CAT mojos.
     pub collateral_amount: u64,
 
-    /// Per-voter registration fee, in XCH mojos. Aggregated in the
-    /// singleton until `finalize`, then paid out to the finalizer as
-    /// economic incentive to actually run the proof.
-    pub registration_fee: u64,
-
-    /// Minimum L1 blocks between deployment and finalize. Enforced
-    /// on-chain via `ASSERT_HEIGHT_RELATIVE`. Mitigates the
-    /// "bootstrap attack" where the first registrant tries to
-    /// finalize immediately with a 1-voter quorum.
-    pub election_length_blocks: u64,
-
     /// Must equal `TREE_DEPTH`. Stored explicitly for self-validation.
     pub tree_depth: u32,
 
     /// Must equal `MAX_SIGNERS`. Stored explicitly for self-validation.
     pub max_signers: usize,
 
-    /// Hex-encoded Groth16 verification key (576 bytes for our
-    /// 4-input circuit). Produced by the MPC ceremony.
+    /// Hex-encoded Groth16 verification key (672 bytes for our
+    /// 6-input circuit: 336 base + 7 IC * 48). Produced by the MPC
+    /// ceremony.
     pub verification_key_hex: String,
 
     /// Optional UI label.
@@ -147,7 +142,8 @@ impl ElectionConfig {
     ///     compiled puzzles / circuit can't even verify the proofs)
     ///   * launcher / tail hex are decodable Bytes32
     ///   * verification key has the exact length our circuit needs
-    ///     (576 bytes = 336 base + 5 * 48 IC)
+    ///     (672 bytes = 336 base + (PUBLIC_INPUT_COUNT + 1) * 48 IC,
+    ///     i.e. 7 * 48 for our 6-input circuit)
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.tree_depth != TREE_DEPTH {
             return Err("ElectionConfig.tree_depth must equal TREE_DEPTH (32)");
@@ -181,8 +177,6 @@ mod tests {
             election_launcher_id_hex: "11".repeat(32),
             cat_tail_hash_hex: "22".repeat(32),
             collateral_amount: 1_000,
-            registration_fee: 10,
-            election_length_blocks: 4_608,
             tree_depth: TREE_DEPTH,
             max_signers: MAX_SIGNERS,
             verification_key_hex: "00".repeat(336 + (PUBLIC_INPUT_COUNT + 1) * 48),
@@ -256,7 +250,8 @@ mod tests {
 
     /// WHAT: `.validate()` rejects a verification key whose byte
     ///       length doesn't match the circuit's expected layout
-    ///       (576 = 336 base + 5 IC * 48 bytes).
+    ///       (672 = 336 base + 7 IC * 48 bytes for our 6-input
+    ///       circuit).
     /// HOW:  set verification_key_hex to 100-byte zero-buffer, expect
     ///       an `Err`.
     /// WHY:  passing the wrong-size VK to the on-chain finalize
@@ -284,8 +279,6 @@ mod tests {
         assert_eq!(parsed.election_launcher_id_hex, c.election_launcher_id_hex);
         assert_eq!(parsed.cat_tail_hash_hex, c.cat_tail_hash_hex);
         assert_eq!(parsed.collateral_amount, c.collateral_amount);
-        assert_eq!(parsed.registration_fee, c.registration_fee);
-        assert_eq!(parsed.election_length_blocks, c.election_length_blocks);
         assert_eq!(parsed.tree_depth, c.tree_depth);
         assert_eq!(parsed.max_signers, c.max_signers);
         assert_eq!(parsed.verification_key_hex, c.verification_key_hex);
@@ -320,8 +313,6 @@ mod tests {
                 "election_launcher_id_hex": "{}",
                 "cat_tail_hash_hex": "{}",
                 "collateral_amount": 1,
-                "registration_fee": 1,
-                "election_length_blocks": 1,
                 "tree_depth": {TREE_DEPTH},
                 "max_signers": {MAX_SIGNERS},
                 "verification_key_hex": "{}"
