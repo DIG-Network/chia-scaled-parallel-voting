@@ -326,11 +326,13 @@ fn finalize_action_through_full_action_layer_executes_on_simulator() {
     // The Rue puzzle declares VK as `struct VK { alpha (G1), beta
     // (G2), gamma (G2), delta (G2) }` — a 4-element CLVM list
     // serialised as `(alpha . (beta . (gamma . (delta . ()))))`.
-    // Similarly IC = 5-element list of G1 points.
+    // For the 6-public-input voting circuit (CHIP rev 2026-05-02),
+    // IC is a 7-element list of G1 points (ic0 + ic1..ic6).
     //
     // `chia_chunked_bytes` produces the FLAT layout
-    //   alpha(48) || beta(96) || gamma(96) || delta(96) || ic0..ic4(48 each)
-    // = 576 bytes. Split into the typed fields and curry as proper
+    //   alpha(48) || beta(96) || gamma(96) || delta(96)
+    //     || ic0..ic6 (48 each)
+    // = 672 bytes. Split into the typed fields and curry as proper
     // CLVM lists.
     let vk_full_bytes = vk_ark.chia_chunked_bytes().expect("vk chunked bytes");
     let vk_alpha = Bytes::new(vk_full_bytes[0..48].to_vec());
@@ -344,7 +346,9 @@ fn finalize_action_through_full_action_layer_executes_on_simulator() {
     let ic2 = Bytes::new(vk_full_bytes[432..480].to_vec());
     let ic3 = Bytes::new(vk_full_bytes[480..528].to_vec());
     let ic4 = Bytes::new(vk_full_bytes[528..576].to_vec());
-    let ic_struct = (ic0, (ic1, (ic2, (ic3, (ic4, ())))));
+    let ic5 = Bytes::new(vk_full_bytes[576..624].to_vec());
+    let ic6 = Bytes::new(vk_full_bytes[624..672].to_vec());
+    let ic_struct = (ic0, (ic1, (ic2, (ic3, (ic4, (ic5, (ic6, ())))))));
 
     let election_length_blocks: u64 = 0; // immediate finalize for the test
     let finalize_curried = CurriedProgram {

@@ -74,7 +74,10 @@ pub struct Transcript {
     pub circuit_id: String,
 
     /// Total number of public inputs to the circuit
-    /// (`PUBLIC_INPUT_COUNT = 4` for our voting CHIP).
+    /// (`PUBLIC_INPUT_COUNT = 6` for our voting CHIP rev
+    /// 2026-05-02 — `registration_merkle_root`,
+    /// `registration_vote_weight`, `agg_signers`, `vote_message`,
+    /// `threshold_pack`, `ballot_launcher_id`).
     pub public_input_count: usize,
 
     /// Total number of constraints in the R1CS (informational).

@@ -128,15 +128,15 @@ block. The convention:
   * `prove` rejects `BelowThreshold` (2k ≤ n) before running the
     prover.
   * Boundary majority (2k = n+1) succeeds.
-  * VK `chia_chunked_bytes` is exactly 576 bytes (the layout the
-    on-chain `finalize.rue` expects: alpha_g1 + beta_g2 + gamma_g2
-    + delta_g2 + 5 IC).
+  * VK `chia_chunked_bytes` is exactly 672 bytes (the layout the
+    on-chain `finalize.rue` expects for the 6-public-input circuit:
+    alpha_g1 + beta_g2 + gamma_g2 + delta_g2 + 7 IC).
   * VK serialise/deserialise round-trips.
   * `public_inputs_as_fr` is deterministic.
   * **`public_inputs_as_fr_match_scalars_compute`** — the cross-
     layer consistency contract: the circuit's Fr public-input
     commitment EQUALS `bytes32_to_fr(Scalars::compute(...).s_i)`
-    for all 4 inputs. This is what guarantees the off-chain Groth16
+    for all 6 inputs. This is what guarantees the off-chain Groth16
     prover and the on-chain `finalize.rue` IC linear combination
     speak the same scalars byte-for-byte.
 

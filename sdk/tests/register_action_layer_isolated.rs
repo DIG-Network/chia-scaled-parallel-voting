@@ -452,8 +452,12 @@ fn election_action_root_leaves(
     // are STRUCTS the puzzle accesses by field, not flat blobs.
     let finalize_node = load(&mut a, puzzles::ELECTION_FINALIZE_HEX);
     let vk_bytes = &deployer.params.verification_key.raw_bytes;
+    // Canonical chunked VK layout for the 6-input circuit:
+    //   alpha_g1(48) || beta_g2(96) || gamma_g2(96) || delta_g2(96)
+    //   || ic0..ic6 (7 * 48) = 672 bytes.
+    // (Pre-CHIP-2026-05-02 this was 576 bytes / 5 ICs.)
     assert!(
-        vk_bytes.len() >= 576,
+        vk_bytes.len() >= 672,
         "finalize curry: vk too short to slice into VK + IC structs (got {})",
         vk_bytes.len(),
     );
@@ -475,7 +479,13 @@ fn election_action_root_leaves(
                 Bytes::new(vk_bytes[432..480].to_vec()),
                 (
                     Bytes::new(vk_bytes[480..528].to_vec()),
-                    (Bytes::new(vk_bytes[528..576].to_vec()), ()),
+                    (
+                        Bytes::new(vk_bytes[528..576].to_vec()),
+                        (
+                            Bytes::new(vk_bytes[576..624].to_vec()),
+                            (Bytes::new(vk_bytes[624..672].to_vec()), ()),
+                        ),
+                    ),
                 ),
             ),
         ),

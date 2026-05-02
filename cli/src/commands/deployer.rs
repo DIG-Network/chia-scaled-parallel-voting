@@ -25,8 +25,8 @@
 // SECURITY:
 //   * VK input must be the FINAL output of a completed MPC ceremony
 //     (`chip-voting ceremony finalize`). The CLI re-validates length
-//     (must equal `336 + (PUBLIC_INPUT_COUNT + 1) * 48` = 576 bytes)
-//     before attempting deploy.
+//     (must equal `336 + (PUBLIC_INPUT_COUNT + 1) * 48` = 672 bytes
+//     for the 6-public-input voting circuit) before attempting deploy.
 //   * Bundle is shown for confirmation before broadcast unless
 //     `--yes` is set.
 
