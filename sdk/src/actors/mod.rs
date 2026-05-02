@@ -30,11 +30,13 @@
 //     canonical Chia signing pipeline.
 
 pub mod aggregator;
+pub mod ballot;
 pub mod deployer;
 pub mod indexer;
 pub mod voter;
 
 pub use aggregator::Aggregator;
+pub use ballot::{BallotIssuer, BallotReader, CreateBallotParams, CreatedBallot};
 pub use deployer::{DeploymentArtifacts, ElectionDeployer};
 pub use indexer::Indexer;
 pub use voter::Voter;

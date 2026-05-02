@@ -61,6 +61,7 @@ pub mod state;
 // ── Public re-exports ─────────────────────────────────────────────────
 
 pub use actors::{Aggregator, ElectionDeployer, Indexer, Voter};
+pub use actors::ballot::{BallotIssuer, BallotReader, CreateBallotParams, CreatedBallot};
 pub use actors::deployer::{DeployParams, DeploymentArtifacts};
 pub use actors::voter::VoterKeys;
 pub use config::{ElectionConfig, MAX_SIGNERS, PUBLIC_INPUT_COUNT, TREE_DEPTH};
