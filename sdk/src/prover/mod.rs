@@ -18,27 +18,33 @@
 //   * `conversions`  — chia_bls ↔ arkworks BLS12-381 byte-encoding
 //                       bridge; scalar conversions; G1 aggregation.
 //
-// ── Public-input convention (matches on-chain finalize.rue) ─────────
+// ── Public-input convention (matches puzzles/ballot_coin/finalize.rue) ──
 //
-// The Groth16 verifier consumes 4 BLS12-381 Fr scalars as public
-// inputs. Each scalar is `bytes32_to_fr(sha256(input_i))` — the
-// big-endian-mod-r interpretation of the sha256 of the i-th input:
+// The Groth16 verifier consumes 6 BLS12-381 Fr scalars as public
+// inputs (CHIP rev 2026-05-02). Each scalar is
+// `bytes32_to_fr(sha256(input_i) mod r)` — the big-endian-mod-r
+// interpretation of the sha256 of the i-th input:
 //
-//   1. s1 = sha256(registration_merkle_root)        (32 bytes)
-//   2. s2 = sha256(registration_count_be8)          (8-byte count)
-//   3. s3 = sha256(agg_signers_g1_compressed_48)    (48-byte G1)
-//   4. s4 = sha256(vote_message)                    (32 bytes;
-//                                                   `sha256(outcome ||
-//                                                    election_launcher_id)`
-//                                                   per finalize.rue)
+//   1. s1 = sha256(registration_merkle_root)             (32 bytes)
+//   2. s2 = sha256(registration_vote_weight_be8)         (8-byte weight)
+//   3. s3 = sha256(agg_signers_g1_compressed_48)         (48-byte G1)
+//   4. s4 = sha256(vote_message)                         (32 bytes;
+//                                                        `sha256(outcome ||
+//                                                         ballot_launcher_id ||
+//                                                         election_launcher_id)`
+//                                                        per ballot_coin/finalize.rue)
+//   5. s5 = sha256(threshold_pack(num, den))             (16 bytes;
+//                                                        `int_to_8_bytes_be(num) ||
+//                                                         int_to_8_bytes_be(den)`)
+//   6. s6 = sha256(ballot_launcher_id)                   (32 bytes)
 //
-// The on-chain `finalize.rue`:
-//   1. Asserts `s_i == sha256(input_i)` for each i.
-//   2. Computes `vk_input = IC[0] + Σ s_i * IC[i+1]`.
+// The on-chain `ballot_coin/finalize.rue`:
+//   1. Asserts `s_i == sha256(input_i) mod r` for each i.
+//   2. Computes `vk_input = IC[0] + Σ s_i * IC[i+1]` (i = 1..=6).
 //   3. Verifies the Groth16 pairing identity over `vk_input`.
 //
 // The off-chain `VotingCircuit::public_inputs_as_fr` returns the
-// SAME `[Fr; 4]` (via `Scalars::compute → scalars_to_fr_array`) so
+// SAME `[Fr; 6]` (via `Scalars::compute → scalars_to_fr_array`) so
 // the prover commits to the same IC values.
 //
 // ── Private witnesses (per signer, k of n where 2k > n) ─────────────
@@ -84,13 +90,14 @@
 //     setup MUST come from a multi-party MPC ceremony (see
 //     `crate::ceremony`).
 //   * The resulting `ArkVerifyingKey` serialises to the exact
-//     576-byte layout `ElectionConfig::verification_key_hex`
+//     672-byte layout `ElectionConfig::verification_key_hex`
 //     validates against (`alpha_g1 ‖ beta_g2 ‖ gamma_g2 ‖ delta_g2 ‖
-//     IC[0..4]`) via `ArkVerifyingKey::chia_chunked_bytes`.
+//     IC[0..6]`, 7 IC points × 48 bytes) via
+//     `ArkVerifyingKey::chia_chunked_bytes`.
 
 pub mod circuit;
 pub mod conversions;
 pub mod proof;
 
 pub use circuit::VotingCircuit;
-pub use proof::{Groth16Proof, Scalars};
+pub use proof::{threshold_pack_bytes, Groth16Proof, Scalars};

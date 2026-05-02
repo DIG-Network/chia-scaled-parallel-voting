@@ -8,11 +8,13 @@
 //
 // CIRCUIT DESIGN (matches `prover/mod.rs`):
 //
-//   Public inputs (4 BLS12-381 Fr scalars):
-//     1. registration_merkle_root  ←  bytes32_to_fr(root)
-//     2. registration_count        ←  Fr::from(count)
-//     3. agg_signers               ←  bytes32_to_fr(sha256(agg_pk_bytes))
-//     4. vote_message              ←  bytes32_to_fr(vote_msg)
+//   Public inputs (6 BLS12-381 Fr scalars; CHIP rev 2026-05-02):
+//     1. registration_merkle_root   ←  bytes32_to_fr(sha256(root) mod r)
+//     2. registration_vote_weight   ←  bytes32_to_fr(sha256(weight_be8) mod r)
+//     3. agg_signers                ←  bytes32_to_fr(sha256(agg_pk_bytes) mod r)
+//     4. vote_message               ←  bytes32_to_fr(sha256(vote_msg) mod r)
+//     5. threshold_pack             ←  bytes32_to_fr(sha256(num_be8 || den_be8) mod r)
+//     6. ballot_launcher_id         ←  bytes32_to_fr(sha256(launcher_id) mod r)
 //
 //   Private witnesses (per signer, k of n where 2k > n):
 //     - signer pubkey (committed to as Fr scalar via sha256)
@@ -100,9 +102,22 @@ pub struct SignerWitness {
 pub struct VotingCircuit {
     // ── Public inputs (committed to via the verification key) ───────
     pub registration_merkle_root: Bytes32,
-    pub registration_count: u64,
+    /// Sum of voter weights at registration-snapshot time — replaces
+    /// the pre-CHIP `registration_count` (which assumed all voters
+    /// have equal weight). The on-chain `ballot_coin/finalize.rue`
+    /// curries `REGISTRATION_VOTE_WEIGHT_SNAPSHOT` and asserts
+    /// `s2 == sha256(int_to_8_bytes_be(weight)) mod r`.
+    pub registration_vote_weight: u64,
     pub agg_signers: PublicKey,
     pub vote_message: Bytes32,
+    /// Quorum threshold numerator (e.g. 2 in 2/3).
+    pub vote_threshold_num: u64,
+    /// Quorum threshold denominator (e.g. 3 in 2/3).
+    pub vote_threshold_den: u64,
+    /// Ballot Coin launcher ID — pins the proof to a single ballot.
+    /// Without this commitment a prover could replay a proof against
+    /// any ballot whose other public inputs happened to coincide.
+    pub ballot_launcher_id: Bytes32,
 
     // ── Private witnesses (k-of-n; 2k > n required) ─────────────────
     pub signers: Vec<SignerWitness>,
@@ -110,24 +125,28 @@ pub struct VotingCircuit {
 
 impl VotingCircuit {
     /// FN: public_inputs_as_fr
-    /// WHAT: convert the 4 public inputs to BLS12-381 Fr scalars in
+    /// WHAT: convert the 6 public inputs to BLS12-381 Fr scalars in
     ///       the exact order the on-chain verifier expects.
     /// CONTRACT: derived via `Scalars::compute(...)` (sha256 of each
     ///           input) followed by `bytes32_to_fr` (big-endian, mod
-    ///           r). This matches the on-chain `finalize.rue` flow:
+    ///           r). This matches the on-chain
+    ///           `puzzles/ballot_coin/finalize.rue` flow:
     ///             1. `assert sha256(input_i) == s_i`         (hash equality)
-    ///             2. `vk_input = IC[0] + Σ s_i * IC[i+1]`    (G1 linear comb)
+    ///             2. `vk_input = IC[0] + Σ s_i * IC[i+1]`    (G1 linear comb, i=1..=6)
     ///             3. Groth16 pairing identity over vk_input.
     ///           The off-chain Groth16 prover commits to the SAME
     ///           Fr values via the IC vector, so the pairing equation
     ///           holds iff the prover used `bytes32_to_fr(s_i)` as
     ///           its public inputs — exactly what this method returns.
-    pub fn public_inputs_as_fr(&self) -> [Fr; 4] {
+    pub fn public_inputs_as_fr(&self) -> [Fr; 6] {
         let scalars = crate::prover::Scalars::compute(
             self.registration_merkle_root,
-            self.registration_count,
+            self.registration_vote_weight,
             &self.agg_signers,
             self.vote_message,
+            self.vote_threshold_num,
+            self.vote_threshold_den,
+            self.ballot_launcher_id,
         );
         crate::prover::conversions::scalars_to_fr_array(&scalars)
     }
@@ -138,13 +157,17 @@ impl VotingCircuit {
     /// CONTRACT: caller has obtained `proving_key` from a trusted
     ///           setup matching THIS circuit's constraint shape.
     /// ERRORS:
-    ///   * `BelowThreshold` — `2 * signers.len() <= registration_count`.
+    ///   * `BelowThreshold` — `2 * signers.len() <= registration_vote_weight`.
+    ///     NOTE: this naive 2k>n pre-check is preserved from the
+    ///     count-based circuit; the production weighted-quorum
+    ///     gadget (`Σ signer_weights * den >= num * registration_vote_weight`)
+    ///     lands in Phase 6 along with the per-signer weight witness.
     ///   * `ProvingError(_)` — internal arkworks failure.
     /// PIPELINE: arkworks `Groth16::prove` → `Groth16Proof::from_arkworks`
     ///           (bridges typed proof to the wire form via the same
     ///           compressed encoding the on-chain verifier expects).
     pub fn prove(&self, proving_key: &ArkProvingKey) -> VotingResult<Groth16Proof> {
-        if 2 * self.signers.len() <= self.registration_count as usize {
+        if 2 * self.signers.len() <= self.registration_vote_weight as usize {
             return Err(VotingError::BelowThreshold);
         }
         let mut rng = ark_std::rand::rngs::OsRng;
@@ -158,17 +181,16 @@ impl VotingCircuit {
     ///       before broadcasting the finalize spend, since on-chain
     ///       failure costs the entire bundle fee.
     /// USAGE: `VotingCircuit::verify_offchain(&vk, &proof,
-    ///        &[s1_bytes, s2_bytes, s3_bytes, s4_bytes])` where each
-    ///        scalar input is the 32-byte form (`Scalars::s_i`); they
-    ///        are converted to Fr via `bytes32_to_fr` (big-endian,
-    ///        mod r — matches the on-chain `bls_g1_multiply` scalar
-    ///        interpretation).
+    ///        &[s1, s2, s3, s4, s5, s6])` where each scalar input is
+    ///        the 32-byte form (`Scalars::s_i`); they are converted
+    ///        to Fr via `bytes32_to_fr` (big-endian, mod r — matches
+    ///        the on-chain `bls_g1_multiply` scalar interpretation).
     /// PIPELINE: `Groth16Proof::to_arkworks` (parse + curve-point
     ///           validation) → `Groth16::verify_with_processed_vk`.
     pub fn verify_offchain(
         verification_key: &ArkVerifyingKey,
         proof: &Groth16Proof,
-        public_inputs: &[Bytes32; 4],
+        public_inputs: &[Bytes32; 6],
     ) -> VotingResult<bool> {
         let proof = proof.to_arkworks()?;
         let inputs: Vec<Fr> = public_inputs.iter().map(bytes32_to_fr).collect();
@@ -183,16 +205,19 @@ impl ConstraintSynthesizer<Fr> for VotingCircuit {
     /// WHAT: synthesise the circuit's R1CS constraints.
     ///
     /// PUBLIC INPUTS (allocated in this exact order, matching
-    /// `public_inputs_as_fr` and the on-chain IC layout):
+    /// `public_inputs_as_fr` and the on-chain IC layout under CHIP
+    /// rev 2026-05-02):
     ///   1. s1 = bytes32_to_fr(sha256(registration_merkle_root))
-    ///   2. s2 = bytes32_to_fr(sha256(registration_count_be8))
+    ///   2. s2 = bytes32_to_fr(sha256(registration_vote_weight_be8))
     ///   3. s3 = bytes32_to_fr(sha256(agg_signers_g1_compressed))
     ///   4. s4 = bytes32_to_fr(sha256(vote_message))
+    ///   5. s5 = bytes32_to_fr(sha256(threshold_pack(num,den)))
+    ///   6. s6 = bytes32_to_fr(sha256(ballot_launcher_id))
     ///
     /// PRIVATE WITNESSES:
-    ///   * raw_count   — `Fr::from(registration_count)`
+    ///   * raw_count    — `Fr::from(registration_vote_weight)`
     ///   * signer_count — `Fr::from(self.signers.len() as u64)`
-    ///   * slack       — `Fr::from(2 * signer_count - count - 1)`
+    ///   * slack        — `Fr::from(2 * signer_count - raw_count - 1)`
     ///
     /// CONSTRAINTS ENCODED IN-CIRCUIT:
     ///   A. STRICT MAJORITY:
@@ -235,7 +260,7 @@ impl ConstraintSynthesizer<Fr> for VotingCircuit {
     ///   bls_verify + scalar-binding assertions); together they
     ///   pin every property a fully in-circuit verifier would.
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // ── Public inputs: 4 sha256-derived Fr scalars ───────────
+        // ── Public inputs: 6 sha256-derived Fr scalars ───────────
         //
         // Derived via `Scalars::compute → scalars_to_fr_array` so
         // the off-chain Aggregator's `Scalars` wire form and this
@@ -245,22 +270,35 @@ impl ConstraintSynthesizer<Fr> for VotingCircuit {
         let _s2 = cs.new_input_variable(|| Ok(scalars_fr[1]))?;
         let _s3 = cs.new_input_variable(|| Ok(scalars_fr[2]))?;
         let _s4 = cs.new_input_variable(|| Ok(scalars_fr[3]))?;
+        let _s5 = cs.new_input_variable(|| Ok(scalars_fr[4]))?;
+        // s6 (ballot_launcher_id) is allocated as a public input but
+        // not constrained in-circuit beyond its IC commitment — its
+        // sole purpose is binding the proof to a specific ballot via
+        // the public-input vector (drift here ⇒ different vk_input ⇒
+        // pairing fails).
+        let _s6 = cs.new_input_variable(|| Ok(scalars_fr[5]))?;
 
         // ── Private witnesses for the threshold check ────────────
         //
-        // raw_count is the un-hashed registration_count value the
-        // threshold arithmetic operates on. In the production circuit
-        // (constraint B above) this would be cryptographically bound
-        // to s2 via an in-circuit sha256 gadget; here it's a free
-        // witness, with the on-chain `finalize.rue` enforcing the
-        // hash binding instead.
+        // raw_count is the un-hashed registration_vote_weight value
+        // the threshold arithmetic operates on. In the production
+        // circuit (constraint B above) this would be cryptographically
+        // bound to s2 via an in-circuit sha256 gadget; here it's a
+        // free witness, with the on-chain `finalize.rue` enforcing
+        // the hash binding instead. NOTE: under CHIP rev 2026-05-02
+        // this gadget still uses the naive `2k > n` form against
+        // `registration_vote_weight`; the weighted-quorum (num/den)
+        // gadget lands in Phase 6 along with per-signer weight
+        // witnesses. The `s5 = sha256(threshold_pack)` public input
+        // is already allocated above so the production circuit can
+        // bind to it without an API break.
         let raw_count_var =
-            cs.new_witness_variable(|| Ok(Fr::from(self.registration_count)))?;
+            cs.new_witness_variable(|| Ok(Fr::from(self.registration_vote_weight)))?;
         let signer_count = self.signers.len() as u64;
         let signer_count_var =
             cs.new_witness_variable(|| Ok(Fr::from(signer_count)))?;
 
-        // (A) Enforce 2 * signer_count >= registration_count + 1
+        // (A) Enforce 2 * signer_count >= registration_vote_weight + 1
         //     (equivalently: strict majority `2k > n`).
         //
         // R1CS form: introduce `slack >= 0` such that
@@ -270,7 +308,7 @@ impl ConstraintSynthesizer<Fr> for VotingCircuit {
             .checked_mul(signer_count)
             .ok_or(SynthesisError::Unsatisfiable)?;
         let n_plus_1 = self
-            .registration_count
+            .registration_vote_weight
             .checked_add(1)
             .ok_or(SynthesisError::Unsatisfiable)?;
         if two_k < n_plus_1 {
@@ -341,11 +379,12 @@ impl ArkVerifyingKey {
 
     /// FN: chia_chunked_bytes
     /// WHAT: serialise the VK in the EXACT layout the on-chain
-    ///       `finalize.rue` puzzle is curried with:
+    ///       `puzzles/ballot_coin/finalize.rue` puzzle is curried with:
     ///   `alpha_g1 || beta_g2 || gamma_g2 || delta_g2`  (336 bytes)
-    ///   followed by `IC[0..N+1]`                       (5 * 48 bytes)
-    /// for a 4-public-input circuit, total = 576 bytes — matches
-    /// `ElectionConfig::verification_key_hex` length validation.
+    ///   followed by `IC[0..N+1]`                       (7 * 48 bytes)
+    /// for a 6-public-input circuit (CHIP rev 2026-05-02), total =
+    /// 672 bytes — matches `ElectionConfig::verification_key_hex`
+    /// length validation against `336 + (PUBLIC_INPUT_COUNT + 1) * 48`.
     pub fn chia_chunked_bytes(&self) -> VotingResult<Vec<u8>> {
         let vk = &self.0;
         let mut out = Vec::with_capacity(336 + (vk.gamma_abc_g1.len()) * 48);
@@ -392,12 +431,18 @@ pub fn generate_test_setup<R: Rng + ark_std::rand::CryptoRng>(
     // Shape-defining circuit — single signer over a single voter
     // so the `slack >= 0` constraint is satisfiable (2*1 - 1 - 1
     // = 0). Witness values are discarded by arkworks during
-    // setup; only the constraint structure matters.
+    // setup; only the constraint structure matters (number of
+    // public inputs + R1CS shape). Under CHIP rev 2026-05-02 the
+    // resulting VK has 7 IC points (ic0 + ic1..ic6) ⇒ 672 bytes
+    // total via `chia_chunked_bytes`.
     let shape_circuit = VotingCircuit {
         registration_merkle_root: Bytes32::default(),
-        registration_count: 1,
+        registration_vote_weight: 1,
         agg_signers: PublicKey::default(),
         vote_message: Bytes32::default(),
+        vote_threshold_num: 1,
+        vote_threshold_den: 2,
+        ballot_launcher_id: Bytes32::default(),
         signers: vec![SignerWitness {
             pubkey: PublicKey::default(),
             leaf_index: 0,
@@ -448,7 +493,7 @@ mod tests {
         SecretKey::from_seed(&[seed_byte; 32]).public_key()
     }
 
-    fn make_circuit(n_signers: u32, registration_count: u64) -> VotingCircuit {
+    fn make_circuit(n_signers: u32, registration_vote_weight: u64) -> VotingCircuit {
         let signers = (0..n_signers)
             .map(|i| SignerWitness {
                 pubkey: test_pubkey(i as u8 + 1),
@@ -458,9 +503,12 @@ mod tests {
             .collect::<Vec<_>>();
         VotingCircuit {
             registration_merkle_root: Bytes32::new([0x11; 32]),
-            registration_count,
+            registration_vote_weight,
             agg_signers: test_pubkey(0xAA),
             vote_message: Bytes32::new([0x42; 32]),
+            vote_threshold_num: 2,
+            vote_threshold_den: 3,
+            ballot_launcher_id: Bytes32::new([0x77; 32]),
             signers,
         }
     }
@@ -478,8 +526,8 @@ mod tests {
         let (_pk, vk) = generate_test_setup(&mut rng).unwrap();
         assert_eq!(
             vk.0.gamma_abc_g1.len(),
-            5,
-            "IC must be 1 + PUBLIC_INPUT_COUNT (= 5 for our circuit)"
+            7,
+            "IC must be 1 + PUBLIC_INPUT_COUNT (= 7 for our 6-input circuit)"
         );
     }
 
@@ -502,12 +550,14 @@ mod tests {
         let proof = circuit.prove(&pk).expect("prove must succeed");
 
         // Convert the public inputs back to Bytes32 form for the
-        // verifier API (which takes a `[Bytes32; 4]`).
-        let inputs_b32: [Bytes32; 4] = [
+        // verifier API (which takes a `[Bytes32; 6]`).
+        let inputs_b32: [Bytes32; 6] = [
             Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[0])),
             Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[1])),
             Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[2])),
             Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[3])),
+            Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[4])),
+            Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[5])),
         ];
         assert!(
             VotingCircuit::verify_offchain(&vk, &proof, &inputs_b32).unwrap(),
@@ -539,11 +589,13 @@ mod tests {
         let inputs = circuit.public_inputs_as_fr();
         let proof = circuit.prove(&pk).unwrap();
 
-        let mut inputs_b32: [Bytes32; 4] = [
+        let mut inputs_b32: [Bytes32; 6] = [
             Bytes32::new(fr_to_b32(&inputs[0])),
             Bytes32::new(fr_to_b32(&inputs[1])),
             Bytes32::new(fr_to_b32(&inputs[2])),
             Bytes32::new(fr_to_b32(&inputs[3])),
+            Bytes32::new(fr_to_b32(&inputs[4])),
+            Bytes32::new(fr_to_b32(&inputs[5])),
         ];
         // Tamper with the registration_merkle_root input.
         inputs_b32[0] = Bytes32::new([0xFF; 32]);
@@ -583,28 +635,30 @@ mod tests {
         let circuit = make_circuit(3, 4); // 2k = 6 > 4 ✓
         let proof = circuit.prove(&pk).unwrap();
         let inputs = circuit.public_inputs_as_fr();
-        let inputs_b32: [Bytes32; 4] = [
+        let inputs_b32: [Bytes32; 6] = [
             Bytes32::new(fr_to_b32(&inputs[0])),
             Bytes32::new(fr_to_b32(&inputs[1])),
             Bytes32::new(fr_to_b32(&inputs[2])),
             Bytes32::new(fr_to_b32(&inputs[3])),
+            Bytes32::new(fr_to_b32(&inputs[4])),
+            Bytes32::new(fr_to_b32(&inputs[5])),
         ];
         assert!(VotingCircuit::verify_offchain(&vk, &proof, &inputs_b32).unwrap());
     }
 
-    /// WHAT: VK `chia_chunked_bytes` is exactly 576 bytes for our
-    ///       4-input circuit.
+    /// WHAT: VK `chia_chunked_bytes` is exactly 672 bytes for our
+    ///       6-input circuit (CHIP rev 2026-05-02).
     /// HOW:  generate setup, call chia_chunked_bytes, assert length.
     /// WHY:  this length is what `ElectionConfig::validate` checks
     ///       against (`expected_vk_bytes = 336 + (PUBLIC_INPUT_COUNT
-    ///       + 1) * 48 = 576`). Drift would mean configs ship with
+    ///       + 1) * 48 = 672`). Drift would mean configs ship with
     ///       wrong-sized VKs and validation breaks.
     #[test]
-    fn vk_chia_chunked_bytes_is_576_bytes() {
+    fn vk_chia_chunked_bytes_is_672_bytes() {
         let mut rng = deterministic_rng();
         let (_pk, vk) = generate_test_setup(&mut rng).unwrap();
         let bytes = vk.chia_chunked_bytes().unwrap();
-        assert_eq!(bytes.len(), 576, "expected layout: alpha_g1+beta_g2+gamma_g2+delta_g2+5*ic");
+        assert_eq!(bytes.len(), 672, "expected layout: alpha_g1+beta_g2+gamma_g2+delta_g2+7*ic");
     }
 
     /// WHAT: VK round-trips through `serialize_compressed` /
@@ -626,11 +680,13 @@ mod tests {
         let circuit = make_circuit(2, 3);
         let proof = circuit.prove(&pk).unwrap();
         let inputs = circuit.public_inputs_as_fr();
-        let inputs_b32: [Bytes32; 4] = [
+        let inputs_b32: [Bytes32; 6] = [
             Bytes32::new(fr_to_b32(&inputs[0])),
             Bytes32::new(fr_to_b32(&inputs[1])),
             Bytes32::new(fr_to_b32(&inputs[2])),
             Bytes32::new(fr_to_b32(&inputs[3])),
+            Bytes32::new(fr_to_b32(&inputs[4])),
+            Bytes32::new(fr_to_b32(&inputs[5])),
         ];
         assert!(VotingCircuit::verify_offchain(&vk2, &proof, &inputs_b32).unwrap());
     }
@@ -651,13 +707,13 @@ mod tests {
     }
 
     /// WHAT: `circuit.public_inputs_as_fr()` equals
-    ///       `Scalars::compute(...) → Fr` for ALL 4 public inputs.
+    ///       `Scalars::compute(...) → Fr` for ALL 6 public inputs.
     /// HOW:  build a circuit; call public_inputs_as_fr (Fr-typed);
     ///       independently call `Scalars::compute(...)` (Bytes32-
     ///       typed); convert each scalar to Fr via `bytes32_to_fr`;
     ///       compare element by element.
     /// WHY:  this is THE on-chain contract. The on-chain
-    ///       `finalize.rue` puzzle:
+    ///       `puzzles/ballot_coin/finalize.rue` puzzle:
     ///         1. Asserts `s_i == sha256(public_input_i)`.
     ///         2. Computes vk_input = IC[0] + Σ s_i * IC[i+1].
     ///         3. Verifies the Groth16 pairing identity.
@@ -673,9 +729,12 @@ mod tests {
         let c = make_circuit(2, 3);
         let scalars = Scalars::compute(
             c.registration_merkle_root,
-            c.registration_count,
+            c.registration_vote_weight,
             &c.agg_signers,
             c.vote_message,
+            c.vote_threshold_num,
+            c.vote_threshold_den,
+            c.ballot_launcher_id,
         );
         let scalars_fr = scalars_to_fr_array(&scalars);
         let circuit_fr = c.public_inputs_as_fr();

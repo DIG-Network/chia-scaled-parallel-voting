@@ -172,8 +172,8 @@ pub fn aggregate_g2<'a>(points: impl IntoIterator<Item = &'a G2Affine>) -> G2Aff
 }
 
 /// FN: scalars_to_fr_array
-/// WHAT: bridge `Scalars` (4-tuple of `Bytes32`, our wire form) to
-///       the `[Fr; 4]` form the Groth16 circuit consumes as public
+/// WHAT: bridge `Scalars` (6-tuple of `Bytes32`, our wire form) to
+///       the `[Fr; 6]` form the Groth16 circuit consumes as public
 ///       inputs.
 /// CONTRACT: each `s_i` is interpreted big-endian and reduced
 ///           mod r. This MUST agree with the on-chain
@@ -182,13 +182,15 @@ pub fn aggregate_g2<'a>(points: impl IntoIterator<Item = &'a G2Affine>) -> G2Aff
 /// USAGE: called by `VotingCircuit::public_inputs_as_fr` so the
 ///        off-chain circuit's public-input commitment matches the
 ///        on-chain `IC[0] + Σ s_i * IC[i+1]` linear combination
-///        byte-for-byte.
-pub fn scalars_to_fr_array(s: &Scalars) -> [Fr; 4] {
+///        byte-for-byte (i = 1..=6 under CHIP rev 2026-05-02).
+pub fn scalars_to_fr_array(s: &Scalars) -> [Fr; 6] {
     [
         bytes32_to_fr(&s.s1),
         bytes32_to_fr(&s.s2),
         bytes32_to_fr(&s.s3),
         bytes32_to_fr(&s.s4),
+        bytes32_to_fr(&s.s5),
+        bytes32_to_fr(&s.s6),
     ]
 }
 

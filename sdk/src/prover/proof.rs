@@ -105,51 +105,67 @@ impl Groth16Proof {
 }
 
 /// STRUCT: Scalars
-/// PURPOSE: pre-computed `sha256(public_input_i)` for each of the four
-///          public inputs to our circuit.
+/// PURPOSE: pre-computed `sha256(public_input_i)` for each of the six
+///          public inputs to our circuit (CHIP rev 2026-05-02).
 ///
-/// LAYOUT: matches the on-chain `finalize.rue` `Scalars` struct order:
+/// LAYOUT: matches the on-chain `puzzles/ballot_coin/finalize.rue`
+///         `Scalars` struct order EXACTLY:
 ///   s1 = registration_merkle_root
-///   s2 = registration_count (8-byte big-endian)
+///   s2 = registration_vote_weight (8-byte big-endian)
 ///   s3 = aggregated signers' G1-compressed bytes
 ///   s4 = vote_message
+///   s5 = threshold_pack(num, den) — packs the on-chain quorum
+///        threshold so the circuit binds to it (defense in depth)
+///   s6 = ballot_launcher_id — binds the proof to a specific ballot,
+///        preventing cross-ballot replay
 ///
 /// IMMUTABILITY: derived purely from the public inputs; recomputable
 ///               by anyone, no secret data.
 ///
 /// CIRCUIT CONNECTION: convert via
 /// [`crate::prover::conversions::scalars_to_fr_array`] to get the
-/// `[Fr; 4]` form `VotingCircuit::generate_constraints` allocates as
+/// `[Fr; 6]` form `VotingCircuit::generate_constraints` allocates as
 /// public-input variables. The off-chain prover and the on-chain
 /// `IC[0] + Σ s_i * IC[i+1]` linear combination MUST consume identical
 /// scalars — this round-trip is the canonical contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scalars {
-    /// `sha256(registration_merkle_root)`
+    /// `sha256(registration_merkle_root) mod r`
     pub s1: Bytes32,
-    /// `sha256(registration_count_be8)` — big-endian 8-byte encoding,
-    /// matching the on-chain `int_to_8_bytes_be` Rue helper.
+    /// `sha256(registration_vote_weight_be8) mod r` — big-endian 8-byte
+    /// encoding, matching the on-chain `int_to_8_bytes_be` Rue helper.
     pub s2: Bytes32,
-    /// `sha256(agg_signers_g1_compressed_48)`
+    /// `sha256(agg_signers_g1_compressed_48) mod r`
     pub s3: Bytes32,
-    /// `sha256(vote_message)`
+    /// `sha256(vote_message) mod r`
     pub s4: Bytes32,
+    /// `sha256(threshold_pack(num, den)) mod r` where the pack is
+    /// `int_to_8_bytes_be(num) || int_to_8_bytes_be(den)` — 16 bytes
+    /// total, exactly matching `finalize.rue::threshold_pack_bytes`.
+    pub s5: Bytes32,
+    /// `sha256(ballot_launcher_id) mod r` — pins the proof to a single
+    /// ballot. Without this the same proof could finalize a different
+    /// ballot whose other inputs happened to coincide.
+    pub s6: Bytes32,
 }
 
 impl Scalars {
     /// FN: compute
-    /// WHAT: derive all four scalars from the four public inputs.
+    /// WHAT: derive all six scalars from the six public inputs.
     /// USAGE:
     ///   * `Aggregator::prepare_finalize_witness` — populates the
     ///     finalize-action solution.
     ///   * `VotingCircuit::public_inputs_as_fr` — derives the
-    ///     [`Fr; 4`] form the circuit commits to via Groth16's IC.
+    ///     [`Fr; 6`] form the circuit commits to via Groth16's IC.
     /// IDEMPOTENT: same inputs → same scalars; safe to call repeatedly.
     pub fn compute(
         registration_merkle_root: Bytes32,
-        registration_count: u64,
+        registration_vote_weight: u64,
         agg_signers: &PublicKey,
         vote_message: Bytes32,
+        vote_threshold_num: u64,
+        vote_threshold_den: u64,
+        ballot_launcher_id: Bytes32,
     ) -> Self {
         // Each scalar = `sha256(input) mod r`, where r is the
         // BLS12-381 subgroup order. The mod-r reduction is REQUIRED
@@ -162,22 +178,39 @@ impl Scalars {
         // so the high bit is always 0 and signed/unsigned
         // interpretations agree.
         let s1 = sha256_mod_r(registration_merkle_root.as_ref());
-        let s2 = sha256_mod_r(&registration_count.to_be_bytes());
+        let s2 = sha256_mod_r(&registration_vote_weight.to_be_bytes());
         let s3 = sha256_mod_r(&agg_signers.to_bytes());
         let s4 = sha256_mod_r(vote_message.as_ref());
-        Self { s1, s2, s3, s4 }
+        let s5 = sha256_mod_r(&threshold_pack_bytes(
+            vote_threshold_num,
+            vote_threshold_den,
+        ));
+        let s6 = sha256_mod_r(ballot_launcher_id.as_ref());
+        Self { s1, s2, s3, s4, s5, s6 }
     }
 
     /// FN: as_array
-    /// WHAT: return the 4 scalars as a `[Bytes32; 4]` in the canonical
-    ///       `(s1, s2, s3, s4)` order.
+    /// WHAT: return the 6 scalars as a `[Bytes32; 6]` in the canonical
+    ///       `(s1, s2, s3, s4, s5, s6)` order.
     /// USAGE: convenient for off-chain serialisation in tests + for
     ///        `chip-voting-sdk` callers that want to feed the scalars
     ///        directly into `VotingCircuit::verify_offchain`'s
-    ///        `&[Bytes32; 4]` parameter.
-    pub fn as_array(&self) -> [Bytes32; 4] {
-        [self.s1, self.s2, self.s3, self.s4]
+    ///        `&[Bytes32; 6]` parameter.
+    pub fn as_array(&self) -> [Bytes32; 6] {
+        [self.s1, self.s2, self.s3, self.s4, self.s5, self.s6]
     }
+}
+
+/// FN: threshold_pack_bytes (pub for re-use by callers)
+/// WHAT: pack `(num, den)` into a 16-byte big-endian blob — exactly
+///       the byte layout `puzzles/ballot_coin/finalize.rue::
+///       threshold_pack_bytes` produces. Used as the sha256 preimage
+///       for scalar `s5`.
+pub fn threshold_pack_bytes(num: u64, den: u64) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&num.to_be_bytes());
+    out[8..].copy_from_slice(&den.to_be_bytes());
+    out
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
@@ -261,8 +294,8 @@ mod tests {
     #[test]
     fn scalars_are_deterministic() {
         let pk = pk_at(0);
-        let a = Scalars::compute(b32(1), 5, &pk, b32(2));
-        let b = Scalars::compute(b32(1), 5, &pk, b32(2));
+        let a = Scalars::compute(b32(1), 5, &pk, b32(2), 2, 3, b32(7));
+        let b = Scalars::compute(b32(1), 5, &pk, b32(2), 2, 3, b32(7));
         assert_eq!(a, b);
     }
 
@@ -278,43 +311,54 @@ mod tests {
     #[test]
     fn scalars_change_when_any_input_changes() {
         let pk = pk_at(0);
-        let base = Scalars::compute(b32(1), 5, &pk, b32(2));
+        let base = Scalars::compute(b32(1), 5, &pk, b32(2), 2, 3, b32(7));
 
         // Vary registration_merkle_root.
-        let v1 = Scalars::compute(b32(0xAA), 5, &pk, b32(2));
+        let v1 = Scalars::compute(b32(0xAA), 5, &pk, b32(2), 2, 3, b32(7));
         assert_ne!(base.s1, v1.s1);
         assert_eq!(base.s2, v1.s2);
 
-        // Vary registration_count.
-        let v2 = Scalars::compute(b32(1), 6, &pk, b32(2));
+        // Vary registration_vote_weight.
+        let v2 = Scalars::compute(b32(1), 6, &pk, b32(2), 2, 3, b32(7));
         assert_eq!(base.s1, v2.s1);
         assert_ne!(base.s2, v2.s2);
 
         // Vary agg_signers.
-        let v3 = Scalars::compute(b32(1), 5, &pk_at(1), b32(2));
+        let v3 = Scalars::compute(b32(1), 5, &pk_at(1), b32(2), 2, 3, b32(7));
         assert_eq!(base.s1, v3.s1);
         assert_eq!(base.s2, v3.s2);
         assert_ne!(base.s3, v3.s3);
 
         // Vary vote_message.
-        let v4 = Scalars::compute(b32(1), 5, &pk, b32(0xCC));
+        let v4 = Scalars::compute(b32(1), 5, &pk, b32(0xCC), 2, 3, b32(7));
         assert_ne!(base.s4, v4.s4);
+
+        // Vary threshold (num).
+        let v5 = Scalars::compute(b32(1), 5, &pk, b32(2), 9, 3, b32(7));
+        assert_ne!(base.s5, v5.s5);
+        assert_eq!(base.s4, v5.s4);
+
+        // Vary ballot_launcher_id.
+        let v6 = Scalars::compute(b32(1), 5, &pk, b32(2), 2, 3, b32(0xBB));
+        assert_ne!(base.s6, v6.s6);
+        assert_eq!(base.s5, v6.s5);
     }
 
-    /// WHAT: scalar `s2` is `sha256(count.to_be_bytes())`.
-    /// HOW:  run scalars on a recognisable count (1234567890),
+    /// WHAT: scalar `s2` is `sha256(weight.to_be_bytes())`.
+    /// HOW:  run scalars on a recognisable weight (1234567890),
     ///       independently compute sha256 of its big-endian 8-byte
     ///       form, assert equality.
-    /// WHY:  the Rue side uses `int_to_8_bytes_be` for the count
-    ///       encoding. Any mismatch (e.g., little-endian, varint)
-    ///       would mean the on-chain verifier sees a different scalar
-    ///       than the prover used.
+    /// WHY:  the Rue side uses `int_to_8_bytes_be` for the
+    ///       registration_vote_weight encoding. Any mismatch (e.g.,
+    ///       little-endian, varint) would mean the on-chain verifier
+    ///       sees a different scalar than the prover used.
     #[test]
-    fn s2_uses_be8_encoding_of_count() {
+    fn s2_uses_be8_encoding_of_vote_weight() {
         let pk = pk_at(0);
-        let scalars = Scalars::compute(b32(0), 1234567890u64, &pk, b32(0));
+        let scalars =
+            Scalars::compute(b32(0), 1234567890u64, &pk, b32(0), 1, 2, b32(0));
 
-        // s2 = mod_r(sha256(count_be8)) per the on-chain
+        // s2 = mod_r(sha256(weight_be8)) per the on-chain
         // CLVM-compatible scalar encoding (see Scalars::compute
         // doc-comment for why the mod-r reduction is required).
         let mut h = Sha256::new();
@@ -340,7 +384,7 @@ mod tests {
     #[test]
     fn s3_uses_compressed_g1_encoding() {
         let pk = pk_at(0);
-        let scalars = Scalars::compute(b32(0), 0, &pk, b32(0));
+        let scalars = Scalars::compute(b32(0), 0, &pk, b32(0), 1, 2, b32(0));
         let mut h = Sha256::new();
         h.update(pk.to_bytes());
         let mut sha_out = [0u8; 32];
@@ -352,8 +396,35 @@ mod tests {
         assert_eq!(scalars.s3, expected_mod_r);
     }
 
-    /// WHAT: `Scalars::as_array` returns the 4 scalars in the canonical
-    ///       `(s1, s2, s3, s4)` order.
+    /// WHAT: scalar `s5` is `sha256(threshold_pack(num, den)) mod r`,
+    ///       where `threshold_pack` is the 16-byte big-endian blob
+    ///       `int_to_8_bytes_be(num) || int_to_8_bytes_be(den)`.
+    /// HOW:  recompute the pack inline and the mod-r reduction by hand.
+    /// WHY:  this scalar binds the circuit to the on-chain curried
+    ///       quorum threshold. The on-chain finalize.rue uses the
+    ///       same 16-byte preimage; a different layout would cause
+    ///       universal on-chain rejection.
+    #[test]
+    fn s5_uses_threshold_pack_bytes() {
+        let pk = pk_at(0);
+        let scalars =
+            Scalars::compute(b32(0), 0, &pk, b32(0), 2, 3, b32(0));
+        let mut h = Sha256::new();
+        let mut pack = [0u8; 16];
+        pack[..8].copy_from_slice(&2u64.to_be_bytes());
+        pack[8..].copy_from_slice(&3u64.to_be_bytes());
+        h.update(pack);
+        let mut sha_out = [0u8; 32];
+        sha_out.copy_from_slice(&h.finalize());
+        let raw = Bytes32::new(sha_out);
+        let fr = crate::prover::conversions::bytes32_to_fr(&raw);
+        let expected_mod_r =
+            Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&fr));
+        assert_eq!(scalars.s5, expected_mod_r);
+    }
+
+    /// WHAT: `Scalars::as_array` returns the 6 scalars in the canonical
+    ///       `(s1, s2, s3, s4, s5, s6)` order.
     /// HOW:  build a recognisable Scalars value and assert each entry.
     /// WHY:  this array is the form `VotingCircuit::verify_offchain`
     ///       takes. Any reordering would silently break verification
@@ -365,12 +436,16 @@ mod tests {
             s2: b32(0x22),
             s3: b32(0x33),
             s4: b32(0x44),
+            s5: b32(0x55),
+            s6: b32(0x66),
         };
         let arr = s.as_array();
         assert_eq!(arr[0], b32(0x11));
         assert_eq!(arr[1], b32(0x22));
         assert_eq!(arr[2], b32(0x33));
         assert_eq!(arr[3], b32(0x44));
+        assert_eq!(arr[4], b32(0x55));
+        assert_eq!(arr[5], b32(0x66));
     }
 
     /// WHAT: `Groth16Proof` serialises through `serde_json` round-
@@ -411,9 +486,12 @@ mod tests {
         let (pk, _vk) = generate_test_setup(&mut rng).unwrap();
         let circuit = VotingCircuit {
             registration_merkle_root: b32(0x11),
-            registration_count: 3,
+            registration_vote_weight: 3,
             agg_signers: pk_at(0),
             vote_message: b32(0x42),
+            vote_threshold_num: 2,
+            vote_threshold_den: 3,
+            ballot_launcher_id: b32(0x77),
             signers: (0..2)
                 .map(|i| SignerWitness {
                     pubkey: pk_at(i + 1),

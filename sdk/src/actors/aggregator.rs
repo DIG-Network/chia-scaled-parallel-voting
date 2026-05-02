@@ -391,11 +391,23 @@ impl<C: ChainReader> Aggregator<C> {
             return Err(VotingError::InvalidSignature);
         }
 
+        // CHIP rev 2026-05-02: 6 public inputs. The aggregator does
+        // not yet know `vote_threshold_num/den` (curried into the
+        // ballot_coin/finalize puzzle, plumbed in Phase 6) — pass
+        // (0, 0) as placeholders. These produce a *deterministic*
+        // s5 that won't match the real on-chain s5; the
+        // `prepare_finalize_witness` API contract documents this as
+        // "off-chain skeleton; rebuild scalars in Phase 6 spend
+        // builder once threshold is in scope". TODO(phase6): thread
+        // (num, den) through this method.
         let scalars = Scalars::compute(
             voter_set.registration_merkle_root,
             voter_set.registration_count,
             &agg_signers,
             vote_message,
+            0,
+            0,
+            ballot_launcher_id,
         );
 
         Ok(FinalizeWitness {
