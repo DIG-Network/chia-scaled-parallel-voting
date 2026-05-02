@@ -28,6 +28,7 @@
 //     ballot_oracle_announcement_id below.
 
 import super::common_types::*;
+import super::voting_coin::shared::*;
 import shared::*;
 
 inline fn ballot_slot_from_id(ballot_launcher_id: Bytes32) -> Int {

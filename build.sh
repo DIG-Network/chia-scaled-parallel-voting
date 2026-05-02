@@ -18,6 +18,8 @@ LIBRARIES=(
     "puzzles/merkle_utils.rue"
     "puzzles/election/shared.rue"
     "puzzles/registration_coin/shared.rue"
+    "puzzles/ballot_coin/shared.rue"
+    "puzzles/voting_coin/shared.rue"
 )
 
 is_library() {
