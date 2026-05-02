@@ -5,13 +5,29 @@
 // MODULE: actors::voter
 // PURPOSE: Stateful actor representing one voter. Owns:
 //          * the voter's BLS keys
-//          * a reference to a dig-l1-wallet (XCH + CAT)
 //          * the shared ElectionConfig
+//          * the network type (selects mainnet/testnet AGG_SIG additional data)
 //
-// SUPPORTED FLOWS:
-//   * register          — register-action spend (CAT collateral + XCH fee)
-//   * vote              — vote-action spend on the registration coin
-//   * release_collateral — release-action + announce-finalization spend
+// SUPPORTED FLOWS (CHIP rev 2026-05-02):
+//   * register          — register-action spend on the Election
+//                         Singleton. Mints a CAT-wrapped Registration
+//                         Coin at the voter's predicted puzzle hash.
+//                         No XCH fee output (fees were dropped in
+//                         this revision).
+//   * cast_vote         — STUB. Mints the per-(voter, ballot)
+//                         Voting Coin via the Registration Coin's
+//                         `mint_voting_coin` action. Full
+//                         implementation lands in Phase 6 once the
+//                         test infrastructure can drive a simulator
+//                         end-to-end.
+//   * update_vote       — STUB. Updates a Voting Coin's vote
+//                         payload via its `update_vote` action,
+//                         gated by the Ballot Coin oracle.
+//   * release_collateral — STUB. Co-spends the Election Singleton's
+//                         `deregister` action with the Registration
+//                         Coin's `release` action, sending the CAT
+//                         collateral to a destination chosen by the
+//                         voter.
 //
 // SIGNING: every spend bundle is signed via the upstream
 //   `dig_l1_wallet::transaction::sign_coin_spends`
@@ -31,9 +47,9 @@ use clvm_traits::ToClvm;
 use dig_l1_wallet::NetworkType;
 
 use crate::action_spends::{
-    build_action_layer_puzzle, build_action_layer_solution, build_cat_spend,
-    build_election_finalizer_full, build_registration_finalizer_full,
-    build_singleton_spend, load_action_puzzle, ActionSpend,
+    build_action_layer_puzzle, build_action_layer_solution,
+    build_election_finalizer_full, build_singleton_spend, load_action_puzzle,
+    ActionSpend,
 };
 use crate::actors::deployer::sign_bundle_signature;
 use crate::chain::ChainReader;
@@ -61,11 +77,11 @@ impl VoterKeys {
     }
 
     /// FN: sign_unsafe
-    /// WHAT: BLS-sign `message` verbatim — the same shape the on-chain
+    /// WHAT: BLS-sign `message` verbatim — the same shape an on-chain
     ///       `AggSigUnsafe(VOTER_PUBKEY, vote_message)` condition
-    ///       requires (no augmentation).
-    /// USAGE: the vote action's solution requires the voter's
-    ///        AggSigUnsafe over `vote_message(vote_data)`.
+    ///       requires (no augmentation). Used for the per-(voter,
+    ///       ballot) memo signature on the Voting Coin's
+    ///       `update_vote` action (CHIP rev 2026-05-02).
     pub fn sign_unsafe(&self, message: &[u8]) -> Signature {
         chia_bls::sign_raw(&self.secret, message)
     }
@@ -87,6 +103,41 @@ pub struct Voter {
     pub config: ElectionConfig,
     pub keys: VoterKeys,
     pub network: NetworkType,
+}
+
+/// STRUCT: CastVoteParams
+/// PURPOSE: typed bundle for `Voter::cast_vote` arguments.
+/// FIELDS:
+///   * `ballot_launcher_id` — singleton launcher id of the Ballot
+///     Coin this voter is voting on. Binds the Voting Coin to a
+///     single ballot so the SPT slot in `voted_ballots_root`
+///     can't be reused across ballots.
+///   * `vote_data` — the 32-byte payload the voter is committing
+///     to. Typically `sha256(application-specific outcome)`. Sent
+///     as a memo on the Voting Coin so the off-chain aggregator
+///     can read it back without re-running the puzzle.
+pub struct CastVoteParams {
+    pub ballot_launcher_id: Bytes32,
+    pub vote_data: Bytes32,
+}
+
+/// STRUCT: CastVoteResult
+/// PURPOSE: outputs from `Voter::cast_vote`.
+/// FIELDS:
+///   * `voting_coin_id` — coin id of the freshly-minted Voting Coin.
+///     Stable for any subsequent `update_vote` / aggregator lookup.
+///   * `spend_bundle` — fully-signed spend bundle pushable to the
+///     mempool.
+///   * `vote_signature` — BLS signature over the canonical
+///     vote-message (`puzzles::vote_message(vote_data,
+///     ballot_launcher_id, election_launcher_id)`) using
+///     `sign_unsafe`. Written into the Voting Coin's memos; the
+///     off-chain aggregator BLS-aggregates these per-ballot to
+///     produce the finalize witness.
+pub struct CastVoteResult {
+    pub voting_coin_id: Bytes32,
+    pub spend_bundle: SpendBundle,
+    pub vote_signature: chia_protocol::Bytes,
 }
 
 impl Voter {
@@ -113,11 +164,11 @@ impl Voter {
         let cat_tail_hash = self
             .config
             .cat_tail_hash()
-            .map_err(|e| VotingError::Other(anyhow_compat::Error(e.into())))?;
+            .map_err(|e| voting_other(format!("cat_tail_hash: {e}")))?;
         let election_id = self
             .config
             .election_launcher_id()
-            .map_err(|e| VotingError::Other(anyhow_compat::Error(e.into())))?;
+            .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
         Ok(puzzles::fresh_registration_coin_puzzle_hash(
             cat_tail_hash,
             &self.keys.pubkey,
@@ -127,17 +178,18 @@ impl Voter {
 
     /// FN: voter_hint
     /// WHAT: stable coin-state hint for tracking this voter's
-    ///       Registration Coin lineage across vote / release spends.
+    ///       Registration Coin lineage across mint_voting_coin /
+    ///       release spends.
     /// USAGE: `chain.get_coin_records_by_hint(voter_hint_hex(), ..)`.
     pub fn voter_hint(&self) -> VotingResult<Bytes32> {
         let election_id = self
             .config
             .election_launcher_id()
-            .map_err(|e| VotingError::Other(anyhow_compat::Error(e.into())))?;
+            .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
         let cat_tail_hash = self
             .config
             .cat_tail_hash()
-            .map_err(|e| VotingError::Other(anyhow_compat::Error(e.into())))?;
+            .map_err(|e| voting_other(format!("cat_tail_hash: {e}")))?;
         Ok(puzzles::voter_hint(election_id, cat_tail_hash, &self.keys.pubkey))
     }
 
@@ -150,28 +202,26 @@ impl Voter {
 
     /// Build a registration spend bundle.
     ///
-    /// The full implementation is structurally identical to
-    /// `chia_l2_consensus::client::register_validator`. It composes:
+    /// The full implementation composes:
     ///
-    ///   1. **CAT collateral spend** — `dig_l1_wallet::L1Wallet::
-    ///      select_cat_coins` to pick CAT inputs, then
-    ///      `chia_sdk_driver::Cat::issue_with_coin` (or
-    ///      `Cat::spend_all` against existing CATs) to send
-    ///      COLLATERAL_AMOUNT into the Registration Coin's expected
-    ///      puzzle hash. The CAT spend's inner conditions include the
-    ///      `create_reg` `CreateCoinAnnouncement` that the Election
-    ///      Singleton's register action asserts.
-    ///   2. **Election Singleton spend** — wraps the action layer with
-    ///      the `register` action selected. The action's solution
-    ///      carries `(new_voter_pubkey, register_leaf_index,
-    ///      register_siblings, cat_parent_coin_id)`.
-    ///   3. **XCH wallet spend** — `L1Wallet::select_coins` to fund
-    ///      `REGISTRATION_FEE + bundle_fee`.
+    ///   1. **CAT collateral spend** — the caller pre-builds a CAT
+    ///      issuance / spend that creates the Registration Coin at
+    ///      its expected puzzle hash with `COLLATERAL_AMOUNT`. The
+    ///      CAT spend's inner conditions emit the `create_reg`
+    ///      `CreateCoinAnnouncement` that the Election Singleton's
+    ///      register action asserts.
+    ///   2. **Election Singleton spend** — wraps the action layer
+    ///      with the `register` action selected. The action's
+    ///      solution carries `(new_voter_pubkey, register_leaf_index,
+    ///      register_siblings, ...cat_parent_coin_id)`.
+    ///
+    /// Per CHIP rev 2026-05-02 there is **no XCH registration fee**;
+    /// callers that want to attach a fee output build it externally.
     ///
     /// Final signing uses [`sign_bundle_signature`], which calls
     /// `RequiredSignature::from_coin_spends` to walk every AGG_SIG_*
     /// condition (the voter's `AggSigMe(VOTER_PUBKEY,
-    /// registration_message)` plus the wallet's standard p2 sigs).
+    /// registration_message)`).
     pub async fn register<C: ChainReader>(
         &self,
         smt: &crate::merkle::SparseMerkleTree,
@@ -191,17 +241,19 @@ impl Voter {
             .map_err(|e| voting_other(format!("cat_tail_hash: {e}")))?;
 
         // ── 1. Find the current Election Singleton ──────────────
-        // Never key off the genesis (eve) singleton puzzle hash alone:
-        // each spend changes inner state, so `coin_id` and
-        // `puzzle_hash` change. Walk from `election_launcher_id` to
-        // the latest **unspent** coin (see `find_current_singleton`).
-        // Use the propagation-aware poller: on mainnet a
-        // freshly-confirmed spend can take blocks to show on every
-        // peer in the chia_query pool — same as
-        // `wait_for_unspent_coin_at_puzzle_hash`, but for lineage.
+        // After CHIP rev 2026-05-02 the launcher walker requires an
+        // `election_start_height` to predict the eve singleton's
+        // puzzle hash for the fast path. Pass 0 here — the slow
+        // path (`coin_records_by_parent_ids`) succeeds regardless,
+        // and the eve fast path only matters before any singleton
+        // spend has confirmed (in which case
+        // `ElectionState::genesis(_, 0)` matches the deployer's
+        // default in [`Aggregator::new`]).
+        let election_start_height: u64 = 0;
         let current = crate::actors::aggregator::wait_for_current_singleton(
             chain,
             &self.config,
+            election_start_height,
             "Election Singleton (launcher lineage)",
             std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(300),
@@ -221,9 +273,6 @@ impl Voter {
             crate::actors::aggregator::election_actions_merkle_root_for_config(&self.config);
         // Inner puzzle MUST match what's curried into the singleton
         // on-chain (`on_chain_state` from the launcher lineage walk).
-        // Never use `ElectionState::genesis(smt.root())` alone — after
-        // at least one register spend, accumulated state (count,
-        // fees, root) differs from genesis even when `smt` is synced.
         if on_chain_state.registration_merkle_root != smt.root() {
             return Err(voting_other(format!(
                 "Voter::register: aggregator SMT root {} does not match on-chain {} — re-sync",
@@ -240,6 +289,12 @@ impl Voter {
         )?;
 
         // ── 3. Build the curried register action puzzle ─────────
+        // CURRY ORDER (post-CHIP rev 2026-05-02):
+        //   (TREE_DEPTH, EMPTY_LEAF_HASH, CAT_MOD_HASH, CAT_TAIL_HASH,
+        //    ACTION_LAYER_MOD_HASH, REGISTRATION_FINALIZER_MOD_HASH,
+        //    REGISTRATION_MERKLE_ROOT, COLLATERAL_AMOUNT,
+        //    ELECTION_LAUNCHER_ID, EMPTY_BALLOT_ROOT)
+        // (No `registration_fee` — fees were dropped in this revision.)
         let register_program_node =
             load_action_puzzle(&mut ctx, puzzles::ELECTION_REGISTER_HEX)?;
         let register_curried = CurriedProgram {
@@ -253,8 +308,8 @@ impl Voter {
                 PuzzleHashes::registration_finalizer(),
                 puzzles::registration_actions_merkle_root(),
                 self.config.collateral_amount,
-                self.config.registration_fee,
-                election_id
+                election_id,
+                puzzles::empty_ballot_root()
             ),
         }
         .to_clvm(&mut *ctx)
@@ -266,16 +321,9 @@ impl Voter {
         //    ...cat_parent_coin_id)
         //
         // SLOT ENCODING: register.rue's `slot_from_pubkey` builds
-        //   `0x00 || sha256(pk)[0..4]` and casts to Int. That's a
-        //   5-byte atom regardless of the slot's actual value.
-        //   `compute_slot == register_leaf_index` is `clvm =` which
-        //   compares INTEGER values, BUT it ALSO depends on byte
-        //   length when the puzzle uses `(== a b)` patterns that
-        //   compile to raw atom equality (Rue's `==` for ints).
-        //   Mainnet revealed that slots with the high bit CLEAR
-        //   (canonical u64 = 4 bytes) mismatch the puzzle's 5-byte
-        //   form. We pass the slot as the EXACT 5-byte sequence
-        //   the puzzle constructs so `==` always succeeds.
+        //   `0x00 || sha256(pk)[0..4]` and casts to Int. We pass the
+        //   slot as the EXACT 5-byte sequence the puzzle constructs
+        //   so `==` always succeeds regardless of the slot's value.
         let slot = self.slot();
         let siblings = smt.prove(slot);
         let voter_pk_bytes = chia_protocol::Bytes::new(self.keys.pubkey.to_bytes().to_vec());
@@ -302,7 +350,7 @@ impl Voter {
         let elect_finalizer_solution = ().to_clvm(&mut *ctx).map_err(driver_err)?;
         let action_layer_solution = build_action_layer_solution(
             &mut ctx,
-            &election_action_root_leaves(&self.config),
+            &crate::actors::aggregator::compute_election_action_root_leaves(&self.config),
             &action_spends,
             elect_finalizer_solution,
         )?;
@@ -322,13 +370,6 @@ impl Voter {
         // (sha256("register" || pk || election_id)) is automatically
         // collected from the emitted condition by
         // RequiredSignature::from_coin_spends.
-        //
-        // The caller is responsible for any signatures the
-        // cat_parent_spend's inner puzzle requires (e.g., the XCH
-        // wallet's standard p2 sig if cat_parent_spend is a CAT
-        // issuance from a wallet coin) — they should pre-sign that
-        // spend before passing it in. Here we sign ONLY the
-        // register-action's voter sig.
         let coin_spends = vec![cat_parent_spend, register_singleton_spend];
         // Pre-flight: dry-run every coin spend's puzzle so a CLVM
         // `raise` surfaces with the EXACT coin id that failed,
@@ -368,492 +409,92 @@ impl Voter {
         Ok(SpendBundle::new(coin_spends, signature))
     }
 
-    /// Build a vote spend bundle.
+    /// Build a `cast_vote` spend bundle.
     ///
-    /// Single-coin spend. Steps:
+    /// **STUB — full implementation deferred to Phase 6.**
     ///
-    ///   1. **Locate the registration coin**: hex-encode the voter
-    ///      hint (`Self::voter_hint_hex`), call
-    ///      `chain.get_coin_records_by_hint(hint, ..)`, filter to the
-    ///      latest unspent record whose `puzzle_hash` matches
-    ///      `Self::registration_coin_puzzle_hash`.
-    ///   2. **Reconstruct the [`chia_sdk_driver::Cat`] primitive**:
-    ///      fetch the parent spend via `chain.
-    ///      get_puzzle_and_solution(parent_id, height)`, allocate
-    ///      both into a `SpendContext`, and call
-    ///      `Cat::parse_children(&mut ctx, parent_coin, puzzle,
-    ///      solution)` to recover the spendable Cat with its
-    ///      `lineage_proof`.
-    ///   3. **Build the action-layer inner spend**:
-    ///        - construct the action selectors + Merkle proofs against
-    ///          [`puzzles::registration_actions_merkle_root`];
-    ///        - the vote action's solution is `(vote_data,
-    ///          vote_signature)`;
-    ///        - the action layer's puzzle reveal is
-    ///          [`puzzles::ACTION_LAYER_HEX`] curried with
-    ///          `(election_finalizer_full_hash, MERKLE_ROOT, STATE)`.
-    ///   4. **Wrap with [`chia_sdk_driver::CatSpend`]** and call
-    ///      `Cat::spend_all(&mut ctx, &[cat_spend])` — handles ring
-    ///      announcements, prev_subtotal, extra_delta, etc.
-    ///   5. **Sign** with [`Self::sign_with_voter_and_wallet_keys`].
-    ///   6. Wrap with `assemble_spend_bundle`.
-    pub async fn vote<C: ChainReader>(
+    /// The eventual flow (per CHIP rev 2026-05-02):
+    ///   1. Locate the voter's current Registration Coin via
+    ///      `voter_hint`.
+    ///   2. Drive the Registration Coin's `mint_voting_coin` action,
+    ///      whose solution carries the SPT proof for the ballot's
+    ///      slot in `voted_ballots_root` plus the Ballot Coin
+    ///      oracle's `open` announcement (proves the ballot is
+    ///      still open at this height).
+    ///   3. Mint the singleton-style Voting Coin at
+    ///      `puzzles::voting_coin_state_tree_hash(...)`'s
+    ///      predicted puzzle hash, hinted by
+    ///      `puzzles::voting_coin_hint(...)`.
+    ///   4. Sign the voter's AggSigMe over the canonical
+    ///      `puzzles::vote_message(vote_data, ballot_launcher_id,
+    ///      election_launcher_id)`.
+    pub async fn cast_vote<C: ChainReader>(
         &self,
-        vote_data: Bytes32,
-        chain: &C,
+        _chain: &C,
+        _params: CastVoteParams,
+    ) -> VotingResult<CastVoteResult> {
+        Err(VotingError::Other(anyhow_compat::Error(
+            "Voter::cast_vote stubbed pending Phase 6 (voting coin lineage)".into(),
+        )))
+    }
+
+    /// Build an `update_vote` spend bundle.
+    ///
+    /// **STUB — full implementation deferred to Phase 6.**
+    ///
+    /// The eventual flow (per CHIP rev 2026-05-02):
+    ///   1. Locate the voter's current Voting Coin via
+    ///      `voting_coin_hint(election_id, cat_tail, pk,
+    ///      ballot_launcher_id)`.
+    ///   2. Drive the Voting Coin's `update_vote` action. Its
+    ///      solution must include the Ballot Coin oracle's `open`
+    ///      announcement and a fresh AggSigMe from the voter over
+    ///      the new vote payload.
+    ///   3. Recreate the Voting Coin at the updated state with the
+    ///      new memo signature.
+    ///
+    /// **Importantly: NO singleton co-spend.** The Voting Coin's
+    /// own oracle binding to the Ballot Coin replaces the legacy
+    /// Election Singleton oracle action (which was deleted in
+    /// commit `9e79ddd`).
+    pub async fn update_vote<C: ChainReader>(
+        &self,
+        _chain: &C,
+        _voting_coin_id: Bytes32,
+        _new_vote_data: Bytes32,
     ) -> VotingResult<SpendBundle> {
-        let cat_tail_hash = self
-            .config
-            .cat_tail_hash()
-            .map_err(|e| voting_other(format!("cat_tail_hash: {e}")))?;
-        let election_id = self
-            .config
-            .election_launcher_id()
-            .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
-
-        // The vote action's solution carries TWO logical pieces of
-        // signing material:
-        //
-        //  (a) The bundle's aggregated BLS signature (NOT in the
-        //      solution — collected later via
-        //      `sign_bundle_signature`). It must include the voter's
-        //      `sign_raw` over `vote_message(vote_data)` =
-        //      `sha256("vote" || election_id || pk || vote_data)`,
-        //      because `vote.rue` emits an
-        //      `AggSigUnsafe(voter_pubkey, vote_message)` condition
-        //      that consensus's signature verifier walks.
-        //      `RequiredSignature::from_coin_spends` builds that
-        //      `(pk, message)` pair automatically; our signing pool
-        //      contains the voter's secret key so the resulting
-        //      aggregated signature satisfies it.
-        //
-        //  (b) The `vote_signature` field of the action's solution
-        //      itself. The on-chain puzzle does NOT verify this
-        //      cryptographically — it just hands it to the finalizer,
-        //      which writes it into the recreated coin's memos so the
-        //      OFF-CHAIN aggregator (`extract_votes`) can read it
-        //      with one coin-record lookup. The aggregator then
-        //      BLS-sums every voter's memo signature and verifies the
-        //      sum against the canonical aggregate message
-        //      `sha256(vote_outcome || election_id)` (see
-        //      `Aggregator::prepare_finalize_witness`).
-        //
-        // For the canonical voting flow each voter votes for the
-        // outcome they want adopted — i.e., `vote_outcome ==
-        // vote_data`. The memo signature is a BLS signature over
-        // `sha256(vote_data || election_id)` using `sign_unsafe`
-        // (== `chia_bls::sign_raw`) — UNAUGMENTED. Voters do NOT
-        // augment with their own pubkey because the on-chain
-        // verification uses single-pair BLS aggregate semantics:
-        //
-        //   e(agg_signers, H(canonical_message)) ==
-        //     e(G1_GENERATOR, agg_sig)
-        //
-        // (`puzzles/election/finalize.rue`'s
-        // `bls_pairing_identity`). Algebraically that requires
-        //
-        //   agg_sig = sk_agg · H(canonical_message)
-        //          = (Σ sk_i) · H(canonical_message)
-        //          = Σ (sk_i · H(canonical_message))
-        //          = Σ sign_raw(sk_i, canonical_message)
-        //
-        // — exactly the sum the off-chain aggregator forms from
-        // these per-voter memo signatures. PoP-style; the rogue-key
-        // attack is closed by the Groth16 circuit's "agg_signers ==
-        // G1 sum of signing pubkeys" binding (CHIP-Groth16-L2
-        // constraint D).
-        //
-        // DST: `chia_bls::sign_raw` hashes under the standard Chia
-        // augmented-scheme DST (`BLS_SIG_BLS12381G2_XMD:
-        // SHA-256_SSWU_RO_AUG_`) without applying the per-pubkey
-        // augmentation. This matches CLVM's `g2_map` default, so
-        // the on-chain `g2_map(canonical_message)` produces the
-        // same `H(canonical_message)` we sign here.
-        //
-        // EARLIER INCARNATIONS that surfaced on mainnet:
-        //   * Used `sign_unsafe` over the per-voter on-chain
-        //     `vote_message` instead of the canonical aggregate
-        //     message — `Aggregator::build_finalize` rejected with
-        //     `InvalidSignature` because the memo signatures
-        //     couldn't aggregate-verify against the canonical
-        //     message at all.
-        //   * Switched to `chia_bls::sign` (augmented) over the
-        //     canonical message — off-chain aggregator pre-check
-        //     passed (uses `aggregate_verify` which augments per
-        //     pair), but on-chain `bls_verify(agg_sig, agg_signers,
-        //     vote_message)` rejected with `bls_verify failed`
-        //     because the augmented-per-voter sigs couldn't
-        //     collapse to the single-pair augmented form. We then
-        //     switched the on-chain check to a PoP-style
-        //     `bls_pairing_identity` and reverted the voter to
-        //     `sign_raw` — the configuration we're in now.
-        // Pinned by `voter_canonical_signature_pop_pairing_verifies`.
-        let canonical_message = canonical_vote_message_for(vote_data, election_id);
-        let vote_signature = self.keys.sign_unsafe(canonical_message.as_ref());
-
-        // ── 1. Locate the voter's registration coin ─────────────
-        // `coin_records_by_hint` returns the full lineage (spent +
-        // unspent). Never take `find(is_unspent)` alone — if the same
-        // hint ever indexed multiple live coins, the iterator order
-        // could pick a stale row. Only the coin whose outer puzzle
-        // hash matches the **pre-vote** `fresh_registration_*` shape
-        // is spendable with the vote action.
-        let hint = self.voter_hint()?;
-        let expected_outer_ph =
-            puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &self.keys.pubkey, election_id);
-        let reg_records = chain.coin_records_by_hint(hint).await?;
-        let reg_record = reg_records
-            .into_iter()
-            .filter(|r| r.is_unspent() && r.coin.puzzle_hash == expected_outer_ph)
-            .max_by_key(|r| r.confirmed_height)
-            .ok_or_else(|| {
-                voting_other(format!(
-                    "Voter::vote: no unspent registration coin at pre-vote puzzle hash {} \
-                     (hint {}). Has the voter registered? If so, they may already have voted — \
-                     the post-vote puzzle hash differs from the fresh-registration hash.",
-                    hex::encode(expected_outer_ph),
-                    hex::encode(hint)
-                ))
-            })?;
-        let reg_coin = reg_record.coin;
-
-        // Reconstruct CAT lineage proof from the parent's spend.
-        let cat_lineage = self.reconstruct_cat_lineage(chain, reg_coin).await?;
-
-        // ── 2. Build the action layer + vote action spend ────────
-        let mut ctx = SpendContext::new();
-        let voter_hint = hint;
-        let reg_finalizer = build_registration_finalizer_full(&mut ctx, voter_hint)?;
-        // Pre-vote state: has_voted=false, vote_data=zero,
-        // release_destination=nil.
-        let reg_state_node = self.registration_state_node(
-            &mut ctx,
-            /*has_voted=*/ false,
-            /*vote_data=*/ Bytes32::default(),
-            /*release_destination=*/ None,
-        )?;
-        let reg_action_layer = build_action_layer_puzzle(
-            &mut ctx,
-            reg_finalizer,
-            puzzles::registration_actions_merkle_root(),
-            reg_state_node,
-        )?;
-
-        // Vote action solution: (vote_data, ...vote_signature)
-        let vote_action = load_action_puzzle(&mut ctx, puzzles::REGISTRATION_VOTE_HEX)?;
-        let vote_sig_bytes = chia_protocol::Bytes::new(vote_signature.to_bytes().to_vec());
-        let vote_solution_value = (vote_data, vote_sig_bytes);
-        let vote_solution = vote_solution_value
-            .to_clvm(&mut *ctx)
-            .map_err(driver_err)?;
-        let action_spends = vec![ActionSpend {
-            puzzle: vote_action,
-            solution: vote_solution,
-        }];
-        // Registration finalizer takes ...my_amount: Int.
-        let reg_finalizer_solution = reg_coin.amount.to_clvm(&mut *ctx).map_err(driver_err)?;
-        let action_layer_solution = build_action_layer_solution(
-            &mut ctx,
-            &registration_action_root_leaves(),
-            &action_spends,
-            reg_finalizer_solution,
-        )?;
-
-        let vote_spend = build_cat_spend(
-            &mut ctx,
-            reg_coin,
-            cat_tail_hash,
-            reg_action_layer,
-            action_layer_solution,
-            cat_lineage,
-            reg_coin.coin_id(),
-            reg_coin.coin_id(),
-            0,
-        )?;
-
-        // ── 3. Sign + assemble bundle ────────────────────────────
-        // Voter's AggSigUnsafe over vote_message is automatically
-        // collected from the emitted condition by
-        // RequiredSignature::from_coin_spends.
-        let coin_spends = vec![vote_spend];
-        crate::dry_run_coin_spends(&coin_spends)
-            .map_err(|e| voting_other(format!("Voter::vote dry-run: {e:?}")))?;
-        let signature =
-            sign_bundle_signature(&coin_spends, std::slice::from_ref(&self.keys.secret), self.network)?;
-        Ok(SpendBundle::new(coin_spends, signature))
+        Err(VotingError::Other(anyhow_compat::Error(
+            "Voter::update_vote stubbed pending Phase 6".into(),
+        )))
     }
 
     /// Build a collateral release spend bundle.
     ///
-    /// Two-coin spend bundle:
-    ///   1. Election Singleton spend (`announce_finalization` action) —
-    ///      emits the finalization CreateCoinAnnouncement keyed on
-    ///      `(vote_outcome, count, root)`.
-    ///   2. CAT-wrapped Registration Coin spend (`release` action) —
-    ///      asserts that announcement (using the announcer's
-    ///      coin_id supplied via the solution), emits AggSigMe over
-    ///      `(pubkey, election_id, destination)`, and sends the CAT
-    ///      collateral to `destination`.
+    /// **STUB — full implementation deferred to Phase 6.**
     ///
-    /// CONTRACT: the Election Singleton MUST already be finalized
-    /// (state.finalized = true) — `announce_finalization` asserts
-    /// this. The voter's registration coin can be in any state
-    /// (has_voted=true OR false; un-voted registrants still recover
-    /// their collateral).
+    /// The eventual flow (per CHIP rev 2026-05-02):
+    ///   1. Co-spend the Election Singleton's `deregister` action,
+    ///      which announces `puzzles::deregister_announcement_msg(
+    ///      voter_pubkey)` and decrements
+    ///      `(registration_count, registration_vote_weight)`.
+    ///   2. Spend the voter's Registration Coin (located by
+    ///      `voter_hint`) via its `release` action; the action
+    ///      asserts the singleton's `deregister` announcement,
+    ///      emits AggSigMe over the release message, and sends
+    ///      the CAT collateral to `destination`.
     ///
-    /// CHAIN READS:
-    ///   * [`crate::actors::aggregator::wait_for_current_singleton`] to
-    ///     find the Election Singleton by launcher-id lineage — not a
-    ///     fixed genesis puzzle hash.
-    ///   * `coin_records_by_hint` on the voter's hint to find the
-    ///     voter's current registration coin.
-    ///   * `puzzle_and_solution` on each parent to derive lineage
-    ///     proofs.
+    /// The legacy `announce_finalization` action no longer exists
+    /// (per-ballot finalization moved to the Ballot Coin); the
+    /// release spend is gated entirely on `deregister`.
     pub async fn release_collateral<C: ChainReader>(
         &self,
-        destination: Bytes32,
-        chain: &C,
+        _chain: &C,
+        _registration_coin_id: Bytes32,
+        _destination: Bytes32,
     ) -> VotingResult<SpendBundle> {
-        let election_id = self
-            .config
-            .election_launcher_id()
-            .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
-        let cat_tail_hash = self
-            .config
-            .cat_tail_hash()
-            .map_err(|e| voting_other(format!("cat_tail_hash: {e}")))?;
-
-        // ── 1–2. Resolve launcher lineage + finalized state ───────
-        // Puzzle hash changes after every singleton spend — only a
-        // launcher-parent walk yields the spendable coin and correct
-        // `Proof::Lineage` / `Proof::Eve` (same as registration).
-        let current = crate::actors::aggregator::wait_for_current_singleton(
-            chain,
-            &self.config,
-            "Election Singleton (releaseCollateral)",
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(300),
-        )
-        .await?;
-        if !current.state.finalized {
-            return Err(voting_other(
-                "Voter::release_collateral: election is not finalized — \
-                 cannot release collateral until finalize action has run",
-            ));
-        }
-        let outcome = current.state.vote_outcome;
-        let count = current.state.registration_count;
-        let root = current.state.registration_merkle_root;
-
-        let singleton_coin = current.coin;
-        let singleton_lineage_proof = current.lineage_proof;
-        let singleton_coin_id = singleton_coin.coin_id();
-
-        // ── 3. Find the voter's registration coin ────────────────
-        let hint = self.voter_hint()?;
-        let reg_records = chain.coin_records_by_hint(hint).await?;
-        let reg_record = reg_records
-            .into_iter().find(|r| r.is_unspent())
-            .ok_or_else(|| {
-                voting_other(format!(
-                    "Voter::release_collateral: no unspent registration coin \
-                     found for hint {} — has the voter registered?",
-                    hex::encode(hint)
-                ))
-            })?;
-        let reg_coin = reg_record.coin;
-
-        // Reconstruct CAT lineage proof from the parent's spend.
-        let cat_lineage = self.reconstruct_cat_lineage(chain, reg_coin).await?;
-
-        // Determine whether `reg_coin` is the FRESH (just-registered)
-        // coin or the POST-VOTE recreation, by comparing its
-        // puzzle_hash to the curried fresh-registration puzzle hash
-        // (which encodes `has_voted=false, vote_data=0, dest=None`).
-        // The on-chain Registration Coin's CAT-wrapped puzzle hash
-        // changes whenever the action layer's curried state changes,
-        // so an exact match → pre-vote, mismatch → post-vote (the
-        // voter's `vote` action ran and rewrapped at a NEW state).
-        //
-        // For the post-vote case we MUST recover the actual `vote_data`
-        // the voter cast, because the release action's puzzle reveal
-        // re-wraps at the CURRENT (post-vote) state. The `vote` action
-        // wrote `vote_data` into the recreated coin's memos as
-        // `[hint, vote_data, vote_signature]` (per
-        // `puzzles/registration_coin/finalizer.rue`), so we read it
-        // back from the parent's spend.
-        let fresh_ph = puzzles::fresh_registration_coin_puzzle_hash(
-            cat_tail_hash,
-            &self.keys.pubkey,
-            election_id,
-        );
-        let (reg_has_voted, reg_vote_data) = if reg_coin.puzzle_hash == fresh_ph {
-            (false, Bytes32::default())
-        } else {
-            // Post-vote: parse memos from the parent spend.
-            let parent_id = reg_coin.parent_coin_info;
-            let (parent_puzzle, parent_solution) = chain
-                .puzzle_and_solution(parent_id)
-                .await?
-                .ok_or_else(|| voting_other(format!(
-                    "Voter::release_collateral: parent {} of post-vote registration coin not spent / not found",
-                    hex::encode(parent_id)
-                )))?;
-            let memos = crate::actors::aggregator::extract_create_coin_memos(
-                &parent_puzzle,
-                &parent_solution,
-                reg_coin.puzzle_hash.into(),
-            )
-            .map_err(|e| voting_other(format!(
-                "Voter::release_collateral: extract_create_coin_memos for parent {}: {e}",
-                hex::encode(parent_id)
-            )))?;
-            // Memos are [hint, vote_data, vote_signature]. Pick the
-            // 32-byte memo whose value isn't the hint — that's vote_data.
-            let mut vote_data: Option<Bytes32> = None;
-            for m in &memos {
-                if m.len() == 32 && m.as_slice() != hint.as_ref() {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(m);
-                    vote_data = Some(Bytes32::new(arr));
-                    break;
-                }
-            }
-            let vd = vote_data.ok_or_else(|| voting_other(format!(
-                "Voter::release_collateral: post-vote registration coin {} parent spend's memos contain no \
-                 32-byte vote_data (memos: {})",
-                hex::encode(reg_coin.coin_id()),
-                memos.iter().map(hex::encode).collect::<Vec<_>>().join(", ")
-            )))?;
-            (true, vd)
-        };
-        tracing::debug!(
-            reg_coin_id = %hex::encode(reg_coin.coin_id()),
-            has_voted = reg_has_voted,
-            vote_data = %hex::encode(reg_vote_data),
-            "Voter::release_collateral: detected registration coin state"
-        );
-
-        // ── 4. Build the announce_finalization spend (singleton) ──
-        let mut ctx = SpendContext::new();
-        let elect_finalizer = build_election_finalizer_full(&mut ctx, election_id)?;
-
-        // The election's MERKLE_ROOT is per-deployment.
-        let election_merkle_root =
-            crate::actors::aggregator::election_actions_merkle_root_for_config(&self.config);
-        let election_state_node = self.election_state_node(&mut ctx, &current.state)?;
-        let action_layer_node = build_action_layer_puzzle(
-            &mut ctx,
-            elect_finalizer,
-            election_merkle_root,
-            election_state_node,
-        )?;
-
-        // announce_finalization takes (StateTruth) only — no extra
-        // args. Build its solution here.
-        let announce_action = load_action_puzzle(
-            &mut ctx,
-            puzzles::ELECTION_ANNOUNCE_FINALIZATION_HEX,
-        )?;
-        // Action solution: nil (announce_finalization reads only
-        // from the state truth).
-        let announce_solution = ().to_clvm(&mut *ctx).map_err(driver_err)?;
-        let action_spends = vec![ActionSpend {
-            puzzle: announce_action,
-            solution: announce_solution,
-        }];
-        // Election finalizer takes `..._my_solution: Any` (trailing
-        // tail). For announce_finalization (which doesn't recreate),
-        // pass nil.
-        let finalizer_solution = ().to_clvm(&mut *ctx).map_err(driver_err)?;
-        let action_layer_solution = build_action_layer_solution(
-            &mut ctx,
-            &election_action_root_leaves(&self.config),
-            &action_spends,
-            finalizer_solution,
-        )?;
-
-        let announce_spend = build_singleton_spend(
-            &mut ctx,
-            singleton_coin,
-            election_id,
-            action_layer_node,
-            action_layer_solution,
-            singleton_lineage_proof,
-        )?;
-
-        // ── 5. Build the release spend (CAT-wrapped Reg Coin) ────
-        let voter_hint = hint;
-        let reg_finalizer = build_registration_finalizer_full(&mut ctx, voter_hint)?;
-        // Build the action-layer state at the CURRENT (post-vote-or-pre-vote)
-        // registration-coin state. The `release` action transitions
-        // `release_destination` from None → Some(destination), but the puzzle
-        // REVEAL must match what the on-chain coin currently has — which
-        // depends on whether the voter voted (post-vote: has_voted=true,
-        // vote_data=actual) or not (pre-vote: defaults).
-        let reg_state_node = self.registration_state_node(
-            &mut ctx,
-            reg_has_voted,
-            reg_vote_data,
-            /*release_destination=*/ None,
-        )?;
-        let reg_action_layer = build_action_layer_puzzle(
-            &mut ctx,
-            reg_finalizer,
-            puzzles::registration_actions_merkle_root(),
-            reg_state_node,
-        )?;
-
-        // Release action solution:
-        //   (collateral_destination, singleton_coin_id,
-        //    finalized_outcome, finalized_count, ...finalized_root)
-        let release_action = load_action_puzzle(&mut ctx, puzzles::REGISTRATION_RELEASE_HEX)?;
-        let release_solution_value = (
-            destination,
-            (singleton_coin_id, (outcome, (count, root))),
-        );
-        let release_solution = release_solution_value
-            .to_clvm(&mut *ctx)
-            .map_err(driver_err)?;
-
-        let release_action_spends = vec![ActionSpend {
-            puzzle: release_action,
-            solution: release_solution,
-        }];
-        // Registration coin finalizer takes `...my_amount: Int`
-        // (trailing tail). The dispatcher passes `finalizer_solution`
-        // verbatim — for a single Int, the value goes in directly,
-        // not wrapped in a list.
-        let reg_finalizer_solution = reg_coin.amount.to_clvm(&mut *ctx).map_err(driver_err)?;
-        let reg_action_layer_solution = build_action_layer_solution(
-            &mut ctx,
-            &registration_action_root_leaves(),
-            &release_action_spends,
-            reg_finalizer_solution,
-        )?;
-
-        let release_spend = build_cat_spend(
-            &mut ctx,
-            reg_coin,
-            cat_tail_hash,
-            reg_action_layer,
-            reg_action_layer_solution,
-            cat_lineage,
-            reg_coin.coin_id(),
-            reg_coin.coin_id(),
-            0,
-        )?;
-
-        // ── 6. Sign the bundle ───────────────────────────────────
-        let coin_spends = vec![announce_spend, release_spend];
-        // Voter signs AggSigMe over the release message (handled by
-        // RequiredSignature::from_coin_spends walking conditions).
-        // No wallet signature needed for a release-only bundle.
-        crate::dry_run_coin_spends(&coin_spends)
-            .map_err(|e| voting_other(format!("Voter::release_collateral dry-run: {e:?}")))?;
-        let signature =
-            sign_bundle_signature(&coin_spends, std::slice::from_ref(&self.keys.secret), self.network)?;
-        Ok(SpendBundle::new(coin_spends, signature))
+        Err(VotingError::Other(anyhow_compat::Error(
+            "Voter::release_collateral stubbed pending Phase 6".into(),
+        )))
     }
 
     // ── Internal helpers for spend assembly ─────────────────────
@@ -861,36 +502,12 @@ impl Voter {
     /// Reconstruct the CAT lineage proof for `cat_coin` by parsing
     /// its parent's actual on-chain spend.
     ///
-    /// CONTRACT: `cat_coin` is a CAT-wrapped Registration Coin. Its
-    /// parent is EITHER:
-    ///   * the validator's wallet CAT (which is itself CAT-wrapped at
-    ///     a standard p2 inner) — the case immediately after the
-    ///     `register` action runs, before the voter has voted;
-    ///   * the previous registration coin (CAT-wrapped at the action-
-    ///     layer inner with a different state hash) — the case after
-    ///     a `vote` spend has already moved the lineage forward.
-    ///
-    /// Both shapes are valid CAT v2 spends. The canonical way to
-    /// derive the child's `LineageProof` from the parent's spend is
-    /// [`chia_sdk_driver::Cat::parse_children`], which:
-    ///   1. parses the `CatLayer` (asserting it IS a CAT spend);
-    ///   2. extracts `lineage_proof`, `asset_id`, and the inner
-    ///      puzzle hash from the on-chain reveal;
-    ///   3. runs the inner puzzle to discover child `CreateCoin`
-    ///      conditions and produces a [`Cat`] for each child with the
-    ///      correct `parent_inner_puzzle_hash` baked in.
-    ///
-    /// Hand-rolling this with `voter_hint` lookups was incorrect in
-    /// two ways: (a) the validator's wallet CAT is hinted by its own
-    /// p2 puzzle hash, NOT the voter hint, so the `find_by_hint`
-    /// branch would silently fall through to `None` and emit an
-    /// "eve" lineage proof; (b) even when a hint match existed (post-
-    /// vote release path), the parent's inner puzzle hash was the
-    /// PRE-vote `fresh_registration_inner_hash`, not the post-vote
-    /// inner hash — the CAT outer would then reject the spend with a
-    /// `clvm raise` because the lineage proof's claimed inner ph
-    /// didn't reproduce the parent's outer puzzle hash under the
-    /// CAT curry.
+    /// Salvaged from the pre-CHIP rev 2026-05-02 implementation —
+    /// kept here for the eventual Phase 6 implementations of
+    /// `cast_vote` / `update_vote` / `release_collateral`, all of
+    /// which still need to derive a CAT lineage proof from the
+    /// parent spend.
+    #[allow(dead_code)]
     async fn reconstruct_cat_lineage<C: ChainReader>(
         &self,
         chain: &C,
@@ -969,11 +586,11 @@ impl Voter {
 
     /// Build the ElectionState CLVM tree node.
     ///
-    /// SHAPE: matches Rue's trailing-tail convention from
+    /// SHAPE: matches the post-CHIP rev 2026-05-02 layout from
     /// `puzzles/election/shared.rue`:
-    ///   `(root . (count . (fees . (finalized . vote_outcome))))`
-    /// — `vote_outcome` is the trailing tail (a Bytes32 directly),
-    /// NOT wrapped in `(vote_outcome . NIL)`. The deployer's
+    ///   `(root . (count . (vote_weight . election_start_height)))`
+    /// — `election_start_height` is the trailing tail (a `u64`
+    /// directly), NOT wrapped in `(_ . NIL)`. The deployer's
     /// `genesis_state_tree_hash` predicts the puzzle hash assuming
     /// this exact shape; an extra NIL terminator here would make
     /// the action layer's curried state-hash diverge from the
@@ -989,60 +606,8 @@ impl Voter {
             (
                 state.registration_count,
                 (
-                    state.accumulated_fees,
-                    (state.finalized as u8, state.vote_outcome),
-                ),
-            ),
-        );
-        value.to_clvm(&mut **ctx).map_err(driver_err)
-    }
-
-    /// Build the RegistrationState CLVM tree node.
-    fn registration_state_node(
-        &self,
-        ctx: &mut SpendContext,
-        has_voted: bool,
-        vote_data: Bytes32,
-        release_destination: Option<Bytes32>,
-    ) -> VotingResult<clvmr::NodePtr> {
-        let pk_bytes =
-            chia_protocol::Bytes::new(self.keys.pubkey.to_bytes().to_vec());
-        let election_id = self
-            .config
-            .election_launcher_id()
-            .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
-
-        if release_destination.is_none() {
-            if has_voted {
-                // Rue `Bool` true ↔ 0x01 atom (matches clvm_runner tests).
-                let v = (
-                    pk_bytes,
-                    (election_id, (1u8, (vote_data, ()))),
-                );
-                return v.to_clvm(&mut **ctx).map_err(driver_err);
-            }
-            // Rue `Bool` false ↔ nil (), NOT a 1-byte 0 atom. Must match
-            // `puzzles::fresh_registration_state_tree_hash` / register.rue
-            // initial state or `assert State.has_voted == false` in vote.rue fails.
-            let v = (
-                pk_bytes,
-                (election_id, ((), (vote_data, ()))),
-            );
-            return v.to_clvm(&mut **ctx).map_err(driver_err);
-        }
-
-        // Trailing tail = release_destination (Some).
-        let hv = if has_voted { 1u8 } else { 0u8 };
-        let value = (
-            pk_bytes,
-            (
-                election_id,
-                (
-                    hv,
-                    (
-                        vote_data,
-                        release_destination.expect("branch is Some"),
-                    ),
+                    state.registration_vote_weight,
+                    state.election_start_height,
                 ),
             ),
         );
@@ -1067,22 +632,13 @@ impl Voter {
         )
     }
 
-    /// The byte-exact message this voter signs to cast a vote.
-    pub fn vote_message(&self, vote_data: Bytes32) -> Bytes32 {
-        use sha2::{Digest, Sha256};
-        let election_id = self.config.election_launcher_id().expect("config validated");
-        let mut h = Sha256::new();
-        h.update(b"vote");
-        h.update(election_id.as_ref());
-        h.update(self.keys.pubkey.to_bytes());
-        h.update(vote_data.as_ref());
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&h.finalize());
-        Bytes32::new(arr)
-    }
-
     /// The bare release message — `AggSigMe` augmentation is computed
     /// by `RequiredSignature::from_coin_spends` at signing time.
+    ///
+    /// SHAPE: `sha256("release" || election_id || pubkey || destination)`.
+    /// The post-CHIP rev 2026-05-02 release flow keeps the same
+    /// preimage shape; only the gating (Ballot Coin oracle vs the
+    /// singleton's deregister announcement) changed.
     pub fn release_message(&self, destination: Bytes32) -> Bytes32 {
         use sha2::{Digest, Sha256};
         let election_id = self.config.election_launcher_id().expect("config validated");
@@ -1103,28 +659,6 @@ fn voting_other(msg: impl Into<String>) -> VotingError {
     VotingError::Other(anyhow_compat::Error(msg.into().into()))
 }
 
-/// FN: canonical_vote_message_for (file-private)
-/// WHAT: byte-exact aggregate-vote message every voter must sign for
-///       inclusion in the off-chain BLS aggregate.
-/// FORMULA: `sha256(vote_outcome || election_launcher_id)` —
-///          IDENTICAL to `aggregator::canonical_vote_message`.
-/// CALLER CONTRACT: pass `vote_outcome` (NOT `vote_message`). For the
-/// canonical "voter signs for the outcome they want" model,
-/// `vote_outcome == vote_data`.
-/// MIRROR: this helper is a sibling of
-/// `aggregator::canonical_vote_message` — kept private here to avoid
-/// widening the SDK's public surface; both must update in lock-step.
-/// Pinned by `voter_memo_signature_matches_canonical_aggregate_message`.
-fn canonical_vote_message_for(vote_outcome: Bytes32, election_id: Bytes32) -> Bytes32 {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(vote_outcome.as_ref());
-    h.update(election_id.as_ref());
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&h.finalize());
-    Bytes32::new(arr)
-}
-
 /// Tiny helper that returns a filename-safe ISO-8601-ish timestamp
 /// without pulling chrono into the SDK (we already use it in CLI).
 fn chrono_compat_now() -> String {
@@ -1141,118 +675,6 @@ fn chrono_compat_now() -> String {
 ///       error into a VotingError.
 fn driver_err<E: std::fmt::Debug>(e: E) -> VotingError {
     voting_other(format!("clvm/driver: {e:?}"))
-}
-
-/// Use the public helper from `puzzles` so external callers (tests,
-/// downstream tooling) build trees with byte-identical roots.
-use crate::puzzles::registration_action_root_leaves;
-
-/// FN: election_action_root_leaves
-/// WHAT: the leaf set for the Election Singleton's actions Merkle
-///       tree. The election's leaves depend on per-deployment
-///       constants (VK, IC, COLLATERAL_AMOUNT, …) so the leaves
-///       must be reconstructed from `ElectionConfig` here.
-fn election_action_root_leaves(config: &ElectionConfig) -> Vec<Bytes32> {
-    use chia_protocol::Bytes;
-    use clvm_traits::{clvm_curried_args, ToClvm};
-    use clvm_utils::CurriedProgram;
-    use clvmr::Allocator;
-
-    let mut allocator = Allocator::new();
-    let launcher_id = config
-        .election_launcher_id()
-        .expect("config validated");
-    let cat_tail_hash = config.cat_tail_hash().expect("config validated");
-
-    // Build each action puzzle's tree hash directly without a
-    // closure (avoids the multiple-mutable-borrow issue that a
-    // closure capturing `allocator` would create).
-    let load = |alloc: &mut Allocator, hex_str: &str| -> clvmr::NodePtr {
-        let bytes = hex::decode(hex_str.trim().trim_start_matches("0x")).unwrap();
-        let prog = chia_protocol::Program::from(bytes);
-        prog.to_clvm(alloc).unwrap()
-    };
-
-    // Register: 10 curried params.
-    let register_node = load(&mut allocator, puzzles::ELECTION_REGISTER_HEX);
-    let register_curried = CurriedProgram {
-        program: register_node,
-        args: clvm_curried_args!(
-            crate::config::TREE_DEPTH,
-            Bytes32::new(crate::config::EMPTY_LEAF_HASH),
-            PuzzleHashes::cat_outer(),
-            cat_tail_hash,
-            PuzzleHashes::action_layer(),
-            PuzzleHashes::registration_finalizer(),
-            puzzles::registration_actions_merkle_root(),
-            config.collateral_amount,
-            config.registration_fee,
-            launcher_id
-        ),
-    }
-    .to_clvm(&mut allocator)
-    .unwrap();
-    let register_leaf =
-        Bytes32::new(clvm_utils::tree_hash(&allocator, register_curried).to_bytes());
-
-    // Finalize: 4 curried params (VK struct, IC struct,
-    // election_length_blocks, launcher_id). MUST mirror
-    // `aggregator::compute_election_action_root_leaves` and
-    // `Aggregator::build_finalize_with_proof` byte-for-byte —
-    // see the long-form rationale on the aggregator-side helper.
-    let finalize_node = load(&mut allocator, puzzles::ELECTION_FINALIZE_HEX);
-    let vk_bytes =
-        hex::decode(&config.verification_key_hex).expect("config validated");
-    if vk_bytes.len() < 576 {
-        panic!(
-            "verification_key_hex too short for finalize curry: got {}, expected ≥ 576",
-            vk_bytes.len(),
-        );
-    }
-    let vk_alpha = Bytes::new(vk_bytes[0..48].to_vec());
-    let vk_beta = Bytes::new(vk_bytes[48..144].to_vec());
-    let vk_gamma = Bytes::new(vk_bytes[144..240].to_vec());
-    let vk_delta = Bytes::new(vk_bytes[240..336].to_vec());
-    let vk_struct = (vk_alpha, (vk_beta, (vk_gamma, (vk_delta, ()))));
-    let ic0 = Bytes::new(vk_bytes[336..384].to_vec());
-    let ic1 = Bytes::new(vk_bytes[384..432].to_vec());
-    let ic2 = Bytes::new(vk_bytes[432..480].to_vec());
-    let ic3 = Bytes::new(vk_bytes[480..528].to_vec());
-    let ic4 = Bytes::new(vk_bytes[528..576].to_vec());
-    let ic_struct = (ic0, (ic1, (ic2, (ic3, (ic4, ())))));
-    let finalize_curried = CurriedProgram {
-        program: finalize_node,
-        args: clvm_curried_args!(
-            vk_struct,
-            ic_struct,
-            config.election_length_blocks,
-            launcher_id
-        ),
-    }
-    .to_clvm(&mut allocator)
-    .unwrap();
-    let finalize_leaf =
-        Bytes32::new(clvm_utils::tree_hash(&allocator, finalize_curried).to_bytes());
-
-    // announce_finalization: no curried args.
-    let announce_node = load(&mut allocator, puzzles::ELECTION_ANNOUNCE_FINALIZATION_HEX);
-    let announce_leaf =
-        Bytes32::new(clvm_utils::tree_hash(&allocator, announce_node).to_bytes());
-
-    // oracle: no curried args.
-    let oracle_node = load(&mut allocator, puzzles::ELECTION_ORACLE_HEX);
-    let oracle_leaf =
-        Bytes32::new(clvm_utils::tree_hash(&allocator, oracle_node).to_bytes());
-
-    let mut leaves = vec![register_leaf, finalize_leaf, announce_leaf, oracle_leaf];
-    // Sort so the tree built here matches the deployer's
-    // `election_actions_merkle_root` convention.
-    leaves.sort_by(|a, b| {
-        puzzles::hash_atom_b32(a)
-            .as_ref()
-            .cmp(puzzles::hash_atom_b32(b).as_ref())
-    });
-    leaves
 }
 
 /// FN: convert_coin
@@ -1289,8 +711,9 @@ fn parse_hex32(s: &str) -> VotingResult<Bytes32> {
 //
 // These tests exercise the synchronous, pure helpers — message
 // derivation, hint computation, coin conversion. The `register`,
-// `vote`, and `release_collateral` async methods need a Simulator and
-// live in `tests/integration.rs`.
+// `cast_vote`, `update_vote`, and `release_collateral` async methods
+// need a Simulator and live in the integration tests once Phase 6
+// stands up.
 
 #[cfg(test)]
 mod tests {
@@ -1313,8 +736,6 @@ mod tests {
             election_launcher_id_hex: "11".repeat(32),
             cat_tail_hash_hex: "22".repeat(32),
             collateral_amount: 1_000,
-            registration_fee: 10,
-            election_length_blocks: 4_608,
             tree_depth: crate::config::TREE_DEPTH,
             max_signers: crate::config::MAX_SIGNERS,
             verification_key_hex: "00".repeat(
@@ -1322,17 +743,6 @@ mod tests {
             ),
             label: None,
         }
-    }
-
-    fn message_for(prefix: &[u8], pk: &PublicKey, election_id: Bytes32, payload: Bytes32) -> Bytes32 {
-        let mut h = Sha256::new();
-        h.update(prefix);
-        h.update(election_id.as_ref());
-        h.update(pk.to_bytes());
-        h.update(payload.as_ref());
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&h.finalize());
-        Bytes32::new(arr)
     }
 
     fn voter_keys() -> VoterKeys {
@@ -1358,135 +768,95 @@ mod tests {
         assert_eq!(v.pubkey, v.secret.public_key());
     }
 
-    /// WHAT: `vote_message(vote_data)` equals
-    ///       `sha256("vote" || election_id || pubkey || vote_data)`
-    ///       byte-exact.
-    /// HOW:  hand-compute the sha256 inline against the same inputs
-    ///       (test_voter_pk + good_config + a fixed vote_data) and
-    ///       assert equality.
-    /// WHY:  the on-chain vote action emits an
-    ///       `AggSigUnsafe(VOTER_PUBKEY, vote_message)` over EXACTLY
-    ///       these bytes. Any drift would mean voter signatures
-    ///       can't be verified on-chain or aggregated off-chain.
-    #[test]
-    fn vote_message_is_deterministic_and_correct() {
-        // We can build a Voter without a wallet for these pure-helper
-        // tests by directly constructing the struct (test-only).
-        let voter_pk = test_voter_pk();
-        let config = good_config();
-        let election_id = config.election_launcher_id().unwrap();
-        let vote_data = Bytes32::new([0x42; 32]);
-
-        // Reproduce the formula independently and compare.
-        let expected = message_for(b"vote", &voter_pk, election_id, vote_data);
-
-        // Mini Voter that only needs `config` + `keys.pubkey`.
-        // Using the public `vote_message` formula manually since we
-        // can't construct a full Voter without a real L1Wallet.
-        let mut h = Sha256::new();
-        h.update(b"vote");
-        h.update(election_id.as_ref());
-        h.update(voter_pk.to_bytes());
-        h.update(vote_data.as_ref());
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&h.finalize());
-        let actual = Bytes32::new(arr);
-
-        assert_eq!(actual, expected);
-    }
-
     /// WHAT: `release_message(destination)` equals
     ///       `sha256("release" || election_id || pubkey || destination)`
     ///       byte-exact.
     /// HOW:  hand-compute the sha256 inline against the same inputs,
     ///       compare.
-    /// WHY:  same as the vote-message test — the on-chain release
-    ///       action emits an `AggSigMe(VOTER_PUBKEY, release_message)`
-    ///       and any drift would prevent the voter from ever
-    ///       reclaiming their CAT collateral.
+    /// WHY:  the on-chain release action emits an
+    ///       `AggSigMe(VOTER_PUBKEY, release_message)` and any drift
+    ///       would prevent the voter from ever reclaiming their CAT
+    ///       collateral.
     #[test]
     fn release_message_is_deterministic_and_correct() {
-        let voter_pk = test_voter_pk();
-        let config = good_config();
-        let election_id = config.election_launcher_id().unwrap();
+        let _voter_pk = test_voter_pk();
+        let _config = good_config();
+        // Reproduce the formula independently and compare against
+        // the public helper.
+        let voter = Voter {
+            config: good_config(),
+            keys: voter_keys(),
+            network: NetworkType::Testnet11,
+        };
+        let election_id = voter.config.election_launcher_id().unwrap();
         let destination = Bytes32::new([0xCC; 32]);
-
-        let expected = message_for(b"release", &voter_pk, election_id, destination);
 
         let mut h = Sha256::new();
         h.update(b"release");
         h.update(election_id.as_ref());
-        h.update(voter_pk.to_bytes());
+        h.update(voter.keys.pubkey.to_bytes());
         h.update(destination.as_ref());
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&h.finalize());
-        let actual = Bytes32::new(arr);
+        let expected = Bytes32::new(arr);
 
-        assert_eq!(actual, expected);
+        assert_eq!(voter.release_message(destination), expected);
     }
 
-    /// WHAT: `canonical_vote_message_for(outcome, election_id)` is
-    ///       byte-identical to `aggregator::canonical_vote_message`.
-    /// HOW:  hand-compute `sha256(outcome || election_id)` inline and
-    ///       compare against the file-private helper used by
-    ///       `Voter::vote` to sign the memo signature.
-    /// WHY:  the aggregator BLS-aggregates per-voter memo signatures
-    ///       and verifies the sum against ITS canonical message. Any
-    ///       drift between the two formulas would make
-    ///       `Aggregator::build_finalize` reject every collected vote
-    ///       with `VotingError::InvalidSignature` (mainnet symptom
-    ///       observed in PHASE 5 before this regression test).
+    /// WHAT: `puzzles::vote_message(outcome, ballot_id, election_id)`
+    ///       is byte-identical to `sha256(outcome || ballot_id ||
+    ///       election_id)`.
+    /// HOW:  hand-compute the sha256 inline and compare.
+    /// WHY:  the on-chain Voting Coin's `update_vote` action emits
+    ///       an `AggSigUnsafe(VOTER_PUBKEY, vote_message)` over
+    ///       these exact bytes. Any drift would mean voter
+    ///       signatures can't be verified on-chain or aggregated
+    ///       off-chain.
     #[test]
-    fn voter_memo_signature_matches_canonical_aggregate_message() {
+    fn vote_message_three_arg_form_is_deterministic_and_correct() {
         let outcome = Bytes32::new([0x42; 32]);
+        let ballot_id = Bytes32::new([0xAB; 32]);
         let election_id = Bytes32::new([0x11; 32]);
 
         let mut h = Sha256::new();
         h.update(outcome.as_ref());
+        h.update(ballot_id.as_ref());
         h.update(election_id.as_ref());
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&h.finalize());
         let expected = Bytes32::new(arr);
 
-        assert_eq!(canonical_vote_message_for(outcome, election_id), expected);
+        assert_eq!(
+            puzzles::vote_message(outcome, ballot_id, election_id),
+            expected
+        );
     }
 
-    /// WHAT: signing `canonical_vote_message_for(vote_data,
-    ///       election_id)` with `sign_unsafe` (== unaugmented
-    ///       `chia_bls::sign_raw`) produces a signature that
-    ///       satisfies the textbook PoP-style BLS aggregate
-    ///       pairing identity
-    ///         e(pk, H(msg)) == e(G1_GENERATOR, sig)
-    ///       — i.e. exactly what `puzzles/election/finalize.rue`'s
-    ///       `bls_pairing_identity` opcode checks on-chain (with
-    ///       agg_signers == pk and agg_sig == sig in the single-
-    ///       voter case). The off-chain `Aggregator::
-    ///       prepare_finalize_witness` mirrors the same check for
-    ///       k voters via `chia_bls::aggregate_pairing`.
+    /// WHAT: signing `puzzles::vote_message(...)` with
+    ///       `sign_unsafe` (== unaugmented `chia_bls::sign_raw`)
+    ///       produces a signature that satisfies the textbook
+    ///       PoP-style BLS aggregate pairing identity
+    ///         e(pk, H(msg)) == e(G1_GENERATOR, sig).
     /// HOW:  build a deterministic voter, compute the canonical
-    ///       message, sign it with `sign_unsafe`, hash the message
-    ///       to G2 via `chia_bls::hash_to_g2` (default DST), and
-    ///       call `chia_bls::aggregate_pairing` with the two
-    ///       (G1, G2) pairs the on-chain identity expects.
-    ///       Negate G1_GENERATOR to flip the right-hand pairing.
-    /// WHY:  PHASE 5 of the live mainnet test failed when voters
-    ///       signed with augmented `chia_bls::sign` and the puzzle
-    ///       called single-pair `bls_verify(agg_sig, agg_signers,
-    ///       vote_message)` (which augments internally with
-    ///       `agg_signers || msg`). Switching to PoP-style
-    ///       (unaugmented signing + `bls_pairing_identity` on
-    ///       chain) is what makes the math work; this test pins
-    ///       that exact equivalence so future drift is caught
-    ///       before broadcast.
+    ///       message via the public helper, sign it with
+    ///       `sign_unsafe`, hash the message to G2 via
+    ///       `chia_bls::hash_to_g2` (default DST), and call
+    ///       `chia_bls::aggregate_pairing` with the two (G1, G2)
+    ///       pairs the on-chain identity expects.
+    /// WHY:  pins that the SDK is on the unaugmented (sign_raw /
+    ///       sign_unsafe) path — switching to augmented `sign()`
+    ///       would silently break the off-chain aggregator's BLS
+    ///       sum (the pre-CHIP-rev mainnet symptom).
     #[test]
     fn voter_canonical_signature_pop_pairing_verifies() {
         use chia_bls::{hash_to_g2, PublicKey as Pk};
         let v = voter_keys();
         let outcome = Bytes32::new([0xA5; 32]);
+        let ballot_id = Bytes32::new([0xBB; 32]);
         let election_id = Bytes32::new([0x77; 32]);
-        let msg = canonical_vote_message_for(outcome, election_id);
+        let msg = puzzles::vote_message(outcome, ballot_id, election_id);
 
-        // Voter side: sign UNAUGMENTED (matches `Voter::vote`).
+        // Voter side: sign UNAUGMENTED.
         let sig = v.sign_unsafe(msg.as_ref());
 
         // On-chain side: e(pk, H(msg)) * e(-G1_GENERATOR, sig) == 1
@@ -1507,26 +877,6 @@ mod tests {
             "augmented sign() output must NOT satisfy the PoP-style identity — \
              pins that the SDK is on the unaugmented (sign_raw / sign_unsafe) path",
         );
-    }
-
-    /// WHAT: vote_message and release_message for the same payload
-    ///       produce DIFFERENT message bytes.
-    /// HOW:  build both messages with the same payload (a fixed
-    ///       Bytes32) and the same voter, assert inequality.
-    /// WHY:  the `b"vote"` vs `b"release"` prefix domain-separates
-    ///       the two messages so a vote signature can never be
-    ///       replayed as a release authorisation (or vice versa).
-    ///       Pin this critical security boundary.
-    #[test]
-    fn vote_and_release_messages_are_distinct() {
-        let voter_pk = test_voter_pk();
-        let config = good_config();
-        let election_id = config.election_launcher_id().unwrap();
-        let payload = Bytes32::new([0x42; 32]);
-
-        let v_msg = message_for(b"vote", &voter_pk, election_id, payload);
-        let r_msg = message_for(b"release", &voter_pk, election_id, payload);
-        assert_ne!(v_msg, r_msg);
     }
 
     /// WHAT: `convert_coin` correctly parses `0x`-prefixed hex
