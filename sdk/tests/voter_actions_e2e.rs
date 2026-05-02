@@ -29,8 +29,17 @@ mod common;
 use chia_bls::Signature;
 use chia_protocol::{Bytes, Bytes32, Coin};
 use chia_sdk_test::Simulator;
+// CHIP rev 2026-05-02: ELECTION_ANNOUNCE_FINALIZATION_HEX moved to
+// BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX (per-ballot oracle replaces the
+// singleton-level finalize-announce action), and REGISTRATION_VOTE_HEX
+// was replaced by REGISTRATION_MINT_VOTING_COIN_HEX (the registration
+// coin no longer hosts a `vote` action — it mints a Voting Coin which
+// then carries the vote). Aliases preserve the body of these tests
+// until they're rewritten in Phase 6 against the new puzzles.
 use chip_voting_sdk::puzzles::{
-    ELECTION_ANNOUNCE_FINALIZATION_HEX, REGISTRATION_RELEASE_HEX, REGISTRATION_VOTE_HEX,
+    BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX as ELECTION_ANNOUNCE_FINALIZATION_HEX,
+    REGISTRATION_MINT_VOTING_COIN_HEX as REGISTRATION_VOTE_HEX,
+    REGISTRATION_RELEASE_HEX,
 };
 use clvm_traits::ToClvm;
 use clvmr::Allocator;
@@ -52,6 +61,8 @@ use clvmr::Allocator;
 ///       AggSigUnsafe message format in the puzzle EXACTLY matches
 ///       the format the consensus signer expects.
 #[test]
+#[ignore = "stubbed pending Phase 6 — see app/docs/superpowers/plans/2026-05-02-chip-migration.md \
+            (registration_coin's `vote` action replaced by `mint_voting_coin`)"]
 fn vote_action_executes_on_simulator_with_valid_signature() {
     let mut sim = Simulator::new();
     let (voter_sk, voter_pk) = common::test_voter(0x42);
@@ -103,6 +114,8 @@ fn vote_action_executes_on_simulator_with_valid_signature() {
 ///       check — if it ever stopped enforcing the bound message,
 ///       voters could replay any signature for any vote.
 #[test]
+#[ignore = "stubbed pending Phase 6 — see app/docs/superpowers/plans/2026-05-02-chip-migration.md \
+            (registration_coin's `vote` action replaced by `mint_voting_coin`)"]
 fn vote_action_rejects_wrong_signature() {
     let mut sim = Simulator::new();
     let (voter_sk, voter_pk) = common::test_voter(0x42);
@@ -180,6 +193,8 @@ fn vote_action_rejects_wrong_signature() {
 ///       FULL collateral-release flow runs correctly on consensus,
 ///       end-to-end.
 #[test]
+#[ignore = "stubbed pending Phase 6 — see app/docs/superpowers/plans/2026-05-02-chip-migration.md \
+            (announce_finalization moved to Ballot Coin; release pairing TBD)"]
 fn release_paired_with_announce_finalization_executes_on_simulator() {
     let mut sim = Simulator::new();
     let (voter_sk, voter_pk) = common::test_voter(0x55);
@@ -270,6 +285,8 @@ fn release_paired_with_announce_finalization_executes_on_simulator() {
 ///       consensus regardless of the format issue (the bug only
 ///       affects the SUCCESS path, not the failure path).
 #[test]
+#[ignore = "stubbed pending Phase 6 — see app/docs/superpowers/plans/2026-05-02-chip-migration.md \
+            (announce_finalization moved to Ballot Coin; release pairing TBD)"]
 fn release_alone_rejected_without_finalization_announcement() {
     let mut sim = Simulator::new();
     let (voter_sk, voter_pk) = common::test_voter(0x55);
@@ -330,6 +347,8 @@ fn release_alone_rejected_without_finalization_announcement() {
 ///       would let releases bind to ANY finalization, defeating the
 ///       purpose of the announcement.
 #[test]
+#[ignore = "stubbed pending Phase 6 — see app/docs/superpowers/plans/2026-05-02-chip-migration.md \
+            (announce_finalization moved to Ballot Coin; release pairing TBD)"]
 fn release_rejects_mismatched_finalization_outcome() {
     let mut sim = Simulator::new();
     let (voter_sk, voter_pk) = common::test_voter(0x55);

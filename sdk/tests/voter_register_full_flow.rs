@@ -59,7 +59,6 @@ async fn voter_register_against_simulator_full_flow() {
         "a406d3a9de984d03c9591c10d917593b434d5263cabe2b42f6b367df16832f81"
     ));
     let collateral_amount: u64 = 1_000;
-    let registration_fee: u64 = 0;
     let params = DeployParams {
         verification_key: VerificationKey {
             // Live test uses real ceremony VK; for the simulator we
@@ -70,8 +69,8 @@ async fn voter_register_against_simulator_full_flow() {
         },
         cat_tail_hash,
         collateral_amount,
-        registration_fee,
-        election_length_blocks: 4,
+        // CHIP rev 2026-05-02: registration_fee + election_length_blocks dropped.
+        election_start_height: 0,
         label: None,
     };
     let deployer = ElectionDeployer::new(params);
@@ -134,10 +133,13 @@ async fn voter_register_against_simulator_full_flow() {
     let _ = ctx; // we hand the spends off to Voter::register
 
     // ── 3. Sanity: predicted eve_ph matches what's on chain ──
+    // CHIP rev 2026-05-02: compute_eve_*_puzzle_hash now takes the
+    // election_start_height as a separate arg (it's no longer baked into
+    // ElectionConfig). Use 0 to match the deployer's `election_start_height: 0`.
     let predicted_eve_ph =
-        chip_voting_sdk::actors::aggregator::compute_eve_singleton_puzzle_hash(&config);
+        chip_voting_sdk::actors::aggregator::compute_eve_singleton_puzzle_hash(&config, 0);
     let predicted_inner =
-        chip_voting_sdk::actors::aggregator::compute_eve_inner_puzzle_hash(&config);
+        chip_voting_sdk::actors::aggregator::compute_eve_inner_puzzle_hash(&config, 0);
     let predicted_singleton =
         puzzles::election_singleton_puzzle_hash(launcher_id, predicted_inner);
     println!("predicted eve_ph (compute_eve_singleton_puzzle_hash): {}", hex::encode(predicted_eve_ph));

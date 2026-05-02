@@ -66,12 +66,18 @@ use clvm_utils::{tree_hash, CurriedProgram};
 ///      action layer level (which we can debug iteratively without
 ///      mainnet).
 #[test]
+#[ignore = "stubbed pending Phase 6 — see app/docs/superpowers/plans/2026-05-02-chip-migration.md \
+            (singleton merkle root no longer carries finalize/announce/oracle leaves; \
+            register-action curry shape may also drop the registration_fee arg)"]
 fn register_action_layer_executes_on_simulator_without_singleton() {
     let mut sim = Simulator::new();
     let (voter_sk, voter_pk) = common::test_voter(0xCAu8);
     let launcher_id = Bytes32::new([0xAB; 32]);
     let cat_tail_hash = Bytes32::new([0x77; 32]);
     let collateral_amount: u64 = 1_000;
+    // CHIP rev 2026-05-02: registration_fee dropped from DeployParams; this
+    // local is retained only to keep the legacy register-action curry shape
+    // valid for compile (the test is `#[ignore]`-d below).
     let registration_fee: u64 = 0;
 
     // ── 1. Build the election finalizer ──────────────────────
@@ -85,8 +91,8 @@ fn register_action_layer_executes_on_simulator_without_singleton() {
         },
         cat_tail_hash,
         collateral_amount,
-        registration_fee,
-        election_length_blocks: 4,
+        // CHIP rev 2026-05-02: registration_fee + election_length_blocks dropped.
+        election_start_height: 0,
         label: None,
     };
     let deployer = ElectionDeployer::new(params.clone());
@@ -218,11 +224,16 @@ fn register_action_layer_executes_on_simulator_without_singleton() {
 ///       synthetic eve lineage proof. Insert the SINGLETON-wrapped
 ///       coin (at the singleton outer puzzle hash). Submit.
 #[test]
+#[ignore = "stubbed pending Phase 6 — see app/docs/superpowers/plans/2026-05-02-chip-migration.md \
+            (singleton merkle root no longer carries finalize/announce/oracle leaves)"]
 fn register_action_layer_with_singleton_outer_executes_on_simulator() {
     let mut sim = Simulator::new();
     let (voter_sk, voter_pk) = common::test_voter(0xCAu8);
     let cat_tail_hash = Bytes32::new([0x77; 32]);
     let collateral_amount: u64 = 1_000;
+    // CHIP rev 2026-05-02: registration_fee dropped from DeployParams; this
+    // local is retained only to keep the legacy register-action curry shape
+    // valid for compile (the test is `#[ignore]`-d below).
     let registration_fee: u64 = 0;
 
     // The launcher_id is the COIN ID of the launcher coin
@@ -246,8 +257,8 @@ fn register_action_layer_with_singleton_outer_executes_on_simulator() {
         },
         cat_tail_hash,
         collateral_amount,
-        registration_fee,
-        election_length_blocks: 4,
+        // CHIP rev 2026-05-02: registration_fee + election_length_blocks dropped.
+        election_start_height: 0,
         label: None,
     };
     let deployer = ElectionDeployer::new(params.clone());
@@ -437,7 +448,8 @@ fn election_action_root_leaves(
             puzzles::PuzzleHashes::registration_finalizer(),
             puzzles::registration_actions_merkle_root(),
             deployer.params.collateral_amount,
-            deployer.params.registration_fee,
+            // CHIP rev 2026-05-02: registration_fee dropped; placeholder.
+            0u64,
             launcher_id
         ),
     }
@@ -450,7 +462,13 @@ fn election_action_root_leaves(
     // production leaf builders (compute_election_action_root_leaves
     // / election_action_root_leaves). See finalize.rue: VK and IC
     // are STRUCTS the puzzle accesses by field, not flat blobs.
-    let finalize_node = load(&mut a, puzzles::ELECTION_FINALIZE_HEX);
+    // CHIP rev 2026-05-02: ELECTION_FINALIZE_HEX removed; finalize moved to
+    // the Ballot Coin. Use the new constant just to make this helper
+    // compile — the assertion that the finalize_leaf appears in the
+    // singleton's merkle root is no longer meaningful (the singleton no
+    // longer hosts a finalize action), and the tests using this helper
+    // are `#[ignore]`-d.
+    let finalize_node = load(&mut a, puzzles::BALLOT_COIN_FINALIZE_HEX);
     let vk_bytes = &deployer.params.verification_key.raw_bytes;
     // Canonical chunked VK layout for the 6-input circuit:
     //   alpha_g1(48) || beta_g2(96) || gamma_g2(96) || delta_g2(96)
@@ -495,7 +513,8 @@ fn election_action_root_leaves(
         args: clvm_curried_args!(
             vk_struct,
             ic_struct,
-            deployer.params.election_length_blocks,
+            // CHIP rev 2026-05-02: election_length_blocks dropped; placeholder.
+            0u64,
             launcher_id
         ),
     }
@@ -503,12 +522,13 @@ fn election_action_root_leaves(
     .unwrap();
     let finalize_leaf = Bytes32::new(tree_hash(&a, finalize_curried).to_bytes());
 
-    // announce_finalization
-    let announce_node = load(&mut a, puzzles::ELECTION_ANNOUNCE_FINALIZATION_HEX);
+    // CHIP rev 2026-05-02: announce_finalization + oracle moved to the
+    // Ballot Coin. Aliased so the helper compiles; tests using it are
+    // `#[ignore]`-d.
+    let announce_node = load(&mut a, puzzles::BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX);
     let announce_leaf = Bytes32::new(tree_hash(&a, announce_node).to_bytes());
 
-    // oracle
-    let oracle_node = load(&mut a, puzzles::ELECTION_ORACLE_HEX);
+    let oracle_node = load(&mut a, puzzles::BALLOT_COIN_ORACLE_HEX);
     let oracle_leaf = Bytes32::new(tree_hash(&a, oracle_node).to_bytes());
 
     let mut leaves = vec![register_leaf, finalize_leaf, announce_leaf, oracle_leaf];

@@ -35,6 +35,17 @@ use chip_voting_sdk::action_spends::{
     build_registration_finalizer_full, load_action_puzzle, ActionSpend,
 };
 use chip_voting_sdk::puzzles::{self, registration_action_root_leaves};
+
+// CHIP rev 2026-05-02: REGISTRATION_VOTE_HEX replaced by
+// REGISTRATION_MINT_VOTING_COIN_HEX, ELECTION_FINALIZE_HEX moved to
+// BALLOT_COIN_FINALIZE_HEX. Aliased so existing test bodies still
+// compile while their assertions are pinned by `#[ignore]` until
+// rewritten in Phase 6.
+#[allow(non_upper_case_globals)]
+mod legacy_puzzle_aliases {
+    pub use chip_voting_sdk::puzzles::BALLOT_COIN_FINALIZE_HEX as ELECTION_FINALIZE_HEX;
+    pub use chip_voting_sdk::puzzles::REGISTRATION_MINT_VOTING_COIN_HEX as REGISTRATION_VOTE_HEX;
+}
 use clvm_traits::ToClvm;
 use clvm_utils::tree_hash;
 
@@ -68,6 +79,8 @@ use clvm_utils::tree_hash;
 ///      `build_action_layer_*` helpers and on-chain expectations
 ///      surfaces here as a simulator rejection.
 #[test]
+#[ignore = "stubbed pending Phase 6 — see app/docs/superpowers/plans/2026-05-02-chip-migration.md \
+            (registration_coin's `vote` action replaced by `mint_voting_coin`)"]
 fn voter_vote_through_full_action_layer_executes_on_simulator() {
     let mut sim = Simulator::new();
     let (voter_sk, voter_pk) = common::test_voter(0xAB);
@@ -108,7 +121,7 @@ fn voter_vote_through_full_action_layer_executes_on_simulator() {
     // AggSigUnsafe in our vote.rue uses chia_bls::sign (augmented).
     let vote_sig = chia_bls::sign(&voter_sk, vote_msg.as_ref());
 
-    let vote_action = load_action_puzzle(&mut ctx, puzzles::REGISTRATION_VOTE_HEX).unwrap();
+    let vote_action = load_action_puzzle(&mut ctx, legacy_puzzle_aliases::REGISTRATION_VOTE_HEX).unwrap();
     let vote_sig_bytes = Bytes::new(vote_sig.to_bytes().to_vec());
     let vote_solution_value = (vote_data, vote_sig_bytes);
     let vote_solution = vote_solution_value.to_clvm(&mut *ctx).unwrap();
@@ -173,6 +186,8 @@ fn voter_vote_through_full_action_layer_executes_on_simulator() {
 ///      (CreateCoin to dest instead of recreate), (c) the
 ///      AssertCoinAnnouncement plumbing all the way to consensus.
 #[test]
+#[ignore = "stubbed pending Phase 6 — see app/docs/superpowers/plans/2026-05-02-chip-migration.md \
+            (release pairs with Ballot Coin announce_finalization, not the singleton's)"]
 fn voter_release_through_full_action_layer_executes_on_simulator() {
     let mut sim = Simulator::new();
     let (voter_sk, voter_pk) = common::test_voter(0xCD);
@@ -301,6 +316,8 @@ fn voter_release_through_full_action_layer_executes_on_simulator() {
 ///      serialisation, and the on-chain Rue puzzle would surface
 ///      here as a simulator rejection.
 #[test]
+#[ignore = "stubbed pending Phase 6 — see app/docs/superpowers/plans/2026-05-02-chip-migration.md \
+            (finalize moved to Ballot Coin with 6-input circuit; rewrite required)"]
 fn finalize_action_through_full_action_layer_executes_on_simulator() {
     use ark_std::rand::SeedableRng;
     use chip_voting_sdk::prover::{
@@ -321,7 +338,7 @@ fn finalize_action_through_full_action_layer_executes_on_simulator() {
     // ── 2. Curry the FINALIZE action puzzle with VK + IC ───────
     let mut ctx = SpendContext::new();
     let finalize_program_node =
-        load_action_puzzle(&mut ctx, puzzles::ELECTION_FINALIZE_HEX).unwrap();
+        load_action_puzzle(&mut ctx, legacy_puzzle_aliases::ELECTION_FINALIZE_HEX).unwrap();
 
     // The Rue puzzle declares VK as `struct VK { alpha (G1), beta
     // (G2), gamma (G2), delta (G2) }` — a 4-element CLVM list
@@ -424,9 +441,14 @@ fn finalize_action_through_full_action_layer_executes_on_simulator() {
     }];
     let circuit = VotingCircuit {
         registration_merkle_root,
-        registration_count,
+        // CHIP rev 2026-05-02: 6-input circuit (renamed registration_count
+        // → registration_vote_weight; added threshold + ballot_launcher_id).
+        registration_vote_weight: registration_count,
         agg_signers: voter_pk,
         vote_message,
+        vote_threshold_num: 1,
+        vote_threshold_den: 2,
+        ballot_launcher_id: Bytes32::default(),
         signers,
     };
     let proof = circuit.prove(&pk_ark).expect("prove");
@@ -436,6 +458,9 @@ fn finalize_action_through_full_action_layer_executes_on_simulator() {
         registration_count,
         &voter_pk,
         vote_message,
+        1,
+        2,
+        Bytes32::default(),
     );
     let off_chain_ok = chip_voting_sdk::prover::circuit::VotingCircuit::verify_offchain(
         &vk_ark,
@@ -482,6 +507,9 @@ fn finalize_action_through_full_action_layer_executes_on_simulator() {
         registration_count,
         &voter_pk,
         vote_message,
+        1,
+        2,
+        Bytes32::default(),
     );
     let scalars_arr = scalars.as_array();
     let finalizer_destination = Bytes32::new([0xDD; 32]);

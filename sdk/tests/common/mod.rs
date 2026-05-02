@@ -196,8 +196,10 @@ pub fn dummy_deploy_params() -> DeployParams {
         },
         cat_tail_hash: Bytes32::new([0x77; 32]),
         collateral_amount: 1_000,
-        registration_fee: 10,
-        election_length_blocks: 4_608,
+        // CHIP rev 2026-05-02: registration_fee and election_length_blocks
+        // were dropped from DeployParams (per-ballot timing replaces the
+        // global election length; XCH fee was removed entirely).
+        election_start_height: 0,
         label: Some("integration-test".into()),
     }
 }
@@ -216,8 +218,8 @@ pub fn real_deploy_params_with_pk() -> (DeployParams, chip_voting_sdk::prover::c
         verification_key: VerificationKey { raw_bytes: vk_bytes },
         cat_tail_hash: Bytes32::new([0x77; 32]),
         collateral_amount: 1_000,
-        registration_fee: 10,
-        election_length_blocks: 4_608,
+        // CHIP rev 2026-05-02: registration_fee + election_length_blocks dropped.
+        election_start_height: 0,
         label: Some("integration-test-real-vk".into()),
     };
     (params, pk)

@@ -2235,6 +2235,8 @@ mod tests {
                 vote_data: vote_outcome,
                 vote_signature_hex: sign_canonical(sk, canonical_msg),
                 registration_coin_id: Bytes32::default(),
+                ballot_launcher_id: Bytes32::default(),
+                voting_coin_id: Bytes32::default(),
             })
             .collect();
 
@@ -2369,6 +2371,8 @@ mod tests {
                 vote_data: vote_outcome,
                 vote_signature_hex: sign_canonical(sk, canonical_msg),
                 registration_coin_id: Bytes32::default(),
+                ballot_launcher_id: Bytes32::default(),
+                voting_coin_id: Bytes32::default(),
             })
             .collect();
 
@@ -2389,11 +2393,18 @@ mod tests {
         assert_eq!(w.agg_signers, expected_agg_pk);
 
         // scalars must match the prover's deterministic computation.
+        // CHIP rev 2026-05-02: Scalars::compute now takes 7 args
+        // (added vote_threshold_num, vote_threshold_den, ballot_launcher_id).
+        // Use placeholder threshold (1/2 = strict majority) and the
+        // placeholder ballot id baked into the witness.
         let expected_scalars = Scalars::compute(
             w.registration_merkle_root,
             w.registration_count,
             &w.agg_signers,
             w.vote_message,
+            1,
+            2,
+            placeholder_ballot_id(),
         );
         assert_eq!(w.scalars, expected_scalars);
     }
@@ -2440,6 +2451,8 @@ mod tests {
                 vote_data: vote_outcome,
                 vote_signature_hex: sign_canonical(sk, canonical_msg),
                 registration_coin_id: Bytes32::default(),
+                ballot_launcher_id: Bytes32::default(),
+                voting_coin_id: Bytes32::default(),
             })
             .collect();
         let w = agg
@@ -2489,6 +2502,8 @@ mod tests {
                 vote_data: vote_outcome,
                 vote_signature_hex: sign_canonical(sk, canonical_msg),
                 registration_coin_id: Bytes32::default(),
+                ballot_launcher_id: Bytes32::default(),
+                voting_coin_id: Bytes32::default(),
             })
             .collect();
         let w = agg
@@ -2528,6 +2543,8 @@ mod tests {
                 // 96 bytes of 0xFF is not a valid BLS G2 point.
                 vote_signature_hex: "ff".repeat(96),
                 registration_coin_id: Bytes32::default(),
+                ballot_launcher_id: Bytes32::default(),
+                voting_coin_id: Bytes32::default(),
             })
             .collect();
 
@@ -2572,6 +2589,8 @@ mod tests {
                 vote_data: real_outcome,
                 vote_signature_hex: sign_canonical(sk, wrong_msg),
                 registration_coin_id: Bytes32::default(),
+                ballot_launcher_id: Bytes32::default(),
+                voting_coin_id: Bytes32::default(),
             })
             .collect();
         // We pass the REAL outcome to prepare_finalize_witness, but
@@ -2604,6 +2623,8 @@ mod tests {
                 vote_data: Bytes32::default(),
                 vote_signature_hex: "not-hex".into(),
                 registration_coin_id: Bytes32::default(),
+                ballot_launcher_id: Bytes32::default(),
+                voting_coin_id: Bytes32::default(),
             })
             .collect();
 
@@ -2683,8 +2704,11 @@ mod tests {
         );
 
         let mut allocator = Allocator::new();
+        // CHIP rev 2026-05-02: ELECTION_FINALIZE_HEX removed (finalize moved
+        // to Ballot Coin). Placeholder bytecode to keep the body compiling
+        // until the test is rewritten in Phase 6 against BALLOT_COIN_FINALIZE_HEX.
         let prog_node = chia_protocol::Program::from(
-            hex::decode(p::ELECTION_FINALIZE_HEX.trim().trim_start_matches("0x")).unwrap(),
+            hex::decode(p::BALLOT_COIN_FINALIZE_HEX.trim().trim_start_matches("0x")).unwrap(),
         )
         .to_clvm(&mut allocator)
         .unwrap();
@@ -2717,7 +2741,10 @@ mod tests {
             args: clvm_curried_args!(
                 vk_struct,
                 ic_struct,
-                cfg.election_length_blocks,
+                // CHIP rev 2026-05-02: election_length_blocks dropped from
+                // ElectionConfig (per-ballot timing replaces global length).
+                // Placeholder for the ignored re-enable in Phase 6.
+                0u64,
                 launcher_id
             ),
         }
