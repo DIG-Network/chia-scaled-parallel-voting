@@ -1,0 +1,63 @@
+// voting_coin/finalizer.rue
+// Custom finalizer for the Voting Coin (CAT inner).
+//
+// Mirrors the Registration Coin's finalizer but with no release
+// branch — the Voting Coin lineage doesn't release any collateral
+// (the 1 mojo it carries is bookkeeping for indexers; the voter's
+// CAT collateral lives on the parent Registration Coin and is
+// released independently via the singleton's `deregister` flow).
+//
+// Behaviour:
+//   * Always recreate the Voting Coin at `my_amount` (CAT outer
+//     enforces amount preservation).
+//   * Recreated puzzle hash carries the new state, the same
+//     VOTING_COIN_ACTIONS_MERKLE_ROOT, and the same finalizer.
+//   * Memos = [HINT] for indexer continuity across update_vote
+//     spends.
+//
+// Once VOTE_CLOSE_HEIGHT is reached, update_vote can no longer run
+// (its AssertBeforeHeightAbsolute fails); the Voting Coin then sits
+// idle on chain. Aggregators read its state at finalize time.
+
+import super::action::StateTruth;
+import super::finalizer::*;
+import shared::*;
+
+fn main(
+    ACTION_LAYER_MOD_HASH: Bytes32,
+    HINT: Bytes32,
+    // 2nd curry
+    FINALIZER_SELF_HASH: Bytes32,
+    Truth: FinalizerTruths,
+    last_action_output: (StateTruth, List<List<Condition>>),
+    ...my_amount: Int,
+) -> List<Condition> {
+    let new_state = unchecked_cast::<VotingCoinState>(last_action_output.first.actual_state);
+
+    let recreated_puzzle_hash: Bytes32 = curry_tree_hash(
+        ACTION_LAYER_MOD_HASH,
+        [
+            curry_tree_hash(
+                FINALIZER_SELF_HASH,
+                [
+                    tree_hash_atom(FINALIZER_SELF_HASH),
+                ]
+            ),
+            tree_hash_atom(Truth.Merkle_Root),
+            tree_hash(new_state),
+        ]
+    );
+
+    let recreation_condition = CreateCoin {
+        puzzle_hash: recreated_puzzle_hash,
+        amount: my_amount,
+        memos: Memos {
+            value: [HINT],
+        },
+    };
+
+    [
+        recreation_condition,
+        ...flatten_list(last_action_output.rest)
+    ]
+}

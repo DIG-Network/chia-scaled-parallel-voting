@@ -1,0 +1,106 @@
+// voting_coin/update_vote.rue
+// Update-vote action for the Voting Coin.
+//
+// Lets the voter change `vote_data` until the ballot closes. Recreates
+// the Voting Coin with the new payload, re-signs `vote_message` for
+// the off-chain aggregator, and (defense-in-depth) co-spends the
+// Ballot Coin's `oracle` action to re-prove the ballot is still open.
+// The Election Singleton is NOT spent — the whole point of CHIP rev
+// 2026-05-02 is that vote edits stay on the parallel lane.
+//
+// Two on-chain checks gate the timing:
+//   1. AssertBeforeHeightAbsolute(VOTE_CLOSE_HEIGHT) — local check
+//      against the curried close height. Cheap and fails closed.
+//   2. AssertCoinAnnouncement on the Ballot Coin oracle's
+//      "ballot_oracle_open" announcement, which proves the curried
+//      VOTE_CLOSE_HEIGHT is the Ballot Coin's actual curried close
+//      height (defends against a malicious mint that lied about
+//      close height — see CHIP.md "Why oracle is required").
+//
+// State transition:
+//   vote_data → new_vote_data (other curried/state fields unchanged)
+
+import super::common_types::*;
+import shared::*;
+
+fn main(
+    // ── Curried ─────────────────────────────────────────────────────
+    BALLOT_LAUNCHER_ID: Bytes32,
+    ELECTION_LAUNCHER_ID: Bytes32,
+    VOTE_CLOSE_HEIGHT: Int,
+    Truth: VotingCoinStateTruth,
+    // ── Solution ────────────────────────────────────────────────────
+    new_vote_data: Bytes32,
+    new_signature: Signature,
+    ...ballot_coin_id: Bytes32,
+) -> (VotingCoinStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    // 1. Local height gate — ballot must still be open.
+    let assert_before_close = AssertBeforeHeightAbsolute {
+        height: VOTE_CLOSE_HEIGHT,
+    };
+
+    // 2. Ballot Coin oracle co-spend assertion. Pins the Ballot Coin's
+    //    actual curried close height to the value we curry — defends
+    //    against a malicious mint having lied at mint_voting_coin time.
+    let ballot_b: Bytes = BALLOT_LAUNCHER_ID as Bytes;
+    let oracle_message: Bytes32 = sha256(
+        "ballot_oracle_open"
+        + ballot_b
+        + int_to_8_bytes_be(VOTE_CLOSE_HEIGHT)
+    );
+    let oracle_announcement_id: Bytes32 = sha256(
+        (ballot_coin_id as Bytes)
+        + (oracle_message as Bytes)
+    );
+    let assert_ballot_open = AssertCoinAnnouncement {
+        id: oracle_announcement_id,
+    };
+
+    // 3. Voter signs the new vote_message. Canonical preimage from
+    //    CHIP rev 2026-05-02:
+    //      vote_message = sha256(vote_outcome || ballot_launcher_id || election_launcher_id)
+    let vm: Bytes32 = vote_message(
+        new_vote_data,
+        BALLOT_LAUNCHER_ID,
+        ELECTION_LAUNCHER_ID,
+    );
+    let agg_sig_update = AggSigMe {
+        public_key: State.voter_pubkey,
+        message: vm,
+    };
+
+    // 4. Aggregator-facing announcement carrying the fresh signature.
+    let announce_update = CreateCoinAnnouncement {
+        message: sha256(
+            "vote_updated"
+            + ballot_b
+            + (State.voter_pubkey as Bytes)
+            + (new_vote_data as Bytes)
+            + (new_signature as Bytes)
+        ),
+    };
+
+    // 5. Recreate Voting Coin with new vote_data; everything else
+    //    stays bound to the same registration / ballot / voter.
+    let new_state = VotingCoinState {
+        voter_pubkey: State.voter_pubkey,
+        ballot_launcher_id: State.ballot_launcher_id,
+        vote_data: new_vote_data,
+        registration_coin_id: State.registration_coin_id,
+    };
+
+    (
+        VotingCoinStateTruth {
+            Ephemeral_State: nil,
+            State: new_state,
+        },
+        [
+            assert_before_close,
+            assert_ballot_open,
+            agg_sig_update,
+            announce_update,
+        ],
+    )
+}
