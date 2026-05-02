@@ -23,6 +23,7 @@
 //        UX (e.g., a UI shows "deploy first" for `NotDeployed` vs
 //        "network down" for `Rpc(_)`).
 
+use chia_protocol::Bytes32;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -89,6 +90,19 @@ pub enum VotingError {
 
     #[error("not enough signatures to satisfy 2k > registration_count")]
     BelowThreshold,
+
+    // ── Ballot / Voting Coin ──────────────────────────────────────────
+    #[error("ballot {0} not found in chain state")]
+    BallotNotFound(Bytes32),
+
+    #[error("ballot {0} has already ended at height {1}")]
+    BallotEnded(Bytes32, u32),
+
+    #[error("registration {0} has already minted a Voting Coin for ballot {1}")]
+    DuplicateVotingCoin(Bytes32, Bytes32),
+
+    #[error("vote_message preimage mismatch: expected sha256(outcome||ballot||election)")]
+    VoteMessagePreimageMismatch,
 
     // ── Ceremony ──────────────────────────────────────────────────────
     #[error("ceremony already finalized")]
