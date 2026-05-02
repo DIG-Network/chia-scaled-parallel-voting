@@ -1,14 +1,12 @@
 // election/finalizer.rue
-// Custom finalizer for the Election Singleton.
+// Finalizer for the Election Singleton.
 //
-// Differs from the standard CHIP-0050 finalizer in one respect: the
-// recreated singleton's amount is `1 + new_state.accumulated_fees`
-// rather than always `1`. This lets the singleton coin physically hold
-// the accumulated registration fees as XCH dust until the finalize
-// action zeros out `accumulated_fees` and emits a CreateCoin paying
-// them to the finalizer's destination.
+// Standard CHIP-0050 finalizer: recreates the singleton at amount 1
+// after each inner action runs. Under CHIP rev 2026-05-02 the singleton
+// no longer accumulates XCH fees (registration fee is removed), so the
+// recreated coin amount is always 1.
 //
-// Recreation puzzle hash format (matches the standard finalizer):
+// Recreation puzzle hash format:
 //   curry_tree_hash(
 //     ACTION_LAYER_MOD_HASH,
 //     [
@@ -33,8 +31,6 @@ fn main(
 ) -> List<Condition> {
     let new_state = unchecked_cast::<ElectionState>(last_action_output.first.actual_state);
 
-    let recreation_amount: Int = 1 + new_state.accumulated_fees;
-
     let recreation_condition = CreateCoin {
         puzzle_hash: curry_tree_hash(
             ACTION_LAYER_MOD_HASH,
@@ -49,7 +45,7 @@ fn main(
                 tree_hash(new_state),
             ]
         ),
-        amount: recreation_amount,
+        amount: 1,
         memos: Memos {
             value: [HINT],
         }

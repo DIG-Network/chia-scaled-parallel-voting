@@ -1,0 +1,104 @@
+// election/create_ballot.rue
+// CreateBallot action for the Election Singleton.
+//
+// Mints a fresh Ballot Coin lineage. Following the standard Chia
+// singleton-launch pattern, the action emits a launcher EVE coin
+// (a 1-mojo coin at SINGLETON_LAUNCHER_PUZZLE_HASH) as a child of the
+// current Election Singleton spend. Whoever knows the resulting
+// eve coin id can then spend the launcher to instantiate the Ballot
+// Coin singleton; the driver / SDK is responsible for that follow-up
+// spend with the correct deployment-wide curries (VK, IC, threshold
+// pack, BALLOT_ACTIONS_MERKLE_ROOT) and per-ballot args
+// (vote_close_height, outcome_domain_hash). All Ballot Coins minted
+// from a given Election Singleton inherit a stable
+// `ballot_launcher_id = eve_coin_id` that uniquely identifies the
+// ballot for the rest of the system.
+//
+// The action:
+//   1. Pins the singleton's current coin id via AssertMyCoinId so the
+//      eve coin id can be derived deterministically inside the puzzle.
+//   2. Computes eve_coin_id = sha256(singleton_coin_id ||
+//      SINGLETON_LAUNCHER_PUZZLE_HASH || 8-byte BE 1).
+//   3. Emits CreateCoin for the launcher eve coin with hint =
+//      eve_coin_id (= ballot_launcher_id) so indexers can find it.
+//   4. Emits an indexer-facing CreateCoinAnnouncement carrying
+//      ballot_launcher_id, vote_close_height, and outcome_domain_hash.
+//   5. Recreates the Election Singleton with state UNCHANGED — ballot
+//      issuance does not mutate registration_count, vote_weight, or
+//      the SPT root. The election finalizer applies the no-op state.
+//
+// Permissions: this action is unsigned-by-puzzle-design. Deployment
+// guardrails for who may mint ballots SHOULD live in a wrapper key
+// or governance layer outside this CHIP's scope (the singleton
+// merely enforces that ballot lineage is traceable here).
+
+import super::common_types::*;
+import shared::*;
+
+fn main(
+    // ── Curried ─────────────────────────────────────────────────────
+    SINGLETON_LAUNCHER_PUZZLE_HASH: Bytes32,
+    ELECTION_LAUNCHER_ID: Bytes32,
+    Truth: ElectionStateTruth,
+    // ── Solution ────────────────────────────────────────────────────
+    singleton_coin_id: Bytes32,
+    ballot_seed: Bytes32,
+    vote_close_height: Int,
+    ...outcome_domain_hash: Bytes32,
+) -> (ElectionStateTruth, List<Condition>) {
+    // Pin the singleton's current coin id. CLVM ASSERT_MY_COIN_ID will
+    // reject the spend if `singleton_coin_id` doesn't match the actual
+    // coin being spent — this is what lets the puzzle compute the eve
+    // coin id deterministically.
+    let assert_self = AssertMyCoinId {
+        coin_id: singleton_coin_id,
+    };
+
+    // Eve coin id = sha256(parent_coin_id || puzzle_hash || amount_be8).
+    // This becomes the Ballot Coin's launcher_id once the eve coin is
+    // spent through the standard SINGLETON_LAUNCHER puzzle in a
+    // follow-up spend the driver builds.
+    let eve_coin_id: Bytes32 = sha256(
+        (singleton_coin_id as Bytes)
+        + (SINGLETON_LAUNCHER_PUZZLE_HASH as Bytes)
+        + int_to_8_bytes_be(1)
+    );
+
+    // Mint the launcher eve coin. Hint = ballot_launcher_id so
+    // off-chain indexers can find both the eve coin and (after the
+    // launcher spend) the Ballot Coin lineage by the same key.
+    let mint_eve = CreateCoin {
+        puzzle_hash: SINGLETON_LAUNCHER_PUZZLE_HASH,
+        amount: 1,
+        memos: Memos {
+            value: [eve_coin_id],
+        },
+    };
+
+    // Indexer / aggregator announcement — carries every ballot config
+    // value the SDK needs to reconstruct the Ballot Coin's curried
+    // puzzle hash off-chain. ballot_seed is included so successive
+    // create_ballot spends in the same block (which would otherwise
+    // produce identical announcement preimages because the singleton
+    // coin id is fresh per-spend) are still distinguishable to relays.
+    let announce_create = CreateCoinAnnouncement {
+        message: sha256(
+            "ballot_created"
+            + (ELECTION_LAUNCHER_ID as Bytes)
+            + (eve_coin_id as Bytes)
+            + (ballot_seed as Bytes)
+            + int_to_8_bytes_be(vote_close_height)
+            + (outcome_domain_hash as Bytes)
+        ),
+    };
+
+    // State unchanged.
+    (
+        Truth,
+        [
+            assert_self,
+            mint_eve,
+            announce_create,
+        ],
+    )
+}

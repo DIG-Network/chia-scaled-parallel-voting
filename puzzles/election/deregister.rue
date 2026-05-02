@@ -1,0 +1,128 @@
+// election/deregister.rue
+// Deregister action for the Election Singleton.
+//
+// A registered voter exits the registered set. The action:
+//   1. Verifies the voter's slot index is the canonical slot derived
+//      from their pubkey (sha256(pubkey) prefix), matching the slot
+//      register.rue would have placed them in.
+//   2. Verifies a membership proof for that slot (active leaf
+//      sha256(pubkey)) against the current SPT root.
+//   3. Computes the new SPT root with EMPTY_LEAF_HASH at the same
+//      slot — i.e. the voter's leaf is wiped.
+//   4. Decrements registration_count and registration_vote_weight by
+//      COLLATERAL_AMOUNT (per-voter weight is curried-constant for
+//      this election; matches the per-voter lockup register.rue
+//      verified via AssertCoinAnnouncement).
+//   5. Emits a coin announcement authorizing the matching Registration
+//      Coin's `release` action to unlock collateral. The release path
+//      asserts this exact announcement.
+//   6. Requires AggSigMe from the voter pubkey so only the voter can
+//      deregister themselves.
+//
+// Note: deregistration is independent of any ballot's finalize state.
+// A voter may deregister mid-deployment; their Voting Coins remain on
+// chain and continue to be aggregable for ballots they cast on prior
+// to deregistration. Per CHIP rev 2026-05-02 the singleton's
+// `deregister` announcement is the canonical authorization for
+// collateral release; ballot finalize announcements are not.
+
+import super::common_types::*;
+import shared::*;
+
+inline fn slot_from_pubkey(pubkey: PublicKey) -> Int {
+    let pk_hash_b: Bytes = sha256(pubkey as Bytes) as Bytes;
+    let prefix: Bytes = substr(pk_hash_b, 0, 4);
+    let unsigned_bytes: Bytes = 0x00 as Bytes + prefix;
+    unsigned_bytes as Int
+}
+
+fn compute_root(
+    node: Bytes32,
+    index: Int,
+    remaining: HashCons,
+    depth_remaining: Int,
+) -> Bytes32 {
+    if depth_remaining == 0 {
+        node
+    } else {
+        let sibling: Bytes32 = remaining.head;
+        let node_b: Bytes = node as Bytes;
+        let sibling_b: Bytes = sibling as Bytes;
+        let parent: Bytes32 = if index % 2 == 0 {
+            sha256(node_b + sibling_b)
+        } else {
+            sha256(sibling_b + node_b)
+        };
+        compute_root(parent, index / 2, remaining.tail, depth_remaining - 1)
+    }
+}
+
+fn main(
+    // ── Curried ─────────────────────────────────────────────────────
+    TREE_DEPTH: Int,
+    EMPTY_LEAF_HASH: Bytes32,
+    COLLATERAL_AMOUNT: Int,
+    REGISTRATION_MERKLE_ROOT: Bytes32,
+    Truth: ElectionStateTruth,
+    // ── Solution ────────────────────────────────────────────────────
+    voter_pubkey: PublicKey,
+    deregister_leaf_index: Int,
+    ...deregister_siblings: HashCons,
+) -> (ElectionStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    // Slot integrity: index MUST be the canonical slot for this pubkey
+    // (matches register.rue's invariant).
+    let computed_slot: Int = slot_from_pubkey(voter_pubkey);
+    assert deregister_leaf_index == computed_slot;
+
+    // Membership proof: the slot currently holds sha256(pubkey).
+    let pk_b: Bytes = voter_pubkey as Bytes;
+    let active_leaf: Bytes32 = sha256(pk_b);
+    let pre_root: Bytes32 = compute_root(
+        active_leaf, deregister_leaf_index, deregister_siblings, TREE_DEPTH,
+    );
+    assert pre_root == State.registration_merkle_root;
+
+    // New root with the voter's leaf wiped to EMPTY_LEAF_HASH.
+    let new_root: Bytes32 = compute_root(
+        EMPTY_LEAF_HASH, deregister_leaf_index, deregister_siblings, TREE_DEPTH,
+    );
+
+    // Voter's signature authorizing their own deregistration. Bound to
+    // the election launcher so a sig from one election cannot replay on
+    // another.
+    let bbl_b: Bytes = State.registration_merkle_root as Bytes;
+    let deregister_sig_message: Bytes32 = sha256(
+        "deregister_self"
+        + pk_b
+        + bbl_b
+    );
+    let agg_sig_deregister = AggSigMe {
+        public_key: voter_pubkey,
+        message: deregister_sig_message,
+    };
+
+    // Authorization announcement for Registration Coin release path.
+    let announce_deregister = CreateCoinAnnouncement {
+        message: deregister_announcement_msg(voter_pubkey),
+    };
+
+    let new_state = ElectionState {
+        registration_merkle_root: new_root,
+        registration_count: State.registration_count - 1,
+        registration_vote_weight: State.registration_vote_weight - COLLATERAL_AMOUNT,
+        election_start_height: State.election_start_height,
+    };
+
+    (
+        ElectionStateTruth {
+            Ephemeral_State: Truth.Ephemeral_State,
+            State: new_state,
+        },
+        [
+            agg_sig_deregister,
+            announce_deregister,
+        ],
+    )
+}

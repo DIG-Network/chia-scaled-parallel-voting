@@ -2,23 +2,21 @@
 // Register action for the Election Singleton.
 //
 // A voter joins the registered set. The action:
-//   1. Asserts the singleton is not yet finalized.
-//   2. Verifies the voter's slot index is the canonical slot derived
+//   1. Verifies the voter's slot index is the canonical slot derived
 //      from their pubkey (sha256(pubkey) prefix).
-//   3. Verifies an emptiness proof for that slot against the current
+//   2. Verifies an emptiness proof for that slot against the current
 //      SPT root.
-//   4. Computes the new SPT root with sha256(pubkey) inserted at the
+//   3. Computes the new SPT root with sha256(pubkey) inserted at the
 //      slot.
-//   5. Computes the expected CAT-wrapped Registration Coin puzzle hash
+//   4. Computes the expected CAT-wrapped Registration Coin puzzle hash
 //      and asserts a CreateCoinAnnouncement from the parent CAT spend
 //      confirming the Registration Coin was created with that puzzle
 //      hash and COLLATERAL_AMOUNT. This binds the on-chain CAT lockup
 //      to the registration so the voter cannot under-collateralize.
-//   6. Updates state: increments registration_count, accumulates
-//      REGISTRATION_FEE into accumulated_fees, stores the new SPT root.
-//      The election finalizer translates the new accumulated_fees into
-//      the next singleton coin's amount.
-//   7. Requires AggSigMe from the registering voter pubkey.
+//   5. Updates state: increments registration_count, adds
+//      COLLATERAL_AMOUNT to registration_vote_weight, stores the new
+//      SPT root.
+//   6. Requires AggSigMe from the registering voter pubkey.
 //
 // The Registration Coin puzzle hash that must be created is:
 //
@@ -26,7 +24,7 @@
 //       action_layer(
 //           registration_finalizer_full_hash(HINT),
 //           REGISTRATION_MERKLE_ROOT,                     // constant for this election
-//           initial_RegistrationState(voter_pubkey, election_id),
+//           initial_RegistrationState(voter_pubkey, election_id, EMPTY_BALLOT_ROOT),
 //       )
 //   )
 //
@@ -39,9 +37,9 @@
 //   - A CAT spend that creates the Registration Coin at this exact
 //     puzzle hash with COLLATERAL_AMOUNT, emitting the matching
 //     "create_reg" CreateCoinAnnouncement.
-//   - An XCH coin contributing REGISTRATION_FEE so the Election
-//     Singleton's recreated coin balances (its amount grows by
-//     REGISTRATION_FEE on register).
+//
+// No XCH registration fee under CHIP rev 2026-05-02; the singleton's
+// recreated coin amount does NOT grow on register.
 
 import super::common_types::*;
 import super::registration_coin::shared::*;
@@ -75,8 +73,9 @@ fn compute_root(
     }
 }
 
-/// Compute the CAT-wrapped puzzle hash of the freshly registered
-/// (HAS_VOTED=false, vote_data=0) Registration Coin for this voter.
+/// Compute the CAT-wrapped puzzle hash of a freshly registered
+/// Registration Coin (empty per-registration ballot SPT, no release
+/// destination) for this voter.
 fn fresh_registration_coin_puzzle_hash(
     cat_mod_hash: Bytes32,
     cat_tail_hash: Bytes32,
@@ -85,11 +84,13 @@ fn fresh_registration_coin_puzzle_hash(
     registration_merkle_root: Bytes32,
     voter_pubkey: PublicKey,
     election_launcher_id: Bytes32,
+    empty_ballot_root: Bytes32,
 ) -> Bytes32 {
     // Per-voter hint baked into the finalizer's curry — gives off-chain
     // indexers a stable lookup key for this voter's registration coin
-    // lineage across vote / release spends. Binds launcher, CAT asset,
-    // and voter so hinted coins cannot collide across elections or tails.
+    // lineage across mint_voting_coin / release spends. Binds launcher,
+    // CAT asset, and voter so hinted coins cannot collide across
+    // elections or tails.
     let hint: Bytes32 = sha256(
         "CHIP/onchain/voter_hint/v1/"
         + (election_launcher_id as Bytes)
@@ -97,12 +98,12 @@ fn fresh_registration_coin_puzzle_hash(
         + (voter_pubkey as Bytes)
     );
 
-    // Initial state: not voted, empty vote_data, no release destination.
+    // Initial state: empty per-registration ballot SPT, no release
+    // destination yet (set later by the singleton's `deregister` action).
     let initial_state = RegistrationState {
         voter_pubkey: voter_pubkey,
         election_launcher_id: election_launcher_id,
-        has_voted: false,
-        vote_data: 0x0000000000000000000000000000000000000000000000000000000000000000,
+        voted_ballots_root: empty_ballot_root,
         release_destination: nil,
     };
 
@@ -163,8 +164,8 @@ fn main(
     REGISTRATION_FINALIZER_MOD_HASH: Bytes32,
     REGISTRATION_MERKLE_ROOT: Bytes32,
     COLLATERAL_AMOUNT: Int,
-    REGISTRATION_FEE: Int,
     ELECTION_LAUNCHER_ID: Bytes32,
+    EMPTY_BALLOT_ROOT: Bytes32,
     Truth: ElectionStateTruth,
     // ── Solution ────────────────────────────────────────────────────
     new_voter_pubkey: PublicKey,
@@ -173,9 +174,6 @@ fn main(
     ...cat_parent_coin_id: Bytes32,
 ) -> (ElectionStateTruth, List<Condition>) {
     inline let State = Truth.State;
-
-    // Cannot register after finalization.
-    assert State.finalized == false;
 
     // Slot integrity: index MUST be the canonical slot for this pubkey.
     let computed_slot: Int = slot_from_pubkey(new_voter_pubkey);
@@ -203,6 +201,7 @@ fn main(
         REGISTRATION_MERKLE_ROOT,
         new_voter_pubkey,
         ELECTION_LAUNCHER_ID,
+        EMPTY_BALLOT_ROOT,
     );
 
     // The CAT parent must emit this exact CreateCoinAnnouncement,
@@ -240,9 +239,8 @@ fn main(
     let new_state = ElectionState {
         registration_merkle_root: new_root,
         registration_count: State.registration_count + 1,
-        accumulated_fees: State.accumulated_fees + REGISTRATION_FEE,
-        finalized: false,
-        vote_outcome: 0x0000000000000000000000000000000000000000000000000000000000000000,
+        registration_vote_weight: State.registration_vote_weight + COLLATERAL_AMOUNT,
+        election_start_height: State.election_start_height,
     };
 
     (
