@@ -36,7 +36,7 @@ use crate::error::{anyhow_compat, VotingError, VotingResult};
 use crate::merkle::{MerkleProof, SparseMerkleTree};
 use crate::prover::Scalars;
 use crate::puzzles;
-use crate::state::{ElectionState, VoteRecord, VoterSet};
+use crate::state::{BallotCoinSnapshot, ElectionState, VoteRecord, VoterSet};
 
 /// STRUCT: Aggregator
 /// PURPOSE: stateful aggregator/finalizer actor.
@@ -60,6 +60,14 @@ pub struct Aggregator<C: ChainReader = chia_query::ChiaQuery> {
     state: Option<ElectionState>,
     voter_set: Option<VoterSet>,
     smt: Option<SparseMerkleTree>,
+    ballots: Option<Vec<BallotCoinSnapshot>>,
+    /// Election launch height — required to predict the singleton's
+    /// genesis state (4-field shape; `election_start_height` is the
+    /// trailing field). For the eve-only fast path the deployer
+    /// stores this in `DeployParams`; here it's seeded by `new`
+    /// (defaulting to 0 — callers needing post-eve recovery must
+    /// override via [`Self::with_election_start_height`]).
+    election_start_height: u64,
     /// Pre-computed `election_singleton_puzzle_hash(launcher_id, inner_ph)`
     /// for the GENESIS state. Cached so we don't recompute on every
     /// sync. Production singletons that have been spent at least once
@@ -73,7 +81,13 @@ impl<C: ChainReader> Aggregator<C> {
     /// WHAT: construct from a validated config + a ChainReader.
     /// COST: precomputes the eve singleton puzzle hash (~few hashes).
     pub fn new(config: ElectionConfig, chain: C, network: NetworkType) -> Self {
-        let eve_singleton_puzzle_hash = compute_eve_singleton_puzzle_hash(&config);
+        // Default `election_start_height = 0` matches `ElectionState::genesis(_, 0)`
+        // — appropriate for the eve fast path on a freshly-launched election
+        // when the caller has not yet supplied a height. Post-eve
+        // reconstruction needs the real value; see `with_election_start_height`.
+        let election_start_height = 0u64;
+        let eve_singleton_puzzle_hash =
+            compute_eve_singleton_puzzle_hash(&config, election_start_height);
         Self {
             config,
             network,
@@ -81,8 +95,23 @@ impl<C: ChainReader> Aggregator<C> {
             state: None,
             voter_set: None,
             smt: None,
+            ballots: None,
+            election_start_height,
             eve_singleton_puzzle_hash,
         }
+    }
+
+    /// FN: with_election_start_height
+    /// WHAT: builder-style override for the launch-height anchor used
+    ///       to predict the genesis singleton state. Required when the
+    ///       aggregator must compute eve / post-eve puzzle hashes for
+    ///       a deployment whose `DeployParams::election_start_height`
+    ///       was non-zero.
+    pub fn with_election_start_height(mut self, election_start_height: u64) -> Self {
+        self.election_start_height = election_start_height;
+        self.eve_singleton_puzzle_hash =
+            compute_eve_singleton_puzzle_hash(&self.config, election_start_height);
+        self
     }
 
     /// Shared reference to the underlying chain reader. Use for
@@ -118,17 +147,24 @@ impl<C: ChainReader> Aggregator<C> {
     ///   * `VotingError::StateMismatch` if multiple unspent singletons
     ///     exist at the eve puzzle hash (impossible for a real singleton
     ///     but worth surfacing as a hard error).
-    pub async fn sync(&mut self) -> VotingResult<VoterSet> {
+    /// Returns the full sync snapshot (state + voter set + SMT +
+    /// observed Ballot Coins). Per CHIP rev 2026-05-02 the
+    /// aggregator's view is now per-ballot rather than singleton-
+    /// scoped, so callers needing per-ballot state read from
+    /// `ballots`.
+    pub async fn sync(&mut self) -> VotingResult<SyncSnapshot> {
         let snapshot = sync_with_chain(
             &self.chain,
             &self.config,
             self.eve_singleton_puzzle_hash,
+            self.election_start_height,
         )
         .await?;
-        self.state = Some(snapshot.state);
-        self.smt = Some(snapshot.smt);
+        self.state = Some(snapshot.state.clone());
+        self.smt = Some(snapshot.smt.clone());
         self.voter_set = Some(snapshot.voter_set.clone());
-        Ok(snapshot.voter_set)
+        self.ballots = Some(snapshot.ballots.clone());
+        Ok(snapshot)
     }
 
     /// Last-synced `ElectionState`. Returns `NotDeployed` if `sync()`
@@ -144,6 +180,15 @@ impl<C: ChainReader> Aggregator<C> {
     /// finalize witnesses.
     pub fn merkle_tree(&self) -> VotingResult<&SparseMerkleTree> {
         self.smt.as_ref().ok_or(VotingError::NotDeployed)
+    }
+    /// Last-synced Ballot Coin snapshots (one per observed ballot).
+    /// Empty until per-ballot enumeration lands in Phase 4.5
+    /// (indexer); for now `sync()` returns an empty Vec and the real
+    /// per-ballot lineage walk is stubbed.
+    pub fn ballots(&self) -> VotingResult<&[BallotCoinSnapshot]> {
+        self.ballots
+            .as_deref()
+            .ok_or(VotingError::NotDeployed)
     }
 
     /// FN: collect_votes
@@ -162,9 +207,37 @@ impl<C: ChainReader> Aggregator<C> {
     ///     CLVM in-process, and decodes the
     ///     `[HINT, vote_data, vote_signature]` memos written by
     ///     `registration_coin/finalizer.rue`.
+    /// FN: collect_votes (legacy / back-compat)
+    /// WHAT: enforces the lifecycle invariant (sync first), then
+    ///       returns an empty Vec. The post-CHIP-rev-2026-05-02 model
+    ///       collects votes per Ballot Coin, not globally — see
+    ///       [`Self::collect_votes_for_ballot`]. Existing callers that
+    ///       only used this method as an "empty before voting" probe
+    ///       continue to work; callers that needed real vote records
+    ///       must migrate to the per-ballot variant.
     pub async fn collect_votes(&self) -> VotingResult<Vec<VoteRecord>> {
-        let voter_set = self.voter_set()?;
-        extract_votes(&self.chain, &self.config, voter_set).await
+        let _ = self.voter_set()?;
+        Ok(Vec::new())
+    }
+
+    /// FN: collect_votes_for_ballot
+    /// WHAT: enumerate every Voting Coin spent against
+    ///       `ballot_launcher_id`, decode the (vote_data, signature)
+    ///       memos, and return the validated `VoteRecord`s.
+    /// STATUS: STUB — pending Phase 6 (test infrastructure) which adds
+    ///         the on-chain Voting Coin lineage walker. Returns
+    ///         `VotingError::Other` until the walker lands.
+    pub async fn collect_votes_for_ballot(
+        &self,
+        _ballot_launcher_id: Bytes32,
+    ) -> VotingResult<Vec<VoteRecord>> {
+        let _ = self.voter_set()?;
+        Err(VotingError::Other(anyhow_compat::Error(
+            "collect_votes_for_ballot is stubbed pending Phase 6 \
+             (Voting Coin lineage walker)"
+                .to_string()
+                .into(),
+        )))
     }
 
     /// FN: prepare_finalize_witness
@@ -206,6 +279,7 @@ impl<C: ChainReader> Aggregator<C> {
     pub fn prepare_finalize_witness(
         &self,
         vote_outcome: Bytes32,
+        ballot_launcher_id: Bytes32,
         votes: &[VoteRecord],
     ) -> VotingResult<FinalizeWitness> {
         let voter_set = self.voter_set()?;
@@ -278,7 +352,8 @@ impl<C: ChainReader> Aggregator<C> {
         let election_id = self.config.election_launcher_id().map_err(|e| {
             VotingError::Other(anyhow_compat::Error(format!("config: {e}").into()))
         })?;
-        let vote_message = canonical_vote_message(vote_outcome, election_id);
+        let vote_message =
+            canonical_vote_message(vote_outcome, ballot_launcher_id, election_id);
 
         // Pre-check 6: PoP-style BLS aggregate verify off-chain
         // — mirrors the EXACT pairing identity the on-chain
@@ -325,6 +400,7 @@ impl<C: ChainReader> Aggregator<C> {
 
         Ok(FinalizeWitness {
             vote_outcome,
+            ballot_launcher_id,
             vote_message,
             agg_signers,
             agg_signature,
@@ -336,26 +412,60 @@ impl<C: ChainReader> Aggregator<C> {
         })
     }
 
-    /// FN: build_finalize
-    /// WHAT: assemble the finalize spend bundle.
-    ///
-    /// PRE-CHECKS + WITNESS (fully implemented, runs first):
-    ///   * Delegates to `prepare_finalize_witness` for all input
-    ///     validation, BLS aggregation, Merkle proofs, and scalar
-    ///     computation.
-    ///
-    /// REMAINING WORK (returns `VotingError::ProvingError` until
-    /// `crate::prover::VotingCircuit::prove` is implemented):
-    ///   1. Run the Groth16 prover with the witness's
-    ///      `(merkle_proofs, agg_signers, agg_signature, scalars)`.
-    ///   2. Build the action-layer solution with the `finalize` action
-    ///      selected: `(proof, vote_outcome, agg_signers, agg_sig,
-    ///      scalars, finalizer_destination=reward_address)`.
-    ///   3. Wrap with `SingletonArgs::curry_tree_hash` and spend via
-    ///      `chia_sdk_driver::SpendContext`.
-    ///   4. Sign via `sign_bundle_signature` (the finalize action
-    ///      itself emits no AggSig conditions, but a wrapping fee-coin
-    ///      spend may).
+    /// FN: build_finalize_for_ballot
+    /// WHAT: assemble the finalize spend bundle that targets the
+    ///       Ballot Coin (NOT the Election Singleton — the singleton
+    ///       no longer participates in finalize per CHIP rev
+    ///       2026-05-02).
+    /// STATUS: STUB. The new spend assembly depends on:
+    ///         (a) Phase 5 — 6-input prover (`Scalars { s6 }`,
+    ///             `vote_message(outcome, ballot, election)` as input
+    ///             #6).
+    ///         (b) Phase 6 — Ballot Coin lineage walker / spend
+    ///             builder.
+    ///         Returns `VotingError::Other` until both land.
+    pub async fn build_finalize_for_ballot(
+        &self,
+        _ballot_launcher_id: Bytes32,
+        _vote_outcome: Bytes32,
+        _votes: &[VoteRecord],
+        _reward_address: Bytes32,
+        _proving_key: &crate::prover::circuit::ArkProvingKey,
+    ) -> VotingResult<SpendBundle> {
+        let _ = self.state()?;
+        Err(VotingError::Other(anyhow_compat::Error(
+            "build_finalize_for_ballot is stubbed pending Phase 5 \
+             (6-input prover) and Phase 6 (Ballot Coin spend builder)"
+                .to_string()
+                .into(),
+        )))
+    }
+
+    /// FN: build_finalize_with_proof_for_ballot
+    /// STATUS: STUB. See `build_finalize_for_ballot`.
+    pub async fn build_finalize_with_proof_for_ballot(
+        &self,
+        _ballot_launcher_id: Bytes32,
+        _vote_outcome: Bytes32,
+        _votes: &[VoteRecord],
+        _reward_address: Bytes32,
+        _proof: crate::prover::Groth16Proof,
+    ) -> VotingResult<SpendBundle> {
+        let _ = self.state()?;
+        Err(VotingError::Other(anyhow_compat::Error(
+            "build_finalize_with_proof_for_ballot is stubbed pending \
+             Phase 5 (6-input prover) and Phase 6 (Ballot Coin spend \
+             builder)"
+                .to_string()
+                .into(),
+        )))
+    }
+
+    /// FN: build_finalize (legacy back-compat shim)
+    /// WHAT: routes to the per-ballot stub. The pre-CHIP-rev model
+    ///       targeted the Election Singleton; that path is gone.
+    ///       Existing callers should migrate to
+    ///       [`Self::build_finalize_for_ballot`].
     pub async fn build_finalize(
         &self,
         vote_outcome: Bytes32,
@@ -363,50 +473,26 @@ impl<C: ChainReader> Aggregator<C> {
         reward_address: Bytes32,
         proving_key: &crate::prover::circuit::ArkProvingKey,
     ) -> VotingResult<SpendBundle> {
-        // 1. Witness preparation (BLS aggregation, majority check,
-        //    scalar derivation). All pre-checks run before the
-        //    expensive prover invocation so callers get fast
-        //    feedback on bad inputs.
-        let witness = self.prepare_finalize_witness(vote_outcome, votes)?;
-
-        // 2. Build the in-memory `VotingCircuit` and run the prover.
-        //    The circuit's signers vector mirrors `witness.signer_pubkeys`;
-        //    Merkle proofs are passed via the witness too. The
-        //    arkworks prover takes a few seconds per ~hundred
-        //    signers on a modern laptop.
-        let signers: Vec<crate::prover::circuit::SignerWitness> = witness
-            .signer_pubkeys
-            .iter()
-            .zip(witness.merkle_proofs.iter())
-            .map(|(pk, proof)| crate::prover::circuit::SignerWitness {
-                pubkey: *pk,
-                leaf_index: crate::merkle::SparseMerkleTree::slot_for_pubkey(pk),
-                merkle_proof: proof.clone(),
-            })
-            .collect();
-        let circuit = crate::prover::circuit::VotingCircuit {
-            registration_merkle_root: witness.registration_merkle_root,
-            registration_count: witness.registration_count,
-            agg_signers: witness.agg_signers,
-            vote_message: witness.vote_message,
-            signers,
-        };
-        let proof = circuit.prove(proving_key)?;
-
-        // 3. Delegate to the proof-supplied variant for spend
-        //    assembly + signing.
-        self.build_finalize_with_proof(vote_outcome, votes, reward_address, proof)
-            .await
+        // Pre-checks still run (sync, voter set populated, etc.) so
+        // callers get the same lifecycle errors they used to. Spend
+        // assembly is stubbed — see `build_finalize_for_ballot`.
+        let _ = self.voter_set()?;
+        let _ = votes;
+        let _ = vote_outcome;
+        let _ = reward_address;
+        let _ = proving_key;
+        Err(VotingError::Other(anyhow_compat::Error(
+            "build_finalize is stubbed: the singleton-targeting \
+             finalize is gone; use build_finalize_for_ballot"
+                .to_string()
+                .into(),
+        )))
     }
 
-    /// FN: build_finalize_with_proof
-    /// WHAT: complete the finalize spend assembly given a
-    ///       pre-computed Groth16 proof.
-    /// USAGE: call `prepare_finalize_witness` first; pass the
-    ///        resulting witness into your prover (e.g.,
-    ///        `VotingCircuit::prove`) to produce a `Groth16Proof`;
-    ///        then call this method with the proof to assemble +
-    ///        sign the finalize bundle.
+    /// FN: build_finalize_with_proof (legacy shim)
+    /// WHAT: stub returning `VotingError::Other`. The singleton-
+    ///       targeting finalize is gone; new code should call
+    ///       [`Self::build_finalize_with_proof_for_ballot`].
     pub async fn build_finalize_with_proof(
         &self,
         vote_outcome: Bytes32,
@@ -414,265 +500,52 @@ impl<C: ChainReader> Aggregator<C> {
         reward_address: Bytes32,
         proof: crate::prover::Groth16Proof,
     ) -> VotingResult<SpendBundle> {
-        use clvm_traits::{clvm_curried_args, ToClvm};
-        use clvm_utils::CurriedProgram;
-        use chia_sdk_driver::SpendContext;
-
-        let witness = self.prepare_finalize_witness(vote_outcome, votes)?;
-        let _ = reward_address;
-        let election_id = self.config.election_launcher_id().map_err(|e| {
-            VotingError::Other(anyhow_compat::Error(format!("election_launcher_id: {e}").into()))
-        })?;
-        let cat_tail_hash = self.config.cat_tail_hash().map_err(|e| {
-            VotingError::Other(anyhow_compat::Error(format!("cat_tail_hash: {e}").into()))
-        })?;
-
-        // ── 1. Find the current Election Singleton ──────────────
-        // Never use only `coin_records_by_puzzle_hash(eve_ph)` —
-        // after the first spend the singleton's puzzle_hash changes.
-        //
-        // Use the propagation-aware poller (mirrors what
-        // `Voter::register` and `Voter::release_collateral` do):
-        // by the time this runs, every voter has just spent the
-        // singleton (register × N) and the aggregator's own peer
-        // pool may briefly lag the chain it just observed via
-        // `sync()`. A bare `find_current_singleton` would surface
-        // that lag as `NotDeployed`, which we hit on mainnet at
-        // PHASE 5 in run-8. Polling closes that race without
-        // forcing the CLI to wrap every call site.
-        let current_tip = wait_for_current_singleton(
-            &self.chain,
-            &self.config,
-            "Election Singleton (build_finalize)",
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(300),
-        )
-        .await?;
-        let singleton_coin = current_tip.coin;
-        let singleton_lineage = current_tip.lineage_proof;
-
-        // ── 2. Build the action layer + finalize action spend ───
-        let mut ctx = SpendContext::new();
-        let elect_finalizer = crate::action_spends::build_election_finalizer_full(
-            &mut ctx,
-            election_id,
-        )?;
-        let merkle_root = election_actions_merkle_root_for_config(&self.config);
-        let pre_state = self.state()?.clone();
-        // Build state CLVM. Trailing-tail convention: vote_outcome
-        // is the trailing element WITHOUT a NIL terminator (matches
-        // `puzzles/election/shared.rue::ElectionState`'s
-        // `...vote_outcome: Bytes32` and the deployer's
-        // `genesis_state_tree_hash` prediction). Adding a stray NIL
-        // here would make the action-layer puzzle hash diverge from
-        // the launcher's commitment and the singleton outer would
-        // reject the spend.
-        let state_node = (
-            pre_state.registration_merkle_root,
-            (
-                pre_state.registration_count,
-                (
-                    pre_state.accumulated_fees,
-                    (pre_state.finalized as u8, pre_state.vote_outcome),
-                ),
-            ),
-        )
-            .to_clvm(&mut *ctx)
-            .map_err(|e| {
-                VotingError::Other(anyhow_compat::Error(format!("state to_clvm: {e:?}").into()))
-            })?;
-        let action_layer_node = crate::action_spends::build_action_layer_puzzle(
-            &mut ctx,
-            elect_finalizer,
-            merkle_root,
-            state_node,
-        )?;
-
-        // Build the curried finalize action puzzle.
-        let finalize_program_node =
-            crate::action_spends::load_action_puzzle(&mut ctx, puzzles::ELECTION_FINALIZE_HEX)?;
-        // Per finalize.rue: VK = struct of (alpha G1 / beta G2 /
-        // gamma G2 / delta G2) — 4-element CLVM list. IC = 5-elt
-        // list of G1 points. Curry as STRUCTS, not flat blobs (the
-        // puzzle accesses VK.alpha, VK.beta, IC.ic0..IC.ic4).
-        let vk_bytes = hex::decode(&self.config.verification_key_hex).map_err(|e| {
-            VotingError::Other(anyhow_compat::Error(format!("vk hex: {e}").into()))
-        })?;
-        if vk_bytes.len() < 576 {
-            return Err(VotingError::Other(anyhow_compat::Error(
-                format!("vk hex too short: got {}, expected ≥ 576", vk_bytes.len()).into(),
-            )));
-        }
-        let vk_alpha = chia_protocol::Bytes::new(vk_bytes[0..48].to_vec());
-        let vk_beta = chia_protocol::Bytes::new(vk_bytes[48..144].to_vec());
-        let vk_gamma = chia_protocol::Bytes::new(vk_bytes[144..240].to_vec());
-        let vk_delta = chia_protocol::Bytes::new(vk_bytes[240..336].to_vec());
-        let vk_struct = (vk_alpha, (vk_beta, (vk_gamma, (vk_delta, ()))));
-        let ic0 = chia_protocol::Bytes::new(vk_bytes[336..384].to_vec());
-        let ic1 = chia_protocol::Bytes::new(vk_bytes[384..432].to_vec());
-        let ic2 = chia_protocol::Bytes::new(vk_bytes[432..480].to_vec());
-        let ic3 = chia_protocol::Bytes::new(vk_bytes[480..528].to_vec());
-        let ic4 = chia_protocol::Bytes::new(vk_bytes[528..576].to_vec());
-        let ic_struct = (ic0, (ic1, (ic2, (ic3, (ic4, ())))));
-        let finalize_curried = CurriedProgram {
-            program: finalize_program_node,
-            args: clvm_curried_args!(
-                vk_struct,
-                ic_struct,
-                self.config.election_length_blocks,
-                election_id
-            ),
-        }
-        .to_clvm(&mut *ctx)
-        .map_err(|e| {
-            VotingError::Other(anyhow_compat::Error(format!("finalize curry: {e:?}").into()))
-        })?;
-
-        // Per finalize.rue: `proof: Proof` where `struct Proof
-        // { a: PublicKey, b: Signature, c: PublicKey }` — a
-        // 3-element CLVM list (a . (b . (c . ()))).
-        // `finalizer_destination` is the trailing `...` arg of the
-        // finalize action, NOT of the action layer's
-        // finalizer_solution.
-        let proof_a_bytes = chia_protocol::Bytes::new(hex::decode(&proof.a_hex).map_err(|e| {
-            VotingError::Other(anyhow_compat::Error(format!("proof.a hex: {e}").into()))
-        })?);
-        let proof_b_bytes = chia_protocol::Bytes::new(hex::decode(&proof.b_hex).map_err(|e| {
-            VotingError::Other(anyhow_compat::Error(format!("proof.b hex: {e}").into()))
-        })?);
-        let proof_c_bytes = chia_protocol::Bytes::new(hex::decode(&proof.c_hex).map_err(|e| {
-            VotingError::Other(anyhow_compat::Error(format!("proof.c hex: {e}").into()))
-        })?);
-        let proof_value = (proof_a_bytes, (proof_b_bytes, (proof_c_bytes, ())));
-        let agg_signers_bytes =
-            chia_protocol::Bytes::new(witness.agg_signers.to_bytes().to_vec());
-        let agg_sig_bytes =
-            chia_protocol::Bytes::new(witness.agg_signature.to_bytes().to_vec());
-        let scalars_arr = witness.scalars.as_array();
-        // Finalize action solution shape (matches finalize.rue):
-        //   (proof, vote_outcome, agg_signers, agg_sig, scalars,
-        //    ...finalizer_destination)
-        // The reward_address (finalizer_destination) is the trailing
-        // tail — no nil after it.
-        let finalize_solution_value = (
-            proof_value,
-            (
-                vote_outcome,
-                (
-                    agg_signers_bytes,
-                    (agg_sig_bytes, (scalars_arr, reward_address)),
-                ),
-            ),
-        );
-        let finalize_solution = finalize_solution_value
-            .to_clvm(&mut *ctx)
-            .map_err(|e| {
-                VotingError::Other(anyhow_compat::Error(
-                    format!("finalize solution to_clvm: {e:?}").into(),
-                ))
-            })?;
-
-        // Election finalizer's `..._my_solution: Any` — pass nil
-        // (the election finalizer doesn't read its own tail; the
-        // reward_address goes into the finalize ACTION solution
-        // above, not the finalizer solution).
-        let finalizer_solution = ().to_clvm(&mut *ctx).map_err(|e| {
-            VotingError::Other(anyhow_compat::Error(
-                format!("finalizer solution to_clvm: {e:?}").into(),
-            ))
-        })?;
-
-        let action_spends = vec![crate::action_spends::ActionSpend {
-            puzzle: finalize_curried,
-            solution: finalize_solution,
-        }];
-        let action_layer_solution = crate::action_spends::build_action_layer_solution(
-            &mut ctx,
-            &compute_election_action_root_leaves(&self.config),
-            &action_spends,
-            finalizer_solution,
-        )?;
-
-        // ── 3. Wrap with the singleton outer + assemble ─────────
-        // Lineage (`Proof::Eve` vs `Proof::Lineage`) comes from the
-        // same launcher-id walk as `find_current_singleton`.
-        let singleton_spend = crate::action_spends::build_singleton_spend(
-            &mut ctx,
-            singleton_coin,
-            election_id,
-            action_layer_node,
-            action_layer_solution,
-            singleton_lineage,
-        )?;
-
-        // ── 4. Sign + bundle ────────────────────────────────────
-        // The finalize action emits no AggSig conditions, so the
-        // bundle's aggregate signature is empty unless a fee-coin
-        // spend is included. For an unaccompanied finalize, sign
-        // with no keys — produces the BLS identity.
-        let _ = cat_tail_hash; // (used by future paired CAT-fee spend)
-        let coin_spends = vec![singleton_spend];
-        // Pre-flight #1: dry-run the singleton spend locally so any
-        // CLVM trap (Groth16 pairing failure, BLS aggregate verify
-        // failure, scalar mismatch, etc.) surfaces with the EXACT
-        // failing coin id BEFORE the bundle reaches mempool. The
-        // alternative is what mainnet PHASE 5 surfaced before this
-        // check existed: the node accepts the bundle into mempool
-        // (`status=SUCCESS`), but a later block-construction
-        // validator silently drops it because the puzzle traps,
-        // and the CLI hangs waiting for a spend that will never
-        // come (`Election Singleton (finalize): coin <X> not
-        // spent within 900s`).
-        if let Err(e) = crate::dry_run_coin_spends(&coin_spends) {
-            return Err(VotingError::Other(anyhow_compat::Error(
-                format!("build_finalize_with_proof dry-run: {e:?}").into(),
-            )));
-        }
-        let signature = sign_bundle_signature(&coin_spends, &[], self.network)?;
-        let bundle = SpendBundle::new(coin_spends, signature);
-
-        // Pre-flight #2: full mempool-admission check via
-        // `chia_consensus::validate_clvm_and_signature`. This is
-        // the EXACT path full nodes use, so any consensus-level
-        // rejection (`AssertHeightRelativeFailed`,
-        // `BadAggregateSignature`, `CostExceeded`, etc.) surfaces
-        // here as a typed `ErrorCode` instead of as the opaque
-        // `status=FAILED` byte that `chia_query::push_tx` returns.
-        //
-        // We fetch the chain peak and validate at `peak + 1`
-        // (the next block this bundle would land in). If the chain
-        // doesn't expose a peak, we conservatively use a far-future
-        // height — that's only safe for non-height-relative checks,
-        // but the chain backends we ship with (`ChiaQuery`,
-        // `SharedSimulator`) both implement `peak_height`.
-        let peak = self
-            .chain
-            .peak_height()
-            .await
-            .ok()
-            .flatten()
-            .map(|h| h.saturating_add(1))
-            .unwrap_or(u32::MAX / 2);
-        if let Err(e) = crate::validate_bundle_for_consensus(&bundle, peak) {
-            return Err(VotingError::Other(anyhow_compat::Error(
-                format!(
-                    "build_finalize_with_proof consensus pre-flight at height {peak}: {e:?}",
-                )
+        let _ = self.voter_set()?;
+        let _ = (vote_outcome, votes, reward_address, proof);
+        Err(VotingError::Other(anyhow_compat::Error(
+            "build_finalize_with_proof is stubbed: the singleton-\
+             targeting finalize is gone; use \
+             build_finalize_with_proof_for_ballot"
+                .to_string()
                 .into(),
-            )));
-        }
-
-        Ok(bundle)
+        )))
     }
 
+    // ── Removed singleton-finalize spend assembly. The original body
+    // curried the action layer with `finalize` / `announce_finalization`
+    // / `oracle` action puzzles that no longer exist post-CHIP rev
+    // 2026-05-02. Re-enabling requires Phase 5 (6-input prover) plus
+    // Phase 6 (Ballot Coin builder); the per-ballot variants above are
+    // the migration destination.
+}
+
+#[cfg(any())]
+fn _legacy_finalize_assembly_dropped() {
+    // The body that lived here built a singleton-targeting finalize
+    // spend by currying `finalize.rue` with VK / IC structs and
+    // wrapping the result in the action layer plus singleton outer.
+    // It was deleted wholesale because:
+    //   * the singleton no longer exposes a `finalize` action;
+    //   * the per-ballot finalize spend is structurally different
+    //     (Ballot Coin spend, not singleton spend);
+    //   * the prover signature changed from 5 to 6 scalars (Phase 5).
+}
+
+#[cfg(any())]
+fn _legacy_finalize_body_dropped_continued() {
+    // ── start orphan-body marker ──
+    // The legacy body continued below; its statements have all been
+    // deleted. The marker keeps the surrounding diff readable.
+    // ── end orphan-body marker ──
+    let _ = ();
+}
+
+impl<C: ChainReader> Aggregator<C> {
     /// FN: sign_coin_spends
-    /// WHAT: convenience wrapper around `sign_bundle_signature`
-    ///       (which itself wraps `dig_l1_wallet::transaction::sign_coin_spends`
-    ///       → `chia_sdk_signer::RequiredSignature::from_coin_spends`).
-    /// USAGE: typical for the optional fee-coin spend that funds the
-    ///        finalize bundle. The finalize action itself emits no
-    ///        AGG_SIG conditions, so a finalize-only spend would not
-    ///        need any sigs.
+    /// WHAT: convenience wrapper around `sign_bundle_signature`.
+    /// USAGE: typical for the optional fee-coin spend that funds a
+    ///        ballot-finalize bundle. The bundle itself emits no
+    ///        AGG_SIG conditions on the Ballot Coin path.
     pub fn sign_coin_spends(
         &self,
         coin_spends: &[CoinSpend],
@@ -707,6 +580,12 @@ impl<C: ChainReader> Aggregator<C> {
 #[derive(Debug, Clone)]
 pub struct FinalizeWitness {
     pub vote_outcome: Bytes32,
+    /// Ballot Coin launcher id this witness was produced against —
+    /// included so downstream callers (Phase 5 prover, Phase 6 spend
+    /// builder) can derive the 6th public input
+    /// `vote_message(outcome, ballot, election)` without re-querying
+    /// the aggregator.
+    pub ballot_launcher_id: Bytes32,
     pub vote_message: Bytes32,
     pub agg_signers: PublicKey,
     pub agg_signature: Signature,
@@ -726,36 +605,26 @@ fn aggregate_pubkeys(pks: &[PublicKey]) -> PublicKey {
     pks.iter().fold(PublicKey::default(), |acc, pk| acc + pk)
 }
 
-/// FN: canonical_vote_message (file-private)
-/// WHAT: derive the AGGREGATE vote message — the single message all
-///       signers' aggregated signature is verified against in the
+/// FN: canonical_vote_message
+/// WHAT: derive the AGGREGATE vote message — the single message every
+///       voter's aggregated signature is verified against in the
 ///       Groth16 circuit's `bls_aggregate_verify` constraint.
-/// FORMULA: `sha256(vote_outcome || election_launcher_id)`.
-/// SIGNATURE SCHEME: voters MUST use UNAUGMENTED BLS (i.e.,
-///       `chia_bls::sign_raw`, equivalent to on-chain
-///       `AggSigUnsafe`) when signing this message. The augmented
-///       scheme (`chia_bls::sign`) prepends the signer's pubkey to
-///       the message bytes, which makes individual signatures
-///       non-aggregatable against a single shared message.
-/// MIRROR: matches `prover::Scalars::compute`'s `vote_message` input
-///         (public input #4 of the circuit). DIFFERENT from the
-///         per-voter on-chain `vote.rue` message
-///         (`sha256("vote" || election_id || pk || vote_data)`) —
-///         that one authenticates the individual on-chain spend; this
-///         one binds the aggregate consensus.
-/// USAGE: voters who want their vote counted toward `vote_outcome`
-///        sign this canonical message off-chain via `sign_raw`. The
-///        aggregator collects these signatures (in
-///        `VoteRecord.vote_signature_hex`) and BLS-sums them into
-///        `agg_signature`.
-fn canonical_vote_message(vote_outcome: Bytes32, election_id: Bytes32) -> Bytes32 {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(vote_outcome.as_ref());
-    h.update(election_id.as_ref());
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&h.finalize());
-    Bytes32::new(arr)
+/// FORMULA (CHIP rev 2026-05-02):
+///   `sha256(vote_outcome || ballot_launcher_id || election_launcher_id)`.
+///   Three-input form binds the signature to the (election, ballot,
+///   outcome) triple so a signature can't be replayed onto a
+///   different ballot.
+/// MIRROR: delegates to [`crate::puzzles::vote_message`], the single
+///         source of truth for the canonical preimage.
+/// SIGNATURE SCHEME: voters MUST use UNAUGMENTED BLS
+///       (`chia_bls::sign_raw`, equivalent to on-chain
+///       `AggSigUnsafe`).
+pub fn canonical_vote_message(
+    vote_outcome: Bytes32,
+    ballot_launcher_id: Bytes32,
+    election_launcher_id: Bytes32,
+) -> Bytes32 {
+    crate::puzzles::vote_message(vote_outcome, ballot_launcher_id, election_launcher_id)
 }
 
 // ============================================================================
@@ -772,6 +641,15 @@ pub struct SyncSnapshot {
     pub state: ElectionState,
     pub voter_set: VoterSet,
     pub smt: SparseMerkleTree,
+    /// Per-CHIP-rev-2026-05-02: every Ballot Coin minted so far. Each
+    /// snapshot carries the ballot launcher id, its current
+    /// `BallotState` (`finalized` / `vote_outcome` / `agg_signers`),
+    /// and the observed coin id of the singleton tip.
+    /// Phase 4 (current): always empty — `apply_singleton_spend`
+    /// recognises the `create_ballot` action but the per-ballot
+    /// lineage walker that fills the snapshot lives in Phase 4.5
+    /// (indexer).
+    pub ballots: Vec<BallotCoinSnapshot>,
 }
 
 /// FN: sync_with_chain
@@ -801,6 +679,7 @@ pub async fn sync_with_chain<C: ChainReader>(
     chain: &C,
     config: &ElectionConfig,
     eve_singleton_puzzle_hash: Bytes32,
+    election_start_height: u64,
 ) -> VotingResult<SyncSnapshot> {
     // Fast-path: eve singleton present and unspent. Single attempt
     // here is enough — this hot-path runs many times per session;
@@ -815,13 +694,18 @@ pub async fn sync_with_chain<C: ChainReader>(
         // root the on-chain register action verifies against.
         let smt = SparseMerkleTree::new();
         let empty_root = smt.root();
-        let state = ElectionState::genesis(empty_root);
+        let state = ElectionState::genesis(empty_root, election_start_height);
         let voter_set = VoterSet {
             registration_merkle_root: empty_root,
             registration_count: 0,
             voters: vec![],
         };
-        return Ok(SyncSnapshot { state, voter_set, smt });
+        return Ok(SyncSnapshot {
+            state,
+            voter_set,
+            smt,
+            ballots: Vec::new(),
+        });
     }
     if candidates.len() > 1 {
         // Two unspent coins at the same eve puzzle hash is
@@ -846,7 +730,13 @@ pub async fn sync_with_chain<C: ChainReader>(
     // empty + genesis state with the depth-32 empty SPT root.
     let mut smt = SparseMerkleTree::new();
     let mut voters: Vec<chia_bls::PublicKey> = Vec::new();
-    let mut state = ElectionState::genesis(smt.root());
+    let mut state = ElectionState::genesis(smt.root(), election_start_height);
+    // Ballot Coin snapshots emitted by the singleton's `create_ballot`
+    // action. Phase 4.5 (indexer) walks each ballot's own lineage to
+    // populate these fully; the aggregator only emits an entry when
+    // it sees a `create_ballot` selected on the singleton. Currently
+    // the lineage walker is stubbed (see `apply_singleton_spend`).
+    let mut ballots: Vec<BallotCoinSnapshot> = Vec::new();
 
     let mut current = eve_record;
     loop {
@@ -866,7 +756,14 @@ pub async fn sync_with_chain<C: ChainReader>(
                     .into(),
                 ))
             })?;
-        apply_singleton_spend(&puzzle, &solution, &mut smt, &mut voters, &mut state)?;
+        apply_singleton_spend(
+            &puzzle,
+            &solution,
+            &mut smt,
+            &mut voters,
+            &mut state,
+            &mut ballots,
+        )?;
 
         // Find the child of this coin (the next singleton).
         let children = chain
@@ -898,7 +795,12 @@ pub async fn sync_with_chain<C: ChainReader>(
     };
     state.registration_merkle_root = voter_set.registration_merkle_root;
     state.registration_count = voter_set.registration_count;
-    Ok(SyncSnapshot { state, voter_set, smt })
+    Ok(SyncSnapshot {
+        state,
+        voter_set,
+        smt,
+        ballots,
+    })
 }
 
 /// STRUCT: CurrentSingleton
@@ -956,10 +858,11 @@ pub struct CurrentSingleton {
 pub async fn find_current_singleton<C: ChainReader>(
     chain: &C,
     config: &ElectionConfig,
+    election_start_height: u64,
 ) -> VotingResult<CurrentSingleton> {
     use chia_puzzle_types::{EveProof, LineageProof, Proof};
 
-    let eve_ph = compute_eve_singleton_puzzle_hash(config);
+    let eve_ph = compute_eve_singleton_puzzle_hash(config, election_start_height);
     let launcher_id = config
         .election_launcher_id()
         .map_err(|e| anyhow_other(format!("election_launcher_id: {e}")))?;
@@ -981,7 +884,7 @@ pub async fn find_current_singleton<C: ChainReader>(
             parent_amount: launcher_record.coin.amount,
         });
         let smt = SparseMerkleTree::new();
-        let state = ElectionState::genesis(smt.root());
+        let state = ElectionState::genesis(smt.root(), election_start_height);
         let voter_set = VoterSet {
             registration_merkle_root: smt.root(),
             registration_count: 0,
@@ -1005,7 +908,8 @@ pub async fn find_current_singleton<C: ChainReader>(
 
     let mut smt = SparseMerkleTree::new();
     let mut voters: Vec<chia_bls::PublicKey> = Vec::new();
-    let mut state = ElectionState::genesis(smt.root());
+    let mut state = ElectionState::genesis(smt.root(), election_start_height);
+    let mut ballots: Vec<BallotCoinSnapshot> = Vec::new();
 
     let mut current = eve_record;
     // Track the previous coin + state so the loop can build the
@@ -1086,7 +990,14 @@ pub async fn find_current_singleton<C: ChainReader>(
                 ))
             })?;
         prev = Some((current.coin, state.clone()));
-        apply_singleton_spend(&puzzle, &solution, &mut smt, &mut voters, &mut state)?;
+        apply_singleton_spend(
+            &puzzle,
+            &solution,
+            &mut smt,
+            &mut voters,
+            &mut state,
+            &mut ballots,
+        )?;
 
         let children = chain.coin_records_by_parent_ids(&[coin_id]).await?;
         let next = children
@@ -1117,6 +1028,7 @@ pub async fn find_current_singleton<C: ChainReader>(
 pub async fn wait_for_current_singleton<C: ChainReader>(
     chain: &C,
     config: &ElectionConfig,
+    election_start_height: u64,
     label: &str,
     poll_interval: std::time::Duration,
     max_wait: std::time::Duration,
@@ -1139,7 +1051,7 @@ pub async fn wait_for_current_singleton<C: ChainReader>(
             }
         }
 
-        match find_current_singleton(chain, config).await {
+        match find_current_singleton(chain, config, election_start_height).await {
             Ok(cs) => {
                 tracing::info!(
                     label,
@@ -1228,6 +1140,7 @@ fn apply_singleton_spend(
     smt: &mut SparseMerkleTree,
     voters: &mut Vec<chia_bls::PublicKey>,
     state: &mut ElectionState,
+    _ballots: &mut Vec<BallotCoinSnapshot>,
 ) -> VotingResult<()> {
     use clvm_traits::ToClvm;
     use clvmr::{reduction::Reduction, run_program, Allocator, ChiaDialect};
@@ -1310,48 +1223,29 @@ fn apply_singleton_spend(
     // it succeeds we return early.
     let registered_count = cca_messages.len();
 
-    // ── Finalize detection ───────────────────────────────────────
+    // ── Action discrimination (post-CHIP rev 2026-05-02) ─────────
     //
-    // Per `finalize.rue` / `announce_finalization.rue`, a finalize
-    // (or announce_finalization) spend emits a CCA with message
-    //   sha256("finalized" || vote_outcome || count_be8 || root)
-    // We know `count` and `root` from the in-progress reconstructed
-    // state. We brute-force `vote_outcome` over the 32-byte atoms in
-    // the solution; the action solution carries vote_outcome_data
-    // verbatim, so it's guaranteed to be present as a leaf atom.
+    // The Election Singleton's three allowed actions are
+    // `register`, `create_ballot`, and `deregister`.  Finalization
+    // moved to the Ballot Coin layer, so the old "finalized" CCA
+    // is gone and the singleton's `finalized` / `vote_outcome` /
+    // `accumulated_fees` fields no longer exist.
     //
-    // SECURITY: the search space is bounded by the solution's tree
-    // depth, and a sha256 collision against any other 32-byte atom
-    // is cryptographically negligible — so a match is conclusive.
-    {
-        use sha2::{Digest, Sha256};
-        let count_be = state.registration_count.to_be_bytes();
-        let root_bytes = state.registration_merkle_root.as_ref();
-        for cca in &cca_messages {
-            for outcome in &candidate_outcomes {
-                let mut h = Sha256::new();
-                h.update(b"finalized");
-                h.update(outcome);
-                h.update(count_be);
-                h.update(root_bytes);
-                let digest = h.finalize();
-                if digest[..] == cca[..] {
-                    state.finalized = true;
-                    state.vote_outcome = Bytes32::new(*outcome);
-                    // accumulated_fees is zeroed by `finalize.rue`
-                    // at the same transition; track that here so
-                    // downstream consumers see a coherent state.
-                    state.accumulated_fees = 0;
-                    tracing::debug!(
-                        vote_outcome = %hex::encode(outcome),
-                        registration_count = state.registration_count,
-                        "apply_singleton_spend: detected finalize transition"
-                    );
-                    return Ok(());
-                }
-            }
-        }
-    }
+    // Phase 4 provides a defensive register-detection fallback:
+    // any CCA in the spend output is treated as a register hint and
+    // the solution's first plausible 48-byte BLS pubkey is folded
+    // into the SPT. The full `create_ballot` / `deregister`
+    // reconstruction (Ballot Coin lineage walking, vote_weight
+    // bookkeeping) lives in Phase 4.5 (indexer) — until then
+    // `_ballots` is left untouched and `registration_vote_weight`
+    // is updated alongside the count for register only.
+    //
+    // SECURITY: this fallback is intentionally permissive (any CCA
+    // counts). The on-chain action layer is what actually enforces
+    // each transition; the aggregator's voter set is recomputed on
+    // every sync, so a misclassification here at most yields a
+    // stale snapshot — never a forged one.
+    let _ = candidate_outcomes;
 
     // ── Register fallback ────────────────────────────────────────
     if registered_count > 0 {
@@ -1362,6 +1256,11 @@ fn apply_singleton_spend(
                 voters.push(pk);
                 state.registration_count = voters.len() as u64;
                 state.registration_merkle_root = smt.root();
+                // Each register adds collateral_amount to the total
+                // vote weight; we don't have config here, so we
+                // leave registration_vote_weight unchanged. Phase
+                // 4.5 (indexer) will reconcile this against the
+                // chain's CAT records.
             }
         }
     }
@@ -1549,6 +1448,13 @@ pub async fn extract_votes<C: ChainReader>(
             vote_data,
             vote_signature_hex: hex::encode(vote_signature_bytes),
             registration_coin_id: post_vote_record.coin.coin_id(),
+            // Phase 4 scaffold: the legacy `extract_votes` walker is
+            // a back-compat fallback that never observes per-ballot
+            // identity. Phase 6 (test infrastructure) replaces this
+            // entirely with a Voting-Coin-driven walker; until then
+            // we emit zeroed identity so the field exists.
+            ballot_launcher_id: Bytes32::default(),
+            voting_coin_id: Bytes32::default(),
         });
     }
     Ok(out)
@@ -1630,112 +1536,23 @@ fn walk_atom_list(
 ///       a matching root, and call `.proof(leaf)` to get the proof
 ///       for any selected action.
 pub fn compute_election_action_root_leaves(config: &ElectionConfig) -> Vec<Bytes32> {
-    use chia_protocol::Bytes;
-    use clvm_traits::{clvm_curried_args, ToClvm};
-    use clvm_utils::CurriedProgram;
-    use clvmr::Allocator;
-    use crate::puzzles::{self as p, PuzzleHashes};
-
-    let mut allocator = Allocator::new();
     let launcher_id = config
         .election_launcher_id()
         .expect("config validated");
     let cat_tail_hash = config.cat_tail_hash().expect("config validated");
 
-    let load = |alloc: &mut Allocator, hex_str: &str| -> clvmr::NodePtr {
-        let bytes = hex::decode(hex_str.trim().trim_start_matches("0x")).unwrap();
-        let prog = chia_protocol::Program::from(bytes);
-        prog.to_clvm(alloc).unwrap()
-    };
+    let [register_leaf, create_ballot_leaf, deregister_leaf] =
+        election_action_leaves(config, launcher_id, cat_tail_hash);
 
-    let register_node = load(&mut allocator, p::ELECTION_REGISTER_HEX);
-    let register_curried = CurriedProgram {
-        program: register_node,
-        args: clvm_curried_args!(
-            crate::config::TREE_DEPTH,
-            Bytes32::new(crate::config::EMPTY_LEAF_HASH),
-            PuzzleHashes::cat_outer(),
-            cat_tail_hash,
-            PuzzleHashes::action_layer(),
-            PuzzleHashes::registration_finalizer(),
-            p::registration_actions_merkle_root(),
-            config.collateral_amount,
-            config.registration_fee,
-            launcher_id
-        ),
-    }
-    .to_clvm(&mut allocator)
-    .unwrap();
-    let register_leaf =
-        Bytes32::new(clvm_utils::tree_hash(&allocator, register_curried).to_bytes());
-
-    // FINALIZE LEAF: must match the EXACT curry shape
-    // `Aggregator::build_finalize_with_proof` reconstructs at spend
-    // time. `finalize.rue` declares its first two curried params as
-    // `VK: VK` and `IC: IC` STRUCTS — accessed as `VK.alpha`,
-    // `IC.ic0`, etc. The curried args therefore must be CLVM CONS
-    // TREES (one cons per struct field, terminated with `()`),
-    // NOT flat byte blobs.
-    //
-    // VK fields per finalize.rue:
-    //   alpha (G1, 48 bytes), beta (G2, 96), gamma (G2, 96), delta
-    //   (G2, 96)              — total 336 bytes.
-    // IC fields:
-    //   ic0..ic4 (G1, 48 bytes each)        — total 240 bytes.
-    //
-    // Earlier incarnation: a single `Bytes::new(vk_base)` blob plus
-    // a single `Bytes::new(ic)` blob produced a tree hash that
-    // could never appear in a legitimate spend's puzzle reveal,
-    // baking an unreachable `finalize` leaf into every deployed
-    // election's actions Merkle root. Mainnet PHASE 5 surfaced this
-    // as `action puzzle hash <X> not in merkle root (leaves: ...)`.
-    // Pinned by `finalize_leaf_uses_struct_curry_matching_spender`.
-    let finalize_node = load(&mut allocator, p::ELECTION_FINALIZE_HEX);
-    let vk_bytes = hex::decode(&config.verification_key_hex).expect("config validated");
-    if vk_bytes.len() < 576 {
-        panic!(
-            "verification_key_hex too short for finalize curry: got {}, expected ≥ 576",
-            vk_bytes.len(),
-        );
-    }
-    let vk_alpha = Bytes::new(vk_bytes[0..48].to_vec());
-    let vk_beta = Bytes::new(vk_bytes[48..144].to_vec());
-    let vk_gamma = Bytes::new(vk_bytes[144..240].to_vec());
-    let vk_delta = Bytes::new(vk_bytes[240..336].to_vec());
-    let vk_struct = (vk_alpha, (vk_beta, (vk_gamma, (vk_delta, ()))));
-    let ic0 = Bytes::new(vk_bytes[336..384].to_vec());
-    let ic1 = Bytes::new(vk_bytes[384..432].to_vec());
-    let ic2 = Bytes::new(vk_bytes[432..480].to_vec());
-    let ic3 = Bytes::new(vk_bytes[480..528].to_vec());
-    let ic4 = Bytes::new(vk_bytes[528..576].to_vec());
-    let ic_struct = (ic0, (ic1, (ic2, (ic3, (ic4, ())))));
-    let finalize_curried = CurriedProgram {
-        program: finalize_node,
-        args: clvm_curried_args!(
-            vk_struct,
-            ic_struct,
-            config.election_length_blocks,
-            launcher_id
-        ),
-    }
-    .to_clvm(&mut allocator)
-    .unwrap();
-    let finalize_leaf =
-        Bytes32::new(clvm_utils::tree_hash(&allocator, finalize_curried).to_bytes());
-
-    let announce_node = load(&mut allocator, p::ELECTION_ANNOUNCE_FINALIZATION_HEX);
-    let announce_leaf =
-        Bytes32::new(clvm_utils::tree_hash(&allocator, announce_node).to_bytes());
-
-    let oracle_node = load(&mut allocator, p::ELECTION_ORACLE_HEX);
-    let oracle_leaf =
-        Bytes32::new(clvm_utils::tree_hash(&allocator, oracle_node).to_bytes());
-
-    let mut leaves = vec![register_leaf, finalize_leaf, announce_leaf, oracle_leaf];
+    // Match the in-tree sort `puzzles::election_actions_merkle_root`
+    // applies (ascending by `hash_atom_b32` of the leaf). This makes
+    // `MerkleTree::new(&leaves).proof(leaf)` produce a proof against
+    // the same root.
+    let mut leaves = vec![register_leaf, create_ballot_leaf, deregister_leaf];
     leaves.sort_by(|a, b| {
-        p::hash_atom_b32(a)
+        puzzles::hash_atom_b32(a)
             .as_ref()
-            .cmp(p::hash_atom_b32(b).as_ref())
+            .cmp(puzzles::hash_atom_b32(b).as_ref())
     });
     leaves
 }
@@ -1745,9 +1562,12 @@ pub fn compute_election_action_root_leaves(config: &ElectionConfig) -> Vec<Bytes
 ///       genesis (eve) Election Singleton.
 /// USAGE: voter / aggregator helpers that need the inner_puzzle_hash
 ///        (e.g., to fill in a singleton lineage proof).
-pub fn compute_eve_inner_puzzle_hash(config: &ElectionConfig) -> Bytes32 {
+pub fn compute_eve_inner_puzzle_hash(
+    config: &ElectionConfig,
+    election_start_height: u64,
+) -> Bytes32 {
     let empty_root = crate::merkle::SparseMerkleTree::new().root();
-    let genesis = ElectionState::genesis(empty_root);
+    let genesis = ElectionState::genesis(empty_root, election_start_height);
     compute_election_inner_puzzle_hash_for_state(config, &genesis)
 }
 
@@ -1788,7 +1608,9 @@ pub fn compute_election_inner_puzzle_hash_for_state(
     let finalizer_full =
         puzzles::curry_tree_hash(finalizer_first, &[puzzles::hash_atom_b32(&finalizer_first)]);
     let merkle_root = compute_election_actions_merkle_root(config, launcher_id, cat_tail_hash);
-    let state_hash = election_state_tree_hash(state);
+    // Source-of-truth: ElectionState::clvm_tree_hash composes the
+    // 4-field cons tree (root, count, vote_weight, start_height).
+    let state_hash = state.clvm_tree_hash();
     // Curry args: finalizer_full is already a TREE HASH of a
     // curried program (NOT atom-wrapped); merkle_root is a Bytes32
     // atom value (atom-wrapped); state_hash is a tree hash of a
@@ -1825,7 +1647,10 @@ pub fn election_actions_merkle_root_for_config(config: &ElectionConfig) -> Bytes
 /// MIRROR: identical to the path `Deployer::genesis_inner_puzzle_hash`
 ///         + `puzzles::election_singleton_puzzle_hash` follow during
 ///         deploy. Both must agree byte-for-byte.
-pub fn compute_eve_singleton_puzzle_hash(config: &ElectionConfig) -> Bytes32 {
+pub fn compute_eve_singleton_puzzle_hash(
+    config: &ElectionConfig,
+    election_start_height: u64,
+) -> Bytes32 {
     use crate::puzzles::PuzzleHashes;
 
     let launcher_id = config
@@ -1852,11 +1677,10 @@ pub fn compute_eve_singleton_puzzle_hash(config: &ElectionConfig) -> Bytes32 {
     // Step 2: action root (each action curried with deploy-time consts).
     let merkle_root = compute_election_actions_merkle_root(config, launcher_id, cat_tail_hash);
 
-    // Step 3: genesis state tree hash. Empty SMT root is the
-    // 32-level pair-hash result, NOT the leaf-level
-    // EMPTY_LEAF_HASH. See deployer.rs for full rationale.
+    // Step 3: genesis state tree hash via the source-of-truth helper.
     let empty_root = crate::merkle::SparseMerkleTree::new().root();
-    let state_hash = genesis_state_tree_hash(empty_root);
+    let state_hash =
+        ElectionState::genesis(empty_root, election_start_height).clvm_tree_hash();
 
     // See `compute_eve_inner_puzzle_hash` above for the curry-arg
     // convention rationale: finalizer_full is a tree hash of a
@@ -1880,43 +1704,38 @@ fn compute_election_actions_merkle_root(
     launcher_id: Bytes32,
     cat_tail_hash: Bytes32,
 ) -> Bytes32 {
+    let leaves = election_action_leaves(config, launcher_id, cat_tail_hash);
+    // `leaves` is `[register_full, create_ballot_full, deregister_full]`
+    // in declaration order; `puzzles::election_actions_merkle_root`
+    // sorts internally before composing the root, so the order here
+    // is intentional and matches the deployer.
+    puzzles::election_actions_merkle_root(leaves[0], leaves[1], leaves[2])
+}
+
+/// FN: election_action_leaves (file-private)
+/// WHAT: the three currier-tree-hashes for the Election Singleton's
+///       allowed actions per CHIP rev 2026-05-02:
+///         * register
+///         * create_ballot
+///         * deregister
+///       Mirrors the deployer's `election_register_action_hash` /
+///       `election_create_ballot_action_hash` /
+///       `election_deregister_action_hash` triple — both sides MUST
+///       agree byte-for-byte.
+fn election_action_leaves(
+    config: &ElectionConfig,
+    launcher_id: Bytes32,
+    cat_tail_hash: Bytes32,
+) -> [Bytes32; 3] {
     use crate::puzzles::PuzzleHashes;
 
-    let raw_vk_hex = &config.verification_key_hex;
-    let vk_bytes = hex::decode(raw_vk_hex).expect("config validated → VK hex valid");
-    assert!(
-        vk_bytes.len() >= 576,
-        "compute_election_actions_merkle_root: vk too short to slice into VK + IC structs \
-         (got {} bytes, expected ≥ 576)",
-        vk_bytes.len(),
-    );
-    // VK struct hash = (alpha . (beta . (gamma . (delta . ()))))
-    // IC struct hash = (ic0 . (ic1 . (ic2 . (ic3 . (ic4 . ())))))
-    // Mirror of the spender-side curry shape in
-    // `Aggregator::build_finalize_with_proof` and the deployer-side
-    // hash in `ElectionDeployer::election_finalize_action_hash`.
-    // See the long-form rationale on the spender-side helper.
-    let alpha_h = puzzles::hash_atom(&vk_bytes[0..48]);
-    let beta_h = puzzles::hash_atom(&vk_bytes[48..144]);
-    let gamma_h = puzzles::hash_atom(&vk_bytes[144..240]);
-    let delta_h = puzzles::hash_atom(&vk_bytes[240..336]);
-    let nil_h = puzzles::hash_atom(&[]);
-    let vk_tail = puzzles::hash_pair(delta_h, nil_h);
-    let vk_tail = puzzles::hash_pair(gamma_h, vk_tail);
-    let vk_tail = puzzles::hash_pair(beta_h, vk_tail);
-    let vk_struct_h = puzzles::hash_pair(alpha_h, vk_tail);
-
-    let ic0_h = puzzles::hash_atom(&vk_bytes[336..384]);
-    let ic1_h = puzzles::hash_atom(&vk_bytes[384..432]);
-    let ic2_h = puzzles::hash_atom(&vk_bytes[432..480]);
-    let ic3_h = puzzles::hash_atom(&vk_bytes[480..528]);
-    let ic4_h = puzzles::hash_atom(&vk_bytes[528..576]);
-    let ic_tail = puzzles::hash_pair(ic4_h, nil_h);
-    let ic_tail = puzzles::hash_pair(ic3_h, ic_tail);
-    let ic_tail = puzzles::hash_pair(ic2_h, ic_tail);
-    let ic_tail = puzzles::hash_pair(ic1_h, ic_tail);
-    let ic_struct_h = puzzles::hash_pair(ic0_h, ic_tail);
-
+    // ── register ─────────────────────────────────────────────────
+    // CURRY ORDER (post-CHIP rev 2026-05-02):
+    //   (TREE_DEPTH, EMPTY_LEAF_HASH, CAT_MOD_HASH, CAT_TAIL_HASH,
+    //    ACTION_LAYER_MOD_HASH, REGISTRATION_FINALIZER_MOD_HASH,
+    //    REGISTRATION_MERKLE_ROOT, COLLATERAL_AMOUNT,
+    //    ELECTION_LAUNCHER_ID, EMPTY_BALLOT_ROOT)
+    // (No `registration_fee` — fees were dropped in this revision.)
     let register_full = puzzles::curry_tree_hash(
         PuzzleHashes::election_register(),
         &[
@@ -1928,52 +1747,37 @@ fn compute_election_actions_merkle_root(
             puzzles::hash_atom_b32(&PuzzleHashes::registration_finalizer()),
             puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root()),
             uint_atom_hash(config.collateral_amount),
-            uint_atom_hash(config.registration_fee),
             puzzles::hash_atom_b32(&launcher_id),
+            puzzles::hash_atom_b32(&puzzles::empty_ballot_root()),
         ],
     );
-    let finalize_full = puzzles::curry_tree_hash(
-        PuzzleHashes::election_finalize(),
+
+    // ── create_ballot ────────────────────────────────────────────
+    // CURRY ORDER: (SINGLETON_LAUNCHER_PUZZLE_HASH, ELECTION_LAUNCHER_ID).
+    let singleton_launcher_ph =
+        Bytes32::from(chia_puzzles::SINGLETON_LAUNCHER_HASH);
+    let create_ballot_full = puzzles::curry_tree_hash(
+        PuzzleHashes::election_create_ballot(),
         &[
-            vk_struct_h,
-            ic_struct_h,
-            uint_atom_hash(config.election_length_blocks),
+            puzzles::hash_atom_b32(&singleton_launcher_ph),
             puzzles::hash_atom_b32(&launcher_id),
         ],
     );
-    let announce_full = PuzzleHashes::election_announce_finalization();
-    let oracle_full = PuzzleHashes::election_oracle();
-    puzzles::election_actions_merkle_root(
-        register_full,
-        finalize_full,
-        announce_full,
-        oracle_full,
-    )
-}
 
-fn genesis_state_tree_hash(empty_root: Bytes32) -> Bytes32 {
-    election_state_tree_hash(&ElectionState::genesis(empty_root))
-}
+    // ── deregister ───────────────────────────────────────────────
+    // CURRY ORDER: (TREE_DEPTH, EMPTY_LEAF_HASH, COLLATERAL_AMOUNT,
+    //               REGISTRATION_MERKLE_ROOT).
+    let deregister_full = puzzles::curry_tree_hash(
+        PuzzleHashes::election_deregister(),
+        &[
+            uint_atom_hash(crate::config::TREE_DEPTH as u64),
+            puzzles::hash_atom_b32(&Bytes32::new(crate::config::EMPTY_LEAF_HASH)),
+            uint_atom_hash(config.collateral_amount),
+            puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root()),
+        ],
+    );
 
-/// FN: election_state_tree_hash (file-private)
-/// WHAT: tree hash of an arbitrary `ElectionState` cons tree, in
-///       the trailing-tail shape Rue's `...vote_outcome` syntax
-///       produces:
-///         (root . (count . (fees . (finalized . vote_outcome))))
-/// USAGE: backbone of `compute_election_inner_puzzle_hash_for_state`
-///        — every singleton spend's lineage proof needs the
-///        previous coin's exact inner puzzle hash, which depends on
-///        the state at THAT coin.
-fn election_state_tree_hash(state: &ElectionState) -> Bytes32 {
-    let root_h = puzzles::hash_atom_b32(&state.registration_merkle_root);
-    let count_h = uint_atom_hash(state.registration_count);
-    let fees_h = uint_atom_hash(state.accumulated_fees);
-    let finalized_h = uint_atom_hash(state.finalized as u64);
-    let outcome_h = puzzles::hash_atom_b32(&state.vote_outcome);
-    let pair = puzzles::hash_pair(finalized_h, outcome_h);
-    let pair = puzzles::hash_pair(fees_h, pair);
-    let pair = puzzles::hash_pair(count_h, pair);
-    puzzles::hash_pair(root_h, pair)
+    [register_full, create_ballot_full, deregister_full]
 }
 
 /// CLVM canonical unsigned-integer atom encoding (mirror of
@@ -2024,10 +1828,24 @@ mod tests {
             },
             cat_tail_hash: Bytes32::new([0x77; 32]),
             collateral_amount: 1_000,
-            registration_fee: 10,
-            election_length_blocks: 4_608,
+            // CHIP rev 2026-05-02: registration_fee /
+            // election_length_blocks dropped; election_start_height
+            // is the new state anchor.
+            election_start_height: 0,
             label: Some("aggregator-test".into()),
         }
+    }
+
+    /// Convenience: the launch height baked into `dummy_deploy_params`.
+    /// Tests that need to predict puzzle hashes against the deployed
+    /// genesis state read this rather than hard-coding a literal.
+    const TEST_ELECTION_START_HEIGHT: u64 = 0;
+
+    /// Convenience: a placeholder ballot id for tests that exercise
+    /// the per-ballot prepare_finalize_witness signature without
+    /// needing an actual on-chain Ballot Coin.
+    fn placeholder_ballot_id() -> Bytes32 {
+        Bytes32::new([0xB1; 32])
     }
 
     /// Deploy the election to a fresh simulator and return the
@@ -2062,14 +1880,18 @@ mod tests {
         let chain = SharedSimulator::new(&mut sim);
         let mut agg = Aggregator::new(config.clone(), chain, NetworkType::Mainnet);
 
-        let voter_set = agg.sync().await.expect("sync should succeed after deploy");
-        assert_eq!(voter_set.voters.len(), 0);
-        assert_eq!(voter_set.registration_count, 0);
+        let snapshot = agg.sync().await.expect("sync should succeed after deploy");
+        assert_eq!(snapshot.voter_set.voters.len(), 0);
+        assert_eq!(snapshot.voter_set.registration_count, 0);
+        assert!(snapshot.ballots.is_empty());
 
         let cached_state = agg.state().expect("state populated after sync");
         // Empty SPT root at depth 32 (NOT the leaf hash).
         let empty_root = SparseMerkleTree::new().root();
-        assert_eq!(*cached_state, ElectionState::genesis(empty_root));
+        assert_eq!(
+            *cached_state,
+            ElectionState::genesis(empty_root, TEST_ELECTION_START_HEIGHT),
+        );
 
         let cached_smt = agg.merkle_tree().expect("smt populated after sync");
         assert!(cached_smt.is_empty());
@@ -2095,8 +1917,6 @@ mod tests {
             election_launcher_id_hex: hex::encode(fake_launcher),
             cat_tail_hash_hex: hex::encode([0x77u8; 32]),
             collateral_amount: 1_000,
-            registration_fee: 10,
-            election_length_blocks: 4_608,
             tree_depth: crate::config::TREE_DEPTH,
             max_signers: crate::config::MAX_SIGNERS,
             verification_key_hex: hex::encode(vec![
@@ -2121,7 +1941,7 @@ mod tests {
     ///       deployer's path
     ///       (`derive_launcher_id` → `genesis_inner_puzzle_hash` →
     ///       `election_singleton_puzzle_hash`), and assert equality
-    ///       with `compute_eve_singleton_puzzle_hash(&config)`.
+    ///       with `compute_eve_singleton_puzzle_hash(&config, TEST_ELECTION_START_HEIGHT)`.
     /// WHY:  if these two paths ever drift, `Aggregator::sync` would
     ///       look at the wrong puzzle hash and miss every singleton.
     #[test]
@@ -2136,7 +1956,7 @@ mod tests {
         let inner = deployer.genesis_inner_puzzle_hash(launcher_id);
         let expected = puzzles::election_singleton_puzzle_hash(launcher_id, inner);
 
-        assert_eq!(compute_eve_singleton_puzzle_hash(&config), expected);
+        assert_eq!(compute_eve_singleton_puzzle_hash(&config, TEST_ELECTION_START_HEIGHT), expected);
     }
 
     /// WHAT: calling `state()`, `voter_set()`, or `merkle_tree()`
@@ -2247,6 +2067,8 @@ mod tests {
             vote_data: Bytes32::default(),
             vote_signature_hex: "00".repeat(96),
             registration_coin_id: Bytes32::default(),
+            ballot_launcher_id: Bytes32::default(),
+            voting_coin_id: Bytes32::default(),
         };
         let pk = stub_proving_key();
         let res = agg
@@ -2297,6 +2119,8 @@ mod tests {
             vote_data: Bytes32::default(),
             vote_signature_hex: "00".repeat(96),
             registration_coin_id: Bytes32::default(),
+            ballot_launcher_id: Bytes32::default(),
+            voting_coin_id: Bytes32::default(),
         };
         let pk_stub = stub_proving_key();
         let res = agg
@@ -2347,6 +2171,8 @@ mod tests {
             vote_data: Bytes32::default(),
             vote_signature_hex: "00".repeat(96),
             registration_coin_id: Bytes32::default(),
+            ballot_launcher_id: Bytes32::default(),
+            voting_coin_id: Bytes32::default(),
         };
         let pk_stub = stub_proving_key();
         let res = agg
@@ -2386,7 +2212,8 @@ mod tests {
 
         let vote_outcome = Bytes32::new([0xCD; 32]);
         let election_id = config.election_launcher_id().unwrap();
-        let canonical_msg = canonical_vote_message(vote_outcome, election_id);
+        let canonical_msg =
+            canonical_vote_message(vote_outcome, placeholder_ballot_id(), election_id);
 
         // 2 of 3 votes → strict majority (2*2=4 > 3).
         let votes: Vec<_> = voters[..2]
@@ -2520,7 +2347,8 @@ mod tests {
 
         let vote_outcome = Bytes32::new([0x42; 32]);
         let election_id = config.election_launcher_id().unwrap();
-        let canonical_msg = canonical_vote_message(vote_outcome, election_id);
+        let canonical_msg =
+            canonical_vote_message(vote_outcome, placeholder_ballot_id(), election_id);
 
         let votes: Vec<_> = voters[..2]
             .iter()
@@ -2533,7 +2361,7 @@ mod tests {
             .collect();
 
         let w = agg
-            .prepare_finalize_witness(vote_outcome, &votes)
+            .prepare_finalize_witness(vote_outcome, placeholder_ballot_id(), &votes)
             .expect("witness preparation succeeds");
 
         // Field-by-field assertions:
@@ -2590,7 +2418,8 @@ mod tests {
 
         let vote_outcome = Bytes32::new([0xAB; 32]);
         let election_id = config.election_launcher_id().unwrap();
-        let canonical_msg = canonical_vote_message(vote_outcome, election_id);
+        let canonical_msg =
+            canonical_vote_message(vote_outcome, placeholder_ballot_id(), election_id);
 
         let votes: Vec<_> = voters[..2]
             .iter()
@@ -2602,7 +2431,7 @@ mod tests {
             })
             .collect();
         let w = agg
-            .prepare_finalize_witness(vote_outcome, &votes)
+            .prepare_finalize_witness(vote_outcome, placeholder_ballot_id(), &votes)
             .expect("witness preparation succeeds");
 
         // PoP-style single-pair pairing identity:
@@ -2639,7 +2468,8 @@ mod tests {
 
         let vote_outcome = Bytes32::new([0x99; 32]);
         let election_id = config.election_launcher_id().unwrap();
-        let canonical_msg = canonical_vote_message(vote_outcome, election_id);
+        let canonical_msg =
+            canonical_vote_message(vote_outcome, placeholder_ballot_id(), election_id);
         let votes: Vec<_> = voters[..3]
             .iter()
             .map(|(sk, pk)| VoteRecord {
@@ -2650,7 +2480,7 @@ mod tests {
             })
             .collect();
         let w = agg
-            .prepare_finalize_witness(vote_outcome, &votes)
+            .prepare_finalize_witness(vote_outcome, placeholder_ballot_id(), &votes)
             .unwrap();
 
         for (i, pk) in w.signer_pubkeys.iter().enumerate() {
@@ -2689,7 +2519,11 @@ mod tests {
             })
             .collect();
 
-        let res = agg.prepare_finalize_witness(Bytes32::default(), &votes);
+        let res = agg.prepare_finalize_witness(
+            Bytes32::default(),
+            placeholder_ballot_id(),
+            &votes,
+        );
         assert!(matches!(res, Err(VotingError::InvalidSignature)));
     }
 
@@ -2716,7 +2550,8 @@ mod tests {
         let wrong_outcome = Bytes32::new([0xBB; 32]);
         let election_id = config.election_launcher_id().unwrap();
         // Voters mistakenly sign the wrong outcome.
-        let wrong_msg = canonical_vote_message(wrong_outcome, election_id);
+        let wrong_msg =
+            canonical_vote_message(wrong_outcome, placeholder_ballot_id(), election_id);
 
         let votes: Vec<_> = voters[..2]
             .iter()
@@ -2730,7 +2565,11 @@ mod tests {
         // We pass the REAL outcome to prepare_finalize_witness, but
         // the signatures are over the WRONG message. aggregate_verify
         // catches this.
-        let res = agg.prepare_finalize_witness(real_outcome, &votes);
+        let res = agg.prepare_finalize_witness(
+            real_outcome,
+            placeholder_ballot_id(),
+            &votes,
+        );
         assert!(matches!(res, Err(VotingError::InvalidSignature)));
     }
 
@@ -2756,7 +2595,11 @@ mod tests {
             })
             .collect();
 
-        let res = agg.prepare_finalize_witness(Bytes32::default(), &votes);
+        let res = agg.prepare_finalize_witness(
+            Bytes32::default(),
+            placeholder_ballot_id(),
+            &votes,
+        );
         assert!(matches!(res, Err(VotingError::InvalidSignature)));
     }
 
@@ -2798,24 +2641,17 @@ mod tests {
         assert_eq!(aggregate_pubkeys(&[p1, p2]), aggregate_pubkeys(&[p2, p1]));
     }
 
-    /// WHAT: the `finalize` leaf computed by
-    ///       `compute_election_action_root_leaves` (deployer side)
-    ///       agrees byte-for-byte with the tree hash of the
-    ///       `CurriedProgram` built by
-    ///       `Aggregator::build_finalize_with_proof` (spender side).
-    /// HOW:  rebuild the finalize leaf via the same struct curry the
-    ///       aggregator uses for spending, run it through
-    ///       `clvm_utils::tree_hash`, and assert it appears in
-    ///       `compute_election_action_root_leaves(...)`'s output.
-    /// WHY:  the on-chain action layer asserts every selected
-    ///       action's puzzle hash is in the merkle root. If the
-    ///       deployer-side leaf shape ever drifted from the
-    ///       spender-side curry shape (the exact bug PHASE 5 hit on
-    ///       mainnet — `action puzzle hash <X> not in merkle root`),
-    ///       every finalize spend would be rejected. Pin both sides
-    ///       to use the SAME `(VK_struct, IC_struct, length, lid)`
-    ///       curry envelope.
+    /// WHAT (legacy): pinned the singleton-finalize leaf shape across
+    ///                deployer + spender. The singleton no longer
+    ///                hosts a `finalize` action post-CHIP rev
+    ///                2026-05-02 — the corresponding leaf check now
+    ///                belongs on the Ballot Coin, and re-enabling
+    ///                requires Phase 5 (6-input prover) + Phase 6
+    ///                (Ballot Coin spend builder) to land first.
     #[test]
+    #[ignore = "Phase 4 migration: finalize moved to Ballot Coin; \
+                re-enable in Phase 6 against the Ballot Coin's \
+                finalize action curry shape"]
     fn finalize_leaf_uses_struct_curry_matching_spender() {
         use chia_protocol::Bytes;
         use clvm_traits::{clvm_curried_args, ToClvm};
@@ -2887,24 +2723,31 @@ mod tests {
         );
     }
 
-    /// WHAT: `canonical_vote_message(outcome, election_id)` equals
-    ///       `sha256(outcome || election_id)` byte-exact.
+    /// WHAT: post-CHIP rev 2026-05-02, `canonical_vote_message`
+    ///       takes 3 inputs and equals
+    ///       `sha256(outcome || ballot_launcher_id || election_id)`
+    ///       byte-exact.
     /// HOW:  recompute via sha2 inline and assert equality.
     /// WHY:  this is the message every aggregator-side voter must
     ///       sign for their signature to make it into `agg_signature`.
-    ///       Drift would universally break aggregation.
+    ///       Binding all three ids prevents replay across ballots.
     #[test]
-    fn canonical_vote_message_is_sha256_of_outcome_and_election_id() {
+    fn canonical_vote_message_is_sha256_of_outcome_ballot_and_election_id() {
         use sha2::{Digest, Sha256};
         let outcome = Bytes32::new([0x42; 32]);
+        let ballot = Bytes32::new([0xB1; 32]);
         let election = Bytes32::new([0x11; 32]);
 
         let mut h = Sha256::new();
         h.update(outcome.as_ref());
+        h.update(ballot.as_ref());
         h.update(election.as_ref());
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&h.finalize());
 
-        assert_eq!(canonical_vote_message(outcome, election), Bytes32::new(arr));
+        assert_eq!(
+            canonical_vote_message(outcome, ballot, election),
+            Bytes32::new(arr),
+        );
     }
 }
