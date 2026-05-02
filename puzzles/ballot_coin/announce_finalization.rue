@@ -1,0 +1,44 @@
+// ballot_coin/announce_finalization.rue
+// Re-announce action for the Ballot Coin's terminal (finalized) state.
+//
+// Permissionless and idempotent. Asserts the Ballot Coin has already
+// been finalized (state.finalized == true), then re-emits the same
+// finalization announcement that finalize.rue emitted in the block it
+// ran. Recreates the Ballot Coin unchanged.
+//
+// Why this is needed (see CHIP.md "Why announce_finalization is
+// required"): finalize.rue's announcement is ephemeral — it is only
+// available for assertion in the block finalize ran. Outcome-gated
+// downstream contracts (payout coins, treasury releases, late
+// indexers, future deployments that react to ballot outcomes) need
+// to assert the finalization on their own schedule. This action lets
+// any party prompt a fresh on-chain attestation of the finalized
+// state without re-running finalize.
+//
+// State is read-only here; the action takes no solution params.
+
+import super::common_types::*;
+import shared::*;
+
+fn main(
+    // ── Curried ─────────────────────────────────────────────────────
+    BALLOT_LAUNCHER_ID: Bytes32,
+    Truth: BallotStateTruth,
+    // No solution params.
+) -> (BallotStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    // Only valid after finalize has run.
+    assert State.finalized == true;
+
+    let announce = CreateCoinAnnouncement {
+        message: ballot_finalization_msg(
+            BALLOT_LAUNCHER_ID,
+            State.vote_outcome,
+            State.agg_signers,
+        ),
+    };
+
+    // State unchanged.
+    (Truth, [announce])
+}

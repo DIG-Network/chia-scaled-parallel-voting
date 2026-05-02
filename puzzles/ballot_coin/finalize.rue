@@ -1,0 +1,208 @@
+// ballot_coin/finalize.rue
+// Finalize action for the Ballot Coin.
+//
+// One-shot per ballot. Verifies a Groth16 proof + BLS aggregate
+// signature attesting that voters whose combined weight meets the
+// curried threshold signed the ballot's vote outcome, then transitions
+// the Ballot Coin's state to finalized=true with the committed
+// outcome. Does NOT spend the Election Singleton — the singleton's
+// lane is reserved for orchestration (register / createBallot /
+// deregister); this is the whole point of moving finalize onto the
+// Ballot Coin under CHIP rev 2026-05-02.
+//
+// Time lock: emits ASSERT_HEIGHT_ABSOLUTE(VOTE_CLOSE_HEIGHT) so the
+// ballot must have closed before finalize can run.
+//
+// Six public inputs (ordering MUST match `circuit.rs` exactly):
+//   s1  ←  sha256(registration_merkle_root)             mod r
+//   s2  ←  sha256(registration_vote_weight_be8)         mod r
+//   s3  ←  sha256(agg_signers)                          mod r
+//   s4  ←  sha256(vote_message)                         mod r
+//   s5  ←  sha256(threshold_pack(num, den))             mod r   ← preserved on-chain threshold check
+//   s6  ←  sha256(ballot_launcher_id)                   mod r   ← prevents cross-ballot replay
+//
+// State transitions:
+//   finalized    → true
+//   vote_outcome → vote_outcome_data
+//   agg_signers  → agg_signers (commitment to signer set)
+
+import super::common_types::*;
+import shared::*;
+
+struct VK {
+    alpha: PublicKey,
+    beta: Signature,
+    gamma: Signature,
+    delta: Signature,
+}
+
+struct IC {
+    ic0: PublicKey,
+    ic1: PublicKey,    // multiplied by scalar(registration_merkle_root)
+    ic2: PublicKey,    // multiplied by scalar(registration_vote_weight)
+    ic3: PublicKey,    // multiplied by scalar(agg_signers)
+    ic4: PublicKey,    // multiplied by scalar(vote_message)
+    ic5: PublicKey,    // multiplied by scalar(threshold_pack)
+    ic6: PublicKey,    // multiplied by scalar(ballot_launcher_id)
+}
+
+struct Proof {
+    a: PublicKey,
+    b: Signature,
+    c: PublicKey,
+}
+
+struct Scalars {
+    s1: PublicKey,    // sha256(registration_merkle_root) mod r
+    s2: PublicKey,    // sha256(registration_vote_weight_be8) mod r
+    s3: PublicKey,    // sha256(agg_signers) mod r
+    s4: PublicKey,    // sha256(vote_message) mod r
+    s5: PublicKey,    // sha256(threshold_pack) mod r
+    s6: PublicKey,    // sha256(ballot_launcher_id) mod r
+}
+
+/// Pack (num, den) into a 16-byte BE blob; both are u64 / 8-byte BE.
+/// Hash the pack to produce the canonical threshold_pack scalar input.
+inline fn threshold_pack_bytes(num: Int, den: Int) -> Bytes {
+    int_to_8_bytes_be(num) + int_to_8_bytes_be(den)
+}
+
+fn main(
+    // ── Curried (action-specific config) ────────────────────────────
+    VK: VK,
+    IC: IC,
+    BALLOT_LAUNCHER_ID: Bytes32,
+    ELECTION_LAUNCHER_ID: Bytes32,
+    VOTE_CLOSE_HEIGHT: Int,
+    VOTE_THRESHOLD_NUM: Int,
+    VOTE_THRESHOLD_DEN: Int,
+    REGISTRATION_MERKLE_ROOT_SNAPSHOT: Bytes32,
+    REGISTRATION_VOTE_WEIGHT_SNAPSHOT: Int,
+    Truth: BallotStateTruth,
+    // ── Solution ────────────────────────────────────────────────────
+    proof: Proof,
+    vote_outcome_data: Bytes32,
+    agg_signers: PublicKey,
+    agg_sig: Signature,
+    ...scalars: Scalars,
+) -> (BallotStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    // One-shot per ballot.
+    assert State.finalized == false;
+
+    // Time lock — ballot must have closed.
+    let assert_closed = AssertHeightAbsolute {
+        height: VOTE_CLOSE_HEIGHT,
+    };
+
+    // Vote message binds outcome to ballot identity AND election
+    // identity. Order MUST match circuit.rs and voting_coin/shared.rue
+    // `vote_message`.
+    let outcome_b: Bytes = vote_outcome_data as Bytes;
+    let ballot_b: Bytes = BALLOT_LAUNCHER_ID as Bytes;
+    let election_b: Bytes = ELECTION_LAUNCHER_ID as Bytes;
+    let vote_message: Bytes32 = sha256(outcome_b + ballot_b + election_b);
+
+    // Threshold pack — packs (num, den) so the circuit binds the exact
+    // quorum threshold the deployment curried. Forces the on-chain
+    // curried threshold to match the circuit's threshold input
+    // (defense in depth on top of the circuit's internal threshold
+    // constraint).
+    let threshold_pack_b: Bytes = threshold_pack_bytes(
+        VOTE_THRESHOLD_NUM, VOTE_THRESHOLD_DEN,
+    );
+
+    // BLS12-381 subgroup order r. See deleted election/finalize.rue
+    // history for the full WHY-mod-r rationale (CLVM op_mod vs op_modpow,
+    // signed-vs-unsigned scalar interpretation, mempool-mode disable
+    // flags). The same considerations apply unchanged here.
+    let r: Bytes = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
+    let zero_pad: Bytes = 0x00;
+
+    // Scalar verification — bind each scalar to sha256(input) mod r.
+    let vmr_b: Bytes = REGISTRATION_MERKLE_ROOT_SNAPSHOT as Bytes;
+    assert ((zero_pad + sha256(vmr_b)) as Int % (r as Int)) as Bytes
+        == (scalars.s1 as Bytes);
+
+    assert (
+        (zero_pad + sha256(int_to_8_bytes_be(REGISTRATION_VOTE_WEIGHT_SNAPSHOT))) as Int
+        % (r as Int)
+    ) as Bytes == (scalars.s2 as Bytes);
+
+    let agg_b: Bytes = agg_signers as Bytes;
+    assert ((zero_pad + sha256(agg_b)) as Int % (r as Int)) as Bytes
+        == (scalars.s3 as Bytes);
+
+    let vm_b: Bytes = vote_message as Bytes;
+    assert ((zero_pad + sha256(vm_b)) as Int % (r as Int)) as Bytes
+        == (scalars.s4 as Bytes);
+
+    assert ((zero_pad + sha256(threshold_pack_b)) as Int % (r as Int)) as Bytes
+        == (scalars.s5 as Bytes);
+
+    assert ((zero_pad + sha256(ballot_b)) as Int % (r as Int)) as Bytes
+        == (scalars.s6 as Bytes);
+
+    // VK input: IC[0] + IC[1]*s1 + ... + IC[6]*s6.
+    let vk_input: PublicKey = IC.ic0
+        + IC.ic1 * scalars.s1
+        + IC.ic2 * scalars.s2
+        + IC.ic3 * scalars.s3
+        + IC.ic4 * scalars.s4
+        + IC.ic5 * scalars.s5
+        + IC.ic6 * scalars.s6;
+
+    // Groth16 pairing identity.
+    bls_pairing_identity(
+        proof.a,    proof.b,
+        -VK.alpha,  VK.beta,
+        -vk_input,  VK.gamma,
+        -proof.c,   VK.delta,
+    );
+
+    // BLS aggregate signature verification (PoP / unaugmented).
+    // Identical scheme to the deleted election/finalize.rue: voters
+    // sign sk_i · H(vote_message), aggregate is sum, verified via the
+    // single-pair pairing identity.
+    let G1_GENERATOR: PublicKey =
+        0x97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb;
+    let h_vote_message: Signature = g2_map(vote_message as Bytes);
+    bls_pairing_identity(
+        agg_signers,     h_vote_message,
+        -G1_GENERATOR,   agg_sig,
+    );
+
+    // BallotState.agg_signers is a 32-byte commitment to the signer
+    // set; the full G1 aggregate is 48 bytes, so we hash it once to
+    // collapse to Bytes32. The same hash is used in the finalization
+    // announcement so on-chain consumers see a stable identifier.
+    let agg_signers_commitment: Bytes32 = sha256(agg_b);
+
+    // Finalization announcement — asserted by downstream outcome-gated
+    // contracts and re-emittable via announce_finalization.
+    let announce_finalize = CreateCoinAnnouncement {
+        message: ballot_finalization_msg(
+            BALLOT_LAUNCHER_ID,
+            vote_outcome_data,
+            agg_signers_commitment,
+        ),
+    };
+
+    let new_state = BallotState {
+        finalized: true,
+        vote_outcome: vote_outcome_data,
+        agg_signers: agg_signers_commitment,
+    };
+
+    (
+        BallotStateTruth {
+            Ephemeral_State: Truth.Ephemeral_State,
+            State: new_state,
+        },
+        [
+            assert_closed,
+            announce_finalize,
+        ],
+    )
+}

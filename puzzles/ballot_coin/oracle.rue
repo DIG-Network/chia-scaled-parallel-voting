@@ -1,0 +1,70 @@
+// ballot_coin/oracle.rue
+// Oracle action for the Ballot Coin.
+//
+// Permissionless action, valid in BOTH unfinalized and finalized
+// states. Recreates the Ballot Coin with state UNCHANGED and emits a
+// CoinAnnouncement attesting the ballot's identity, curried close
+// height, and current finalized flag. Consumers (Registration Coin
+// `mint_voting_coin` and Voting Coin `update_vote`) co-spend this
+// action and assert the announcement so they can pin VOTE_CLOSE_HEIGHT
+// to the actual curried value (defense against a malicious mint
+// trying to lie about close height) and / or prove the ballot is
+// still open in the current block.
+//
+// Announcement variants (distinct prefixes prevent cross-replay):
+//
+//   * State.finalized == false:
+//       sha256("ballot_oracle_open"
+//              || ballot_launcher_id
+//              || vote_close_height_be8)
+//
+//   * State.finalized == true:
+//       sha256("ballot_oracle_closed"
+//              || ballot_launcher_id
+//              || vote_close_height_be8
+//              || vote_outcome
+//              || agg_signers)
+//
+// AssertCoinAnnouncement contract: external puzzles must derive the
+// announcer_coin_id (the Ballot Coin's CURRENT coin id) themselves to
+// build the full announcement_id; the same pattern is used by
+// `update_vote.rue` and `registration_coin/mint_voting_coin.rue`.
+
+import super::common_types::*;
+import shared::*;
+
+fn main(
+    // ── Curried ─────────────────────────────────────────────────────
+    BALLOT_LAUNCHER_ID: Bytes32,
+    VOTE_CLOSE_HEIGHT: Int,
+    Truth: BallotStateTruth,
+    // No solution params.
+) -> (BallotStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    let ballot_b: Bytes = BALLOT_LAUNCHER_ID as Bytes;
+    let close_b: Bytes = int_to_8_bytes_be(VOTE_CLOSE_HEIGHT);
+
+    let msg: Bytes32 = if State.finalized {
+        sha256(
+            "ballot_oracle_closed"
+            + ballot_b
+            + close_b
+            + (State.vote_outcome as Bytes)
+            + (State.agg_signers as Bytes)
+        )
+    } else {
+        sha256(
+            "ballot_oracle_open"
+            + ballot_b
+            + close_b
+        )
+    };
+
+    let announce = CreateCoinAnnouncement {
+        message: msg,
+    };
+
+    // State unchanged.
+    (Truth, [announce])
+}
