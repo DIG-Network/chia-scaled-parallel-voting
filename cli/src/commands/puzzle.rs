@@ -27,15 +27,26 @@ pub enum PuzzleCmd {
 pub async fn run(cmd: PuzzleCmd, ctx: &Context) -> anyhow::Result<()> {
     match cmd {
         PuzzleCmd::Hashes => {
+            // CHIP rev 2026-05-02: the singleton's `finalize` and
+            // `announce_finalization` actions, and the registration
+            // coin's `vote` action, were all deleted (per-ballot lane
+            // moved to the Ballot Coin / Voting Coin). The hashes
+            // below mirror the new action surface.
             let value = serde_json::json!({
                 "action_layer":              hex_str(PuzzleHashes::action_layer()),
                 "election_finalizer":        hex_str(PuzzleHashes::election_finalizer()),
                 "election_register":         hex_str(PuzzleHashes::election_register()),
-                "election_finalize":         hex_str(PuzzleHashes::election_finalize()),
-                "election_announce_finalization": hex_str(PuzzleHashes::election_announce_finalization()),
+                "election_create_ballot":    hex_str(PuzzleHashes::election_create_ballot()),
+                "election_deregister":       hex_str(PuzzleHashes::election_deregister()),
+                "ballot_coin_finalizer":     hex_str(PuzzleHashes::ballot_coin_finalizer()),
+                "ballot_coin_finalize":      hex_str(PuzzleHashes::ballot_coin_finalize()),
+                "ballot_coin_oracle":        hex_str(PuzzleHashes::ballot_coin_oracle()),
+                "ballot_coin_announce_finalization": hex_str(PuzzleHashes::ballot_coin_announce_finalization()),
                 "registration_finalizer":    hex_str(PuzzleHashes::registration_finalizer()),
-                "registration_vote":         hex_str(PuzzleHashes::registration_vote()),
+                "registration_mint_voting_coin": hex_str(PuzzleHashes::registration_mint_voting_coin()),
                 "registration_release":      hex_str(PuzzleHashes::registration_release()),
+                "voting_coin_finalizer":     hex_str(PuzzleHashes::voting_coin_finalizer()),
+                "voting_coin_update_vote":   hex_str(PuzzleHashes::voting_coin_update_vote()),
                 "cat_outer":                 hex_str(PuzzleHashes::cat_outer()),
                 "registration_actions_merkle_root": hex_str(puzzles::registration_actions_merkle_root()),
                 "note": "election_actions_merkle_root is per-deployment (depends on curried election constants); see `chip-voting deployer predict-puzzle-hash`",

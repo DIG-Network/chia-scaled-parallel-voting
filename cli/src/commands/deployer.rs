@@ -54,15 +54,13 @@ pub struct DeployParamsArgs {
     #[arg(long)]
     collateral_amount: u64,
 
-    /// Registration fee each voter pays in XCH mojos.
+    /// L1 block height the election was launched at. Stored in the
+    /// genesis `ElectionState` (per CHIP rev 2026-05-02) so per-ballot
+    /// epochs / timing windows can be derived against a stable
+    /// on-chain anchor. Defaults to 0 if unset; pass the current peak
+    /// height for any real deploy.
     #[arg(long, default_value_t = 0)]
-    registration_fee: u64,
-
-    /// Minimum L1 blocks between deploy and earliest finalize. Set
-    /// generously — short windows allow bootstrap-attack griefing
-    /// (single-voter premature finalize).
-    #[arg(long)]
-    election_length_blocks: u64,
+    election_start_height: u64,
 
     /// Path to a JSON file with the Groth16 verification key produced
     /// by the MPC ceremony (`chip-voting ceremony finalize`). The
@@ -232,8 +230,7 @@ fn build_deployer(args: &DeployParamsArgs) -> Result<ElectionDeployer> {
         verification_key: vk,
         cat_tail_hash,
         collateral_amount: args.collateral_amount,
-        registration_fee: args.registration_fee,
-        election_length_blocks: args.election_length_blocks,
+        election_start_height: args.election_start_height,
         label: args.label.clone(),
     }))
 }
@@ -334,9 +331,8 @@ async fn deploy(
     let summary = serde_json::json!({
         "election_launcher_id":    artifacts.config.election_launcher_id_hex,
         "coin_spends":             artifacts.spend_bundle.coin_spends.len(),
-        "election_length_blocks":  params.election_length_blocks,
+        "election_start_height":   params.election_start_height,
         "collateral_amount":       params.collateral_amount,
-        "registration_fee":        params.registration_fee,
         "label":                   params.label,
     });
     ctx.print(&summary)?;

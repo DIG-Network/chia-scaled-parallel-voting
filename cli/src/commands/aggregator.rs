@@ -238,21 +238,21 @@ async fn make_aggregator(config_path: PathBuf, ctx: &Context) -> Result<Aggregat
 
 async fn sync(config_path: PathBuf, ctx: &Context) -> Result<()> {
     let mut agg = make_aggregator(config_path, ctx).await?;
-    let voter_set = agg
+    let snapshot = agg
         .sync()
         .await
         .map_err(|e| anyhow::anyhow!("aggregator sync: {e:?}"))?;
-    let state = agg
+    let _ = agg
         .state()
         .map_err(|e| anyhow::anyhow!("state: {e:?}"))?;
     ctx.print(&serde_json::json!({
         "election_launcher_id":     agg.config.election_launcher_id_hex,
-        "registration_count":       voter_set.registration_count,
-        "registration_merkle_root": format!("0x{}", hex::encode(voter_set.registration_merkle_root)),
-        "accumulated_fees":         state.accumulated_fees,
-        "finalized":                state.finalized,
-        "vote_outcome":             format!("0x{}", hex::encode(state.vote_outcome)),
-        "voter_count":              voter_set.voters.len(),
+        "registration_count":       snapshot.voter_set.registration_count,
+        "registration_merkle_root": format!("0x{}", hex::encode(snapshot.voter_set.registration_merkle_root)),
+        "accumulated_fees":         "(per-ballot — see ballot subcommand)",
+        "finalized":                "(per-ballot — see ballot subcommand)",
+        "vote_outcome":             "(per-ballot — see ballot subcommand)",
+        "voter_count":              snapshot.voter_set.voters.len(),
     }))
 }
 
@@ -265,9 +265,9 @@ async fn state_cmd(config_path: PathBuf, ctx: &Context) -> Result<()> {
     ctx.print(&serde_json::json!({
         "registration_count":       state.registration_count,
         "registration_merkle_root": format!("0x{}", hex::encode(state.registration_merkle_root)),
-        "accumulated_fees":         state.accumulated_fees,
-        "finalized":                state.finalized,
-        "vote_outcome":             format!("0x{}", hex::encode(state.vote_outcome)),
+        "accumulated_fees":         "(per-ballot — see ballot subcommand)",
+        "finalized":                "(per-ballot — see ballot subcommand)",
+        "vote_outcome":             "(per-ballot — see ballot subcommand)",
     }))
 }
 
@@ -334,8 +334,11 @@ async fn prepare_witness(
 
     let votes = load_votes(&votes_file)?;
     let outcome = parse_b32(&vote_outcome, "vote_outcome")?;
+    // TODO(phase-6): plumb the real ballot_launcher_id through CLI
+    // args once per-ballot finalize is wired.
+    let ballot_launcher_id = Bytes32::default();
     let witness = agg
-        .prepare_finalize_witness(outcome, &votes)
+        .prepare_finalize_witness(outcome, ballot_launcher_id, &votes)
         .map_err(|e| anyhow::anyhow!("prepare_finalize_witness: {e:?}"))?;
 
     ctx.print(&serde_json::json!({
@@ -502,6 +505,13 @@ fn load_votes(
                 // `aggregator collect-votes` populates it correctly
                 // from chain data.
                 registration_coin_id: Bytes32::default(),
+                // Per CHIP rev 2026-05-02: ballot/voting coin
+                // identity is part of the record. For dry-run
+                // witness flows these are placeholder zeros; the
+                // real ids are populated by `aggregator
+                // collect-votes` from chain data.
+                ballot_launcher_id: Bytes32::default(),
+                voting_coin_id: Bytes32::default(),
             })
         })
         .collect()

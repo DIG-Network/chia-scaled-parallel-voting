@@ -96,16 +96,19 @@ pub enum VoterCmd {
         overwrite: bool,
     },
 
-    /// Cast a vote: re-spend the voter's registration coin via the
-    /// `vote` action. The vote_data is a 32-byte payload; the voter
-    /// authenticates with an UNAUGMENTED BLS signature
-    /// (`AggSigUnsafe` on-chain).
-    Vote {
+    /// Cast a vote on a specific Ballot Coin (CHIP rev 2026-05-02).
+    /// Mints a fresh Voting Coin off the voter's Registration Coin.
+    /// (STUB — `Voter::cast_vote` is stubbed pending Phase 6.)
+    CastVote {
         #[arg(long)]
         election_config: PathBuf,
 
         #[command(flatten)]
         secret: VoterSecretArgs,
+
+        /// 32-byte hex Ballot Coin launcher id this vote targets.
+        #[arg(long)]
+        ballot_launcher_id: String,
 
         /// 32-byte hex payload the voter is committing to. Typically
         /// `sha256(ballot_options)` or similar.
@@ -119,16 +122,45 @@ pub enum VoterCmd {
         overwrite: bool,
     },
 
-    /// Print the canonical vote message (`sha256("vote" ||
-    /// election_id || pubkey || vote_data)`) the voter must sign
-    /// for a vote action. Mirrors `Voter::vote_message`. Pure
-    /// offline computation.
+    /// Update an existing vote by re-spending the voter's Voting
+    /// Coin via its `update_vote` action. (STUB — `Voter::update_vote`
+    /// is stubbed pending Phase 6.)
+    UpdateVote {
+        #[arg(long)]
+        election_config: PathBuf,
+
+        #[command(flatten)]
+        secret: VoterSecretArgs,
+
+        /// 32-byte hex coin id of the voter's existing Voting Coin.
+        #[arg(long)]
+        voting_coin_id: String,
+
+        /// New 32-byte hex vote payload.
+        #[arg(long)]
+        new_vote_data: String,
+
+        #[arg(long)]
+        bundle_output: Option<PathBuf>,
+
+        #[arg(long)]
+        overwrite: bool,
+    },
+
+    /// Print the canonical vote message
+    /// (`sha256(vote_data || ballot_launcher_id || election_id)`)
+    /// the voter must sign for a `cast_vote` / `update_vote` action.
+    /// Mirrors `puzzles::vote_message`. Pure offline computation.
     VoteMessage {
         #[arg(long)]
         election_config: PathBuf,
 
         #[command(flatten)]
         secret: VoterSecretArgs,
+
+        /// 32-byte hex Ballot Coin launcher id.
+        #[arg(long)]
+        ballot_launcher_id: String,
 
         /// 32-byte hex vote payload.
         #[arg(long)]
@@ -152,16 +184,21 @@ pub enum VoterCmd {
         destination: String,
     },
 
-    /// Release the voter's CAT collateral after the election has
-    /// been finalized. Builds a paired bundle:
-    ///   * Election Singleton: announce_finalization action
-    ///   * Registration Coin:  release action
+    /// Release the voter's CAT collateral. Per CHIP rev 2026-05-02
+    /// this is gated on the singleton's `deregister` action — the
+    /// finalize / announce_finalization actions moved off the
+    /// singleton, so release no longer needs paired finalize.
+    /// (STUB — `Voter::release_collateral` is stubbed pending Phase 6.)
     Release {
         #[arg(long)]
         election_config: PathBuf,
 
         #[command(flatten)]
         secret: VoterSecretArgs,
+
+        /// 32-byte hex coin id of the voter's Registration Coin.
+        #[arg(long)]
+        registration_coin_id: String,
 
         /// Puzzle hash that will receive the released CAT
         /// collateral. 32-byte hex.
@@ -199,18 +236,50 @@ pub async fn run(cmd: VoterCmd, ctx: &Context) -> Result<()> {
             )
             .await
         }
-        VoterCmd::Vote {
+        VoterCmd::CastVote {
             election_config,
             secret,
+            ballot_launcher_id,
             vote_data,
             bundle_output,
             overwrite,
-        } => vote(election_config, secret, vote_data, bundle_output, overwrite, ctx).await,
+        } => {
+            cast_vote(
+                election_config,
+                secret,
+                ballot_launcher_id,
+                vote_data,
+                bundle_output,
+                overwrite,
+                ctx,
+            )
+            .await
+        }
+        VoterCmd::UpdateVote {
+            election_config,
+            secret,
+            voting_coin_id,
+            new_vote_data,
+            bundle_output,
+            overwrite,
+        } => {
+            update_vote(
+                election_config,
+                secret,
+                voting_coin_id,
+                new_vote_data,
+                bundle_output,
+                overwrite,
+                ctx,
+            )
+            .await
+        }
         VoterCmd::VoteMessage {
             election_config,
             secret,
+            ballot_launcher_id,
             vote_data,
-        } => vote_message_cmd(election_config, secret, vote_data, ctx),
+        } => vote_message_cmd(election_config, secret, ballot_launcher_id, vote_data, ctx),
         VoterCmd::ReleaseMessage {
             election_config,
             secret,
@@ -219,10 +288,22 @@ pub async fn run(cmd: VoterCmd, ctx: &Context) -> Result<()> {
         VoterCmd::Release {
             election_config,
             secret,
+            registration_coin_id,
             destination,
             bundle_output,
             overwrite,
-        } => release(election_config, secret, destination, bundle_output, overwrite, ctx).await,
+        } => {
+            release(
+                election_config,
+                secret,
+                registration_coin_id,
+                destination,
+                bundle_output,
+                overwrite,
+                ctx,
+            )
+            .await
+        }
     }
 }
 
@@ -267,15 +348,23 @@ fn status(
 
 fn vote_message_cmd(
     config_path: PathBuf,
-    secret: VoterSecretArgs,
+    _secret: VoterSecretArgs,
+    ballot_launcher_id: String,
     vote_data: String,
     ctx: &Context,
 ) -> Result<()> {
     let config = config_file::load_election_config(&config_path)?;
-    let keys = build_voter_keys(&secret)?;
-    let voter = Voter::new(config, keys, ctx.network);
+    let election_id = config
+        .election_launcher_id()
+        .map_err(|e| anyhow::anyhow!("election_launcher_id: {e}"))?;
+    let blid = parse_b32(&ballot_launcher_id, "ballot_launcher_id")?;
     let vd = parse_b32(&vote_data, "vote_data")?;
-    let msg = voter.vote_message(vd);
+    // Per CHIP rev 2026-05-02 the canonical vote message lives in
+    // `puzzles::vote_message` (mirrored by
+    // `puzzles/voting_coin/shared.rue::vote_message`); the per-voter
+    // wrapper that used to live on `Voter` was deleted along with the
+    // singleton-side vote action.
+    let msg = chip_voting_sdk::puzzles::vote_message(vd, blid, election_id);
     ctx.print(&serde_json::json!({
         "vote_message": format!("0x{}", hex::encode(msg)),
     }))
@@ -385,9 +474,11 @@ fn parse_b32_str(s: &str, name: &str) -> Result<chia_protocol::Bytes32> {
     Ok(chia_protocol::Bytes32::new(arr))
 }
 
-async fn vote(
+#[allow(clippy::too_many_arguments)]
+async fn cast_vote(
     config_path: PathBuf,
     secret: VoterSecretArgs,
+    ballot_launcher_id: String,
     vote_data: String,
     bundle_output: Option<PathBuf>,
     overwrite: bool,
@@ -395,6 +486,7 @@ async fn vote(
 ) -> Result<()> {
     let config = config_file::load_election_config(&config_path)?;
     let keys = build_voter_keys(&secret)?;
+    let blid = parse_b32(&ballot_launcher_id, "ballot_launcher_id")?;
     let vd = parse_b32(&vote_data, "vote_data")?;
     let voter = Voter::new(config, keys, ctx.network);
     let chain = wallet_helpers::make_independent_chain(
@@ -402,16 +494,54 @@ async fn vote(
         ctx.rpc_override.as_deref(),
     )
     .await?;
-    let bundle = voter
-        .vote(vd, &chain)
+    let params = chip_voting_sdk::actors::voter::CastVoteParams {
+        ballot_launcher_id: blid,
+        vote_data: vd,
+    };
+    // STUB: `Voter::cast_vote` is stubbed pending Phase 6 (voting
+    // coin lineage). The error propagates cleanly so users see the
+    // pending-implementation message rather than a panic.
+    let result = voter
+        .cast_vote(&chain, params)
         .await
-        .map_err(|e| anyhow::anyhow!("Voter::vote: {e:?}"))?;
-    finalize_voter_action("vote", bundle, bundle_output, overwrite, ctx).await
+        .map_err(|e| anyhow::anyhow!("Voter::cast_vote: {e:?}"))?;
+    finalize_voter_action("cast_vote", result.spend_bundle, bundle_output, overwrite, ctx).await
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn update_vote(
+    config_path: PathBuf,
+    secret: VoterSecretArgs,
+    voting_coin_id: String,
+    new_vote_data: String,
+    bundle_output: Option<PathBuf>,
+    overwrite: bool,
+    ctx: &Context,
+) -> Result<()> {
+    let config = config_file::load_election_config(&config_path)?;
+    let keys = build_voter_keys(&secret)?;
+    let vc_id = parse_b32(&voting_coin_id, "voting_coin_id")?;
+    let new_vd = parse_b32(&new_vote_data, "new_vote_data")?;
+    let voter = Voter::new(config, keys, ctx.network);
+    let chain = wallet_helpers::make_independent_chain(
+        ctx.network,
+        ctx.rpc_override.as_deref(),
+    )
+    .await?;
+    // STUB: `Voter::update_vote` is stubbed pending Phase 6. Same
+    // shape as cast_vote — we propagate the SDK's stubbed error.
+    let bundle = voter
+        .update_vote(&chain, vc_id, new_vd)
+        .await
+        .map_err(|e| anyhow::anyhow!("Voter::update_vote: {e:?}"))?;
+    finalize_voter_action("update_vote", bundle, bundle_output, overwrite, ctx).await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn release(
     config_path: PathBuf,
     secret: VoterSecretArgs,
+    registration_coin_id: String,
     destination: String,
     bundle_output: Option<PathBuf>,
     overwrite: bool,
@@ -419,6 +549,7 @@ async fn release(
 ) -> Result<()> {
     let config = config_file::load_election_config(&config_path)?;
     let keys = build_voter_keys(&secret)?;
+    let reg_id = parse_b32(&registration_coin_id, "registration_coin_id")?;
     let dest = parse_b32(&destination, "destination")?;
     let voter = Voter::new(config, keys, ctx.network);
     let chain = wallet_helpers::make_independent_chain(
@@ -426,8 +557,11 @@ async fn release(
         ctx.rpc_override.as_deref(),
     )
     .await?;
+    // STUB: `Voter::release_collateral` is stubbed pending Phase 6
+    // (the new release flow co-spends the singleton's `deregister`
+    // action with the registration coin's `release` action).
     let bundle = voter
-        .release_collateral(dest, &chain)
+        .release_collateral(&chain, reg_id, dest)
         .await
         .map_err(|e| anyhow::anyhow!("Voter::release_collateral: {e:?}"))?;
     finalize_voter_action("release", bundle, bundle_output, overwrite, ctx).await

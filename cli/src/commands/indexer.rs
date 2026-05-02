@@ -11,6 +11,7 @@
 // CHAIN: every subcommand connects to ChiaQuery.
 
 use anyhow::Result;
+use chia_protocol::Bytes32;
 use chip_voting_sdk::Indexer;
 use clap::Subcommand;
 use std::path::PathBuf;
@@ -126,9 +127,9 @@ async fn status(config_path: PathBuf, ctx: &Context) -> Result<()> {
     ctx.print(&serde_json::json!({
         "election_launcher_id":     indexer.config.election_launcher_id_hex,
         "registration_count":       state.registration_count,
-        "accumulated_fees":         state.accumulated_fees,
-        "finalized":                state.finalized,
-        "vote_outcome":             format!("0x{}", hex::encode(state.vote_outcome)),
+        "accumulated_fees":         "(per-ballot — see ballot subcommand)",
+        "finalized":                "(per-ballot — see ballot subcommand)",
+        "vote_outcome":             "(per-ballot — see ballot subcommand)",
         "registration_merkle_root": format!("0x{}", hex::encode(state.registration_merkle_root)),
     }))
 }
@@ -141,6 +142,7 @@ async fn voters(config_path: PathBuf, ctx: &Context) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("indexer sync: {e:?}"))?;
     let set = indexer
         .voter_set()
+        .await
         .map_err(|e| anyhow::anyhow!("voter_set: {e:?}"))?;
     let entries: Vec<_> = set
         .voters
@@ -225,15 +227,20 @@ async fn is_finalized_cmd(config_path: PathBuf, ctx: &Context) -> Result<()> {
         .sync()
         .await
         .map_err(|e| anyhow::anyhow!("indexer sync: {e:?}"))?;
+    // TODO(phase-6): expose ballot_launcher_id on the CLI surface.
+    // Per CHIP rev 2026-05-02, finalization is per-ballot.
+    let ballot_launcher_id = Bytes32::default();
     let finalized = indexer
-        .is_finalized()
-        .map_err(|e| anyhow::anyhow!("is_finalized: {e:?}"))?;
+        .is_finalized_for(ballot_launcher_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("is_finalized_for: {e:?}"))?;
     let outcome = indexer
-        .vote_outcome()
-        .map_err(|e| anyhow::anyhow!("vote_outcome: {e:?}"))?;
+        .vote_outcome_for(ballot_launcher_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("vote_outcome_for: {e:?}"))?;
     ctx.print(&serde_json::json!({
         "finalized": finalized,
-        "vote_outcome": format!("0x{}", hex::encode(outcome)),
+        "vote_outcome": outcome.map(|o| format!("0x{}", hex::encode(o))),
     }))
 }
 
@@ -268,6 +275,7 @@ async fn merkle_tree_cmd(config_path: PathBuf, ctx: &Context) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("merkle_tree: {e:?}"))?;
     let voter_set = indexer
         .voter_set()
+        .await
         .map_err(|e| anyhow::anyhow!("voter_set: {e:?}"))?;
     let leaves: Vec<_> = voter_set
         .voters

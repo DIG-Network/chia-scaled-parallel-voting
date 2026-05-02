@@ -1131,8 +1131,11 @@ async fn phase_deploy(
         verification_key: vk.clone(),
         cat_tail_hash,
         collateral_amount: args.collateral_amount,
-        registration_fee: args.registration_fee,
-        election_length_blocks: args.election_length_blocks,
+        // CHIP rev 2026-05-02: registration_fee + election_length_blocks
+        // moved to per-Ballot-Coin params (Phase 6). New mandatory
+        // election_start_height; placeholder 0 here since the live
+        // test orchestrator is not yet wired through Phase 6.
+        election_start_height: 0,
         label: Some(format!("live-test-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))),
     });
     let artifacts = deployer
@@ -1169,6 +1172,8 @@ async fn phase_deploy(
     // eve puzzle hash. Compute its coin id deterministically.
     let eve_inner_ph = chip_voting_sdk::actors::aggregator::compute_eve_inner_puzzle_hash(
         &artifacts.config,
+        // TODO(phase-6): plumb the real election_start_height here.
+        0,
     );
     let eve_outer_ph =
         chip_voting_sdk::puzzles::election_singleton_puzzle_hash(launcher_id, eve_inner_ph);
@@ -1383,6 +1388,8 @@ async fn phase_register_voter(
     let _ = wait_for_current_singleton(
         chain,
         &deploy.config,
+        // TODO(phase-6): real election_start_height
+        0,
         "Election Singleton (CLI pre-flight)",
         Duration::from_secs(30),
         Duration::from_secs(300),
@@ -1540,10 +1547,19 @@ async fn phase_vote(
     // Voter::vote re-queries the registration coin by hint at call time
     // (never cache coin ids across spends).
     let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network);
-    let bundle = voter
-        .vote(vote_data, chain)
+    // CHIP rev 2026-05-02: Voter::vote → Voter::cast_vote(&CastVoteParams).
+    // Stub call propagates the Phase 6 error from the SDK.
+    let cast_result = voter
+        .cast_vote(
+            chain,
+            chip_voting_sdk::actors::voter::CastVoteParams {
+                ballot_launcher_id: Bytes32::default(),
+                vote_data,
+            },
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("Voter::vote: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("Voter::cast_vote: {e:?}"))?;
+    let bundle = cast_result.spend_bundle;
     verify_bundle_locally(&bundle, network)?;
     push_tx(chain, &bundle, &format!("{voter_label} vote")).await?;
     wait_for_spend(chain, reg_coin_id, args, &format!("{voter_label} vote (pre-vote reg coin)")).await?;
@@ -1757,7 +1773,14 @@ async fn phase_release(
     let max_wait = Duration::from_secs(args.confirmation_timeout_secs.max(600));
     let poll = Duration::from_secs(args.poll_interval_secs.max(20));
     let bundle = loop {
-        match voter.release_collateral(destination, chain).await {
+        // CHIP rev 2026-05-02: release_collateral now takes
+        // (chain, registration_coin_id, destination). The
+        // registration_coin_id placeholder will produce a Phase 6
+        // stub error from the SDK.
+        match voter
+            .release_collateral(chain, Bytes32::default(), destination)
+            .await
+        {
             Ok(b) => break b,
             Err(e) => {
                 let msg = format!("{e:?}");
@@ -1829,6 +1852,12 @@ async fn phase_release(
 }
 
 // ── Phase 7: Oracle ──────────────────────────────────────────────────
+//
+// CHIP rev 2026-05-02: the singleton-level Oracle action was removed
+// (per-Ballot-Coin oracle replaces it; see commit 0be3e0b and the
+// Phase-4.6 puzzle work). The block below is compile-out via
+// `#[cfg(any())]` until Phase 6 wires up the per-ballot oracle CLI.
+#[cfg(any())]
 
 /// Spend the Election Singleton via its `oracle` action.
 ///
@@ -2569,8 +2598,10 @@ async fn main() -> Result<()> {
     }
 
     // ── Phase 7: Oracle ────────────────────────────────────────────
-    if !args.skip_oracle {
-        phase_oracle(&chain, network, &args, &deploy).await?;
+    // Phase 7 oracle is compile-stubbed pending Phase 6 (see
+    // `#[cfg(any())] async fn phase_oracle` below).
+    if !args.skip_oracle && false {
+        // phase_oracle(&chain, network, &args, &deploy).await?;
     } else {
         info!("--skip-oracle set: not publishing oracle announcement");
     }

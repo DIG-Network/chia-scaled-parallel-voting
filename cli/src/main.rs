@@ -112,11 +112,12 @@ enum Command {
     #[command(subcommand)]
     Indexer(commands::indexer::IndexerCmd),
 
-    /// Oracle actions (permissionless): predict + produce
-    /// `oracle`-action coin spends so external puzzles can assert
-    /// the (un)finalized vote result on-chain.
+    /// Ballot Coin actions (CHIP rev 2026-05-02). Subcommands are
+    /// stub placeholders pending Phase 6 — they parse cleanly but
+    /// each prints a TODO message until the per-ballot SDK actors
+    /// land.
     #[command(subcommand)]
-    Oracle(commands::oracle::OracleCmd),
+    Ballot(commands::ballot::BallotCmd),
 
     /// MPC trusted-setup ceremony commands.
     #[command(subcommand)]
@@ -148,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Voter(c) => commands::voter::run(c, &ctx).await?,
         Command::Aggregator(c) => commands::aggregator::run(c, &ctx).await?,
         Command::Indexer(c) => commands::indexer::run(c, &ctx).await?,
-        Command::Oracle(c) => commands::oracle::run(c, &ctx).await?,
+        Command::Ballot(c) => commands::ballot::run(c, &ctx).await?,
         Command::Ceremony(c) => commands::ceremony::run(c, &ctx).await?,
         Command::Wallet(c) => commands::wallet::run(c, &ctx).await?,
         Command::Puzzle(c) => commands::puzzle::run(c, &ctx).await?,

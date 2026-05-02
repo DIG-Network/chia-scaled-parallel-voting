@@ -16,10 +16,10 @@
 //   5. NEVER persist secret material to disk in plain text.
 
 pub mod aggregator;
+pub mod ballot;
 pub mod ceremony;
 pub mod deployer;
 pub mod indexer;
-pub mod oracle;
 pub mod puzzle;
 pub mod voter;
 pub mod wallet;
