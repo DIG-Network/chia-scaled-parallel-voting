@@ -1770,11 +1770,25 @@ async fn phase_release(
     let poll = Duration::from_secs(args.poll_interval_secs.max(20));
     let bundle = loop {
         // CHIP rev 2026-05-02: release_collateral now takes
-        // (chain, registration_coin_id, destination). The
-        // registration_coin_id placeholder will produce a Phase 6
-        // stub error from the SDK.
+        //   (chain, &smt, registration_coin_id, destination).
+        // Sync the SMT from chain via find_current_singleton each
+        // iteration so the membership proof tracks the singleton's
+        // CURRENT state (release_collateral asserts SMT root match).
+        let current = match chip_voting_sdk::actors::aggregator::find_current_singleton(
+            chain,
+            &voter.config,
+            0,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => return Err(anyhow::anyhow!("find_current_singleton: {e:?}")),
+        };
+        // Registration coin id placeholder remains until the live
+        // integration test plumbs the actual id through; the SDK
+        // surfaces a clear error if `Bytes32::default()` is not on chain.
         match voter
-            .release_collateral(chain, Bytes32::default(), destination)
+            .release_collateral(chain, &current.smt, Bytes32::default(), destination)
             .await
         {
             Ok(b) => break b,

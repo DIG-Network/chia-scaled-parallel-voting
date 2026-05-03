@@ -541,11 +541,18 @@ async fn release(
     let voter = Voter::new(config, keys, ctx.network);
     let chain =
         wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
-    // STUB: `Voter::release_collateral` is stubbed pending Phase 6
-    // (the new release flow co-spends the singleton's `deregister`
-    // action with the registration coin's `release` action).
+    // Sync the SMT from chain so the deregister action's membership
+    // proof can be constructed (release_collateral asserts it
+    // matches the on-chain singleton state).
+    let current = chip_voting_sdk::actors::aggregator::find_current_singleton(
+        &chain,
+        &voter.config,
+        0,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("find_current_singleton: {e:?}"))?;
     let bundle = voter
-        .release_collateral(&chain, reg_id, dest)
+        .release_collateral(&chain, &current.smt, reg_id, dest)
         .await
         .map_err(|e| anyhow::anyhow!("Voter::release_collateral: {e:?}"))?;
     finalize_voter_action("release", bundle, bundle_output, overwrite, ctx).await

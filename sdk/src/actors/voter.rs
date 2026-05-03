@@ -470,31 +470,316 @@ impl Voter {
 
     /// Build a collateral release spend bundle.
     ///
-    /// **STUB — full implementation deferred to Phase 6.**
+    /// FLOW (CHIP rev 2026-05-02):
+    ///   1. Locate the current Election Singleton via the launcher
+    ///      lineage walker (same path as `Voter::register`).
+    ///   2. Build the curried `deregister` action puzzle and its
+    ///      solution `(voter_pubkey, leaf_index, ...siblings)` — the
+    ///      SPT membership proof that wipes this voter's leaf.
+    ///   3. Wrap with the action layer + singleton outer.
+    ///   4. Look up the voter's Registration Coin by id; verify it
+    ///      sits at the predicted CAT-wrapped puzzle hash for the
+    ///      voter's CURRENT `RegistrationState` (this driver currently
+    ///      assumes a `fresh` state — i.e., the voter has not yet
+    ///      cast any votes nor previously called release).
+    ///   5. Build the `release` action solution
+    ///      `(collateral_destination, ...singleton_coin_id)`. The
+    ///      action asserts the singleton's deregister announcement
+    ///      via the supplied `singleton_coin_id`.
+    ///   6. Wrap with the registration-coin action layer and the
+    ///      CAT outer. Reconstruct the CAT lineage proof from the
+    ///      Registration Coin's on-chain parent spend.
+    ///   7. Sign with the voter's BLS key (both `deregister` and
+    ///      `release` emit `AggSigMe` conditions covered by
+    ///      `RequiredSignature::from_coin_spends`).
     ///
-    /// The eventual flow (per CHIP rev 2026-05-02):
-    ///   1. Co-spend the Election Singleton's `deregister` action,
-    ///      which announces `puzzles::deregister_announcement_msg(
-    ///      voter_pubkey)` and decrements
-    ///      `(registration_count, registration_vote_weight)`.
-    ///   2. Spend the voter's Registration Coin (located by
-    ///      `voter_hint`) via its `release` action; the action
-    ///      asserts the singleton's `deregister` announcement,
-    ///      emits AggSigMe over the release message, and sends
-    ///      the CAT collateral to `destination`.
-    ///
-    /// The legacy `announce_finalization` action no longer exists
-    /// (per-ballot finalization moved to the Ballot Coin); the
-    /// release spend is gated entirely on `deregister`.
+    /// API NOTE: takes a `&SparseMerkleTree` snapshot mirroring the
+    /// singleton's current SPT root so the deregister proof can be
+    /// computed; callers should sync via `Aggregator::sync_with_chain`
+    /// or maintain their own SMT before calling.
     pub async fn release_collateral<C: ChainReader>(
         &self,
-        _chain: &C,
-        _registration_coin_id: Bytes32,
-        _destination: Bytes32,
+        chain: &C,
+        smt: &crate::merkle::SparseMerkleTree,
+        registration_coin_id: Bytes32,
+        destination: Bytes32,
     ) -> VotingResult<SpendBundle> {
-        Err(VotingError::Other(anyhow_compat::Error(
-            "Voter::release_collateral stubbed pending Phase 6".into(),
-        )))
+        use clvm_traits::{clvm_curried_args, ToClvm};
+        use clvm_utils::CurriedProgram;
+
+        let election_id = self
+            .config
+            .election_launcher_id()
+            .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
+        let cat_tail_hash = self
+            .config
+            .cat_tail_hash()
+            .map_err(|e| voting_other(format!("cat_tail_hash: {e}")))?;
+
+        // ── 1. Find the current Election Singleton ──────────────
+        let election_start_height: u64 = 0;
+        let current = crate::actors::aggregator::wait_for_current_singleton(
+            chain,
+            &self.config,
+            election_start_height,
+            "Election Singleton (release_collateral)",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(300),
+        )
+        .await?;
+        let crate::actors::aggregator::CurrentSingleton {
+            coin: singleton_coin,
+            lineage_proof: singleton_lineage_proof,
+            state: on_chain_state,
+            ..
+        } = current;
+
+        // The voter MUST be in the on-chain SMT; this is what the
+        // deregister action's membership proof asserts. Surface the
+        // mismatch early instead of as an opaque CLVM raise.
+        if smt.root() != on_chain_state.registration_merkle_root {
+            return Err(voting_other(format!(
+                "Voter::release_collateral: SMT root {} doesn't match on-chain {} — re-sync",
+                hex::encode(smt.root()),
+                hex::encode(on_chain_state.registration_merkle_root),
+            )));
+        }
+        let singleton_coin_id = singleton_coin.coin_id();
+
+        // ── 2. Build the deregister action layer + solution ──────
+        let mut ctx = SpendContext::new();
+        let elect_finalizer = build_election_finalizer_full(&mut ctx, election_id)?;
+        let merkle_root =
+            crate::actors::aggregator::election_actions_merkle_root_for_config(&self.config);
+        let election_state_node = self.election_state_node(&mut ctx, &on_chain_state)?;
+        let action_layer_node =
+            build_action_layer_puzzle(&mut ctx, elect_finalizer, merkle_root, election_state_node)?;
+
+        // CURRY ORDER (per `puzzles/election/deregister.rue`):
+        //   (TREE_DEPTH, EMPTY_LEAF_HASH, COLLATERAL_AMOUNT,
+        //    REGISTRATION_MERKLE_ROOT)
+        // where REGISTRATION_MERKLE_ROOT here is the inner-coin action
+        // root (registration_actions_merkle_root) — see deployer.rs.
+        let deregister_program_node =
+            load_action_puzzle(&mut ctx, puzzles::ELECTION_DEREGISTER_HEX)?;
+        let deregister_curried = CurriedProgram {
+            program: deregister_program_node,
+            args: clvm_curried_args!(
+                crate::config::TREE_DEPTH,
+                Bytes32::new(crate::config::EMPTY_LEAF_HASH),
+                self.config.collateral_amount,
+                puzzles::registration_actions_merkle_root()
+            ),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(driver_err)?;
+
+        // Solution shape (per deregister.rue):
+        //   `(voter_pubkey, deregister_leaf_index, ...deregister_siblings)`
+        // with the same 5-byte `0x00 || sha256(pk)[0..4]` slot encoding
+        // register.rue uses (re-applied below to keep the two actions
+        // byte-identical on the slot atom).
+        let slot = self.slot();
+        let siblings = smt.prove(slot);
+        let voter_pk_bytes = chia_protocol::Bytes::new(self.keys.pubkey.to_bytes().to_vec());
+        let slot_bytes = {
+            let mut buf = Vec::with_capacity(5);
+            buf.push(0x00);
+            buf.extend_from_slice(&slot.to_be_bytes());
+            chia_protocol::Bytes::new(buf)
+        };
+        let deregister_solution_value = (voter_pk_bytes, (slot_bytes, siblings));
+        let deregister_solution = deregister_solution_value
+            .to_clvm(&mut *ctx)
+            .map_err(driver_err)?;
+
+        let deregister_action_spends = vec![ActionSpend {
+            puzzle: deregister_curried,
+            solution: deregister_solution,
+        }];
+        let elect_finalizer_solution = ().to_clvm(&mut *ctx).map_err(driver_err)?;
+        let action_layer_solution = build_action_layer_solution(
+            &mut ctx,
+            &crate::actors::aggregator::compute_election_action_root_leaves(&self.config),
+            &deregister_action_spends,
+            elect_finalizer_solution,
+        )?;
+
+        let deregister_singleton_spend = build_singleton_spend(
+            &mut ctx,
+            singleton_coin,
+            election_id,
+            action_layer_node,
+            action_layer_solution,
+            singleton_lineage_proof,
+        )?;
+
+        // ── 3. Locate + reconstruct the Registration Coin ────────
+        let reg_record = chain
+            .coin_record_by_id(registration_coin_id)
+            .await?
+            .ok_or_else(|| {
+                voting_other(format!(
+                    "Voter::release_collateral: registration coin {} not found on chain",
+                    hex::encode(registration_coin_id),
+                ))
+            })?;
+        if !reg_record.is_unspent() {
+            return Err(voting_other(format!(
+                "Voter::release_collateral: registration coin {} already spent",
+                hex::encode(registration_coin_id),
+            )));
+        }
+        let predicted_reg_ph = puzzles::fresh_registration_coin_puzzle_hash(
+            cat_tail_hash,
+            &self.keys.pubkey,
+            election_id,
+        );
+        if reg_record.coin.puzzle_hash != predicted_reg_ph {
+            return Err(voting_other(format!(
+                "Voter::release_collateral: registration coin puzzle hash {} doesn't match \
+                 predicted fresh-state CAT-wrapped ph {} — voter may have already cast votes \
+                 (driver currently assumes a fresh registration state)",
+                hex::encode(reg_record.coin.puzzle_hash),
+                hex::encode(predicted_reg_ph),
+            )));
+        }
+
+        let cat_lineage_proof = self
+            .reconstruct_cat_lineage(chain, reg_record.coin)
+            .await?;
+
+        // ── 4. Build the release action layer + solution ─────────
+        let voter_hint = puzzles::voter_hint(election_id, cat_tail_hash, &self.keys.pubkey);
+        let reg_finalizer = crate::action_spends::build_registration_finalizer_full(
+            &mut ctx,
+            voter_hint,
+        )?;
+        // Registration coin's action layer is curried with the
+        // REGISTRATION action root (NOT the election action root).
+        let reg_merkle_root = puzzles::registration_actions_merkle_root();
+        let reg_state = crate::state::RegistrationState::fresh(self.keys.pubkey, election_id);
+        let reg_state_node = self.registration_state_node(&mut ctx, &reg_state)?;
+        let reg_action_layer_node = build_action_layer_puzzle(
+            &mut ctx,
+            reg_finalizer,
+            reg_merkle_root,
+            reg_state_node,
+        )?;
+
+        // The release action takes NO curried params (per release.rue
+        // header — voter_pubkey + election_launcher_id are read from
+        // state, not curried).
+        let release_program_node = load_action_puzzle(&mut ctx, puzzles::REGISTRATION_RELEASE_HEX)?;
+
+        // Solution shape (per release.rue):
+        //   `(collateral_destination, ...singleton_coin_id)`
+        let release_solution_value = (destination, singleton_coin_id);
+        let release_solution = release_solution_value
+            .to_clvm(&mut *ctx)
+            .map_err(driver_err)?;
+        let release_action_spends = vec![ActionSpend {
+            puzzle: release_program_node,
+            solution: release_solution,
+        }];
+        // Registration finalizer takes `..._my_amount: Int` — pass
+        // the registration coin's amount (collateral_amount).
+        let reg_finalizer_solution = self
+            .config
+            .collateral_amount
+            .to_clvm(&mut *ctx)
+            .map_err(driver_err)?;
+        let reg_action_layer_solution = build_action_layer_solution(
+            &mut ctx,
+            &puzzles::registration_action_root_leaves(),
+            &release_action_spends,
+            reg_finalizer_solution,
+        )?;
+
+        // ── 5. Wrap with CAT outer ──────────────────────────────
+        let reg_coin_id = reg_record.coin.coin_id();
+        let cat_release_spend = crate::action_spends::build_cat_spend(
+            &mut ctx,
+            reg_record.coin,
+            cat_tail_hash,
+            reg_action_layer_node,
+            reg_action_layer_solution,
+            cat_lineage_proof,
+            reg_coin_id, // single-CAT ring: prev = self
+            reg_coin_id, // single-CAT ring: next = self
+            0,
+        )?;
+
+        // ── 6. Sign + bundle ────────────────────────────────────
+        let coin_spends = vec![deregister_singleton_spend, cat_release_spend];
+        if let Err(e) = crate::dry_run_coin_spends(&coin_spends) {
+            if let Ok(dir) = std::env::var("CHIP_VOTING_DUMP_DIR") {
+                let path = std::path::Path::new(&dir).join(format!(
+                    "release_collateral-failed-{}.json",
+                    chrono_compat_now()
+                ));
+                let json = serde_json::to_string_pretty(&serde_json::json!({
+                    "error": format!("{e:?}"),
+                    "coin_spends": coin_spends.iter().map(|cs| serde_json::json!({
+                        "coin": {
+                            "parent_coin_info": format!("0x{}", hex::encode(cs.coin.parent_coin_info)),
+                            "puzzle_hash": format!("0x{}", hex::encode(cs.coin.puzzle_hash)),
+                            "amount": cs.coin.amount,
+                        },
+                        "puzzle_reveal_hex": format!("0x{}", hex::encode(cs.puzzle_reveal.as_ref())),
+                        "solution_hex": format!("0x{}", hex::encode(cs.solution.as_ref())),
+                    })).collect::<Vec<_>>(),
+                })).unwrap_or_else(|_| "<json serialise failed>".into());
+                let _ = std::fs::write(&path, json);
+                tracing::warn!(dump_path = %path.display(), "wrote failing bundle to disk");
+            }
+            return Err(voting_other(format!(
+                "Voter::release_collateral dry-run: {e:?}"
+            )));
+        }
+        let signature = sign_bundle_signature(
+            &coin_spends,
+            std::slice::from_ref(&self.keys.secret),
+            self.network,
+        )?;
+        Ok(SpendBundle::new(coin_spends, signature))
+    }
+
+    /// Build the RegistrationState CLVM tree node.
+    ///
+    /// SHAPE: matches `puzzles/registration_coin/shared.rue`:
+    ///   `(voter_pubkey . (election_launcher_id . (voted_ballots_root .
+    ///    release_destination)))`
+    /// — `release_destination` is the trailing tail (`Bytes32 | nil`),
+    /// NOT wrapped in `(_ . NIL)`. For `release_destination = None`
+    /// the trailing field is the empty atom (nil); for `Some(dest)`
+    /// it's the destination bytes32.
+    fn registration_state_node(
+        &self,
+        ctx: &mut SpendContext,
+        state: &crate::state::RegistrationState,
+    ) -> VotingResult<clvmr::NodePtr> {
+        let pk_bytes = chia_protocol::Bytes::new(state.voter_pubkey.to_bytes().to_vec());
+        match state.release_destination {
+            None => (
+                pk_bytes,
+                (
+                    state.election_launcher_id,
+                    (state.voted_ballots_root, ()),
+                ),
+            )
+                .to_clvm(&mut **ctx)
+                .map_err(driver_err),
+            Some(dest) => (
+                pk_bytes,
+                (
+                    state.election_launcher_id,
+                    (state.voted_ballots_root, dest),
+                ),
+            )
+                .to_clvm(&mut **ctx)
+                .map_err(driver_err),
+        }
     }
 
     // ── Internal helpers for spend assembly ─────────────────────
