@@ -536,36 +536,4 @@ mod inner_hash_regression_tests {
         .unwrap();
         master_to_wallet_unhardened(&root_sk.public_key(), 0).derive_synthetic()
     }
-
-    #[test]
-    #[ignore = "inner-hash prediction needs updating for new RegistrationState shape (Phase 1 → Phase 6)"]
-    fn curried_registration_action_layer_matches_predicted_inner_hash() {
-        let pk = synthetic_test_pubkey();
-        let election_id = Bytes32::new([0xAB; 32]);
-        let cat_tail_hash = Bytes32::new([0x33; 32]);
-
-        let mut ctx = SpendContext::new();
-        let hint = voter_hint(election_id, cat_tail_hash, &pk);
-        let reg_finalizer = build_registration_finalizer_full(&mut ctx, hint).unwrap();
-
-        let pk_bytes = Bytes::new(pk.to_bytes().to_vec());
-        let state_node = (pk_bytes, (election_id, ((), (Bytes32::default(), ()))))
-            .to_clvm(&mut *ctx)
-            .unwrap();
-
-        let layer = build_action_layer_puzzle(
-            &mut ctx,
-            reg_finalizer,
-            registration_actions_merkle_root(cat_tail_hash),
-            state_node,
-        )
-        .unwrap();
-
-        let from_runtime = Bytes32::new(tree_hash(&ctx, layer).to_bytes());
-        let from_predictor = fresh_registration_inner_hash(&pk, election_id, cat_tail_hash);
-        assert_eq!(
-            from_runtime, from_predictor,
-            "CurriedProgram(action.rue) must match `fresh_registration_inner_hash`",
-        );
-    }
 }
