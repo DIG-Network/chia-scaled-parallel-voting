@@ -173,6 +173,25 @@ fn main(
 
     // Voting Coin action-layer hash:
     //   curry(action_layer, [vc_finalizer_full_hash, VC_ACTIONS_ROOT, initial_voting_state])
+    //
+    // This is the INNER puzzle hash of the Voting Coin (the puzzle
+    // hash that lives INSIDE the CAT outer wrap). We emit CreateCoin
+    // with this value as the `puzzle_hash` because the surrounding
+    // CAT outer (which is currently spending the Registration Coin)
+    // automatically wraps every inner CreateCoin's puzzle_hash via
+    // `cat_curry(CAT_MOD_HASH, TAIL_HASH, ph)` per chia CAT v2's
+    // morph_condition_for_outer_puzzle. So the on-chain Voting Coin
+    // lands at exactly `cat_curry(CAT_MOD_HASH, TAIL_HASH,
+    // vc_action_layer_hash)` — single CAT-wrap, same TAIL as the
+    // Registration Coin (CAT outer's conservation rule is satisfied).
+    //
+    // PRIOR BUG (CHIP rev 2026-05-02): an earlier draft computed the
+    // double-curried hash here and passed THAT as the CreateCoin's
+    // puzzle_hash. The CAT outer wrapped it AGAIN, producing a
+    // doubly-CAT-wrapped on-chain Voting Coin (uncomposable with
+    // the SDK's `voting_coin_puzzle_hash` predictor and the
+    // `update_vote` action's CAT outer). Pinned by
+    // `voter_cast_vote_e2e`.
     let vc_action_layer_hash: Bytes32 = curry_tree_hash(
         ACTION_LAYER_MOD_HASH,
         [
@@ -182,18 +201,8 @@ fn main(
         ],
     );
 
-    // CAT outer wrap.
-    let voting_coin_full_hash: Bytes32 = curry_tree_hash(
-        CAT_MOD_HASH,
-        [
-            tree_hash_atom(CAT_MOD_HASH),
-            tree_hash_atom(CAT_TAIL_HASH),
-            vc_action_layer_hash,
-        ],
-    );
-
     let mint_vc = CreateCoin {
-        puzzle_hash: voting_coin_full_hash,
+        puzzle_hash: vc_action_layer_hash,
         amount: voting_coin_amount,
         memos: Memos {
             value: [voting_coin_hint],

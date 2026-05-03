@@ -98,7 +98,6 @@ pub enum VoterCmd {
 
     /// Cast a vote on a specific Ballot Coin (CHIP rev 2026-05-02).
     /// Mints a fresh Voting Coin off the voter's Registration Coin.
-    /// (STUB — `Voter::cast_vote` is stubbed pending Phase 6.)
     CastVote {
         #[arg(long)]
         election_config: PathBuf,
@@ -114,6 +113,38 @@ pub enum VoterCmd {
         /// `sha256(ballot_options)` or similar.
         #[arg(long)]
         vote_data: String,
+
+        /// Block height at which the ballot stops accepting vote
+        /// edits. Must match what `BallotIssuer::launch_ballot` curried
+        /// into the on-chain Ballot Coin's oracle / finalize actions.
+        #[arg(long)]
+        vote_close_height: u64,
+
+        /// Per-ballot quorum threshold numerator. Curried into the
+        /// Ballot Coin's `finalize` action.
+        #[arg(long)]
+        vote_threshold_num: u64,
+
+        /// Per-ballot quorum threshold denominator.
+        #[arg(long)]
+        vote_threshold_den: u64,
+
+        /// 32-byte hex `registration_merkle_root` snapshot the
+        /// BallotIssuer captured at `launch_ballot` time. Curried into
+        /// the Ballot Coin's `finalize` action.
+        #[arg(long)]
+        registration_merkle_root_snapshot: String,
+
+        /// `registration_vote_weight` snapshot the BallotIssuer
+        /// captured at `launch_ballot` time.
+        #[arg(long)]
+        registration_vote_weight_snapshot: u64,
+
+        /// CAT mojos to mint into the new Voting Coin. The CAT outer
+        /// enforces conservation, so the recreated Registration Coin
+        /// gets `collateral_amount - voting_coin_amount`.
+        #[arg(long, default_value_t = 1)]
+        voting_coin_amount: u64,
 
         #[arg(long)]
         bundle_output: Option<PathBuf>,
@@ -241,6 +272,12 @@ pub async fn run(cmd: VoterCmd, ctx: &Context) -> Result<()> {
             secret,
             ballot_launcher_id,
             vote_data,
+            vote_close_height,
+            vote_threshold_num,
+            vote_threshold_den,
+            registration_merkle_root_snapshot,
+            registration_vote_weight_snapshot,
+            voting_coin_amount,
             bundle_output,
             overwrite,
         } => {
@@ -249,6 +286,12 @@ pub async fn run(cmd: VoterCmd, ctx: &Context) -> Result<()> {
                 secret,
                 ballot_launcher_id,
                 vote_data,
+                vote_close_height,
+                vote_threshold_num,
+                vote_threshold_den,
+                registration_merkle_root_snapshot,
+                registration_vote_weight_snapshot,
+                voting_coin_amount,
                 bundle_output,
                 overwrite,
                 ctx,
@@ -466,6 +509,12 @@ async fn cast_vote(
     secret: VoterSecretArgs,
     ballot_launcher_id: String,
     vote_data: String,
+    vote_close_height: u64,
+    vote_threshold_num: u64,
+    vote_threshold_den: u64,
+    registration_merkle_root_snapshot: String,
+    registration_vote_weight_snapshot: u64,
+    voting_coin_amount: u64,
     bundle_output: Option<PathBuf>,
     overwrite: bool,
     ctx: &Context,
@@ -474,16 +523,23 @@ async fn cast_vote(
     let keys = build_voter_keys(&secret)?;
     let blid = parse_b32(&ballot_launcher_id, "ballot_launcher_id")?;
     let vd = parse_b32(&vote_data, "vote_data")?;
+    let reg_root_snapshot = parse_b32(
+        &registration_merkle_root_snapshot,
+        "registration_merkle_root_snapshot",
+    )?;
     let voter = Voter::new(config, keys, ctx.network);
     let chain =
         wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
     let params = chip_voting_sdk::actors::voter::CastVoteParams {
         ballot_launcher_id: blid,
         vote_data: vd,
+        vote_close_height,
+        vote_threshold_num,
+        vote_threshold_den,
+        registration_merkle_root_snapshot: reg_root_snapshot,
+        registration_vote_weight_snapshot,
+        voting_coin_amount,
     };
-    // STUB: `Voter::cast_vote` is stubbed pending Phase 6 (voting
-    // coin lineage). The error propagates cleanly so users see the
-    // pending-implementation message rather than a panic.
     let result = voter
         .cast_vote(&chain, params)
         .await

@@ -712,7 +712,7 @@ impl BallotIssuer {
 ///         `clvm_traits` produces for nil-terminated nested tuples /
 ///         `Vec`. We use `Vec<Bytes>::to_clvm` for both the VK list
 ///         (4 entries) and the IC list (7 entries).
-fn build_vk_ic_nodes(
+pub(crate) fn build_vk_ic_nodes(
     ctx: &mut SpendContext,
     config: &ElectionConfig,
 ) -> VotingResult<(NodePtr, NodePtr)> {

@@ -1537,13 +1537,21 @@ async fn phase_vote(
     // (never cache coin ids across spends).
     let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network);
     // CHIP rev 2026-05-02: Voter::vote → Voter::cast_vote(&CastVoteParams).
-    // Stub call propagates the Phase 6 error from the SDK.
+    // The live integration test currently uses placeholder ballot
+    // params — when this test grows real ballot creation/launch
+    // coverage, populate these from the matching `BallotIssuer` calls.
     let cast_result = voter
         .cast_vote(
             chain,
             chip_voting_sdk::actors::voter::CastVoteParams {
                 ballot_launcher_id: Bytes32::default(),
                 vote_data,
+                vote_close_height: 0,
+                vote_threshold_num: 1,
+                vote_threshold_den: 2,
+                registration_merkle_root_snapshot: Bytes32::default(),
+                registration_vote_weight_snapshot: 0,
+                voting_coin_amount: 1,
             },
         )
         .await
