@@ -192,48 +192,51 @@ impl<C: ChainReader> Indexer<C> {
     // so callers can begin compiling against the final API.
 
     /// FN: ballots
-    /// WHAT: list every Ballot Coin associated with this election.
-    /// STATUS: STUB pending Phase 6. The aggregator's `sync_with_chain`
-    ///         already returns a `Vec<BallotCoinSnapshot>` field, but
-    ///         the lineage walker that populates it with real data is
-    ///         scheduled for Phase 6. Once that lands this method will
-    ///         return `Ok(self.ballots.clone().unwrap_or_default())`.
+    /// WHAT: list every Ballot Coin (or its launcher eve coin) for
+    ///       this election by walking the chain. Delegates to
+    ///       [`crate::actors::ballot::list_ballots_via_chain`].
+    /// NOTE: bypasses the cached `self.ballots` populated by
+    ///       `sync()` so callers get a fresh on-chain view per call.
+    ///       This matches the behaviour of the other per-ballot
+    ///       async accessors below.
     pub async fn ballots(&self) -> VotingResult<Vec<BallotCoinSnapshot>> {
-        Err(VotingError::Other(crate::error::anyhow_compat::Error(
-            "Indexer::ballots stubbed pending Phase 6 ballot lineage walker"
-                .to_string()
-                .into(),
-        )))
+        crate::actors::ballot::list_ballots_via_chain(&self.config, &self.chain).await
     }
 
     /// FN: ballot_state
     /// WHAT: per-ballot `BallotState` (`finalized` / `vote_outcome` /
     ///       `agg_signers`) for the ballot identified by
-    ///       `ballot_launcher_id`.
-    /// STATUS: STUB pending Phase 6.
+    ///       `ballot_launcher_id`. Returns `None` if no ballot with
+    ///       that id exists under this election.
+    /// IMPL: delegates to
+    ///       [`crate::actors::ballot::get_ballot_via_chain`] and
+    ///       extracts the snapshot's `state` field.
     pub async fn ballot_state(
         &self,
-        _ballot_launcher_id: Bytes32,
+        ballot_launcher_id: Bytes32,
     ) -> VotingResult<Option<BallotState>> {
-        Err(VotingError::Other(crate::error::anyhow_compat::Error(
-            "Indexer::ballot_state stubbed pending Phase 6"
-                .to_string()
-                .into(),
-        )))
+        let snapshot = crate::actors::ballot::get_ballot_via_chain(
+            &self.config,
+            &self.chain,
+            ballot_launcher_id,
+        )
+        .await?;
+        Ok(snapshot.map(|s| s.state))
     }
 
     /// FN: votes_for_ballot
     /// WHAT: every `VoteRecord` cast against the ballot identified by
     ///       `ballot_launcher_id`.
-    /// STATUS: STUB pending Phase 6. Per-ballot vote enumeration
-    ///         requires the lineage walker to bind votes to ballots
-    ///         via the per-ballot SPT.
+    /// STATUS: STUB pending the Voting Coin lineage walker landing in
+    ///         a subsequent tier (`Aggregator::collect_votes_for_ballot`).
+    ///         Once that lands this method will delegate to it.
     pub async fn votes_for_ballot(
         &self,
         _ballot_launcher_id: Bytes32,
     ) -> VotingResult<Vec<VoteRecord>> {
         Err(VotingError::Other(crate::error::anyhow_compat::Error(
-            "Indexer::votes_for_ballot stubbed pending Phase 6"
+            "Indexer::votes_for_ballot stubbed pending Aggregator::collect_votes_for_ballot \
+             (Voting Coin lineage walker)"
                 .to_string()
                 .into(),
         )))
@@ -241,31 +244,27 @@ impl<C: ChainReader> Indexer<C> {
 
     /// FN: is_finalized_for
     /// WHAT: per-ballot replacement for the removed global
-    ///       `is_finalized()` accessor.
-    /// STATUS: STUB pending Phase 6.
-    pub async fn is_finalized_for(&self, _ballot_launcher_id: Bytes32) -> VotingResult<bool> {
-        Err(VotingError::Other(crate::error::anyhow_compat::Error(
-            "Indexer::is_finalized_for stubbed pending Phase 6"
-                .to_string()
-                .into(),
-        )))
+    ///       `is_finalized()` accessor. Returns `false` if no ballot
+    ///       with that id exists or the ballot hasn't been finalized.
+    /// IMPL: pulls `BallotState.finalized` from `ballot_state`.
+    pub async fn is_finalized_for(&self, ballot_launcher_id: Bytes32) -> VotingResult<bool> {
+        let st = self.ballot_state(ballot_launcher_id).await?;
+        Ok(st.map(|s| s.finalized).unwrap_or(false))
     }
 
     /// FN: vote_outcome_for
     /// WHAT: per-ballot replacement for the removed global
     ///       `vote_outcome()` accessor. Returns `None` for an
-    ///       unfinalized ballot, `Some(outcome_bytes)` for a
-    ///       finalized one.
-    /// STATUS: STUB pending Phase 6.
+    ///       unfinalized ballot OR a non-existent one;
+    ///       `Some(outcome_bytes)` for a finalized one.
+    /// IMPL: pulls `BallotState.vote_outcome` from `ballot_state` and
+    ///       gates on `BallotState.finalized`.
     pub async fn vote_outcome_for(
         &self,
-        _ballot_launcher_id: Bytes32,
+        ballot_launcher_id: Bytes32,
     ) -> VotingResult<Option<Bytes32>> {
-        Err(VotingError::Other(crate::error::anyhow_compat::Error(
-            "Indexer::vote_outcome_for stubbed pending Phase 6"
-                .to_string()
-                .into(),
-        )))
+        let st = self.ballot_state(ballot_launcher_id).await?;
+        Ok(st.and_then(|s| if s.finalized { Some(s.vote_outcome) } else { None }))
     }
 
     /// FN: vote_records

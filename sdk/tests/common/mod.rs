@@ -108,6 +108,25 @@ impl ChainReader for SharedSim {
         }))
     }
 
+    async fn coin_records_by_parent_ids(
+        &self,
+        parent_ids: &[Bytes32],
+    ) -> VotingResult<Vec<ChainCoinRecord>> {
+        let guard = self.0.lock().expect("simulator mutex poisoned");
+        let sim: &Simulator = unsafe { &**guard };
+        let mut out = Vec::new();
+        for &parent_id in parent_ids {
+            for cs in sim.children(parent_id) {
+                out.push(ChainCoinRecord {
+                    coin: cs.coin,
+                    spent_height: cs.spent_height.unwrap_or(0),
+                    confirmed_height: cs.created_height.unwrap_or(0),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// The simulator doesn't expose a peak; tests don't need
     /// propagation tracking. Return `None`.
     async fn peak_height(&self) -> VotingResult<Option<u32>> {

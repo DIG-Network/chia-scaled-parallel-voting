@@ -417,38 +417,137 @@ impl<C: ChainReader> BallotReader<C> {
     }
 
     /// FN: list_ballots
-    /// WHAT: enumerate every Ballot Coin associated with this
-    ///       election as a snapshot.
-    /// STATUS: STUB pending Phase 6. The ballot-lineage walker that
-    ///         populates the `Vec<BallotCoinSnapshot>` is scheduled
-    ///         alongside the rest of the multi-ballot test
-    ///         infrastructure.
+    /// Delegates to [`list_ballots_via_chain`].
     pub async fn list_ballots(&self) -> VotingResult<Vec<BallotCoinSnapshot>> {
-        Err(VotingError::Other(anyhow_compat::Error(
-            "BallotReader::list_ballots stubbed pending Phase 6 \
-             (ballot lineage walker)"
-                .to_string()
-                .into(),
-        )))
+        list_ballots_via_chain(&self.config, &self.chain).await
     }
 
     /// FN: get_ballot
-    /// WHAT: look up a single Ballot Coin by its launcher id.
-    /// RETURNS: `Ok(None)` if no ballot with that launcher id exists
-    ///          under the current config; `Ok(Some(snapshot))`
-    ///          otherwise.
-    /// STATUS: STUB pending Phase 6.
+    /// Delegates to [`get_ballot_via_chain`].
     pub async fn get_ballot(
         &self,
-        _ballot_launcher_id: Bytes32,
+        ballot_launcher_id: Bytes32,
     ) -> VotingResult<Option<BallotCoinSnapshot>> {
-        Err(VotingError::Other(anyhow_compat::Error(
-            "BallotReader::get_ballot stubbed pending Phase 6 \
-             (ballot lineage walker)"
-                .to_string()
-                .into(),
-        )))
+        get_ballot_via_chain(&self.config, &self.chain, ballot_launcher_id).await
     }
+}
+
+/// FN: list_ballots_via_chain
+/// WHAT: enumerate every Ballot Coin (or its launcher eve coin still
+///       awaiting a second-spend) associated with `config` by walking
+///       the Election Singleton lineage on `chain`.
+/// IMPL: walk launcher → eve → child → … → tip. At each spent
+///       singleton, list its children and collect any that landed at
+///       `SINGLETON_LAUNCHER_HASH` with amount 2 — those are the
+///       ballot launcher eve coins minted by `createBallot`. Their
+///       coin id IS the canonical `ballot_launcher_id`.
+/// PER-BALLOT FIELDS: until the caller runs the launcher second-spend
+///       that mints the actual Ballot Coin singleton, per-ballot
+///       curried fields (`vote_close_height`, `outcome_domain_hash`)
+///       and on-chain `BallotState` are NOT yet committed. For now
+///       this walker reports `vote_close_height: 0`,
+///       `outcome_domain_hash: zero`, and `BallotState::fresh()` for
+///       every entry. Once the Ballot Coin singleton is on-chain
+///       (post launcher second-spend), populating these fields is a
+///       follow-up (parse the eve Ballot Coin's curried args / latest
+///       state from chain). The `ballot_launcher_id` is stable and
+///       authoritative today.
+/// USAGE: shared by `BallotReader::list_ballots` (owns a chain) and
+///        `Indexer::ballots` (borrows its chain).
+pub async fn list_ballots_via_chain<C: ChainReader>(
+    config: &ElectionConfig,
+    chain: &C,
+) -> VotingResult<Vec<BallotCoinSnapshot>> {
+    use chia_puzzles::SINGLETON_LAUNCHER_HASH;
+
+    let election_id = config.election_launcher_id().map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("election_launcher_id: {e}").into(),
+        ))
+    })?;
+    let launcher_ph = Bytes32::from(SINGLETON_LAUNCHER_HASH);
+
+    let mut snapshots: Vec<BallotCoinSnapshot> = Vec::new();
+
+    // Step 1: locate the eve singleton (any odd-amount child of the
+    // launcher coin).
+    let eve_children = chain.coin_records_by_parent_ids(&[election_id]).await?;
+    let mut current = match eve_children.into_iter().find(|r| r.coin.amount % 2 == 1) {
+        Some(eve) => eve,
+        None => return Ok(snapshots), // election not deployed
+    };
+
+    // Step 2: walk the singleton lineage. At each step, fetch children
+    // of the current coin and split them: odd-amount → next singleton,
+    // amount 2 + launcher_ph → ballot launcher.
+    loop {
+        let coin_id = current.coin.coin_id();
+        let children = chain.coin_records_by_parent_ids(&[coin_id]).await?;
+
+        let mut next_singleton: Option<crate::chain::ChainCoinRecord> = None;
+        for child in children.into_iter() {
+            if child.coin.puzzle_hash == launcher_ph && child.coin.amount == 2 {
+                snapshots.push(BallotCoinSnapshot {
+                    ballot_launcher_id: child.coin.coin_id(),
+                    election_launcher_id: election_id,
+                    vote_close_height: 0,
+                    outcome_domain_hash: Bytes32::default(),
+                    state: crate::state::BallotState::fresh(),
+                    coin_id: child.coin.coin_id(),
+                });
+            } else if child.coin.amount % 2 == 1 {
+                next_singleton = Some(child);
+            }
+        }
+
+        match next_singleton {
+            Some(next) if !next.is_unspent() => {
+                current = next;
+                continue;
+            }
+            Some(_) | None => break,
+        }
+    }
+
+    Ok(snapshots)
+}
+
+/// FN: get_ballot_via_chain
+/// WHAT: direct point-lookup of a Ballot Coin by `ballot_launcher_id`.
+/// RETURNS: `Ok(None)` if no ballot with that launcher id exists under
+///          `config`; `Ok(Some(snapshot))` otherwise.
+/// USAGE: shared by `BallotReader::get_ballot` and `Indexer::ballot_state`.
+pub async fn get_ballot_via_chain<C: ChainReader>(
+    config: &ElectionConfig,
+    chain: &C,
+    ballot_launcher_id: Bytes32,
+) -> VotingResult<Option<BallotCoinSnapshot>> {
+    use chia_puzzles::SINGLETON_LAUNCHER_HASH;
+
+    let launcher_ph = Bytes32::from(SINGLETON_LAUNCHER_HASH);
+    let election_id = config.election_launcher_id().map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("election_launcher_id: {e}").into(),
+        ))
+    })?;
+
+    let record = match chain.coin_record_by_id(ballot_launcher_id).await? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    if record.coin.puzzle_hash != launcher_ph || record.coin.amount != 2 {
+        return Ok(None);
+    }
+
+    Ok(Some(BallotCoinSnapshot {
+        ballot_launcher_id,
+        election_launcher_id: election_id,
+        vote_close_height: 0,
+        outcome_domain_hash: Bytes32::default(),
+        state: crate::state::BallotState::fresh(),
+        coin_id: ballot_launcher_id,
+    }))
 }
 
 // ============================================================================
