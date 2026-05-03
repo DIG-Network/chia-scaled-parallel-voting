@@ -48,7 +48,7 @@ use dig_l1_wallet::NetworkType;
 
 use crate::action_spends::{
     build_action_layer_puzzle, build_action_layer_solution, build_election_finalizer_full,
-    build_singleton_spend, load_action_puzzle, ActionSpend,
+    build_singleton_spend, build_voting_coin_finalizer_full, load_action_puzzle, ActionSpend,
 };
 use crate::actors::deployer::sign_bundle_signature;
 use crate::chain::ChainReader;
@@ -158,6 +158,57 @@ pub struct CastVoteParams {
     pub registration_merkle_root_snapshot: Bytes32,
     pub registration_vote_weight_snapshot: u64,
     pub voting_coin_amount: u64,
+}
+
+/// STRUCT: UpdateVoteParams
+/// PURPOSE: typed bundle for [`Voter::update_vote`] arguments. Same
+///          per-ballot fields as [`CastVoteParams`] (the voter must
+///          mirror the on-chain Ballot Coin's curried args to spend
+///          its `oracle` action) plus the previously-cast Voting
+///          Coin's identifying state (so the SDK can predict its
+///          on-chain ph and refuse to spend something else).
+/// FIELDS:
+///   * `voting_coin_id` — coin id of the Voting Coin to update,
+///     returned by an earlier `Voter::cast_vote` call.
+///   * `old_vote_data` — the `vote_data` that was cast at
+///     `cast_vote` time. Curried into the on-chain Voting Coin's
+///     state — the SDK uses it to verify the on-chain ph matches.
+///   * `new_vote_data` — the replacement vote payload.
+///   * `registration_coin_id` — the Registration Coin's id at
+///     `cast_vote` time (also curried into the Voting Coin's state).
+///   * `ballot_launcher_id`, `vote_close_height`,
+///     `vote_threshold_num`, `vote_threshold_den`,
+///     `registration_merkle_root_snapshot`,
+///     `registration_vote_weight_snapshot` — same as
+///     [`CastVoteParams`]; needed for the Ballot Coin oracle co-spend.
+#[derive(Clone, Debug)]
+pub struct UpdateVoteParams {
+    pub voting_coin_id: Bytes32,
+    pub old_vote_data: Bytes32,
+    pub new_vote_data: Bytes32,
+    pub registration_coin_id: Bytes32,
+    pub ballot_launcher_id: Bytes32,
+    pub vote_close_height: u64,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+    pub registration_merkle_root_snapshot: Bytes32,
+    pub registration_vote_weight_snapshot: u64,
+}
+
+/// STRUCT: UpdateVoteResult
+/// PURPOSE: outputs from `Voter::update_vote`.
+#[derive(Clone, Debug)]
+pub struct UpdateVoteResult {
+    /// Coin id of the recreated Voting Coin (the original is spent;
+    /// the new one carries the updated `vote_data`).
+    pub recreated_voting_coin_id: Bytes32,
+    pub spend_bundle: SpendBundle,
+    /// The voter's BLS signature over the new canonical vote_message
+    /// (`puzzles::vote_message(new_vote_data, ballot_launcher_id,
+    /// election_launcher_id)`) using `sign_unsafe`. Mirrors
+    /// [`CastVoteResult::vote_signature`] for the off-chain
+    /// aggregator's collection.
+    pub new_vote_signature: chia_protocol::Bytes,
 }
 
 /// STRUCT: CastVoteResult
@@ -879,32 +930,376 @@ impl Voter {
 
     /// Build an `update_vote` spend bundle.
     ///
-    /// **STUB — full implementation deferred to Phase 6.**
+    /// FLOW (CHIP rev 2026-05-02):
+    ///   1. Locate the voter's existing Voting Coin (by
+    ///      `voting_coin_id`) and verify its on-chain ph matches the
+    ///      SDK's prediction from `(old_vote_data, registration_coin_id)`
+    ///      — otherwise the params don't match the coin we're trying
+    ///      to spend.
+    ///   2. Reconstruct the CAT lineage proof from the Voting Coin's
+    ///      parent on-chain spend (the CAT-wrapped mint_voting_coin
+    ///      spend that minted it).
+    ///   3. Find the current unspent Ballot Coin singleton (post any
+    ///      prior oracle co-spends). The Ballot Coin's BallotState
+    ///      is unchanged across oracle spends, so its inner ph
+    ///      stays the same; the lineage proof advances on each spend.
+    ///   4. Build the Ballot Coin oracle co-spend (same shape as in
+    ///      `cast_vote`, but with a `Lineage` proof instead of `Eve`).
+    ///   5. Build the Voting Coin's `update_vote` action spend. Its
+    ///      6-field solution carries
+    ///      `(ballot_launcher_id, election_launcher_id,
+    ///        vote_close_height, new_vote_data, new_signature,
+    ///        ...ballot_coin_id)`. The action emits AggSigMe over
+    ///      the new vote_message which the bundle signer collects.
+    ///   6. Wrap the Voting Coin spend with the CAT outer (same TAIL
+    ///      as the Registration Coin) and the Ballot Coin spend with
+    ///      the Singleton outer. Sign + bundle.
     ///
-    /// The eventual flow (per CHIP rev 2026-05-02):
-    ///   1. Locate the voter's current Voting Coin via
-    ///      `voting_coin_hint(election_id, cat_tail, pk,
-    ///      ballot_launcher_id)`.
-    ///   2. Drive the Voting Coin's `update_vote` action. Its
-    ///      solution must include the Ballot Coin oracle's `open`
-    ///      announcement and a fresh AggSigMe from the voter over
-    ///      the new vote payload.
-    ///   3. Recreate the Voting Coin at the updated state with the
-    ///      new memo signature.
-    ///
-    /// **Importantly: NO singleton co-spend.** The Voting Coin's
-    /// own oracle binding to the Ballot Coin replaces the legacy
-    /// Election Singleton oracle action (which was deleted in
-    /// commit `9e79ddd`).
+    /// **NO singleton co-spend on the Election Singleton.** Vote
+    /// edits live entirely on the Ballot Coin / Voting Coin lane.
     pub async fn update_vote<C: ChainReader>(
         &self,
-        _chain: &C,
-        _voting_coin_id: Bytes32,
-        _new_vote_data: Bytes32,
-    ) -> VotingResult<SpendBundle> {
-        Err(VotingError::Other(anyhow_compat::Error(
-            "Voter::update_vote stubbed pending Phase 6".into(),
-        )))
+        chain: &C,
+        params: UpdateVoteParams,
+    ) -> VotingResult<UpdateVoteResult> {
+        use chia_protocol::Bytes;
+        use chia_puzzle_types::singleton::SingletonArgs;
+        // (chia_puzzle_types::Proof types only used inside
+        // find_current_ballot_singleton — not needed here.)
+        use clvm_traits::{clvm_curried_args, ToClvm};
+        use clvm_utils::{tree_hash, CurriedProgram, TreeHash};
+
+        let cat_tail_hash = self
+            .config
+            .cat_tail_hash()
+            .map_err(|e| voting_other(format!("cat_tail_hash: {e}")))?;
+        let election_id = self
+            .config
+            .election_launcher_id()
+            .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
+
+        // ── 1. Locate the Voting Coin + verify its predicted ph ──
+        let voting_coin_record = chain
+            .coin_record_by_id(params.voting_coin_id)
+            .await?
+            .ok_or_else(|| {
+                voting_other(format!(
+                    "Voter::update_vote: voting coin {} not found on chain",
+                    hex::encode(params.voting_coin_id),
+                ))
+            })?;
+        if !voting_coin_record.is_unspent() {
+            return Err(voting_other(format!(
+                "Voter::update_vote: voting coin {} already spent",
+                hex::encode(params.voting_coin_id),
+            )));
+        }
+        let voting_coin = voting_coin_record.coin;
+        let predicted_voting_coin_ph = puzzles::voting_coin_puzzle_hash(
+            PuzzleHashes::cat_outer(),
+            cat_tail_hash,
+            PuzzleHashes::action_layer(),
+            PuzzleHashes::voting_coin_finalizer(),
+            puzzles::voting_coin_actions_merkle_root(),
+            &self.keys.pubkey,
+            params.ballot_launcher_id,
+            election_id,
+            params.old_vote_data,
+            params.registration_coin_id,
+        );
+        if voting_coin.puzzle_hash != predicted_voting_coin_ph {
+            return Err(voting_other(format!(
+                "Voter::update_vote: on-chain voting coin ph {} doesn't match predicted {} \
+                 — UpdateVoteParams (old_vote_data, registration_coin_id) don't match the \
+                 coin's curried state",
+                hex::encode(voting_coin.puzzle_hash),
+                hex::encode(predicted_voting_coin_ph),
+            )));
+        }
+        let voting_cat_lineage_proof = self
+            .reconstruct_cat_lineage(chain, voting_coin)
+            .await?;
+
+        // ── 2. Reconstruct per-ballot Ballot Coin curry layout ───
+        // We need the inner_ph BEFORE walking the singleton lineage
+        // so the walker can build Lineage proofs.
+        let mut ctx = SpendContext::new();
+        let (vk_node, ic_node) =
+            crate::actors::ballot::build_vk_ic_nodes(&mut ctx, &self.config)?;
+
+        let finalize_program_node =
+            load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_FINALIZE_HEX)?;
+        let finalize_curried = CurriedProgram {
+            program: finalize_program_node,
+            args: clvm_curried_args!(
+                vk_node,
+                ic_node,
+                params.ballot_launcher_id,
+                election_id,
+                params.vote_close_height,
+                params.vote_threshold_num,
+                params.vote_threshold_den,
+                params.registration_merkle_root_snapshot,
+                params.registration_vote_weight_snapshot,
+            ),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(driver_err)?;
+        let finalize_full_hash = Bytes32::new(tree_hash(&ctx, finalize_curried).to_bytes());
+
+        let oracle_program_node = load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_ORACLE_HEX)?;
+        let oracle_curried = CurriedProgram {
+            program: oracle_program_node,
+            args: clvm_curried_args!(params.ballot_launcher_id, params.vote_close_height),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(driver_err)?;
+        let oracle_full_hash = Bytes32::new(tree_hash(&ctx, oracle_curried).to_bytes());
+
+        let announce_program_node =
+            load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX)?;
+        let announce_curried = CurriedProgram {
+            program: announce_program_node,
+            args: clvm_curried_args!(params.ballot_launcher_id),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(driver_err)?;
+        let announce_full_hash =
+            Bytes32::new(tree_hash(&ctx, announce_curried).to_bytes());
+
+        let ballot_actions_root = puzzles::per_ballot_actions_merkle_root(
+            finalize_full_hash,
+            oracle_full_hash,
+            announce_full_hash,
+        );
+        let ballot_root_leaves = puzzles::per_ballot_action_root_leaves(
+            finalize_full_hash,
+            oracle_full_hash,
+            announce_full_hash,
+        );
+
+        // The BallotState is `fresh` until finalize runs, so the
+        // inner ph is the same as what launch_ballot computed.
+        let ballot_finalizer_node =
+            crate::action_spends::build_ballot_finalizer_full(&mut ctx, params.ballot_launcher_id)?;
+        let fresh_ballot_state_value: ((), (Bytes32, Bytes32)) =
+            ((), (Bytes32::default(), Bytes32::default()));
+        let ballot_state_node = fresh_ballot_state_value
+            .to_clvm(&mut *ctx)
+            .map_err(driver_err)?;
+        let ballot_inner_node = build_action_layer_puzzle(
+            &mut ctx,
+            ballot_finalizer_node,
+            ballot_actions_root,
+            ballot_state_node,
+        )?;
+        let ballot_inner_ph = Bytes32::new(tree_hash(&ctx, ballot_inner_node).to_bytes());
+        let ballot_inner_th = TreeHash::new(ballot_inner_ph.to_bytes());
+        let predicted_ballot_full_ph = Bytes32::new(
+            SingletonArgs::curry_tree_hash(params.ballot_launcher_id, ballot_inner_th).to_bytes(),
+        );
+
+        // ── 3. Find the current unspent Ballot Coin singleton ────
+        // (post any prior oracle co-spends from cast_vote /
+        // update_vote / announce_finalization).
+        let (ballot_coin, ballot_lineage_proof) = find_current_ballot_singleton(
+            chain,
+            params.ballot_launcher_id,
+            ballot_inner_ph,
+        )
+        .await?;
+        let ballot_coin_id = ballot_coin.coin_id();
+
+        if ballot_coin.puzzle_hash != predicted_ballot_full_ph {
+            return Err(voting_other(format!(
+                "Voter::update_vote: Ballot Coin on-chain ph {} doesn't match predicted {} \
+                 — UpdateVoteParams's per-ballot fields don't match what BallotIssuer used",
+                hex::encode(ballot_coin.puzzle_hash),
+                hex::encode(predicted_ballot_full_ph),
+            )));
+        }
+
+        // ── 4. Ballot Coin oracle (open) co-spend ────────────────
+        let oracle_solution = ().to_clvm(&mut *ctx).map_err(driver_err)?;
+        let ballot_action_spends = vec![ActionSpend {
+            puzzle: oracle_curried,
+            solution: oracle_solution,
+        }];
+        let ballot_finalizer_solution = ().to_clvm(&mut *ctx).map_err(driver_err)?;
+        let ballot_action_layer_solution = build_action_layer_solution(
+            &mut ctx,
+            &ballot_root_leaves,
+            &ballot_action_spends,
+            ballot_finalizer_solution,
+        )?;
+
+        let ballot_singleton_spend = build_singleton_spend(
+            &mut ctx,
+            ballot_coin,
+            params.ballot_launcher_id,
+            ballot_inner_node,
+            ballot_action_layer_solution,
+            ballot_lineage_proof,
+        )?;
+
+        // ── 5. Voting Coin update_vote spend ─────────────────────
+        // Voting Coin's action layer is curried with VC finalizer
+        // (HINT = voting_coin_hint), VC actions merkle root (= the
+        // uncurried update_vote tree hash, post our update_vote.rue
+        // change), and the curried state matching the coin we're
+        // spending.
+        let voting_coin_hint = puzzles::voting_coin_hint(
+            election_id,
+            cat_tail_hash,
+            &self.keys.pubkey,
+            params.ballot_launcher_id,
+        );
+        let vc_finalizer = build_voting_coin_finalizer_full(&mut ctx, voting_coin_hint)?;
+        let vc_merkle_root = puzzles::voting_coin_actions_merkle_root();
+        // VotingCoinState shape (3 normal fields + 1 rest-arg on last):
+        //   `(voter_pubkey . (ballot_launcher_id . (vote_data .
+        //     registration_coin_id)))`
+        let pk_bytes = Bytes::new(self.keys.pubkey.to_bytes().to_vec());
+        let voting_state_value = (
+            pk_bytes,
+            (
+                params.ballot_launcher_id,
+                (params.old_vote_data, params.registration_coin_id),
+            ),
+        );
+        let voting_state_node = voting_state_value
+            .to_clvm(&mut *ctx)
+            .map_err(driver_err)?;
+        let vc_action_layer_node = build_action_layer_puzzle(
+            &mut ctx,
+            vc_finalizer,
+            vc_merkle_root,
+            voting_state_node,
+        )?;
+
+        // update_vote takes NO curry args (post CHIP rev 2026-05-02
+        // — see puzzles/voting_coin/update_vote.rue header). Solution
+        // shape:
+        //   `(ballot_launcher_id, election_launcher_id,
+        //     vote_close_height, new_vote_data, new_signature,
+        //     ...ballot_coin_id)`
+        let update_vote_program_node =
+            load_action_puzzle(&mut ctx, puzzles::VOTING_COIN_UPDATE_VOTE_HEX)?;
+
+        let new_vm = puzzles::vote_message(
+            params.new_vote_data,
+            params.ballot_launcher_id,
+            election_id,
+        );
+        let new_signature = self.keys.sign_unsafe(new_vm.as_ref());
+        let new_signature_bytes = Bytes::new(new_signature.to_bytes().to_vec());
+
+        let update_vote_solution_value = (
+            params.ballot_launcher_id,
+            (
+                election_id,
+                (
+                    params.vote_close_height,
+                    (
+                        params.new_vote_data,
+                        (new_signature_bytes.clone(), ballot_coin_id),
+                    ),
+                ),
+            ),
+        );
+        let update_vote_solution = update_vote_solution_value
+            .to_clvm(&mut *ctx)
+            .map_err(driver_err)?;
+        let vc_action_spends = vec![ActionSpend {
+            puzzle: update_vote_program_node,
+            solution: update_vote_solution,
+        }];
+        // VC finalizer takes `..._my_amount: Int` (mirrors the
+        // Registration Coin finalizer); pass the voting coin's amount
+        // so the recreated VC gets the same CAT amount.
+        let vc_finalizer_solution = voting_coin
+            .amount
+            .to_clvm(&mut *ctx)
+            .map_err(driver_err)?;
+        let vc_action_layer_solution = build_action_layer_solution(
+            &mut ctx,
+            std::slice::from_ref(&PuzzleHashes::voting_coin_update_vote()),
+            &vc_action_spends,
+            vc_finalizer_solution,
+        )?;
+
+        // CAT outer wrap. Single-CAT ring (we don't co-spend any
+        // other CAT in this bundle).
+        let voting_coin_id_for_ring = voting_coin.coin_id();
+        let cat_update_spend = crate::action_spends::build_cat_spend(
+            &mut ctx,
+            voting_coin,
+            cat_tail_hash,
+            vc_action_layer_node,
+            vc_action_layer_solution,
+            voting_cat_lineage_proof,
+            voting_coin_id_for_ring,
+            voting_coin_id_for_ring,
+            0,
+        )?;
+
+        // ── 6. Compute the recreated Voting Coin's coin id ──────
+        let recreated_voting_coin_ph = puzzles::voting_coin_puzzle_hash(
+            PuzzleHashes::cat_outer(),
+            cat_tail_hash,
+            PuzzleHashes::action_layer(),
+            PuzzleHashes::voting_coin_finalizer(),
+            puzzles::voting_coin_actions_merkle_root(),
+            &self.keys.pubkey,
+            params.ballot_launcher_id,
+            election_id,
+            params.new_vote_data,
+            params.registration_coin_id,
+        );
+        let recreated_voting_coin = chia_protocol::Coin::new(
+            voting_coin_id_for_ring,
+            recreated_voting_coin_ph,
+            voting_coin.amount,
+        );
+        let recreated_voting_coin_id = recreated_voting_coin.coin_id();
+
+        // ── 7. Sign + bundle ─────────────────────────────────────
+        let coin_spends = vec![ballot_singleton_spend, cat_update_spend];
+        if let Err(e) = crate::dry_run_coin_spends(&coin_spends) {
+            if let Ok(dir) = std::env::var("CHIP_VOTING_DUMP_DIR") {
+                let path = std::path::Path::new(&dir).join(format!(
+                    "voter-update_vote-failed-{}.json",
+                    chrono_compat_now()
+                ));
+                let json = serde_json::to_string_pretty(&serde_json::json!({
+                    "error": format!("{e:?}"),
+                    "coin_spends": coin_spends.iter().map(|cs| serde_json::json!({
+                        "coin": {
+                            "parent_coin_info": format!("0x{}", hex::encode(cs.coin.parent_coin_info)),
+                            "puzzle_hash": format!("0x{}", hex::encode(cs.coin.puzzle_hash)),
+                            "amount": cs.coin.amount,
+                        },
+                        "puzzle_reveal_hex": format!("0x{}", hex::encode(cs.puzzle_reveal.as_ref())),
+                        "solution_hex": format!("0x{}", hex::encode(cs.solution.as_ref())),
+                    })).collect::<Vec<_>>(),
+                })).unwrap_or_else(|_| "<json serialise failed>".into());
+                let _ = std::fs::write(&path, json);
+                tracing::warn!(dump_path = %path.display(), "wrote failing bundle to disk");
+            }
+            return Err(voting_other(format!(
+                "Voter::update_vote dry-run: {e:?}"
+            )));
+        }
+        let signature = sign_bundle_signature(
+            &coin_spends,
+            std::slice::from_ref(&self.keys.secret),
+            self.network,
+        )?;
+        Ok(UpdateVoteResult {
+            recreated_voting_coin_id,
+            spend_bundle: SpendBundle::new(coin_spends, signature),
+            new_vote_signature: new_signature_bytes,
+        })
     }
 
     /// Build a collateral release spend bundle.
@@ -1430,6 +1825,90 @@ fn parse_hex32(s: &str) -> VotingResult<Bytes32> {
         ))
     })?;
     Ok(Bytes32::new(arr))
+}
+
+/// FN: find_current_ballot_singleton (file-private)
+/// WHAT: walk a Ballot Coin's singleton lineage starting from its
+///       launcher coin and return the latest unspent Ballot Coin
+///       singleton + the lineage proof needed to spend it.
+/// IMPL: launcher → odd-amount child = eve Ballot Coin (lineage_proof
+///       = `Eve`). If eve is unspent, return it. Otherwise walk to
+///       its odd-amount child (lineage_proof = `Lineage` referencing
+///       the prior coin's parent + the constant inner_ph) and repeat.
+/// STATE INVARIANT: the BallotState transitions only on `finalize`;
+///       `oracle` and `announce_finalization` recreate at the same
+///       state. This walker assumes an as-yet-unfinalized ballot, so
+///       every recreated coin's inner ph equals `expected_inner_ph`.
+///       Once finalize has run, the inner ph changes — callers
+///       hitting that case should re-derive per-spend.
+async fn find_current_ballot_singleton<C: ChainReader>(
+    chain: &C,
+    ballot_launcher_id: Bytes32,
+    expected_inner_ph: Bytes32,
+) -> VotingResult<(chia_protocol::Coin, chia_puzzle_types::Proof)> {
+    use chia_puzzle_types::{EveProof, LineageProof, Proof};
+
+    let launcher_record = chain
+        .coin_record_by_id(ballot_launcher_id)
+        .await?
+        .ok_or_else(|| {
+            voting_other(format!(
+                "find_current_ballot_singleton: launcher coin {} not found",
+                hex::encode(ballot_launcher_id),
+            ))
+        })?;
+    let launcher_coin = launcher_record.coin;
+
+    // Step 1: locate the eve Ballot Coin singleton (child of the
+    // launcher coin, odd amount).
+    let eve_children = chain
+        .coin_records_by_parent_ids(&[ballot_launcher_id])
+        .await?;
+    let mut current = eve_children
+        .into_iter()
+        .find(|r| r.coin.amount % 2 == 1)
+        .ok_or_else(|| {
+            voting_other(
+                "find_current_ballot_singleton: no eve Ballot Coin singleton \
+                 (launch_ballot bundle never submitted?)",
+            )
+        })?;
+
+    let mut lineage_proof = Proof::Eve(EveProof {
+        parent_parent_coin_info: launcher_coin.parent_coin_info,
+        parent_amount: launcher_coin.amount,
+    });
+
+    // Walk forward. Each pre-finalize Ballot Coin recreation has the
+    // SAME inner_ph (`expected_inner_ph`); the lineage proof updates
+    // each step.
+    loop {
+        if current.is_unspent() {
+            return Ok((current.coin, lineage_proof));
+        }
+
+        let parent_coin_for_proof = current.coin;
+        let parent_amount = parent_coin_for_proof.amount;
+        let parent_parent = parent_coin_for_proof.parent_coin_info;
+        let parent_id = parent_coin_for_proof.coin_id();
+        let children = chain.coin_records_by_parent_ids(&[parent_id]).await?;
+        let next = children
+            .into_iter()
+            .find(|r| r.coin.amount % 2 == 1)
+            .ok_or_else(|| {
+                voting_other(format!(
+                    "find_current_ballot_singleton: no singleton child found for \
+                     spent Ballot Coin {}",
+                    hex::encode(parent_id),
+                ))
+            })?;
+        lineage_proof = Proof::Lineage(LineageProof {
+            parent_parent_coin_info: parent_parent,
+            parent_inner_puzzle_hash: expected_inner_ph,
+            parent_amount,
+        });
+        current = next;
+    }
 }
 
 // ============================================================================

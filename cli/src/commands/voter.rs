@@ -154,8 +154,7 @@ pub enum VoterCmd {
     },
 
     /// Update an existing vote by re-spending the voter's Voting
-    /// Coin via its `update_vote` action. (STUB — `Voter::update_vote`
-    /// is stubbed pending Phase 6.)
+    /// Coin via its `update_vote` action.
     UpdateVote {
         #[arg(long)]
         election_config: PathBuf,
@@ -167,9 +166,39 @@ pub enum VoterCmd {
         #[arg(long)]
         voting_coin_id: String,
 
+        /// 32-byte hex vote_data the Voting Coin was minted with
+        /// (curried into its on-chain state).
+        #[arg(long)]
+        old_vote_data: String,
+
         /// New 32-byte hex vote payload.
         #[arg(long)]
         new_vote_data: String,
+
+        /// 32-byte hex Registration Coin id at cast_vote time
+        /// (curried into the Voting Coin's state).
+        #[arg(long)]
+        registration_coin_id: String,
+
+        /// 32-byte hex Ballot Coin launcher id this Voting Coin
+        /// targets.
+        #[arg(long)]
+        ballot_launcher_id: String,
+
+        #[arg(long)]
+        vote_close_height: u64,
+
+        #[arg(long)]
+        vote_threshold_num: u64,
+
+        #[arg(long)]
+        vote_threshold_den: u64,
+
+        #[arg(long)]
+        registration_merkle_root_snapshot: String,
+
+        #[arg(long)]
+        registration_vote_weight_snapshot: u64,
 
         #[arg(long)]
         bundle_output: Option<PathBuf>,
@@ -302,7 +331,15 @@ pub async fn run(cmd: VoterCmd, ctx: &Context) -> Result<()> {
             election_config,
             secret,
             voting_coin_id,
+            old_vote_data,
             new_vote_data,
+            registration_coin_id,
+            ballot_launcher_id,
+            vote_close_height,
+            vote_threshold_num,
+            vote_threshold_den,
+            registration_merkle_root_snapshot,
+            registration_vote_weight_snapshot,
             bundle_output,
             overwrite,
         } => {
@@ -310,7 +347,15 @@ pub async fn run(cmd: VoterCmd, ctx: &Context) -> Result<()> {
                 election_config,
                 secret,
                 voting_coin_id,
+                old_vote_data,
                 new_vote_data,
+                registration_coin_id,
+                ballot_launcher_id,
+                vote_close_height,
+                vote_threshold_num,
+                vote_threshold_den,
+                registration_merkle_root_snapshot,
+                registration_vote_weight_snapshot,
                 bundle_output,
                 overwrite,
                 ctx,
@@ -559,7 +604,15 @@ async fn update_vote(
     config_path: PathBuf,
     secret: VoterSecretArgs,
     voting_coin_id: String,
+    old_vote_data: String,
     new_vote_data: String,
+    registration_coin_id: String,
+    ballot_launcher_id: String,
+    vote_close_height: u64,
+    vote_threshold_num: u64,
+    vote_threshold_den: u64,
+    registration_merkle_root_snapshot: String,
+    registration_vote_weight_snapshot: u64,
     bundle_output: Option<PathBuf>,
     overwrite: bool,
     ctx: &Context,
@@ -567,17 +620,41 @@ async fn update_vote(
     let config = config_file::load_election_config(&config_path)?;
     let keys = build_voter_keys(&secret)?;
     let vc_id = parse_b32(&voting_coin_id, "voting_coin_id")?;
+    let old_vd = parse_b32(&old_vote_data, "old_vote_data")?;
     let new_vd = parse_b32(&new_vote_data, "new_vote_data")?;
+    let reg_coin_id = parse_b32(&registration_coin_id, "registration_coin_id")?;
+    let blid = parse_b32(&ballot_launcher_id, "ballot_launcher_id")?;
+    let reg_root_snapshot = parse_b32(
+        &registration_merkle_root_snapshot,
+        "registration_merkle_root_snapshot",
+    )?;
     let voter = Voter::new(config, keys, ctx.network);
     let chain =
         wallet_helpers::make_independent_chain(ctx.network, ctx.rpc_override.as_deref()).await?;
-    // STUB: `Voter::update_vote` is stubbed pending Phase 6. Same
-    // shape as cast_vote — we propagate the SDK's stubbed error.
-    let bundle = voter
-        .update_vote(&chain, vc_id, new_vd)
+    let params = chip_voting_sdk::actors::voter::UpdateVoteParams {
+        voting_coin_id: vc_id,
+        old_vote_data: old_vd,
+        new_vote_data: new_vd,
+        registration_coin_id: reg_coin_id,
+        ballot_launcher_id: blid,
+        vote_close_height,
+        vote_threshold_num,
+        vote_threshold_den,
+        registration_merkle_root_snapshot: reg_root_snapshot,
+        registration_vote_weight_snapshot,
+    };
+    let result = voter
+        .update_vote(&chain, params)
         .await
         .map_err(|e| anyhow::anyhow!("Voter::update_vote: {e:?}"))?;
-    finalize_voter_action("update_vote", bundle, bundle_output, overwrite, ctx).await
+    finalize_voter_action(
+        "update_vote",
+        result.spend_bundle,
+        bundle_output,
+        overwrite,
+        ctx,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
