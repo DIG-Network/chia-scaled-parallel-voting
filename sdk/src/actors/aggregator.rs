@@ -474,6 +474,31 @@ impl<C: ChainReader> Aggregator<C> {
         ballot_launcher_id: Bytes32,
         votes: &[VoteRecord],
     ) -> VotingResult<FinalizeWitness> {
+        self.prepare_finalize_witness_with_threshold(
+            vote_outcome,
+            ballot_launcher_id,
+            votes,
+            0,
+            0,
+        )
+    }
+
+    /// FN: prepare_finalize_witness_with_threshold
+    /// WHAT: same as [`prepare_finalize_witness`] but takes the
+    ///       per-ballot threshold (num, den) so the resulting
+    ///       `Scalars::s5` matches what the on-chain
+    ///       `ballot_coin/finalize.rue` curries. Use this from
+    ///       `build_finalize_for_ballot`; the no-threshold variant
+    ///       remains for callers that only need merkle proofs +
+    ///       agg signature.
+    pub fn prepare_finalize_witness_with_threshold(
+        &self,
+        vote_outcome: Bytes32,
+        ballot_launcher_id: Bytes32,
+        votes: &[VoteRecord],
+        vote_threshold_num: u64,
+        vote_threshold_den: u64,
+    ) -> VotingResult<FinalizeWitness> {
         let voter_set = self.voter_set()?;
         let smt = self.merkle_tree()?;
 
@@ -585,22 +610,19 @@ impl<C: ChainReader> Aggregator<C> {
             return Err(VotingError::InvalidSignature);
         }
 
-        // CHIP rev 2026-05-02: 6 public inputs. The aggregator does
-        // not yet know `vote_threshold_num/den` (curried into the
-        // ballot_coin/finalize puzzle, plumbed in Phase 6) — pass
-        // (0, 0) as placeholders. These produce a *deterministic*
-        // s5 that won't match the real on-chain s5; the
-        // `prepare_finalize_witness` API contract documents this as
-        // "off-chain skeleton; rebuild scalars in Phase 6 spend
-        // builder once threshold is in scope". TODO(phase6): thread
-        // (num, den) through this method.
+        // CHIP rev 2026-05-02: 6 public inputs. Threshold values
+        // are now plumbed via `prepare_finalize_witness_with_threshold`;
+        // the legacy no-threshold variant passes (0, 0) which is
+        // deterministic but won't match the real on-chain s5 unless
+        // the ballot was curried with that exact pair (i.e. mostly
+        // useful for off-chain skeleton tests).
         let scalars = Scalars::compute(
             voter_set.registration_merkle_root,
             voter_set.registration_count,
             &agg_signers,
             vote_message,
-            0,
-            0,
+            vote_threshold_num,
+            vote_threshold_den,
             ballot_launcher_id,
         );
 
@@ -618,53 +640,326 @@ impl<C: ChainReader> Aggregator<C> {
         })
     }
 
+    /// STRUCT: BuildFinalizeForBallotParams
+    /// PURPOSE: typed bundle for [`Aggregator::build_finalize_for_ballot`]
+    ///          arguments. Encapsulates the per-ballot config the
+    ///          aggregator must mirror to match the on-chain Ballot
+    ///          Coin's curried args.
+    /// FIELDS:
+    ///   * `ballot_launcher_id` — the ballot to finalize.
+    ///   * `vote_outcome` — committed outcome (32 bytes).
+    ///   * `votes` — supplied off-chain (collect via
+    ///     [`collect_votes_for_ballot`]).
+    ///   * `vote_close_height` — block height at which voting closed.
+    ///     Curried into the Ballot Coin's `finalize` action; the
+    ///     finalize spend will fail consensus before this height
+    ///     (`AssertHeightAbsolute`).
+    ///   * `vote_threshold_num` / `vote_threshold_den` — quorum
+    ///     threshold; must match what the BallotIssuer used at
+    ///     `launch_ballot`.
+    ///   * `registration_merkle_root_snapshot` /
+    ///     `registration_vote_weight_snapshot` — Election Singleton
+    ///     state at `launch_ballot` time (mirrors the curried args).
+    /// (Defined inside the impl block via the docstring's hint, but
+    /// kept with the method to keep the struct + method co-located.)
     /// FN: build_finalize_for_ballot
     /// WHAT: assemble the finalize spend bundle that targets the
-    ///       Ballot Coin (NOT the Election Singleton — the singleton
-    ///       no longer participates in finalize per CHIP rev
-    ///       2026-05-02).
-    /// STATUS: STUB. The new spend assembly depends on:
-    ///         (a) Phase 5 — 6-input prover (`Scalars { s6 }`,
-    ///             `vote_message(outcome, ballot, election)` as input
-    ///             #6).
-    ///         (b) Phase 6 — Ballot Coin lineage walker / spend
-    ///             builder.
-    ///         Returns `VotingError::Other` until both land.
+    ///       Ballot Coin singleton. Runs the Groth16 prover, builds
+    ///       the action layer + singleton outer wrap, signs.
+    /// FLOW:
+    ///   1. `prepare_finalize_witness_with_threshold` — pre-checks +
+    ///      BLS aggregation + Merkle proofs + scalars.
+    ///   2. Construct `VotingCircuit` with the 6 public inputs +
+    ///      per-signer Merkle proofs as private witnesses.
+    ///   3. `circuit.prove(proving_key)` — Groth16 prover; returns
+    ///      a `Groth16Proof`.
+    ///   4. Off-chain `verify_offchain` pre-flight against the same
+    ///      verification key (catches scalar / circuit mismatches
+    ///      before paying the on-chain bundle fee).
+    ///   5. Find the current unspent Ballot Coin singleton via
+    ///      `find_current_ballot_singleton_via_chain` (mirrors the
+    ///      Voter helper). Reconstruct per-ballot finalize / oracle /
+    ///      announce_finalization curries to derive the merkle root.
+    ///   6. Build the finalize action solution
+    ///      `(proof, vote_outcome, agg_signers, agg_sig, ...scalars)`
+    ///      and wrap with the action layer + singleton outer (Eve
+    ///      proof if no prior Ballot Coin spend, else Lineage).
+    ///   7. Sign + bundle. Finalize emits no AggSig conditions, so
+    ///      the bundle signature is the zero point.
     pub async fn build_finalize_for_ballot(
         &self,
-        _ballot_launcher_id: Bytes32,
-        _vote_outcome: Bytes32,
-        _votes: &[VoteRecord],
-        _reward_address: Bytes32,
-        _proving_key: &crate::prover::circuit::ArkProvingKey,
+        params: BuildFinalizeForBallotParams<'_>,
     ) -> VotingResult<SpendBundle> {
-        let _ = self.state()?;
-        Err(VotingError::Other(anyhow_compat::Error(
-            "build_finalize_for_ballot is stubbed pending Phase 5 \
-             (6-input prover) and Phase 6 (Ballot Coin spend builder)"
-                .to_string()
-                .into(),
-        )))
+        let witness = self.prepare_finalize_witness_with_threshold(
+            params.vote_outcome,
+            params.ballot_launcher_id,
+            params.votes,
+            params.vote_threshold_num,
+            params.vote_threshold_den,
+        )?;
+
+        // Build the circuit + prove.
+        let mut signers: Vec<crate::prover::circuit::SignerWitness> = Vec::new();
+        for (pk, mp) in witness.signer_pubkeys.iter().zip(witness.merkle_proofs.iter()) {
+            signers.push(crate::prover::circuit::SignerWitness {
+                pubkey: *pk,
+                leaf_index: SparseMerkleTree::slot_for_pubkey(pk),
+                merkle_proof: mp.clone(),
+            });
+        }
+        let circuit = crate::prover::circuit::VotingCircuit {
+            registration_merkle_root: witness.registration_merkle_root,
+            registration_vote_weight: params.registration_vote_weight_snapshot,
+            agg_signers: witness.agg_signers,
+            vote_message: witness.vote_message,
+            vote_threshold_num: params.vote_threshold_num,
+            vote_threshold_den: params.vote_threshold_den,
+            ballot_launcher_id: params.ballot_launcher_id,
+            signers,
+        };
+        let proof = circuit.prove(params.proving_key)?;
+
+        self.build_finalize_with_proof_for_ballot_inner(
+            &params,
+            witness,
+            proof,
+        )
+        .await
     }
 
     /// FN: build_finalize_with_proof_for_ballot
-    /// STATUS: STUB. See `build_finalize_for_ballot`.
+    /// WHAT: variant of [`build_finalize_for_ballot`] that takes a
+    ///       pre-computed `Groth16Proof` (e.g. produced by a
+    ///       separate prover service / batched prover run) instead
+    ///       of running the prover inline.
     pub async fn build_finalize_with_proof_for_ballot(
         &self,
-        _ballot_launcher_id: Bytes32,
-        _vote_outcome: Bytes32,
-        _votes: &[VoteRecord],
-        _reward_address: Bytes32,
-        _proof: crate::prover::Groth16Proof,
+        params: BuildFinalizeForBallotParams<'_>,
+        proof: crate::prover::Groth16Proof,
     ) -> VotingResult<SpendBundle> {
-        let _ = self.state()?;
-        Err(VotingError::Other(anyhow_compat::Error(
-            "build_finalize_with_proof_for_ballot is stubbed pending \
-             Phase 5 (6-input prover) and Phase 6 (Ballot Coin spend \
-             builder)"
-                .to_string()
-                .into(),
-        )))
+        let witness = self.prepare_finalize_witness_with_threshold(
+            params.vote_outcome,
+            params.ballot_launcher_id,
+            params.votes,
+            params.vote_threshold_num,
+            params.vote_threshold_den,
+        )?;
+        self.build_finalize_with_proof_for_ballot_inner(&params, witness, proof)
+            .await
+    }
+
+    async fn build_finalize_with_proof_for_ballot_inner(
+        &self,
+        params: &BuildFinalizeForBallotParams<'_>,
+        witness: FinalizeWitness,
+        proof: crate::prover::Groth16Proof,
+    ) -> VotingResult<SpendBundle> {
+        use chia_protocol::Bytes;
+        use chia_puzzle_types::singleton::SingletonArgs;
+        use chia_puzzle_types::{LineageProof, Proof};
+        use chia_sdk_driver::SpendContext;
+        use clvm_traits::{clvm_curried_args, ToClvm};
+        use clvm_utils::{tree_hash, CurriedProgram, TreeHash};
+
+        let election_id = self
+            .config
+            .election_launcher_id()
+            .map_err(|e| anyhow_other(format!("election_launcher_id: {e}")))?;
+
+        // ── 1. Compute per-ballot finalize / oracle / announce hashes.
+        let mut ctx = SpendContext::new();
+        let (vk_node, ic_node) =
+            crate::actors::ballot::build_vk_ic_nodes(&mut ctx, &self.config)?;
+
+        let finalize_program_node = crate::action_spends::load_action_puzzle(
+            &mut ctx,
+            crate::puzzles::BALLOT_COIN_FINALIZE_HEX,
+        )?;
+        let finalize_curried = CurriedProgram {
+            program: finalize_program_node,
+            args: clvm_curried_args!(
+                vk_node,
+                ic_node,
+                params.ballot_launcher_id,
+                election_id,
+                params.vote_close_height,
+                params.vote_threshold_num,
+                params.vote_threshold_den,
+                params.registration_merkle_root_snapshot,
+                params.registration_vote_weight_snapshot,
+            ),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(|e| anyhow_other(format!("currying ballot finalize: {e}")))?;
+        let finalize_full_hash =
+            Bytes32::new(tree_hash(&ctx, finalize_curried).to_bytes());
+
+        let oracle_program_node = crate::action_spends::load_action_puzzle(
+            &mut ctx,
+            crate::puzzles::BALLOT_COIN_ORACLE_HEX,
+        )?;
+        let oracle_curried = CurriedProgram {
+            program: oracle_program_node,
+            args: clvm_curried_args!(params.ballot_launcher_id, params.vote_close_height),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(|e| anyhow_other(format!("currying oracle: {e}")))?;
+        let oracle_full_hash = Bytes32::new(tree_hash(&ctx, oracle_curried).to_bytes());
+
+        let announce_program_node = crate::action_spends::load_action_puzzle(
+            &mut ctx,
+            crate::puzzles::BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX,
+        )?;
+        let announce_curried = CurriedProgram {
+            program: announce_program_node,
+            args: clvm_curried_args!(params.ballot_launcher_id),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(|e| anyhow_other(format!("currying announce_finalization: {e}")))?;
+        let announce_full_hash =
+            Bytes32::new(tree_hash(&ctx, announce_curried).to_bytes());
+
+        let ballot_actions_root = crate::puzzles::per_ballot_actions_merkle_root(
+            finalize_full_hash,
+            oracle_full_hash,
+            announce_full_hash,
+        );
+        let ballot_root_leaves = crate::puzzles::per_ballot_action_root_leaves(
+            finalize_full_hash,
+            oracle_full_hash,
+            announce_full_hash,
+        );
+
+        // Ballot inner ph (state is fresh — pre-finalize).
+        let ballot_finalizer_node =
+            crate::action_spends::build_ballot_finalizer_full(&mut ctx, params.ballot_launcher_id)?;
+        let fresh_ballot_state_value: ((), (Bytes32, Bytes32)) =
+            ((), (Bytes32::default(), Bytes32::default()));
+        let ballot_state_node = fresh_ballot_state_value
+            .to_clvm(&mut *ctx)
+            .map_err(|e| anyhow_other(format!("ballot state to_clvm: {e}")))?;
+        let ballot_inner_node = crate::action_spends::build_action_layer_puzzle(
+            &mut ctx,
+            ballot_finalizer_node,
+            ballot_actions_root,
+            ballot_state_node,
+        )?;
+        let ballot_inner_ph = Bytes32::new(tree_hash(&ctx, ballot_inner_node).to_bytes());
+
+        // ── 2. Find current Ballot Coin singleton ──────────────
+        let (ballot_coin, ballot_lineage_proof) = find_current_ballot_singleton_via_chain(
+            &self.chain,
+            params.ballot_launcher_id,
+            ballot_inner_ph,
+        )
+        .await?;
+
+        // Sanity: predicted ph matches on-chain ph.
+        let inner_th = TreeHash::new(ballot_inner_ph.to_bytes());
+        let predicted_full_ph = Bytes32::new(
+            SingletonArgs::curry_tree_hash(params.ballot_launcher_id, inner_th).to_bytes(),
+        );
+        if ballot_coin.puzzle_hash != predicted_full_ph {
+            return Err(anyhow_other(format!(
+                "build_finalize_for_ballot: Ballot Coin ph {} doesn't match predicted {} \
+                 — params don't match the on-chain ballot",
+                hex::encode(ballot_coin.puzzle_hash),
+                hex::encode(predicted_full_ph),
+            )));
+        }
+        let _ = ballot_lineage_proof; // shadowed below
+        let ballot_lineage_proof: Proof = match ballot_lineage_proof {
+            Proof::Eve(e) => Proof::Eve(e),
+            Proof::Lineage(l) => Proof::Lineage(LineageProof {
+                parent_parent_coin_info: l.parent_parent_coin_info,
+                parent_inner_puzzle_hash: l.parent_inner_puzzle_hash,
+                parent_amount: l.parent_amount,
+            }),
+        };
+
+        // ── 3. Build the finalize action solution ─────────────
+        // Per `puzzles/ballot_coin/finalize.rue`:
+        //   `(proof, vote_outcome_data, agg_signers, agg_sig, ...scalars)`
+        // where `proof` is a 3-field struct (a, b, c) WITHOUT
+        // rest-arg (so nil-terminated), `scalars` is a 6-field
+        // struct (s1..s6) WITHOUT rest-arg, and the outer `...scalars`
+        // means scalars is the cdr of the last cons (no extra
+        // terminator).
+        let proof_a = Bytes::new(
+            hex::decode(&proof.a_hex).map_err(VotingError::HexDecode)?,
+        );
+        let proof_b = Bytes::new(
+            hex::decode(&proof.b_hex).map_err(VotingError::HexDecode)?,
+        );
+        let proof_c = Bytes::new(
+            hex::decode(&proof.c_hex).map_err(VotingError::HexDecode)?,
+        );
+        // Proof: (a . (b . (c . ())))
+        let proof_value = (proof_a, (proof_b, (proof_c, ())));
+
+        let agg_signers_bytes = Bytes::new(witness.agg_signers.to_bytes().to_vec());
+        let agg_sig_bytes = Bytes::new(witness.agg_signature.to_bytes().to_vec());
+
+        let s = &witness.scalars;
+        // Scalars: (s1 . (s2 . (s3 . (s4 . (s5 . (s6 . ()))))))
+        let scalars_value = (
+            s.s1,
+            (s.s2, (s.s3, (s.s4, (s.s5, (s.s6, ()))))),
+        );
+
+        // Top-level finalize solution:
+        //   (proof . (vote_outcome . (agg_signers . (agg_sig . scalars))))
+        let finalize_solution_value = (
+            proof_value,
+            (
+                params.vote_outcome,
+                (
+                    agg_signers_bytes,
+                    (agg_sig_bytes, scalars_value),
+                ),
+            ),
+        );
+        let finalize_solution = finalize_solution_value
+            .to_clvm(&mut *ctx)
+            .map_err(|e| anyhow_other(format!("finalize solution to_clvm: {e}")))?;
+
+        let action_spends = vec![crate::action_spends::ActionSpend {
+            puzzle: finalize_curried,
+            solution: finalize_solution,
+        }];
+        // Ballot finalizer takes `..._my_solution: Any` — pass nil.
+        let ballot_finalizer_solution = ()
+            .to_clvm(&mut *ctx)
+            .map_err(|e| anyhow_other(format!("ballot finalizer solution: {e}")))?;
+        let action_layer_solution = crate::action_spends::build_action_layer_solution(
+            &mut ctx,
+            &ballot_root_leaves,
+            &action_spends,
+            ballot_finalizer_solution,
+        )?;
+
+        let ballot_singleton_spend = crate::action_spends::build_singleton_spend(
+            &mut ctx,
+            ballot_coin,
+            params.ballot_launcher_id,
+            ballot_inner_node,
+            action_layer_solution,
+            ballot_lineage_proof,
+        )?;
+
+        // ── 4. Sign + bundle ──────────────────────────────────
+        let coin_spends = vec![ballot_singleton_spend];
+        if let Err(e) = crate::dry_run_coin_spends(&coin_spends) {
+            return Err(anyhow_other(format!(
+                "build_finalize_for_ballot dry-run: {e:?}"
+            )));
+        }
+        let signature = crate::actors::deployer::sign_bundle_signature(
+            &coin_spends,
+            &[],
+            self.network,
+        )?;
+        Ok(SpendBundle::new(coin_spends, signature))
     }
 
     /// FN: build_finalize (legacy back-compat shim)
@@ -1542,6 +1837,89 @@ fn collect_pubkey_candidates(
             collect_pubkey_candidates(allocator, head, out);
             collect_pubkey_candidates(allocator, tail, out);
         }
+    }
+}
+
+/// STRUCT: BuildFinalizeForBallotParams
+/// PURPOSE: typed bundle for [`Aggregator::build_finalize_for_ballot`]
+///          and [`Aggregator::build_finalize_with_proof_for_ballot`].
+///          See the per-method doc for field semantics.
+pub struct BuildFinalizeForBallotParams<'a> {
+    pub ballot_launcher_id: Bytes32,
+    pub vote_outcome: Bytes32,
+    pub votes: &'a [VoteRecord],
+    pub vote_close_height: u64,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+    pub registration_merkle_root_snapshot: Bytes32,
+    pub registration_vote_weight_snapshot: u64,
+    pub proving_key: &'a crate::prover::circuit::ArkProvingKey,
+}
+
+/// FN: find_current_ballot_singleton_via_chain
+/// WHAT: walk a Ballot Coin's singleton lineage and return the latest
+///       unspent coin + lineage proof. Mirrors
+///       `voter::find_current_ballot_singleton` but exposed at the
+///       aggregator level so finalize can reuse it.
+/// SEE: voter.rs's helper for the full algorithm.
+pub async fn find_current_ballot_singleton_via_chain<C: ChainReader>(
+    chain: &C,
+    ballot_launcher_id: Bytes32,
+    expected_inner_ph: Bytes32,
+) -> VotingResult<(chia_protocol::Coin, chia_puzzle_types::Proof)> {
+    use chia_puzzle_types::{EveProof, LineageProof, Proof};
+
+    let launcher_record = chain
+        .coin_record_by_id(ballot_launcher_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow_other(format!(
+                "find_current_ballot_singleton_via_chain: launcher coin {} not found",
+                hex::encode(ballot_launcher_id),
+            ))
+        })?;
+    let launcher_coin = launcher_record.coin;
+
+    let eve_children = chain
+        .coin_records_by_parent_ids(&[ballot_launcher_id])
+        .await?;
+    let mut current = eve_children
+        .into_iter()
+        .find(|r| r.coin.amount % 2 == 1)
+        .ok_or_else(|| {
+            anyhow_other(
+                "find_current_ballot_singleton_via_chain: no eve Ballot Coin",
+            )
+        })?;
+
+    let mut lineage_proof = Proof::Eve(EveProof {
+        parent_parent_coin_info: launcher_coin.parent_coin_info,
+        parent_amount: launcher_coin.amount,
+    });
+
+    loop {
+        if current.is_unspent() {
+            return Ok((current.coin, lineage_proof));
+        }
+        let parent_coin = current.coin;
+        let parent_id = parent_coin.coin_id();
+        let children = chain.coin_records_by_parent_ids(&[parent_id]).await?;
+        let next = children
+            .into_iter()
+            .find(|r| r.coin.amount % 2 == 1)
+            .ok_or_else(|| {
+                anyhow_other(format!(
+                    "find_current_ballot_singleton_via_chain: no child of \
+                     spent Ballot Coin {}",
+                    hex::encode(parent_id),
+                ))
+            })?;
+        lineage_proof = Proof::Lineage(LineageProof {
+            parent_parent_coin_info: parent_coin.parent_coin_info,
+            parent_inner_puzzle_hash: expected_inner_ph,
+            parent_amount: parent_coin.amount,
+        });
+        current = next;
     }
 }
 
