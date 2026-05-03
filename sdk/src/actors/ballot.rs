@@ -30,11 +30,20 @@
 //   final API.
 
 use chia_protocol::{Bytes32, SpendBundle};
+use chia_sdk_driver::SpendContext;
+use clvm_traits::ToClvm;
+use clvm_utils::CurriedProgram;
 use dig_l1_wallet::NetworkType;
 
+use crate::action_spends::{
+    build_action_layer_puzzle, build_action_layer_solution, build_election_finalizer_full,
+    build_singleton_spend, load_action_puzzle, ActionSpend,
+};
+use crate::actors::deployer::sign_bundle_signature;
 use crate::chain::ChainReader;
 use crate::config::ElectionConfig;
 use crate::error::{anyhow_compat, VotingError, VotingResult};
+use crate::puzzles;
 use crate::state::BallotCoinSnapshot;
 
 /// STRUCT: CreateBallotParams
@@ -104,32 +113,252 @@ impl BallotIssuer {
 
     /// Build a `createBallot` spend bundle.
     ///
-    /// **STUB — full implementation deferred to Phase 6.**
-    ///
-    /// The eventual flow (per CHIP rev 2026-05-02):
+    /// FLOW (CHIP rev 2026-05-02):
     ///   1. Locate the current Election Singleton via the launcher
-    ///      lineage walker.
-    ///   2. Drive the singleton's `createBallot` action with
-    ///      `(ballot_seed, vote_close_height, outcome_domain_hash)`
-    ///      in the action solution. The action emits the
-    ///      `createBallot` announcement and returns conditions that
-    ///      mint a fresh launcher coin → eve Ballot Coin curried
-    ///      with `(election_launcher_id, ballot_launcher_id,
-    ///      vote_close_height, outcome_domain_hash, ...)`.
-    ///   3. Sign the bundle with the operator's wallet keys via
-    ///      [`crate::actors::deployer::sign_bundle_signature`].
+    ///      lineage walker (same path as `Voter::register`).
+    ///   2. Build the curried `create_ballot` action puzzle whose
+    ///      hash is `puzzles::ELECTION_CREATE_BALLOT_HASH_HEX`
+    ///      curried with `(SINGLETON_LAUNCHER_PUZZLE_HASH,
+    ///      ELECTION_LAUNCHER_ID)` — same shape the deployer uses
+    ///      to compute the action's full hash.
+    ///   3. Build the action solution
+    ///      `(singleton_coin_id, ballot_seed, vote_close_height,
+    ///       outcome_domain_hash)`. The trailing `...outcome_domain_hash`
+    ///      Rue field is a flat tail (no nil terminator).
+    ///   4. Wrap with the action layer + singleton outer (mirrors
+    ///      `Voter::register`).
+    ///   5. Sign with the operator's wallet keys (the create_ballot
+    ///      action itself emits no AggSig conditions, but the
+    ///      singleton outer's standard layer may require one — the
+    ///      signer auto-walks every emitted AggSig condition).
+    ///
+    /// LAUNCHER FOLLOW-UP: per the CHIP migration plan we emit
+    /// **only the createBallot singleton spend** here. The launcher
+    /// eve coin minted by this spend (parent = singleton coin id,
+    /// puzzle = `SINGLETON_LAUNCHER_PUZZLE_HASH`, amount = 1) needs
+    /// a second spend through the standard launcher puzzle to mint
+    /// the actual Ballot Coin singleton instance — that follow-up
+    /// requires the full deployment-wide ballot curries (VK, IC,
+    /// threshold pack, BALLOT_ACTIONS_MERKLE_ROOT) and is the
+    /// caller's responsibility (or a subsequent Phase 6 task). The
+    /// returned `ballot_launcher_id` (= eve coin id) is stable and
+    /// usable today.
+    ///
+    /// `ballot_coin_id` returned here is the **eve coin id** (the
+    /// 1-mojo launcher coin minted by this spend). When the caller
+    /// later spends that launcher through `SINGLETON_LAUNCHER`, the
+    /// resulting Ballot Coin singleton will have parent =
+    /// eve_coin_id; until then the eve coin id is what's actually
+    /// observable on chain after this spend.
     pub async fn create_ballot<C: ChainReader>(
         &self,
-        _chain: &C,
-        _params: CreateBallotParams,
+        chain: &C,
+        params: CreateBallotParams,
     ) -> VotingResult<CreatedBallot> {
-        Err(VotingError::Other(anyhow_compat::Error(
-            "BallotIssuer::create_ballot stubbed pending Phase 6 \
-             (singleton-spend assembly + ballot lineage)"
-                .to_string()
+        use chia_puzzles::SINGLETON_LAUNCHER_HASH;
+        use clvm_traits::clvm_curried_args;
+
+        let election_id = self.config.election_launcher_id().map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("election_launcher_id: {e}").into(),
+            ))
+        })?;
+
+        // ── 1. Find the current Election Singleton ──────────────
+        // Same launcher lineage walker `Voter::register` uses.
+        let election_start_height: u64 = 0;
+        let current = crate::actors::aggregator::wait_for_current_singleton(
+            chain,
+            &self.config,
+            election_start_height,
+            "Election Singleton (create_ballot)",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(300),
+        )
+        .await?;
+        let crate::actors::aggregator::CurrentSingleton {
+            coin: singleton_coin,
+            lineage_proof: singleton_lineage_proof,
+            state: on_chain_state,
+            ..
+        } = current;
+
+        let singleton_coin_id = singleton_coin.coin_id();
+
+        // ── 2. Build the action layer puzzle ────────────────────
+        let mut ctx = SpendContext::new();
+        let elect_finalizer = build_election_finalizer_full(&mut ctx, election_id)?;
+        let merkle_root =
+            crate::actors::aggregator::election_actions_merkle_root_for_config(&self.config);
+        let election_state_node = state_node_for(&mut ctx, &on_chain_state)?;
+        let action_layer_node = build_action_layer_puzzle(
+            &mut ctx,
+            elect_finalizer,
+            merkle_root,
+            election_state_node,
+        )?;
+
+        // ── 3. Build the curried create_ballot action puzzle ────
+        // CURRY ORDER (per `puzzles/election/create_ballot.rue`):
+        //   (SINGLETON_LAUNCHER_PUZZLE_HASH, ELECTION_LAUNCHER_ID)
+        let singleton_launcher_ph = Bytes32::from(SINGLETON_LAUNCHER_HASH);
+        let create_ballot_program_node =
+            load_action_puzzle(&mut ctx, puzzles::ELECTION_CREATE_BALLOT_HEX)?;
+        let create_ballot_curried = CurriedProgram {
+            program: create_ballot_program_node,
+            args: clvm_curried_args!(singleton_launcher_ph, election_id),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(driver_err)?;
+
+        // ── 4. Build the create_ballot action solution ──────────
+        // SOLUTION SHAPE per `create_ballot.rue` (after the curried
+        // `Truth: ElectionStateTruth` arg the action layer prepends
+        // automatically):
+        //   `(singleton_coin_id, ballot_seed, vote_close_height,
+        //    ...outcome_domain_hash)`
+        // Rue's trailing `...outcome_domain_hash: Bytes32` produces a
+        // flat-tail cons chain — the cdr of the last cons IS the
+        // 32-byte hash directly (no NIL terminator).
+        let create_ballot_solution_value = (
+            singleton_coin_id,
+            (
+                params.ballot_seed,
+                (params.vote_close_height, params.outcome_domain_hash),
+            ),
+        );
+        let create_ballot_solution = create_ballot_solution_value
+            .to_clvm(&mut *ctx)
+            .map_err(driver_err)?;
+
+        // Sanity: the runtime tree hash of our curried action puzzle
+        // must match the leaf produced by
+        // `compute_election_action_root_leaves`. Surfaces curry-order
+        // / atom-wrap drift early instead of as an opaque CLVM raise.
+        let runtime_leaf =
+            Bytes32::new(clvm_utils::tree_hash(&ctx, create_ballot_curried).to_bytes());
+        let predicted_leaves =
+            crate::actors::aggregator::compute_election_action_root_leaves(&self.config);
+        if !predicted_leaves.contains(&runtime_leaf) {
+            return Err(VotingError::Other(anyhow_compat::Error(
+                format!(
+                    "BallotIssuer::create_ballot: runtime curry hash {} not in \
+                     predicted leaves {:?}",
+                    hex::encode(runtime_leaf),
+                    predicted_leaves.iter().map(hex::encode).collect::<Vec<_>>(),
+                )
                 .into(),
-        )))
+            )));
+        }
+
+        let action_spends = vec![ActionSpend {
+            puzzle: create_ballot_curried,
+            solution: create_ballot_solution,
+        }];
+        // Election finalizer takes `..._my_solution: Any` — pass nil.
+        let elect_finalizer_solution = ().to_clvm(&mut *ctx).map_err(driver_err)?;
+        let action_layer_solution = build_action_layer_solution(
+            &mut ctx,
+            &crate::actors::aggregator::compute_election_action_root_leaves(&self.config),
+            &action_spends,
+            elect_finalizer_solution,
+        )?;
+
+        // ── 5. Wrap with the singleton outer ────────────────────
+        let create_ballot_singleton_spend = build_singleton_spend(
+            &mut ctx,
+            singleton_coin,
+            election_id,
+            action_layer_node,
+            action_layer_solution,
+            singleton_lineage_proof,
+        )?;
+
+        // ── 6. Compute the eve coin id (= ballot_launcher_id) ───
+        // Mirror of `create_ballot.rue`'s formula:
+        //   eve_coin_id = sha256(singleton_coin_id ||
+        //                        SINGLETON_LAUNCHER_PUZZLE_HASH ||
+        //                        int_to_8_bytes_be(1))
+        // i.e., the standard Chia coin id for a child coin with
+        // parent = singleton_coin_id, puzzle_hash = launcher_ph,
+        // amount = 1. We use `Coin::coin_id()` for byte-exact parity
+        // with the on-chain derivation.
+        let eve_coin = chia_protocol::Coin::new(singleton_coin_id, singleton_launcher_ph, 1);
+        let eve_coin_id = eve_coin.coin_id();
+
+        // ── 7. Sign + bundle ────────────────────────────────────
+        // The createBallot action emits no AggSig conditions of its
+        // own. The Election Singleton's outer puzzle may emit one
+        // (the standard layer is unsynthetised here — the singleton
+        // puzzle is just the singleton wrapper around the action
+        // layer, no operator key required for the inner spend). Pass
+        // an empty key set; `sign_bundle_signature` returns a
+        // zero-aggregate when there are no `AggSigMe` requirements.
+        let coin_spends = vec![create_ballot_singleton_spend];
+        if let Err(e) = crate::dry_run_coin_spends(&coin_spends) {
+            // Dump the failing spend so the operator can replay it through
+            // the CLVM debugger if needed.
+            if let Ok(dir) = std::env::var("CHIP_VOTING_DUMP_DIR") {
+                let path = std::path::Path::new(&dir).join(format!(
+                    "create_ballot-failed-{}.json",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                ));
+                let json = serde_json::to_string_pretty(&serde_json::json!({
+                    "error": format!("{e:?}"),
+                    "coin_spends": coin_spends.iter().map(|cs| serde_json::json!({
+                        "coin": {
+                            "parent_coin_info": format!("0x{}", hex::encode(cs.coin.parent_coin_info)),
+                            "puzzle_hash": format!("0x{}", hex::encode(cs.coin.puzzle_hash)),
+                            "amount": cs.coin.amount,
+                        },
+                        "puzzle_reveal_hex": format!("0x{}", hex::encode(cs.puzzle_reveal.as_ref())),
+                        "solution_hex": format!("0x{}", hex::encode(cs.solution.as_ref())),
+                    })).collect::<Vec<_>>(),
+                })).unwrap_or_else(|_| "<json serialise failed>".into());
+                let _ = std::fs::write(&path, json);
+                tracing::warn!(dump_path = %path.display(), "wrote failing bundle to disk");
+            }
+            return Err(VotingError::Other(anyhow_compat::Error(
+                format!("BallotIssuer::create_ballot dry-run: {e:?}").into(),
+            )));
+        }
+        let signature = sign_bundle_signature(&coin_spends, &[], self.network)?;
+        let spend_bundle = SpendBundle::new(coin_spends, signature);
+
+        Ok(CreatedBallot {
+            ballot_launcher_id: eve_coin_id,
+            ballot_coin_id: eve_coin_id,
+            spend_bundle,
+        })
     }
+}
+
+/// Build the `ElectionState` CLVM node — must match the
+/// `(root . (count . (vote_weight . election_start_height)))` shape
+/// the on-chain action layer expects (the trailing field is a
+/// `u64` directly, NOT wrapped in `(_ . NIL)`).
+fn state_node_for(
+    ctx: &mut SpendContext,
+    state: &crate::state::ElectionState,
+) -> VotingResult<clvmr::NodePtr> {
+    let value = (
+        state.registration_merkle_root,
+        (
+            state.registration_count,
+            (state.registration_vote_weight, state.election_start_height),
+        ),
+    );
+    value.to_clvm(&mut **ctx).map_err(driver_err)
+}
+
+/// FN: driver_err (file-private)
+fn driver_err<E: std::fmt::Debug>(e: E) -> VotingError {
+    VotingError::Other(anyhow_compat::Error(
+        format!("clvm/driver: {e:?}").into(),
+    ))
 }
 
 /// STRUCT: BallotReader
