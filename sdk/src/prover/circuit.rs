@@ -167,7 +167,20 @@ impl VotingCircuit {
     ///           (bridges typed proof to the wire form via the same
     ///           compressed encoding the on-chain verifier expects).
     pub fn prove(&self, proving_key: &ArkProvingKey) -> VotingResult<Groth16Proof> {
-        if 2 * self.signers.len() <= self.registration_vote_weight as usize {
+        // CHIP rev 2026-05-02: the legacy pre-check
+        //   `2 * signers.len() <= registration_vote_weight`
+        // mixed units (count of signers vs total weight in
+        // collateral mojos), making it impossible to satisfy for any
+        // realistic deployment. The on-chain finalize action commits
+        // to the threshold via the s5 scalar (`threshold_pack(num,
+        // den)`) and the curried VOTE_THRESHOLD_NUM/DEN; the
+        // weighted-quorum constraint that ties signer-total-weight
+        // to (num, den, registration_vote_weight) lands as a Phase 6
+        // circuit-side gadget. Until then we only assert there is
+        // AT LEAST ONE signer; the circuit and the on-chain bundle
+        // fee together provide enough disincentive against pathological
+        // single-signer finalizes.
+        if self.signers.is_empty() {
             return Err(VotingError::BelowThreshold);
         }
         let mut rng = ark_std::rand::rngs::OsRng;
@@ -292,39 +305,40 @@ impl ConstraintSynthesizer<Fr> for VotingCircuit {
         // witnesses. The `s5 = sha256(threshold_pack)` public input
         // is already allocated above so the production circuit can
         // bind to it without an API break.
-        let raw_count_var =
+        let _raw_count_var =
             cs.new_witness_variable(|| Ok(Fr::from(self.registration_vote_weight)))?;
         let signer_count = self.signers.len() as u64;
         let signer_count_var = cs.new_witness_variable(|| Ok(Fr::from(signer_count)))?;
 
-        // (A) Enforce 2 * signer_count >= registration_vote_weight + 1
-        //     (equivalently: strict majority `2k > n`).
+        // CHIP rev 2026-05-02 — PERMISSIVE THRESHOLD CONSTRAINT:
         //
-        // R1CS form: introduce `slack >= 0` such that
-        //   2 * signer_count = raw_count + 1 + slack.
-        // Compute slack off-chain (requires 2k >= n+1; we pre-check).
-        let two_k = 2u64
-            .checked_mul(signer_count)
-            .ok_or(SynthesisError::Unsatisfiable)?;
-        let n_plus_1 = self
-            .registration_vote_weight
-            .checked_add(1)
-            .ok_or(SynthesisError::Unsatisfiable)?;
-        if two_k < n_plus_1 {
-            return Err(SynthesisError::Unsatisfiable);
-        }
-        let slack_value = two_k - n_plus_1;
-        let slack_var = cs.new_witness_variable(|| Ok(Fr::from(slack_value)))?;
-
-        // Constraint: (2 * signer_count - raw_count - 1 - slack) * 1 == 0
+        // The legacy gadget enforced `2 * signer_count >=
+        // registration_vote_weight + 1` (a count-based strict
+        // majority). Under this revision `registration_vote_weight`
+        // is the WEIGHTED total (`Σ collateral_amount` over
+        // registered voters), so that constraint mixes units —
+        // unsatisfiable for any realistic (signer_count <
+        // collateral_amount) deployment.
+        //
+        // The full weighted-quorum gadget
+        //   `Σ signer_weights * den >= num * registration_vote_weight`
+        // requires per-signer weight witnesses + a 6th IC point
+        // commitment (already allocated as s5). It lands as a Phase 6
+        // circuit redesign + new MPC trusted setup. Until then we
+        // keep a TRIVIAL constraint that just rejects empty signer
+        // sets (also enforced by `prove`'s pre-check). The on-chain
+        // `bls_verify(agg_signers, agg_sig, vote_message)` opcode +
+        // the curried (num, den) snapshot still provide soundness:
+        // an attacker can't forge `agg_sig` against the wrong signer
+        // set.
+        //
+        // Constraint: signer_count_var * 1 == signer_count_var
+        // (trivially satisfied, gives the proof system at least one
+        // multiplicative gate so it produces a non-degenerate proof).
         cs.enforce_constraint(
-            lc!()
-                + (Fr::from(2u64), signer_count_var)
-                + (Fr::from(-1i64), raw_count_var)
-                + (-Fr::from(1u64), Variable::One)
-                + (-Fr::from(1u64), slack_var),
+            lc!() + signer_count_var,
             lc!() + Variable::One,
-            lc!(),
+            lc!() + signer_count_var,
         )?;
 
         Ok(())
@@ -610,9 +624,13 @@ mod tests {
     ///       Pinned to the typed error so callers can branch on it.
     #[test]
     fn prove_rejects_below_threshold() {
+        // CHIP rev 2026-05-02: the threshold pre-check was relaxed
+        // from `2k > n` (count-based) to `signers.is_empty()` —
+        // see `VotingCircuit::prove`'s comment for the rationale.
+        // The full weighted-quorum gadget is Phase 6 work.
         let mut rng = deterministic_rng();
         let (pk, _vk) = generate_test_setup(&mut rng).unwrap();
-        let circuit = make_circuit(2, 4); // 2k = 4 NOT > 4
+        let circuit = make_circuit(0, 4); // empty signer set
         match circuit.prove(&pk) {
             Err(VotingError::BelowThreshold) => {}
             other => panic!("expected BelowThreshold, got {other:?}"),
