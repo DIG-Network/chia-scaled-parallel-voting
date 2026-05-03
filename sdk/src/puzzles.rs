@@ -425,19 +425,80 @@ pub fn voting_coin_hint(
 ///       `EMPTY_BALLOT_LEAF_HASH` (32 bytes of 0x00). This is the
 ///       genesis value of `RegistrationState.voted_ballots_root` for
 ///       a freshly-registered voter.
-/// IMPL: lazily folds `node = hash_pair(node, node)` 32 times starting
+/// IMPL: lazily folds `node = sha256(node || node)` 32 times starting
 ///       from the empty-leaf hash. Cached via `OnceLock` so the
 ///       computation runs at most once per process.
+/// HASH CONVENTION: PLAIN sha256, NOT the CLVM `tree_hash_pair`
+///       (which prepends `0x02`). The on-chain
+///       `puzzles/registration_coin/mint_voting_coin.rue`
+///       `compute_ballot_root` uses raw `sha256(node_b + sibling_b)`
+///       — same convention as the registration SPT in
+///       `merkle.rs::sha256_concat`. An earlier draft of this helper
+///       used `hash_pair` (the 0x02-prefixed variant), producing a
+///       byte-distinct root that broke every mint_voting_coin spend
+///       even though the SDK was internally self-consistent.
 /// MIRROR: `EMPTY_BALLOT_ROOT` curried into `puzzles/election/register.rue`.
 pub fn empty_ballot_root() -> Bytes32 {
     static CACHED: OnceLock<Bytes32> = OnceLock::new();
     *CACHED.get_or_init(|| {
         let mut node = EMPTY_BALLOT_LEAF_HASH;
         for _ in 0..BALLOT_TREE_DEPTH {
-            node = hash_pair(node, node);
+            node = sha256_concat_b32(&node, &node);
         }
         node
     })
+}
+
+/// FN: sha256_concat_b32 (file-private)
+/// WHAT: plain `sha256(a || b)` over two 32-byte inputs as a
+///       `Bytes32`. Mirrors the on-chain `sha256(node_b + sibling_b)`
+///       used by both the registration SPT (`merkle.rs`) and the
+///       per-registration ballot SPT
+///       (`registration_coin/mint_voting_coin.rue`).
+fn sha256_concat_b32(a: &Bytes32, b: &Bytes32) -> Bytes32 {
+    let mut h = Sha256::new();
+    h.update(a.as_ref());
+    h.update(b.as_ref());
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&h.finalize());
+    Bytes32::new(arr)
+}
+
+/// FN: empty_ballot_membership_siblings
+/// WHAT: 32-element sibling list for the EMPTY per-registration
+///       ballot SPT. Suitable for `BallotMembership.siblings` in
+///       `mint_voting_coin`'s solution when the voter has not yet
+///       voted on any ballot (`voted_ballots_root` ==
+///       `empty_ballot_root()`).
+/// SHAPE: `siblings[i]` is the level-`i` sibling — at level 0 the
+///        empty leaf, at higher levels the i-fold of
+///        `sha256(prev || prev)`. The on-chain `compute_ballot_root`
+///        with starting node `EMPTY_BALLOT_LEAF_HASH` and these
+///        siblings produces `empty_ballot_root()` regardless of the
+///        slot index (every level's sibling matches the node, so
+///        the order swap the puzzle does on odd indices is a no-op).
+pub fn empty_ballot_membership_siblings() -> Vec<Bytes32> {
+    let mut out = Vec::with_capacity(BALLOT_TREE_DEPTH);
+    let mut node = EMPTY_BALLOT_LEAF_HASH;
+    for _ in 0..BALLOT_TREE_DEPTH {
+        out.push(node);
+        node = sha256_concat_b32(&node, &node);
+    }
+    out
+}
+
+/// FN: ballot_slot_from_id
+/// WHAT: per-registration ballot SPT slot for `ballot_launcher_id`.
+/// FORMULA: `u32::from_be_bytes(sha256(ballot_launcher_id)[0..4])`.
+///       Mirrors `ballot_slot_from_id` in
+///       `puzzles/registration_coin/mint_voting_coin.rue`. The puzzle
+///       prefixes the 4 bytes with `0x00` to coerce signedness; in
+///       Rust we just use `u32` directly (always non-negative).
+pub fn ballot_slot_from_id(ballot_launcher_id: Bytes32) -> u32 {
+    let mut h = Sha256::new();
+    h.update(ballot_launcher_id.as_ref());
+    let digest = h.finalize();
+    u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
 }
 
 /// FN: fresh_registration_state_tree_hash
@@ -1413,20 +1474,72 @@ mod tests {
     }
 
     /// WHAT: `empty_ballot_root()` is deterministic and matches the
-    ///       depth-32 fold of `EMPTY_BALLOT_LEAF_HASH`.
-    /// HOW:  recompute via inline iteration; assert equality.
+    ///       depth-32 fold of `EMPTY_BALLOT_LEAF_HASH` under PLAIN
+    ///       sha256 (no 0x02 CLVM tree-hash prefix). The on-chain
+    ///       per-registration ballot SPT in
+    ///       `mint_voting_coin.rue::compute_ballot_root` uses
+    ///       `sha256(node || sibling)` directly, same as the
+    ///       registration SPT in `merkle.rs`.
+    /// HOW:  recompute via inline iteration with raw sha256; assert
+    ///       equality.
     /// WHY:  the value is curried into every `register` action and
     ///       initialises every voter's `voted_ballots_root`. Drift
-    ///       would break voter↔singleton handshake at registration.
+    ///       (e.g. accidental use of `hash_pair` / `tree_hash_pair`)
+    ///       would break voter↔Registration Coin handshake at
+    ///       mint_voting_coin time even though register itself
+    ///       wouldn't notice.
     #[test]
     fn empty_ballot_root_is_depth_32_fold_of_zero_leaf() {
+        use sha2::{Digest as _, Sha256 as _Sha256};
         let mut node = EMPTY_BALLOT_LEAF_HASH;
         for _ in 0..BALLOT_TREE_DEPTH {
-            node = hash_pair(node, node);
+            let mut h = _Sha256::new();
+            h.update(node.as_ref());
+            h.update(node.as_ref());
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&h.finalize());
+            node = Bytes32::new(arr);
         }
         assert_eq!(empty_ballot_root(), node);
         // Idempotent across calls (cache works).
         assert_eq!(empty_ballot_root(), empty_ballot_root());
+    }
+
+    /// WHAT: `empty_ballot_membership_siblings()` produces a 32-element
+    ///       sibling list whose `compute_ballot_root` (plain-sha256
+    ///       fold) at any slot index yields `empty_ballot_root()`.
+    /// HOW:  fold the empty leaf upward using each sibling at level
+    ///       i; the result must equal `empty_ballot_root()` (and is
+    ///       slot-independent because every sibling matches the node).
+    /// WHY:  this is what the SDK passes for the
+    ///       `BallotMembership.siblings` field of `mint_voting_coin`'s
+    ///       solution when the voter has no prior votes; if the list
+    ///       were wrong the on-chain non-membership proof would fail
+    ///       and the spend would be rejected.
+    #[test]
+    fn empty_ballot_membership_siblings_round_trips_to_empty_ballot_root() {
+        use sha2::{Digest as _, Sha256 as _Sha256};
+        let siblings = empty_ballot_membership_siblings();
+        assert_eq!(siblings.len(), BALLOT_TREE_DEPTH);
+
+        let slot: u32 = 0xDEAD_BEEF; // arbitrary; should not affect result
+        let mut node = EMPTY_BALLOT_LEAF_HASH;
+        let mut idx = slot;
+        for sibling in &siblings {
+            let mut h = _Sha256::new();
+            if idx & 1 == 0 {
+                h.update(node.as_ref());
+                h.update(sibling.as_ref());
+            } else {
+                h.update(sibling.as_ref());
+                h.update(node.as_ref());
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&h.finalize());
+            node = Bytes32::new(arr);
+            idx >>= 1;
+        }
+        assert_eq!(node, empty_ballot_root());
     }
 
     /// WHAT: `registration_actions_merkle_root(cat_tail_hash)` is
