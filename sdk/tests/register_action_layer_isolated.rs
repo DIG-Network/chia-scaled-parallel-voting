@@ -128,7 +128,7 @@ fn register_action_layer_executes_on_simulator_without_singleton() {
             cat_tail_hash,
             puzzles::PuzzleHashes::action_layer(),
             puzzles::PuzzleHashes::registration_finalizer(),
-            puzzles::registration_actions_merkle_root(),
+            puzzles::registration_actions_merkle_root(cat_tail_hash),
             collateral_amount,
             registration_fee,
             launcher_id
@@ -286,7 +286,7 @@ fn register_action_layer_with_singleton_outer_executes_on_simulator() {
             cat_tail_hash,
             puzzles::PuzzleHashes::action_layer(),
             puzzles::PuzzleHashes::registration_finalizer(),
-            puzzles::registration_actions_merkle_root(),
+            puzzles::registration_actions_merkle_root(cat_tail_hash),
             collateral_amount,
             registration_fee,
             launcher_id
@@ -402,7 +402,7 @@ fn registration_message(election_launcher_id: Bytes32, voter_pk: &chia_bls::Publ
 fn election_action_root_leaves(
     deployer: &ElectionDeployer,
     launcher_id: Bytes32,
-    _cat_tail_hash: Bytes32,
+    cat_tail_hash: Bytes32,
     _params: &DeployParams,
 ) -> Vec<Bytes32> {
     // Mirror the SDK's internal `election_action_root_leaves` from
@@ -428,7 +428,7 @@ fn election_action_root_leaves(
             deployer.params.cat_tail_hash,
             puzzles::PuzzleHashes::action_layer(),
             puzzles::PuzzleHashes::registration_finalizer(),
-            puzzles::registration_actions_merkle_root(),
+            puzzles::registration_actions_merkle_root(cat_tail_hash),
             deployer.params.collateral_amount,
             // CHIP rev 2026-05-02: registration_fee dropped; placeholder.
             0u64,

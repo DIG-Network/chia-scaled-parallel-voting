@@ -518,7 +518,7 @@ mod inner_hash_regression_tests {
         let layer = build_action_layer_puzzle(
             &mut ctx,
             reg_finalizer,
-            registration_actions_merkle_root(),
+            registration_actions_merkle_root(cat_tail_hash),
             state_node,
         )
         .unwrap();

@@ -101,7 +101,7 @@ fn voter_vote_through_full_action_layer_executes_on_simulator() {
         (pk_bytes, (election_id, ((), (Bytes32::default(), ()))));
     let state_node = state_value.to_clvm(&mut *ctx).unwrap();
 
-    let merkle_root = puzzles::registration_actions_merkle_root();
+    let merkle_root = puzzles::registration_actions_merkle_root(cat_tail_hash);
     let action_layer_node =
         build_action_layer_puzzle(&mut ctx, reg_finalizer, merkle_root, state_node).unwrap();
     let action_layer_ph = Bytes32::new(tree_hash(&ctx, action_layer_node).to_bytes());
@@ -135,7 +135,7 @@ fn voter_vote_through_full_action_layer_executes_on_simulator() {
     // coin's amount so the recreated coin gets the same amount
     // (matches the CAT preservation rule in production).
     let finalizer_solution = coin_amount.to_clvm(&mut *ctx).unwrap();
-    let leaves = registration_action_root_leaves();
+    let leaves = registration_action_root_leaves(cat_tail_hash);
     let action_layer_solution =
         build_action_layer_solution(&mut ctx, &leaves, &action_spends, finalizer_solution).unwrap();
 
@@ -204,7 +204,7 @@ fn voter_release_through_full_action_layer_executes_on_simulator() {
     let state_value: (Bytes, (Bytes32, ((), (Bytes32, ())))) =
         (pk_bytes, (election_id, ((), (Bytes32::default(), ()))));
     let state_node = state_value.to_clvm(&mut *ctx).unwrap();
-    let merkle_root = puzzles::registration_actions_merkle_root();
+    let merkle_root = puzzles::registration_actions_merkle_root(cat_tail_hash);
     let reg_action_layer =
         build_action_layer_puzzle(&mut ctx, reg_finalizer, merkle_root, state_node).unwrap();
     let reg_ph = Bytes32::new(tree_hash(&ctx, reg_action_layer).to_bytes());
@@ -241,7 +241,7 @@ fn voter_release_through_full_action_layer_executes_on_simulator() {
         solution: release_solution,
     }];
     let finalizer_solution = coin_amount.to_clvm(&mut *ctx).unwrap();
-    let leaves = registration_action_root_leaves();
+    let leaves = registration_action_root_leaves(cat_tail_hash);
     let action_layer_solution =
         build_action_layer_solution(&mut ctx, &leaves, &action_spends, finalizer_solution).unwrap();
     let release_spend =

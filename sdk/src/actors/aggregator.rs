@@ -1791,7 +1791,7 @@ fn election_action_leaves(
             puzzles::hash_atom_b32(&cat_tail_hash),
             puzzles::hash_atom_b32(&PuzzleHashes::action_layer()),
             puzzles::hash_atom_b32(&PuzzleHashes::registration_finalizer()),
-            puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root()),
+            puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root(cat_tail_hash)),
             uint_atom_hash(config.collateral_amount),
             puzzles::hash_atom_b32(&launcher_id),
             puzzles::hash_atom_b32(&puzzles::empty_ballot_root()),
@@ -1818,7 +1818,7 @@ fn election_action_leaves(
             uint_atom_hash(crate::config::TREE_DEPTH as u64),
             puzzles::hash_atom_b32(&Bytes32::new(crate::config::EMPTY_LEAF_HASH)),
             uint_atom_hash(config.collateral_amount),
-            puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root()),
+            puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root(cat_tail_hash)),
         ],
     );
 

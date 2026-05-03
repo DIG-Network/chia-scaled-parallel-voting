@@ -308,7 +308,7 @@ impl Voter {
                 cat_tail_hash,
                 PuzzleHashes::action_layer(),
                 PuzzleHashes::registration_finalizer(),
-                puzzles::registration_actions_merkle_root(),
+                puzzles::registration_actions_merkle_root(cat_tail_hash),
                 self.config.collateral_amount,
                 election_id,
                 puzzles::empty_ballot_root()
@@ -568,7 +568,7 @@ impl Voter {
                 crate::config::TREE_DEPTH,
                 Bytes32::new(crate::config::EMPTY_LEAF_HASH),
                 self.config.collateral_amount,
-                puzzles::registration_actions_merkle_root()
+                puzzles::registration_actions_merkle_root(cat_tail_hash)
             ),
         }
         .to_clvm(&mut *ctx)
@@ -657,7 +657,7 @@ impl Voter {
         )?;
         // Registration coin's action layer is curried with the
         // REGISTRATION action root (NOT the election action root).
-        let reg_merkle_root = puzzles::registration_actions_merkle_root();
+        let reg_merkle_root = puzzles::registration_actions_merkle_root(cat_tail_hash);
         let reg_state = crate::state::RegistrationState::fresh(self.keys.pubkey, election_id);
         let reg_state_node = self.registration_state_node(&mut ctx, &reg_state)?;
         let reg_action_layer_node = build_action_layer_puzzle(
@@ -691,7 +691,7 @@ impl Voter {
             .map_err(driver_err)?;
         let reg_action_layer_solution = build_action_layer_solution(
             &mut ctx,
-            &puzzles::registration_action_root_leaves(),
+            &puzzles::registration_action_root_leaves(cat_tail_hash),
             &release_action_spends,
             reg_finalizer_solution,
         )?;

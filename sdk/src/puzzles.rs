@@ -488,7 +488,7 @@ pub fn fresh_registration_inner_hash(
 ) -> Bytes32 {
     let action_layer_mod_hash = PuzzleHashes::action_layer();
     let registration_finalizer_mod_hash = PuzzleHashes::registration_finalizer();
-    let registration_merkle_root = registration_actions_merkle_root();
+    let registration_merkle_root = registration_actions_merkle_root(cat_tail_hash);
 
     let hint = voter_hint(election_launcher_id, cat_tail_hash, voter_pubkey);
     let initial_state_hash = fresh_registration_state_tree_hash(
@@ -577,17 +577,52 @@ pub fn election_singleton_puzzle_hash(
 // (sha256(0x01 || leaf_bytes)) — so the manual arithmetic here stays
 // byte-for-byte equivalent to that helper.
 
+/// FN: curried_mint_voting_coin_hash
+/// WHAT: tree hash of the FULLY-CURRIED `mint_voting_coin` action
+///       puzzle. The action's 5 curried params (per
+///       `puzzles/registration_coin/mint_voting_coin.rue`) are all
+///       deployment-wide constants — only `CAT_TAIL_HASH` varies per
+///       election.
+/// CURRY ORDER: `(CAT_MOD_HASH, CAT_TAIL_HASH, ACTION_LAYER_MOD_HASH,
+///   VOTING_COIN_FINALIZER_MOD_HASH, VOTING_COIN_ACTIONS_MERKLE_ROOT)`.
+/// USAGE: drives [`registration_actions_merkle_root`] (the action root
+///   curried into the Registration Coin's action layer) and is what
+///   the on-chain `action.rue` checks against via
+///   `simplify_merkle_proof(tree_hash(curried_mint_voting_coin),
+///   proof)`.
+/// CHIP rev 2026-05-02 NOTE: this fix addresses a bug where the
+/// previous implementation hashed the UNCURRIED `mint_voting_coin`,
+/// breaking the on-chain merkle proof. The Voting Coin's
+/// `update_vote` action no longer carries per-ballot curry args (per
+/// the matching CHIP rev), so `VOTING_COIN_ACTIONS_MERKLE_ROOT` is
+/// now genuinely deployment-wide and the curried mint hash is too.
+pub fn curried_mint_voting_coin_hash(cat_tail_hash: Bytes32) -> Bytes32 {
+    curry_tree_hash(
+        PuzzleHashes::registration_mint_voting_coin(),
+        &[
+            hash_atom_b32(&PuzzleHashes::cat_outer()),
+            hash_atom_b32(&cat_tail_hash),
+            hash_atom_b32(&PuzzleHashes::action_layer()),
+            hash_atom_b32(&PuzzleHashes::voting_coin_finalizer()),
+            hash_atom_b32(&voting_coin_actions_merkle_root()),
+        ],
+    )
+}
+
 /// FN: registration_actions_merkle_root
 /// WHAT: 2-leaf Merkle root over the Registration Coin's allowed
-///       actions: `mint_voting_coin` and `release`.
-/// WHY: the action layer asserts every selected action's puzzle hash
-///      is in this tree. Both actions read voter info from state (not
-///      curry), so their puzzle hashes are deployment-wide constants
-///      and this root is constant too — computable offline.
+///       actions: `mint_voting_coin` (curried with deployment-wide
+///       constants — see [`curried_mint_voting_coin_hash`]) and
+///       `release` (no curry args).
+/// WHY: the on-chain action layer (`puzzles/action.rue`) verifies
+///      `simplify_merkle_proof(tree_hash(SELECTED_PUZZLE), proof) ==
+///      MERKLE_ROOT`, where `tree_hash(SELECTED_PUZZLE)` is the
+///      tree hash of the FULLY-CURRIED action puzzle. Leaves here
+///      must therefore use curried hashes.
 /// LEAF ORDER: sorted ascending by `hash_atom_b32(leaf)` so the root
 ///             matches what `chia_sdk_types::MerkleTree::new` produces.
-pub fn registration_actions_merkle_root() -> Bytes32 {
-    let mint_voting_coin = hash_atom_b32(&PuzzleHashes::registration_mint_voting_coin());
+pub fn registration_actions_merkle_root(cat_tail_hash: Bytes32) -> Bytes32 {
+    let mint_voting_coin = hash_atom_b32(&curried_mint_voting_coin_hash(cat_tail_hash));
     let release = hash_atom_b32(&PuzzleHashes::registration_release());
     let (a, b) = if mint_voting_coin.as_ref() < release.as_ref() {
         (mint_voting_coin, release)
@@ -601,13 +636,14 @@ pub fn registration_actions_merkle_root() -> Bytes32 {
 /// WHAT: leaf SET (sorted) for the Registration Coin's actions
 ///       Merkle tree. Pass directly to
 ///       `chia_sdk_types::MerkleTree::new(&leaves)` to construct a
-///       tree whose root matches `registration_actions_merkle_root`
-///       and whose `.proof(leaf)` returns the proof selectors that
-///       the on-chain `simplify_merkle_proof` accepts.
+///       tree whose root matches
+///       [`registration_actions_merkle_root`] and whose
+///       `.proof(leaf)` returns the proof selectors that the on-chain
+///       `simplify_merkle_proof` accepts.
 /// SORT: by `tree_hash_atom(puzzle_hash)` ascending — same ordering
 ///       `registration_actions_merkle_root` uses internally.
-pub fn registration_action_root_leaves() -> Vec<Bytes32> {
-    let mint_voting_coin_ph = PuzzleHashes::registration_mint_voting_coin();
+pub fn registration_action_root_leaves(cat_tail_hash: Bytes32) -> Vec<Bytes32> {
+    let mint_voting_coin_ph = curried_mint_voting_coin_hash(cat_tail_hash);
     let release_ph = PuzzleHashes::registration_release();
     let mint_h = hash_atom_b32(&mint_voting_coin_ph);
     let release_h = hash_atom_b32(&release_ph);
@@ -1393,11 +1429,13 @@ mod tests {
         assert_eq!(empty_ballot_root(), empty_ballot_root());
     }
 
-    /// WHAT: `registration_actions_merkle_root()` is deterministic.
+    /// WHAT: `registration_actions_merkle_root(cat_tail_hash)` is
+    ///       deterministic given a fixed `cat_tail_hash`.
     #[test]
     fn registration_actions_merkle_root_is_sorted_canonical() {
-        let r1 = registration_actions_merkle_root();
-        let r2 = registration_actions_merkle_root();
+        let tail = b32(0x77);
+        let r1 = registration_actions_merkle_root(tail);
+        let r2 = registration_actions_merkle_root(tail);
         assert_eq!(r1, r2);
     }
 
@@ -1407,9 +1445,10 @@ mod tests {
     fn registration_actions_merkle_root_matches_merkletree() {
         use chia_sdk_types::MerkleTree;
 
-        let leaves = registration_action_root_leaves();
+        let tail = b32(0x77);
+        let leaves = registration_action_root_leaves(tail);
         let upstream_root = MerkleTree::new(&leaves).root();
-        assert_eq!(registration_actions_merkle_root(), upstream_root);
+        assert_eq!(registration_actions_merkle_root(tail), upstream_root);
     }
 
     /// WHAT: `election_actions_merkle_root` is permutation-invariant.

@@ -9,13 +9,34 @@
 // 2026-05-02 is that vote edits stay on the parallel lane.
 //
 // Two on-chain checks gate the timing:
-//   1. AssertBeforeHeightAbsolute(VOTE_CLOSE_HEIGHT) — local check
-//      against the curried close height. Cheap and fails closed.
+//   1. AssertBeforeHeightAbsolute(vote_close_height) — local check
+//      against the close height supplied via solution. Cheap and
+//      fails closed.
 //   2. AssertCoinAnnouncement on the Ballot Coin oracle's
-//      "ballot_oracle_open" announcement, which proves the curried
-//      VOTE_CLOSE_HEIGHT is the Ballot Coin's actual curried close
+//      "ballot_oracle_open" announcement, which proves the supplied
+//      `vote_close_height` is the Ballot Coin's actual curried close
 //      height (defends against a malicious mint that lied about
-//      close height — see CHIP.md "Why oracle is required").
+//      close height — see CHIP.md "Why oracle is required"). The
+//      State.voter_pubkey signature over `vote_message =
+//      sha256(new_vote_data || ballot_launcher_id || election_launcher_id)`
+//      cryptographically pins the same triple, so a wrong
+//      ballot_launcher_id / election_launcher_id / vote_close_height
+//      in the solution either fails the AggSig (different message) or
+//      fails the AssertCoinAnnouncement (no Ballot Coin in this
+//      bundle emits the wrong-height oracle announcement).
+//
+// CHIP rev 2026-05-02 (CURRY-ARG-FREE): unlike earlier drafts, this
+// action carries no curried args. Per-ballot configuration
+// (BALLOT_LAUNCHER_ID, ELECTION_LAUNCHER_ID, VOTE_CLOSE_HEIGHT) flows
+// in via solution. WHY: the Voting Coin's action layer's
+// `MERKLE_ROOT` is curried into mint_voting_coin as a deployment-wide
+// constant (see CHIP.md "Action root composition"). For that to be
+// possible, every action of the Voting Coin must have a
+// deployment-wide tree hash — which means none of them can carry
+// per-ballot curry args. Putting the per-ballot triple in the
+// solution + AggSigMe-binding the same triple into `vote_message`
+// preserves the security of the on-chain check while keeping the
+// action puzzle deployment-wide.
 //
 // State transition:
 //   vote_data → new_vote_data (other curried/state fields unchanged)
@@ -24,12 +45,12 @@ import super::common_types::*;
 import shared::*;
 
 fn main(
-    // ── Curried ─────────────────────────────────────────────────────
-    BALLOT_LAUNCHER_ID: Bytes32,
-    ELECTION_LAUNCHER_ID: Bytes32,
-    VOTE_CLOSE_HEIGHT: Int,
+    // No curried args — see file header for rationale.
     Truth: VotingCoinStateTruth,
     // ── Solution ────────────────────────────────────────────────────
+    ballot_launcher_id: Bytes32,
+    election_launcher_id: Bytes32,
+    vote_close_height: Int,
     new_vote_data: Bytes32,
     new_signature: Signature,
     ...ballot_coin_id: Bytes32,
@@ -38,17 +59,18 @@ fn main(
 
     // 1. Local height gate — ballot must still be open.
     let assert_before_close = AssertBeforeHeightAbsolute {
-        height: VOTE_CLOSE_HEIGHT,
+        height: vote_close_height,
     };
 
     // 2. Ballot Coin oracle co-spend assertion. Pins the Ballot Coin's
-    //    actual curried close height to the value we curry — defends
-    //    against a malicious mint having lied at mint_voting_coin time.
-    let ballot_b: Bytes = BALLOT_LAUNCHER_ID as Bytes;
+    //    actual curried close height to the value we passed in the
+    //    solution — defends against a malicious mint having lied at
+    //    mint_voting_coin time.
+    let ballot_b: Bytes = ballot_launcher_id as Bytes;
     let oracle_message: Bytes32 = sha256(
         "ballot_oracle_open"
         + ballot_b
-        + int_to_8_bytes_be(VOTE_CLOSE_HEIGHT)
+        + int_to_8_bytes_be(vote_close_height)
     );
     let oracle_announcement_id: Bytes32 = sha256(
         (ballot_coin_id as Bytes)
@@ -63,8 +85,8 @@ fn main(
     //      vote_message = sha256(vote_outcome || ballot_launcher_id || election_launcher_id)
     let vm: Bytes32 = vote_message(
         new_vote_data,
-        BALLOT_LAUNCHER_ID,
-        ELECTION_LAUNCHER_ID,
+        ballot_launcher_id,
+        election_launcher_id,
     );
     let agg_sig_update = AggSigMe {
         public_key: State.voter_pubkey,

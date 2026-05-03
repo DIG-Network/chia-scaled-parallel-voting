@@ -313,7 +313,9 @@ impl ElectionDeployer {
                 puzzles::hash_atom_b32(&self.params.cat_tail_hash),
                 puzzles::hash_atom_b32(&PuzzleHashes::action_layer()),
                 puzzles::hash_atom_b32(&PuzzleHashes::registration_finalizer()),
-                puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root()),
+                puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root(
+                    self.params.cat_tail_hash,
+                )),
                 uint_atom_hash(self.params.collateral_amount),
                 puzzles::hash_atom_b32(&launcher_id),
                 puzzles::hash_atom_b32(&puzzles::empty_ballot_root()),
@@ -354,7 +356,9 @@ impl ElectionDeployer {
                 uint_atom_hash(crate::config::TREE_DEPTH as u64),
                 puzzles::hash_atom_b32(&Bytes32::new(crate::config::EMPTY_LEAF_HASH)),
                 uint_atom_hash(self.params.collateral_amount),
-                puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root()),
+                puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root(
+                    self.params.cat_tail_hash,
+                )),
             ],
         )
     }

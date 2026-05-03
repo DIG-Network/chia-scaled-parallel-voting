@@ -47,9 +47,10 @@ pub async fn run(cmd: PuzzleCmd, ctx: &Context) -> anyhow::Result<()> {
                 "registration_release":      hex_str(PuzzleHashes::registration_release()),
                 "voting_coin_finalizer":     hex_str(PuzzleHashes::voting_coin_finalizer()),
                 "voting_coin_update_vote":   hex_str(PuzzleHashes::voting_coin_update_vote()),
+                "voting_coin_actions_merkle_root": hex_str(puzzles::voting_coin_actions_merkle_root()),
                 "cat_outer":                 hex_str(PuzzleHashes::cat_outer()),
-                "registration_actions_merkle_root": hex_str(puzzles::registration_actions_merkle_root()),
-                "note": "election_actions_merkle_root is per-deployment (depends on curried election constants); see `chip-voting deployer predict-puzzle-hash`",
+                "ballot_actions_merkle_root_deployment_wide": hex_str(puzzles::ballot_actions_merkle_root()),
+                "note": "election_actions_merkle_root and registration_actions_merkle_root are per-deployment (the latter depends on CAT_TAIL_HASH because mint_voting_coin is curried with it); see `chip-voting deployer predict-puzzle-hash` for deploy-aware dumps",
             });
             ctx.print(&value)?;
         }
