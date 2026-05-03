@@ -135,7 +135,7 @@ impl BallotIssuer {
     /// LAUNCHER FOLLOW-UP: per the CHIP migration plan we emit
     /// **only the createBallot singleton spend** here. The launcher
     /// eve coin minted by this spend (parent = singleton coin id,
-    /// puzzle = `SINGLETON_LAUNCHER_PUZZLE_HASH`, amount = 1) needs
+    /// puzzle = `SINGLETON_LAUNCHER_PUZZLE_HASH`, amount = 2) needs
     /// a second spend through the standard launcher puzzle to mint
     /// the actual Ballot Coin singleton instance — that follow-up
     /// requires the full deployment-wide ballot curries (VK, IC,
@@ -145,15 +145,30 @@ impl BallotIssuer {
     /// usable today.
     ///
     /// `ballot_coin_id` returned here is the **eve coin id** (the
-    /// 1-mojo launcher coin minted by this spend). When the caller
+    /// 2-mojo launcher coin minted by this spend). When the caller
     /// later spends that launcher through `SINGLETON_LAUNCHER`, the
     /// resulting Ballot Coin singleton will have parent =
     /// eve_coin_id; until then the eve coin id is what's actually
     /// observable on chain after this spend.
+    ///
+    /// FUNDER COIN: the launcher eve coin must be minted at an even
+    /// amount (2) so the Election Singleton's outer puzzle does not
+    /// mistake it for the singleton's own recreation (which would
+    /// raise via the standard top-layer's
+    /// `(assert (not has_odd_output_been_found))`). The Election
+    /// Singleton itself only carries 1 mojo — exactly enough to
+    /// recreate itself — so the 2 mojos for the launcher MUST come
+    /// from a co-spent funder coin. The caller pre-builds that
+    /// funder spend (any coin spending ≥ 2 mojos with output total
+    /// = its amount − 2; the simplest is a quoted-conditions puzzle
+    /// returning `()` over a 2-mojo coin) and passes it in
+    /// `funder_spend`. Mirrors the `Voter::register` pattern of
+    /// taking a pre-built `cat_parent_spend`.
     pub async fn create_ballot<C: ChainReader>(
         &self,
         chain: &C,
         params: CreateBallotParams,
+        funder_spend: chia_protocol::CoinSpend,
     ) -> VotingResult<CreatedBallot> {
         use chia_puzzles::SINGLETON_LAUNCHER_HASH;
         use clvm_traits::clvm_curried_args;
@@ -264,6 +279,7 @@ impl BallotIssuer {
             elect_finalizer_solution,
         )?;
 
+
         // ── 5. Wrap with the singleton outer ────────────────────
         let create_ballot_singleton_spend = build_singleton_spend(
             &mut ctx,
@@ -278,12 +294,16 @@ impl BallotIssuer {
         // Mirror of `create_ballot.rue`'s formula:
         //   eve_coin_id = sha256(singleton_coin_id ||
         //                        SINGLETON_LAUNCHER_PUZZLE_HASH ||
-        //                        int_to_8_bytes_be(1))
+        //                        int_to_8_bytes_be(2))
         // i.e., the standard Chia coin id for a child coin with
         // parent = singleton_coin_id, puzzle_hash = launcher_ph,
-        // amount = 1. We use `Coin::coin_id()` for byte-exact parity
-        // with the on-chain derivation.
-        let eve_coin = chia_protocol::Coin::new(singleton_coin_id, singleton_launcher_ph, 1);
+        // amount = 2. The launcher coin is minted at the EVEN amount 2
+        // (not the conventional 1) so the singleton outer's
+        // single-odd-CreateCoin invariant is preserved — the finalizer
+        // already emits one odd CreateCoin (the singleton recreation),
+        // and a second odd CreateCoin from this action would trigger
+        // the singleton's `(assert (not has_odd_output_been_found))`.
+        let eve_coin = chia_protocol::Coin::new(singleton_coin_id, singleton_launcher_ph, 2);
         let eve_coin_id = eve_coin.coin_id();
 
         // ── 7. Sign + bundle ────────────────────────────────────
@@ -294,7 +314,12 @@ impl BallotIssuer {
         // layer, no operator key required for the inner spend). Pass
         // an empty key set; `sign_bundle_signature` returns a
         // zero-aggregate when there are no `AggSigMe` requirements.
-        let coin_spends = vec![create_ballot_singleton_spend];
+        // Bundle: funder + singleton spend. The funder provides the
+        // 2 mojos needed for the launcher eve coin; the singleton
+        // contributes 1 (its own recreation amount) and emits both
+        // CreateCoins. Total: 3 in / 3 out (assuming funder spends
+        // exactly 2 mojos with no outputs).
+        let coin_spends = vec![funder_spend, create_ballot_singleton_spend];
         if let Err(e) = crate::dry_run_coin_spends(&coin_spends) {
             // Dump the failing spend so the operator can replay it through
             // the CLVM debugger if needed.

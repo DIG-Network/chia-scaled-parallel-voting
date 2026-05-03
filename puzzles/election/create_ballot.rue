@@ -3,7 +3,7 @@
 //
 // Mints a fresh Ballot Coin lineage. Following the standard Chia
 // singleton-launch pattern, the action emits a launcher EVE coin
-// (a 1-mojo coin at SINGLETON_LAUNCHER_PUZZLE_HASH) as a child of the
+// (a 2-mojo coin at SINGLETON_LAUNCHER_PUZZLE_HASH) as a child of the
 // current Election Singleton spend. Whoever knows the resulting
 // eve coin id can then spend the launcher to instantiate the Ballot
 // Coin singleton; the driver / SDK is responsible for that follow-up
@@ -14,11 +14,21 @@
 // `ballot_launcher_id = eve_coin_id` that uniquely identifies the
 // ballot for the rest of the system.
 //
+// EVEN-AMOUNT LAUNCHER: the launcher coin is minted at amount 2 (not
+// the conventional 1) so the standard singleton top-layer's
+// `check_and_morph_conditions_for_singleton` does NOT mistake it for
+// the singleton's own recreation. That helper raises if it observes
+// more than one odd-amount CreateCoin in the inner conditions; the
+// finalizer already emits one (the singleton recreation at amount 1),
+// so the launcher mint MUST be even. The downstream launcher-spend
+// pass through `SINGLETON_LAUNCHER_PUZZLE_HASH` then mints the eve
+// Ballot Coin singleton at the (odd) amount the operator chooses.
+//
 // The action:
 //   1. Pins the singleton's current coin id via AssertMyCoinId so the
 //      eve coin id can be derived deterministically inside the puzzle.
 //   2. Computes eve_coin_id = sha256(singleton_coin_id ||
-//      SINGLETON_LAUNCHER_PUZZLE_HASH || 8-byte BE 1).
+//      SINGLETON_LAUNCHER_PUZZLE_HASH || 8-byte BE 2).
 //   3. Emits CreateCoin for the launcher eve coin with hint =
 //      eve_coin_id (= ballot_launcher_id) so indexers can find it.
 //   4. Emits an indexer-facing CreateCoinAnnouncement carrying
@@ -57,19 +67,21 @@ fn main(
     // Eve coin id = sha256(parent_coin_id || puzzle_hash || amount_be8).
     // This becomes the Ballot Coin's launcher_id once the eve coin is
     // spent through the standard SINGLETON_LAUNCHER puzzle in a
-    // follow-up spend the driver builds.
+    // follow-up spend the driver builds. Amount = 2 (even) so the
+    // singleton outer's single-odd-CreateCoin invariant is preserved.
     let eve_coin_id: Bytes32 = sha256(
         (singleton_coin_id as Bytes)
         + (SINGLETON_LAUNCHER_PUZZLE_HASH as Bytes)
-        + int_to_8_bytes_be(1)
+        + int_to_8_bytes_be(2)
     );
 
-    // Mint the launcher eve coin. Hint = ballot_launcher_id so
-    // off-chain indexers can find both the eve coin and (after the
-    // launcher spend) the Ballot Coin lineage by the same key.
+    // Mint the launcher eve coin (amount 2 — see EVEN-AMOUNT LAUNCHER
+    // note in the file header). Hint = ballot_launcher_id so off-chain
+    // indexers can find both the eve coin and (after the launcher
+    // spend) the Ballot Coin lineage by the same key.
     let mint_eve = CreateCoin {
         puzzle_hash: SINGLETON_LAUNCHER_PUZZLE_HASH,
-        amount: 1,
+        amount: 2,
         memos: Memos {
             value: [eve_coin_id],
         },

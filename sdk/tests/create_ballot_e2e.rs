@@ -26,13 +26,16 @@
 
 mod common;
 
-use chia_protocol::Bytes32;
+use chia_protocol::{Bytes32, Coin};
+use chia_sdk_driver::SpendContext;
 use chia_sdk_test::Simulator;
 use chip_voting_sdk::actors::ballot::{BallotIssuer, CreateBallotParams};
 use chip_voting_sdk::actors::deployer::ElectionDeployer;
 use chip_voting_sdk::ceremony::VerificationKey;
 use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
 use chip_voting_sdk::{DeployParams, NetworkType};
+use clvm_traits::ToClvm;
+use clvm_utils::tree_hash;
 
 /// WHAT: BallotIssuer::create_ballot builds a spend bundle that the
 ///       simulator accepts, and the predicted `ballot_launcher_id`
@@ -50,13 +53,6 @@ use chip_voting_sdk::{DeployParams, NetworkType};
 ///      against the simulator so any drift between the SDK and the
 ///      Rue-compiled action puzzle surfaces locally before mainnet.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "BallotIssuer::create_ballot dry-run traps with CLVM raise from inside the \
-            action-layer/singleton wrapper at puzzle_hash d52eb3ce858ee... — likely a \
-            mismatch between the state cons encoding the SDK supplies (state_node_for) \
-            and the curried genesis state hash the deployer baked into the singleton \
-            puzzle, OR an action-layer merkle-proof shape mismatch. Debug path: \
-            instrument dry_run_coin_spends to dump CLVM stack on raise; cross-check \
-            against the working Voter::register flow which uses the same helpers."]
 async fn create_ballot_against_simulator_full_flow() {
     // ── 1. Deploy ────────────────────────────────────────────
     let mut sim = Simulator::new();
@@ -87,7 +83,26 @@ async fn create_ballot_against_simulator_full_flow() {
     sim.spend_coins(deploy_spends, std::slice::from_ref(&funder.sk))
         .expect("simulator accepts deploy bundle");
 
-    // ── 2. Build the BallotIssuer + call create_ballot ──────
+    // ── 2. Build a funder coin that will provide 2 mojos for the
+    //       launcher eve coin. The simplest funder is a 2-mojo coin
+    //       at a quoted-empty-conditions puzzle: spending it emits
+    //       no conditions, so all 2 mojos flow into the bundle's
+    //       input total to balance the singleton's launcher
+    //       CreateCoin output.
+    let mut ctx = SpendContext::new();
+    // Quoted-conditions puzzle returning `()` (no conditions):
+    //   `(1 . ())` — Rue/CLVM `(q . conditions_list)` with empty list.
+    let funder_puzzle_value: (u8, ()) = (1u8, ());
+    let funder_puzzle = funder_puzzle_value.to_clvm(&mut *ctx).unwrap();
+    let funder_ph = Bytes32::new(tree_hash(&ctx, funder_puzzle).to_bytes());
+    let funder_coin = Coin::new(Bytes32::new([0xCC; 32]), funder_ph, 2);
+    sim.insert_coin(funder_coin);
+    let funder_solution = ().to_clvm(&mut *ctx).unwrap();
+    let funder_spend =
+        common::coin_spend_from_nodes(&ctx, funder_coin, funder_puzzle, funder_solution);
+    drop(ctx);
+
+    // ── 3. Build the BallotIssuer + call create_ballot ──────
     // Simulator uses Testnet11 AGG_SIG constants — the issuer's
     // network field controls signing augmentation, so we mirror.
     let issuer = BallotIssuer::new(config.clone(), NetworkType::Testnet11);
@@ -105,6 +120,7 @@ async fn create_ballot_against_simulator_full_flow() {
                 vote_close_height,
                 outcome_domain_hash,
             },
+            funder_spend,
         )
         .await
     {
@@ -157,7 +173,12 @@ async fn create_ballot_against_simulator_full_flow() {
         cs.coin.puzzle_hash, launcher_ph,
         "eve coin must be at SINGLETON_LAUNCHER_HASH"
     );
-    assert_eq!(cs.coin.amount, 1, "eve coin must be 1 mojo");
+    assert_eq!(
+        cs.coin.amount, 2,
+        "eve coin must be 2 mojos (even amount so the singleton outer's \
+         single-odd-CreateCoin invariant is preserved — the singleton \
+         recreation is the only odd CreateCoin in the bundle)"
+    );
     assert!(
         cs.spent_height.is_none(),
         "eve coin must be unspent immediately after create_ballot"
