@@ -329,6 +329,35 @@ async fn voter_cast_vote_against_simulator_full_flow() {
         ballot_singleton_record.spent_height.is_some(),
         "eve Ballot Coin must be spent (oracle co-spend) after cast_vote",
     );
+
+    // 9e. Aggregator::collect_votes_for_ballot recovers the vote.
+    let chain = common::SharedSim::new(&mut sim);
+    let mut agg = chip_voting_sdk::Aggregator::new(
+        config.clone(),
+        chain,
+        NetworkType::Testnet11,
+    );
+    agg.sync().await.expect("aggregator sync");
+    let votes = agg
+        .collect_votes_for_ballot(created.ballot_launcher_id)
+        .await
+        .expect("collect_votes_for_ballot");
+    assert_eq!(
+        votes.len(),
+        1,
+        "expected exactly 1 VoteRecord for this ballot",
+    );
+    let v = &votes[0];
+    assert_eq!(v.voter_pubkey, voter_pk, "vote record voter pubkey");
+    assert_eq!(v.vote_data, vote_data, "vote record data");
+    assert_eq!(
+        v.ballot_launcher_id, created.ballot_launcher_id,
+        "vote record ballot id",
+    );
+    assert_eq!(
+        v.voting_coin_id, cast_result.voting_coin_id,
+        "vote record voting coin id",
+    );
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────

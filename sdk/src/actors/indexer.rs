@@ -227,19 +227,23 @@ impl<C: ChainReader> Indexer<C> {
     /// FN: votes_for_ballot
     /// WHAT: every `VoteRecord` cast against the ballot identified by
     ///       `ballot_launcher_id`.
-    /// STATUS: STUB pending the Voting Coin lineage walker landing in
-    ///         a subsequent tier (`Aggregator::collect_votes_for_ballot`).
-    ///         Once that lands this method will delegate to it.
+    /// IMPL: requires `sync()` has populated the voter set; delegates
+    ///       to the same per-voter hint-walking logic as
+    ///       [`crate::actors::aggregator::collect_votes_for_ballot_via_chain`]
+    ///       (so the indexer + aggregator stay byte-identical on the
+    ///       chain-walk side).
     pub async fn votes_for_ballot(
         &self,
-        _ballot_launcher_id: Bytes32,
+        ballot_launcher_id: Bytes32,
     ) -> VotingResult<Vec<VoteRecord>> {
-        Err(VotingError::Other(crate::error::anyhow_compat::Error(
-            "Indexer::votes_for_ballot stubbed pending Aggregator::collect_votes_for_ballot \
-             (Voting Coin lineage walker)"
-                .to_string()
-                .into(),
-        )))
+        let voter_set = self.voter_set.as_ref().ok_or(VotingError::NotDeployed)?;
+        crate::actors::aggregator::collect_votes_for_ballot_via_chain(
+            &self.config,
+            &self.chain,
+            ballot_launcher_id,
+            voter_set,
+        )
+        .await
     }
 
     /// FN: is_finalized_for

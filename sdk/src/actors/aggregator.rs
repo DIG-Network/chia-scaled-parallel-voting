@@ -221,25 +221,217 @@ impl<C: ChainReader> Aggregator<C> {
     }
 
     /// FN: collect_votes_for_ballot
-    /// WHAT: enumerate every Voting Coin spent against
-    ///       `ballot_launcher_id`, decode the (vote_data, signature)
-    ///       memos, and return the validated `VoteRecord`s.
-    /// STATUS: STUB — pending Phase 6 (test infrastructure) which adds
-    ///         the on-chain Voting Coin lineage walker. Returns
-    ///         `VotingError::Other` until the walker lands.
+    /// WHAT: enumerate every Voting Coin currently unspent for
+    ///       `ballot_launcher_id`, decode the latest `(vote_data,
+    ///       signature)` from the spend that minted (or last
+    ///       recreated) it, and return the validated [`VoteRecord`]s.
+    /// IMPL: for each registered voter pubkey:
+    ///   1. Compute their per-ballot `voting_coin_hint`.
+    ///   2. `chain.coin_records_by_hint(hint)` — returns every
+    ///      Voting Coin in the lineage. The latest unspent coin
+    ///      represents the voter's CURRENT vote on this ballot.
+    ///   3. Fetch the parent spend's puzzle+solution. Run via
+    ///      CLVM. Find the `vote_cast` / `vote_updated`
+    ///      `CreateCoinAnnouncement` and brute-force which
+    ///      `(vote_data, signature)` pair from the solution
+    ///      atoms produces a sha256 match. The puzzle's solution
+    ///      contains a small bounded set of 32-byte (vote_data
+    ///      candidate) and 96-byte (signature candidate) atoms,
+    ///      so the search is constant-time per voter.
+    ///   4. Build a [`VoteRecord`] using
+    ///      `Aggregator.config.collateral_amount` as the vote
+    ///      weight (every registered voter contributes equally;
+    ///      mirrors the on-chain `register` action's
+    ///      `registration_vote_weight += COLLATERAL_AMOUNT`).
+    /// VOTERS WITHOUT VOTES: silently skipped (their hint produces
+    /// no Voting Coin).
+    /// MULTI-VOTE: not supported — a voter can have at most one
+    /// Voting Coin per ballot per the on-chain SPT non-membership
+    /// proof in `mint_voting_coin.rue`. Subsequent edits go
+    /// through `update_vote`, which preserves the same coin
+    /// lineage; this function returns the latest state.
     pub async fn collect_votes_for_ballot(
         &self,
-        _ballot_launcher_id: Bytes32,
+        ballot_launcher_id: Bytes32,
     ) -> VotingResult<Vec<VoteRecord>> {
-        let _ = self.voter_set()?;
-        Err(VotingError::Other(anyhow_compat::Error(
-            "collect_votes_for_ballot is stubbed pending Phase 6 \
-             (Voting Coin lineage walker)"
-                .to_string()
-                .into(),
-        )))
+        let voter_set = self.voter_set()?.clone();
+        collect_votes_for_ballot_via_chain(
+            &self.config,
+            &self.chain,
+            ballot_launcher_id,
+            &voter_set,
+        )
+        .await
     }
+}
 
+/// FN: collect_votes_for_ballot_via_chain
+/// WHAT: free-function variant of
+///       [`Aggregator::collect_votes_for_ballot`]. Lets the
+///       [`crate::actors::Indexer`] re-use the same logic without
+///       holding an `Aggregator` instance.
+/// SEE: [`Aggregator::collect_votes_for_ballot`] for the full spec.
+pub async fn collect_votes_for_ballot_via_chain<C: ChainReader>(
+    config: &ElectionConfig,
+    chain: &C,
+    ballot_launcher_id: Bytes32,
+    voter_set: &VoterSet,
+) -> VotingResult<Vec<VoteRecord>> {
+    use clvm_traits::ToClvm;
+    use clvmr::{run_program, Allocator, ChiaDialect};
+
+    let cat_tail_hash = config
+        .cat_tail_hash()
+        .map_err(|e| anyhow_other(format!("cat_tail_hash: {e}")))?;
+    let election_id = config
+        .election_launcher_id()
+        .map_err(|e| anyhow_other(format!("election_launcher_id: {e}")))?;
+
+    let mut records = Vec::new();
+    for voter_pk in &voter_set.voters {
+        let hint = crate::puzzles::voting_coin_hint(
+            election_id,
+            cat_tail_hash,
+            voter_pk,
+            ballot_launcher_id,
+        );
+        let coin_records = chain.coin_records_by_hint(hint).await?;
+        // Take the LATEST unspent (after any update_vote chain).
+        let voting_record = match coin_records
+            .iter()
+            .filter(|r| r.is_unspent())
+            .max_by_key(|r| r.confirmed_height)
+        {
+            Some(r) => r,
+            None => continue,
+        };
+        let voting_coin = voting_record.coin;
+        let parent_id = voting_coin.parent_coin_info;
+
+        let (puzzle, solution) = match chain.puzzle_and_solution(parent_id).await? {
+            Some(s) => s,
+            None => {
+                tracing::debug!(
+                    voter = %hex::encode(voter_pk.to_bytes()),
+                    parent = %hex::encode(parent_id),
+                    "parent of voting coin has no puzzle_and_solution; skipping",
+                );
+                continue;
+            }
+        };
+
+        // Run the parent puzzle to extract the emitted CCAs +
+        // collect candidate atoms from the solution.
+        let mut allocator = Allocator::new();
+        let puzzle_node = puzzle
+            .to_clvm(&mut allocator)
+            .map_err(|e| anyhow_other(format!("puzzle to_clvm: {e}")))?;
+        let solution_node = solution
+            .to_clvm(&mut allocator)
+            .map_err(|e| anyhow_other(format!("solution to_clvm: {e}")))?;
+        let dialect = ChiaDialect::new(0);
+        let conds_root = match run_program(
+            &mut allocator,
+            &dialect,
+            puzzle_node,
+            solution_node,
+            11_000_000_000,
+        ) {
+            Ok(r) => r.1,
+            Err(e) => {
+                tracing::debug!(error = ?e, "running parent spend failed; skipping");
+                continue;
+            }
+        };
+
+        let mut cca_messages: Vec<[u8; 32]> = Vec::new();
+        let mut node = conds_root;
+        while let Some((cond, rest)) = allocator.next(node) {
+            node = rest;
+            let Some((opcode_node, args_node)) = allocator.next(cond) else {
+                continue;
+            };
+            let op = allocator.atom(opcode_node);
+            if op.as_ref() != [60] {
+                continue;
+            }
+            let Some((msg_node, _)) = allocator.next(args_node) else {
+                continue;
+            };
+            let m = allocator.atom(msg_node);
+            if m.as_ref().len() == 32 {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(m.as_ref());
+                cca_messages.push(buf);
+            }
+        }
+
+        // Walk the solution: collect 32-byte and 96-byte atoms.
+        let mut candidate_vote_datas: Vec<[u8; 32]> = Vec::new();
+        collect_bytes32_atoms(&allocator, solution_node, &mut candidate_vote_datas);
+        let mut candidate_sigs: Vec<[u8; 96]> = Vec::new();
+        collect_signature_atoms(&allocator, solution_node, &mut candidate_sigs);
+
+        let mut found: Option<([u8; 32], [u8; 96])> = None;
+        'outer: for &vd in &candidate_vote_datas {
+            for &sig in &candidate_sigs {
+                for &cca in &cca_messages {
+                    if vote_announcement_matches(
+                        b"vote_cast",
+                        ballot_launcher_id,
+                        voter_pk,
+                        &vd,
+                        &sig,
+                        &cca,
+                    ) || vote_announcement_matches(
+                        b"vote_updated",
+                        ballot_launcher_id,
+                        voter_pk,
+                        &vd,
+                        &sig,
+                        &cca,
+                    ) {
+                        found = Some((vd, sig));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        let (vote_data_arr, sig_arr) = match found {
+            Some(x) => x,
+            None => {
+                tracing::debug!(
+                    voter = %hex::encode(voter_pk.to_bytes()),
+                    "vote announcement not decoded — skipping",
+                );
+                continue;
+            }
+        };
+
+        // The Voting Coin's curried state contains
+        // `registration_coin_id`, but recovering it from the unspent
+        // coin's puzzle hash isn't possible without the reveal. We
+        // surface a sentinel — callers that need the exact value
+        // should resolve it via the registration SPT lookup (one
+        // Registration Coin per voter pubkey). For finalize we don't
+        // need it; for audit/replay it's available via the same hint
+        // walk's spent records.
+        let registration_coin_id = Bytes32::default();
+
+        records.push(VoteRecord {
+            voter_pubkey: *voter_pk,
+            vote_data: Bytes32::new(vote_data_arr),
+            vote_signature_hex: hex::encode(sig_arr),
+            registration_coin_id,
+            ballot_launcher_id,
+            voting_coin_id: voting_coin.coin_id(),
+        });
+    }
+    Ok(records)
+}
+
+impl<C: ChainReader> Aggregator<C> {
     /// FN: prepare_finalize_witness
     /// WHAT: collect every off-chain artefact the Groth16 prover and
     ///       the on-chain `finalize` action need, derived from the
@@ -1351,6 +1543,65 @@ fn collect_pubkey_candidates(
             collect_pubkey_candidates(allocator, tail, out);
         }
     }
+}
+
+/// FN: collect_signature_atoms (file-private)
+/// WHAT: walk a CLVM tree and collect every 96-byte atom (BLS G2
+///       signature size). Sibling to [`collect_bytes32_atoms`] /
+///       [`collect_pubkey_candidates`]; used by
+///       [`Aggregator::collect_votes_for_ballot`] when brute-forcing
+///       which `(vote_data, signature)` pair from an action's
+///       solution produces a given on-chain `vote_cast` /
+///       `vote_updated` announcement.
+fn collect_signature_atoms(
+    allocator: &clvmr::Allocator,
+    node: clvmr::NodePtr,
+    out: &mut Vec<[u8; 96]>,
+) {
+    use clvmr::SExp;
+    match allocator.sexp(node) {
+        SExp::Atom => {
+            let bytes = allocator.atom(node);
+            if bytes.as_ref().len() == 96 {
+                if let Ok(arr) = <[u8; 96]>::try_from(bytes.as_ref()) {
+                    if !out.contains(&arr) {
+                        out.push(arr);
+                    }
+                }
+            }
+        }
+        SExp::Pair(head, tail) => {
+            collect_signature_atoms(allocator, head, out);
+            collect_signature_atoms(allocator, tail, out);
+        }
+    }
+}
+
+/// FN: vote_announcement_matches (file-private)
+/// WHAT: compute `sha256(prefix || ballot_id || voter_pk ||
+///       vote_data || sig)` and compare to `expected`. Mirrors the
+///       on-chain `mint_voting_coin.rue` (`"vote_cast"`) and
+///       `voting_coin/update_vote.rue` (`"vote_updated"`) CCA
+///       preimages used by [`Aggregator::collect_votes_for_ballot`]
+///       to brute-force the `(vote_data, sig)` pair from candidate
+///       solution atoms.
+fn vote_announcement_matches(
+    prefix: &[u8],
+    ballot_launcher_id: Bytes32,
+    voter_pk: &chia_bls::PublicKey,
+    vote_data: &[u8; 32],
+    signature: &[u8; 96],
+    expected: &[u8; 32],
+) -> bool {
+    use sha2::{Digest as _, Sha256 as _Sha};
+    let mut h = _Sha::new();
+    h.update(prefix);
+    h.update(ballot_launcher_id.as_ref());
+    h.update(voter_pk.to_bytes());
+    h.update(vote_data);
+    h.update(signature);
+    let actual: [u8; 32] = h.finalize().into();
+    &actual == expected
 }
 
 /// FN: anyhow_other (file-private)
