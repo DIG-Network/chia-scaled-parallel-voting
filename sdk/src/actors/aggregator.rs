@@ -776,6 +776,7 @@ pub async fn sync_with_chain<C: ChainReader>(
             &mut voters,
             &mut state,
             &mut ballots,
+            config.collateral_amount,
         )?;
 
         // Find the child of this coin (the next singleton).
@@ -1005,6 +1006,7 @@ pub async fn find_current_singleton<C: ChainReader>(
             &mut voters,
             &mut state,
             &mut ballots,
+            config.collateral_amount,
         )?;
 
         let children = chain.coin_records_by_parent_ids(&[coin_id]).await?;
@@ -1149,6 +1151,7 @@ fn apply_singleton_spend(
     voters: &mut Vec<chia_bls::PublicKey>,
     state: &mut ElectionState,
     _ballots: &mut Vec<BallotCoinSnapshot>,
+    collateral_amount: u64,
 ) -> VotingResult<()> {
     use clvm_traits::ToClvm;
     use clvmr::{reduction::Reduction, run_program, Allocator, ChiaDialect};
@@ -1268,11 +1271,18 @@ fn apply_singleton_spend(
                 voters.push(pk);
                 state.registration_count = voters.len() as u64;
                 state.registration_merkle_root = smt.root();
-                // Each register adds collateral_amount to the total
-                // vote weight; we don't have config here, so we
-                // leave registration_vote_weight unchanged. Phase
-                // 4.5 (indexer) will reconcile this against the
-                // chain's CAT records.
+                // Mirror register.rue:
+                //   `registration_vote_weight: State.registration_vote_weight
+                //                              + COLLATERAL_AMOUNT`
+                // The on-chain Election Singleton's recreated coin
+                // commits to the new weight in its curried state, so
+                // any caller that wants to spend the post-register
+                // singleton (e.g. release_collateral) needs the same
+                // value here — otherwise the action layer's state
+                // hash diverges from the on-chain coin's puzzle hash
+                // and the singleton outer rejects the spend.
+                state.registration_vote_weight =
+                    state.registration_vote_weight.saturating_add(collateral_amount);
             }
         }
     }
