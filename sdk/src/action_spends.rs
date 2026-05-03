@@ -424,6 +424,45 @@ pub fn build_election_finalizer_full(
     Ok(full)
 }
 
+/// FN: build_ballot_finalizer_full
+/// WHAT: produce the FULLY-curried Ballot Coin finalizer puzzle
+///       reveal (1st curry binds `(ACTION_LAYER_MOD_HASH,
+///       HINT=ballot_launcher_id)`; 2nd curry binds the finalizer's
+///       own first-curry hash). Mirrors
+///       [`build_election_finalizer_full`] but loads the Ballot Coin
+///       finalizer hex and uses `ballot_launcher_id` for the HINT.
+/// USAGE: pass to `build_action_layer_puzzle` when assembling the eve
+///        Ballot Coin's inner action layer.
+pub fn build_ballot_finalizer_full(
+    ctx: &mut SpendContext,
+    ballot_launcher_id: Bytes32,
+) -> VotingResult<NodePtr> {
+    use crate::puzzles::{PuzzleHashes, BALLOT_COIN_FINALIZER_HEX};
+    let bytes = hex::decode(BALLOT_COIN_FINALIZER_HEX.trim().trim_start_matches("0x"))
+        .map_err(|e| voting_other(format!("decoding BALLOT_COIN_FINALIZER_HEX: {e}")))?;
+    let program = Program::from(bytes);
+    let program_node = program
+        .to_clvm(&mut **ctx)
+        .map_err(|e| voting_other(format!("loading ballot finalizer: {e}")))?;
+
+    let action_layer_mod = PuzzleHashes::action_layer();
+    let first_curry = CurriedProgram {
+        program: program_node,
+        args: clvm_curried_args!(action_layer_mod, ballot_launcher_id),
+    }
+    .to_clvm(&mut **ctx)
+    .map_err(|e| voting_other(format!("first-currying ballot finalizer: {e}")))?;
+
+    let first_curry_hash = Bytes32::new(tree_hash(ctx, first_curry).to_bytes());
+    let full = CurriedProgram {
+        program: first_curry,
+        args: clvm_curried_args!(first_curry_hash),
+    }
+    .to_clvm(&mut **ctx)
+    .map_err(|e| voting_other(format!("second-currying ballot finalizer: {e}")))?;
+    Ok(full)
+}
+
 /// FN: load_action_puzzle
 /// WHAT: load an embedded action puzzle's CLVM bytes into the
 ///       allocator, returning the NodePtr — used when an action

@@ -683,6 +683,52 @@ pub fn ballot_action_root_leaves() -> Vec<Bytes32> {
     leaves
 }
 
+/// FN: per_ballot_actions_merkle_root
+/// WHAT: 3-leaf Merkle root over a SPECIFIC Ballot Coin's
+///       fully-curried action puzzle hashes (`finalize`, `oracle`,
+///       `announce_finalization`). All three Ballot Coin actions
+///       carry per-ballot curry args (vote_close_height,
+///       outcome_domain_hash, BALLOT_LAUNCHER_ID, VK/IC, threshold,
+///       registration snapshot), so each Ballot Coin has its own
+///       merkle root. Caller pre-curries each action with its
+///       per-ballot args and supplies the resulting `*_full_hash`es.
+/// LEAF ORDER: sorted ascending by `hash_atom_b32(leaf)` — same
+///             ordering [`ballot_actions_merkle_root`] uses.
+pub fn per_ballot_actions_merkle_root(
+    finalize_full_hash: Bytes32,
+    oracle_full_hash: Bytes32,
+    announce_finalization_full_hash: Bytes32,
+) -> Bytes32 {
+    let mut leaves = [
+        hash_atom_b32(&finalize_full_hash),
+        hash_atom_b32(&oracle_full_hash),
+        hash_atom_b32(&announce_finalization_full_hash),
+    ];
+    leaves.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    let pair01 = hash_pair(leaves[0], leaves[1]);
+    hash_pair(pair01, leaves[2])
+}
+
+/// FN: per_ballot_action_root_leaves
+/// WHAT: leaf SET (sorted) for a per-ballot actions Merkle tree.
+///       Pass to `chia_sdk_types::MerkleTree::new(&leaves)` to
+///       construct a tree whose root matches
+///       [`per_ballot_actions_merkle_root`] and whose `.proof(leaf)`
+///       returns the proof selectors the action layer accepts.
+pub fn per_ballot_action_root_leaves(
+    finalize_full_hash: Bytes32,
+    oracle_full_hash: Bytes32,
+    announce_finalization_full_hash: Bytes32,
+) -> Vec<Bytes32> {
+    let mut leaves = vec![
+        finalize_full_hash,
+        oracle_full_hash,
+        announce_finalization_full_hash,
+    ];
+    leaves.sort_by(|a, b| hash_atom_b32(a).as_ref().cmp(hash_atom_b32(b).as_ref()));
+    leaves
+}
+
 /// FN: voting_coin_actions_merkle_root
 /// WHAT: 1-leaf Merkle root over the Voting Coin's allowed actions —
 ///       currently only `update_vote`. The per-ballot consume-side

@@ -33,11 +33,12 @@ use chia_protocol::{Bytes32, SpendBundle};
 use chia_sdk_driver::SpendContext;
 use clvm_traits::ToClvm;
 use clvm_utils::CurriedProgram;
+use clvmr::NodePtr;
 use dig_l1_wallet::NetworkType;
 
 use crate::action_spends::{
-    build_action_layer_puzzle, build_action_layer_solution, build_election_finalizer_full,
-    build_singleton_spend, load_action_puzzle, ActionSpend,
+    build_action_layer_puzzle, build_action_layer_solution, build_ballot_finalizer_full,
+    build_election_finalizer_full, build_singleton_spend, load_action_puzzle, ActionSpend,
 };
 use crate::actors::deployer::sign_bundle_signature;
 use crate::chain::ChainReader;
@@ -65,6 +66,61 @@ pub struct CreateBallotParams {
     pub ballot_seed: Bytes32,
     pub vote_close_height: u64,
     pub outcome_domain_hash: Bytes32,
+}
+
+/// STRUCT: LaunchBallotParams
+/// PURPOSE: typed bundle for [`BallotIssuer::launch_ballot`]
+///          arguments. Holds the per-ballot config that gets curried
+///          into the eve Ballot Coin's action puzzles (and
+///          consequently into its full singleton-wrapped puzzle hash).
+/// FIELDS:
+///   * `vote_close_height` — block height at which the ballot stops
+///     accepting vote edits. Curried into both the `finalize` action
+///     (as a time lock) and the `oracle` action (so co-spends can
+///     pin the canonical close height). Must match the
+///     `vote_close_height` carried by the original
+///     `BallotIssuer::create_ballot` announcement.
+///   * `outcome_domain_hash` — 32-byte commitment to the allowed
+///     outcome set. Currently informational at launch time
+///     (off-chain consumers correlate it via the create_ballot
+///     announcement); reserved here for forward compatibility with
+///     future on-chain enforcement.
+///   * `vote_threshold_num` / `vote_threshold_den` — numerator /
+///     denominator of the per-ballot quorum threshold. Curried into
+///     the `finalize` action so the on-chain threshold check binds
+///     to the values committed at launch. Note: not present in
+///     `ElectionConfig` today (threshold is per-ballot, not
+///     per-election), so the operator passes them at launch.
+#[derive(Clone, Debug)]
+pub struct LaunchBallotParams {
+    pub vote_close_height: u64,
+    pub outcome_domain_hash: Bytes32,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+}
+
+/// STRUCT: LaunchedBallot
+/// PURPOSE: outputs from [`BallotIssuer::launch_ballot`].
+/// FIELDS:
+///   * `ballot_launcher_id` — singleton launcher id (= the input
+///     `launcher_coin_id`). Echoed for caller convenience so they
+///     don't have to thread the value through.
+///   * `eve_ballot_coin_id` — coin id of the eve Ballot Coin
+///     singleton instantiated by the launcher second-spend. Useful
+///     for ledger-side tracking until the lineage advances.
+///   * `eve_ballot_puzzle_hash` — full singleton-wrapped puzzle hash
+///     of the eve Ballot Coin. The launcher second-spend mints a
+///     coin at exactly this puzzle hash; aggregator/indexer code
+///     can lookup this hash to find the eve Ballot Coin on chain.
+///   * `spend_bundle` — fully-signed bundle pushable to the mempool
+///     by the caller. Per the SDK's no-broadcast rule the issuer
+///     NEVER pushes the bundle itself.
+#[derive(Clone, Debug)]
+pub struct LaunchedBallot {
+    pub ballot_launcher_id: Bytes32,
+    pub eve_ballot_coin_id: Bytes32,
+    pub eve_ballot_puzzle_hash: Bytes32,
+    pub spend_bundle: SpendBundle,
 }
 
 /// STRUCT: CreatedBallot
@@ -359,6 +415,341 @@ impl BallotIssuer {
             spend_bundle,
         })
     }
+
+    /// FN: launch_ballot
+    /// WHAT: build the launcher SECOND-spend for a Ballot Coin —
+    ///       i.e., the spend that consumes the 2-mojo launcher eve
+    ///       coin minted by [`BallotIssuer::create_ballot`] and mints
+    ///       the actual eve Ballot Coin singleton at amount 1 (odd, so
+    ///       it satisfies the singleton outer's parity invariant).
+    /// FLOW:
+    ///   1. Look up the launcher coin on chain by its id (parent =
+    ///      Election Singleton at create_ballot time, ph =
+    ///      `SINGLETON_LAUNCHER_HASH`, amount = 2).
+    ///   2. Snapshot the current Election Singleton state so the
+    ///      ballot's `finalize` action can later enforce the
+    ///      registration-set the ballot was launched against.
+    ///   3. Curry each Ballot Coin action with its per-ballot args:
+    ///        * `finalize` ← (VK, IC, BALLOT_LAUNCHER_ID,
+    ///          ELECTION_LAUNCHER_ID, VOTE_CLOSE_HEIGHT,
+    ///          VOTE_THRESHOLD_NUM, VOTE_THRESHOLD_DEN,
+    ///          REGISTRATION_MERKLE_ROOT_SNAPSHOT,
+    ///          REGISTRATION_VOTE_WEIGHT_SNAPSHOT)
+    ///        * `oracle` ← (BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT)
+    ///        * `announce_finalization` ← (BALLOT_LAUNCHER_ID)
+    ///      and tree-hash each to produce the per-ballot leaf set.
+    ///   4. Compute the per-ballot ballot actions Merkle root.
+    ///   5. Build the Ballot finalizer (1st curry: ACTION_LAYER_MOD,
+    ///      HINT=ballot_launcher_id; 2nd curry: self-hash) and the
+    ///      action layer puzzle (FINALIZER, MERKLE_ROOT,
+    ///      `BallotState::fresh()`). Tree-hash → ballot inner ph.
+    ///   6. Compute the eve Ballot Coin's full singleton-wrapped
+    ///      puzzle hash via `SingletonArgs::curry_tree_hash(
+    ///      launcher_id=launcher_coin_id, inner_ph)`.
+    ///   7. Build the launcher CoinSpend with solution
+    ///      `(eve_full_ph, 1, ())`: the chia-puzzles 0.20.x launcher
+    ///      lacks `ASSERT_MY_AMOUNT`, so the caller chooses the eve
+    ///      singleton's amount independent of the launcher's 2-mojo
+    ///      input. Setting it to 1 keeps the eve singleton odd (the
+    ///      remaining 1 mojo becomes implicit fee).
+    ///   8. Sign + bundle. The launcher emits no AGG_SIG conditions,
+    ///      so the signature aggregates to the zero point.
+    ///
+    /// NETWORK FETCH: walks the on-chain singleton lineage to
+    /// snapshot `(registration_merkle_root, registration_vote_weight)`
+    /// at launch time. The snapshot becomes a curry arg of the
+    /// per-ballot `finalize` action, so changing the snapshot after
+    /// launch would change the eve Ballot Coin's puzzle hash — the
+    /// ballot is permanently bound to the registration state at the
+    /// instant `launch_ballot` reads it.
+    pub async fn launch_ballot<C: ChainReader>(
+        &self,
+        chain: &C,
+        launcher_coin_id: Bytes32,
+        params: LaunchBallotParams,
+    ) -> VotingResult<LaunchedBallot> {
+        use chia_protocol::{Coin, CoinSpend, Program};
+        use chia_puzzle_types::singleton::SingletonArgs;
+        use chia_puzzles::{SINGLETON_LAUNCHER, SINGLETON_LAUNCHER_HASH};
+        use clvm_traits::clvm_curried_args;
+        use clvm_utils::TreeHash;
+
+        let election_id = self.config.election_launcher_id().map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("election_launcher_id: {e}").into(),
+            ))
+        })?;
+
+        // ── 1. Look up the launcher coin ────────────────────────
+        let launcher_record = chain
+            .coin_record_by_id(launcher_coin_id)
+            .await?
+            .ok_or_else(|| {
+                VotingError::Other(anyhow_compat::Error(
+                    format!(
+                        "BallotIssuer::launch_ballot: launcher coin {} not found on chain",
+                        hex::encode(launcher_coin_id),
+                    )
+                    .into(),
+                ))
+            })?;
+        let launcher_coin = launcher_record.coin;
+        let launcher_ph = Bytes32::from(SINGLETON_LAUNCHER_HASH);
+        if launcher_coin.puzzle_hash != launcher_ph {
+            return Err(VotingError::Other(anyhow_compat::Error(
+                format!(
+                    "BallotIssuer::launch_ballot: launcher coin puzzle_hash mismatch \
+                     (got {}, expected SINGLETON_LAUNCHER_HASH {})",
+                    hex::encode(launcher_coin.puzzle_hash),
+                    hex::encode(launcher_ph),
+                )
+                .into(),
+            )));
+        }
+        if launcher_coin.amount != 2 {
+            return Err(VotingError::Other(anyhow_compat::Error(
+                format!(
+                    "BallotIssuer::launch_ballot: launcher coin amount must be 2 \
+                     (got {}); see create_ballot.rue's even-amount-launcher rule",
+                    launcher_coin.amount,
+                )
+                .into(),
+            )));
+        }
+
+        // ── 2. Snapshot current Election Singleton state ────────
+        // Walk the lineage to find the latest Election Singleton; the
+        // resulting (registration_merkle_root, registration_vote_weight)
+        // get curried into the per-ballot `finalize` action so the
+        // ballot is permanently bound to the registration state at
+        // launch time.
+        let election_start_height: u64 = 0;
+        let current = crate::actors::aggregator::wait_for_current_singleton(
+            chain,
+            &self.config,
+            election_start_height,
+            "Election Singleton (launch_ballot)",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(300),
+        )
+        .await?;
+        let registration_merkle_root_snapshot = current.state.registration_merkle_root;
+        let registration_vote_weight_snapshot = current.state.registration_vote_weight;
+
+        // ── 3. Per-ballot fully-curried action hashes ───────────
+        let mut ctx = SpendContext::new();
+
+        // VK + IC: derived from the deployment's verification key.
+        // These end up as opaque CLVM cons trees curried into the
+        // `finalize` action; the `finalize` puzzle never runs in
+        // launch_ballot (the eve Ballot Coin is just minted, not
+        // spent), but the curry must still be canonical so the
+        // predicted puzzle hash matches the eventual on-chain hash.
+        let (vk_node, ic_node) = build_vk_ic_nodes(&mut ctx, &self.config)?;
+
+        // finalize curry order MUST match the parameter order at the
+        // top of `puzzles/ballot_coin/finalize.rue`:
+        //   (VK, IC, BALLOT_LAUNCHER_ID, ELECTION_LAUNCHER_ID,
+        //    VOTE_CLOSE_HEIGHT, VOTE_THRESHOLD_NUM,
+        //    VOTE_THRESHOLD_DEN, REGISTRATION_MERKLE_ROOT_SNAPSHOT,
+        //    REGISTRATION_VOTE_WEIGHT_SNAPSHOT)
+        let finalize_program_node =
+            load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_FINALIZE_HEX)?;
+        let finalize_curried = CurriedProgram {
+            program: finalize_program_node,
+            args: clvm_curried_args!(
+                vk_node,
+                ic_node,
+                launcher_coin_id,
+                election_id,
+                params.vote_close_height,
+                params.vote_threshold_num,
+                params.vote_threshold_den,
+                registration_merkle_root_snapshot,
+                registration_vote_weight_snapshot,
+            ),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(driver_err)?;
+        let finalize_full_hash =
+            Bytes32::new(clvm_utils::tree_hash(&ctx, finalize_curried).to_bytes());
+
+        // oracle curry order (per `puzzles/ballot_coin/oracle.rue`):
+        //   (BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT)
+        let oracle_program_node = load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_ORACLE_HEX)?;
+        let oracle_curried = CurriedProgram {
+            program: oracle_program_node,
+            args: clvm_curried_args!(launcher_coin_id, params.vote_close_height),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(driver_err)?;
+        let oracle_full_hash = Bytes32::new(clvm_utils::tree_hash(&ctx, oracle_curried).to_bytes());
+
+        // announce_finalization curry order (per `announce_finalization.rue`):
+        //   (BALLOT_LAUNCHER_ID)
+        let announce_program_node =
+            load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX)?;
+        let announce_curried = CurriedProgram {
+            program: announce_program_node,
+            args: clvm_curried_args!(launcher_coin_id),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(driver_err)?;
+        let announce_full_hash =
+            Bytes32::new(clvm_utils::tree_hash(&ctx, announce_curried).to_bytes());
+
+        // ── 4. Per-ballot ballot_actions_merkle_root ────────────
+        let ballot_actions_root = puzzles::per_ballot_actions_merkle_root(
+            finalize_full_hash,
+            oracle_full_hash,
+            announce_full_hash,
+        );
+
+        // ── 5. Build the eve Ballot Coin's inner action layer ───
+        let ballot_finalizer_node = build_ballot_finalizer_full(&mut ctx, launcher_coin_id)?;
+
+        // BallotState::fresh() on the wire: 3 fields with `...` rest-arg
+        // on the last. Cons shape: (false . (zero . zero)) — i.e.,
+        // last cons's cdr IS `agg_signers` directly (no NIL terminator).
+        // Rust encoding mirrors that with `((), (vote_outcome, agg_signers))`.
+        let fresh_state_value: ((), (Bytes32, Bytes32)) =
+            ((), (Bytes32::default(), Bytes32::default()));
+        let initial_state_node = fresh_state_value
+            .to_clvm(&mut *ctx)
+            .map_err(driver_err)?;
+
+        let inner_node = build_action_layer_puzzle(
+            &mut ctx,
+            ballot_finalizer_node,
+            ballot_actions_root,
+            initial_state_node,
+        )?;
+        let inner_ph = Bytes32::new(clvm_utils::tree_hash(&ctx, inner_node).to_bytes());
+
+        // ── 6. Eve Ballot Coin's full singleton-wrapped PH ──────
+        let inner_th = TreeHash::new(inner_ph.to_bytes());
+        let singleton_full_th = SingletonArgs::curry_tree_hash(launcher_coin_id, inner_th);
+        let eve_ballot_puzzle_hash = Bytes32::new(singleton_full_th.to_bytes());
+
+        // ── 7. Launcher second-spend ─────────────────────────────
+        // Standard chia singleton launcher (chia-puzzles 0.20.x) has
+        // NO ASSERT_MY_AMOUNT, so the launcher's solution `amount`
+        // is independent of the launcher coin's actual mojos. We
+        // mint the eve Ballot Coin at amount 1 (odd, so the singleton
+        // outer's parity check passes when later spent); the
+        // remaining 1 mojo from the 2-mojo launcher coin becomes
+        // implicit fee.
+        const EVE_BALLOT_AMOUNT: u64 = 1;
+        // Launcher solution shape (per chia-puzzles
+        // `singleton_launcher.clsp`): `(singleton_full_puzzle_hash
+        // amount key_value_list)` — a 3-element proper list. We use
+        // `chia_puzzle_types::singleton::LauncherSolution`'s
+        // `#[clvm(list)]` derive to produce the canonical
+        // nil-terminated CLVM list shape (the launcher's `mod`
+        // expects exactly that).
+        use chia_puzzle_types::singleton::LauncherSolution;
+        let launcher_solution = LauncherSolution {
+            singleton_puzzle_hash: eve_ballot_puzzle_hash,
+            amount: EVE_BALLOT_AMOUNT,
+            key_value_list: (),
+        };
+        let launcher_solution_node = launcher_solution
+            .to_clvm(&mut *ctx)
+            .map_err(driver_err)?;
+
+        let launcher_program = Program::from(SINGLETON_LAUNCHER.to_vec());
+
+        let launcher_solution_bytes =
+            clvmr::serde::node_to_bytes(&ctx, launcher_solution_node).map_err(|e| {
+                VotingError::Other(anyhow_compat::Error(
+                    format!("serializing launcher solution: {e}").into(),
+                ))
+            })?;
+        let launcher_spend = CoinSpend::new(
+            launcher_coin,
+            launcher_program,
+            Program::from(launcher_solution_bytes),
+        );
+
+        // ── 8. Eve Ballot Coin's coin id ─────────────────────────
+        let eve_ballot_coin = Coin::new(launcher_coin_id, eve_ballot_puzzle_hash, EVE_BALLOT_AMOUNT);
+        let eve_ballot_coin_id = eve_ballot_coin.coin_id();
+
+        // ── 9. Sign + bundle ─────────────────────────────────────
+        // Standard launcher emits no AGG_SIG; signature aggregates to
+        // the zero element when `secret_keys` is empty.
+        let coin_spends = vec![launcher_spend];
+        if let Err(e) = crate::dry_run_coin_spends(&coin_spends) {
+            return Err(VotingError::Other(anyhow_compat::Error(
+                format!("BallotIssuer::launch_ballot dry-run: {e:?}").into(),
+            )));
+        }
+        let signature = sign_bundle_signature(&coin_spends, &[], self.network)?;
+        let spend_bundle = SpendBundle::new(coin_spends, signature);
+
+        Ok(LaunchedBallot {
+            ballot_launcher_id: launcher_coin_id,
+            eve_ballot_coin_id,
+            eve_ballot_puzzle_hash,
+            spend_bundle,
+        })
+    }
+}
+
+/// FN: build_vk_ic_nodes (file-private)
+/// WHAT: parse the deployment's `verification_key_hex` (672 bytes)
+///       into the on-chain `VK` + `IC` cons trees expected by
+///       `puzzles/ballot_coin/finalize.rue`.
+/// LAYOUT:
+///   * VK (336 bytes): alpha (PublicKey, 48) + beta (Signature, 96)
+///     + gamma (Signature, 96) + delta (Signature, 96).
+///     Encoded as a 4-field struct WITHOUT `...` → cons shape
+///     `(alpha . (beta . (gamma . (delta . ()))))`.
+///   * IC (336 bytes): 7 G1 points × 48 bytes each (`PUBLIC_INPUT_COUNT
+///     + 1 = 7`). Encoded as a 7-field struct WITHOUT `...` → cons
+///     shape `(ic0 . (ic1 . ... (ic6 . ())))`.
+/// MIRROR: the rest-arg-less Rue struct encoding is what
+///         `clvm_traits` produces for nil-terminated nested tuples /
+///         `Vec`. We use `Vec<Bytes>::to_clvm` for both the VK list
+///         (4 entries) and the IC list (7 entries).
+fn build_vk_ic_nodes(
+    ctx: &mut SpendContext,
+    config: &ElectionConfig,
+) -> VotingResult<(NodePtr, NodePtr)> {
+    use chia_protocol::Bytes;
+
+    let vk_bytes = hex::decode(config.verification_key_hex.trim()).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("decoding verification_key_hex: {e}").into(),
+        ))
+    })?;
+    let expected = 336 + 7 * 48;
+    if vk_bytes.len() != expected {
+        return Err(VotingError::Other(anyhow_compat::Error(
+            format!(
+                "verification_key has {} bytes; expected {} (336 base + 7 IC * 48)",
+                vk_bytes.len(),
+                expected,
+            )
+            .into(),
+        )));
+    }
+
+    let alpha = Bytes::new(vk_bytes[0..48].to_vec());
+    let beta = Bytes::new(vk_bytes[48..144].to_vec());
+    let gamma = Bytes::new(vk_bytes[144..240].to_vec());
+    let delta = Bytes::new(vk_bytes[240..336].to_vec());
+    let vk_fields: Vec<Bytes> = vec![alpha, beta, gamma, delta];
+    let vk_node = vk_fields.to_clvm(&mut **ctx).map_err(driver_err)?;
+
+    let mut ic_fields: Vec<Bytes> = Vec::with_capacity(7);
+    for i in 0..7 {
+        let start = 336 + i * 48;
+        ic_fields.push(Bytes::new(vk_bytes[start..start + 48].to_vec()));
+    }
+    let ic_node = ic_fields.to_clvm(&mut **ctx).map_err(driver_err)?;
+
+    Ok((vk_node, ic_node))
 }
 
 /// Build the `ElectionState` CLVM node — must match the
