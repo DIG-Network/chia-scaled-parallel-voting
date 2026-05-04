@@ -550,7 +550,6 @@ impl Voter {
     ) -> VotingResult<CastVoteResult> {
         use chia_protocol::{Bytes, Coin};
         use chia_puzzle_types::singleton::SingletonArgs;
-        use chia_puzzle_types::{EveProof, Proof};
         use clvm_traits::{clvm_curried_args, ToClvm};
         use clvm_utils::{tree_hash, CurriedProgram, TreeHash};
 
@@ -585,7 +584,11 @@ impl Voter {
         let registration_coin_id = registration_coin.coin_id();
         let cat_lineage_proof = self.reconstruct_cat_lineage(chain, registration_coin).await?;
 
-        // ── 2. Locate the eve Ballot Coin singleton ──────────────
+        // ── 2. Verify the ballot launcher exists and is spent ─────
+        // (launch_ballot must have run; the singleton lineage walk
+        // below resolves the CURRENT unspent Ballot Coin tip — which
+        // may be past the eve after prior cast_vote / update_vote
+        // oracle co-spends from other voters.)
         let launcher_record = chain
             .coin_record_by_id(params.ballot_launcher_id)
             .await?
@@ -602,26 +605,7 @@ impl Voter {
                 hex::encode(params.ballot_launcher_id),
             )));
         }
-        let launcher_coin = launcher_record.coin;
-        let ballot_singleton_lineage_proof = Proof::Eve(EveProof {
-            parent_parent_coin_info: launcher_coin.parent_coin_info,
-            parent_amount: launcher_coin.amount,
-        });
-
-        let ballot_children = chain
-            .coin_records_by_parent_ids(&[params.ballot_launcher_id])
-            .await?;
-        let ballot_singleton_record = ballot_children
-            .into_iter()
-            .find(|r| r.coin.amount % 2 == 1 && r.is_unspent())
-            .ok_or_else(|| {
-                voting_other(
-                    "Voter::cast_vote: no unspent eve Ballot Coin singleton found \
-                     (post-launch); ensure launch_ballot's bundle was submitted",
-                )
-            })?;
-        let ballot_coin = ballot_singleton_record.coin;
-        let ballot_coin_id = ballot_coin.coin_id();
+        let _ = launcher_record; // launcher visited; helper below walks the lineage
 
         // ── 3. Reconstruct per-ballot Ballot Coin curry layout ───
         let mut ctx = SpendContext::new();
@@ -706,6 +690,22 @@ impl Voter {
         let predicted_ballot_full_ph = Bytes32::new(
             SingletonArgs::curry_tree_hash(params.ballot_launcher_id, ballot_inner_th).to_bytes(),
         );
+
+        // Walk the Ballot Coin singleton lineage from launcher to its
+        // CURRENT unspent tip. Pre-finalize, every recreated Ballot
+        // Coin shares `ballot_inner_ph` (BallotState.finalized=false
+        // is invariant across oracle / update_vote co-spends), so the
+        // walker uses that as `expected_inner_ph`. After other voters'
+        // cast_vote / update_vote have already co-spent the eve, this
+        // hops past the eve to the latest recreation. Mirrors
+        // `Aggregator::find_current_ballot_singleton_via_chain`.
+        let (ballot_coin, ballot_singleton_lineage_proof) = find_current_ballot_singleton(
+            chain,
+            params.ballot_launcher_id,
+            ballot_inner_ph,
+        )
+        .await?;
+        let ballot_coin_id = ballot_coin.coin_id();
         if ballot_coin.puzzle_hash != predicted_ballot_full_ph {
             return Err(voting_other(format!(
                 "Voter::cast_vote: Ballot Coin on-chain ph {} doesn't match predicted {} \
