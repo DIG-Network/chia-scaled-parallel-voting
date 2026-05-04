@@ -1881,6 +1881,48 @@ fn apply_singleton_spend(
     // stale snapshot — never a forged one.
     let _ = candidate_outcomes;
 
+    // ── Deregister detection ─────────────────────────────────────
+    //
+    // Per `puzzles/election/deregister.rue`, a deregister spend emits
+    // exactly one CreateCoinAnnouncement whose 32-byte message is
+    // `deregister_announcement_msg(pk) = sha256("deregister" || pk)`
+    // (mirrored in `puzzles::deregister_announcement_msg`). Because
+    // the message preimage is `pk`-only (no merkle root or count
+    // mixed in), we CAN reverse it given the candidate pubkeys
+    // recovered from the solution. For each candidate pk in the
+    // solution, hash `"deregister" || pk` and check whether it
+    // appears among the spend's CCA messages — if so this is a
+    // deregister spend, and we mirror the on-chain SPT update by
+    // wiping that voter's leaf.
+    //
+    // NOTE: deregister discrimination MUST run BEFORE the register
+    // fallback, because the latter is intentionally permissive (any
+    // CCA counts as a register hint).
+    for pk in &candidate_pubkeys {
+        let msg = crate::puzzles::deregister_announcement_msg(pk);
+        if cca_messages.iter().any(|m| m == msg.as_ref()) {
+            // Found a deregister CCA. Wipe the SMT leaf, drop the
+            // voter from the bookkeeping vector, and decrement
+            // count/weight to mirror `deregister.rue`'s state
+            // transition:
+            //   `registration_count -= 1`
+            //   `registration_vote_weight -= COLLATERAL_AMOUNT`
+            //   `registration_merkle_root = <SPT with leaf wiped>`
+            // Idempotent against repeated syncs because `remove`
+            // returns false when the pk isn't currently in the SPT.
+            let removed = smt.remove(pk);
+            if removed {
+                voters.retain(|v| v != pk);
+                state.registration_count = voters.len() as u64;
+                state.registration_merkle_root = smt.root();
+                state.registration_vote_weight = state
+                    .registration_vote_weight
+                    .saturating_sub(collateral_amount);
+            }
+            return Ok(());
+        }
+    }
+
     // ── Register fallback ────────────────────────────────────────
     if registered_count > 0 {
         if let Some(pk) = candidate_pubkeys.into_iter().next() {

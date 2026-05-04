@@ -143,6 +143,30 @@ impl SparseMerkleTree {
         Ok(())
     }
 
+    /// FN: remove
+    /// WHAT: wipe a voter's leaf back to `EMPTY_LEAF_HASH` —
+    ///       mirrors `puzzles/election/deregister.rue`'s SPT
+    ///       transition (`active_leaf` → empty leaf at the same
+    ///       slot).
+    /// IDEMPOTENT: removing a non-registered (or wrong-pubkey)
+    ///             pubkey is a no-op so callers walking
+    ///             apply_singleton_spend re-application can be safe
+    ///             across repeated syncs.
+    /// USAGE: `Aggregator::sync` calls this when it detects a
+    ///        `deregister` CreateCoinAnnouncement on the Election
+    ///        Singleton (per `deregister_announcement_msg`).
+    pub fn remove(&mut self, pubkey: &PublicKey) -> bool {
+        let slot = Self::slot_for_pubkey(pubkey);
+        let pk_bytes = pubkey.to_bytes();
+        match self.leaves.get(&slot) {
+            Some(stored) if stored == &pk_bytes => {
+                self.leaves.remove(&slot);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// FN: contains
     /// WHAT: true iff a voter pubkey is registered (occupies its
     ///       canonical slot).
