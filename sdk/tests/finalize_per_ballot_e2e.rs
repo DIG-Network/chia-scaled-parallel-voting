@@ -37,31 +37,19 @@ use clvm_utils::tree_hash;
 
 /// Tier 3.2 finalize e2e — covers deploy+register+create_ballot+
 /// launch_ballot+cast_vote+advance-height+build_finalize_for_ballot
-/// against the simulator. The build itself succeeds — the
-/// `prepare_finalize_witness_with_threshold` BLS aggregation +
-/// Groth16 prover pipeline produces a valid proof, the SDK assembles
-/// a structurally well-formed bundle, and the singleton outer +
-/// per-ballot merkle root reconstruction match the on-chain coin's
-/// puzzle hash.
+/// against the simulator, and the dry-run + simulator submit both
+/// accept the assembled bundle. The post-finalize check confirms the
+/// eve Ballot Coin singleton was consumed and a recreated singleton
+/// at a new puzzle hash (state.finalized = true) is present.
 ///
-/// REMAINING ON-CHAIN DEBUG: the dry-run check raises a CLVM
-/// exception during finalize.rue execution. Likely candidates (no
-/// triage yet):
-///   * Scalars canonical-encoding mismatch — finalize.rue's
-///     `(... mod r) as Bytes` produces a canonical Int (leading
-///     zeros stripped) while the SDK's `Bytes32` encoding is full
-///     32-byte BE. For values with leading zeros this would not
-///     compare-equal.
-///   * `agg_signers` curried-snapshot mismatch — the s3 scalar
-///     binds the curried snapshot, not just whatever G1 we sum.
-///   * Per-signer signature verification — the AGGREGATE BLS
-///     signature in the solution must verify against `agg_signers`
-///     and `vote_message`; small encoding drifts kill this.
-///
-/// Marking ignored until that on-chain debug lands — the SDK
-/// integration surface is complete and the off-chain prover path
-/// is exercised by the unit tests in `prover/circuit.rs`.
-#[ignore = "Tier 3.2 on-chain finalize CLVM-raise debug pending — see test header"]
+/// FIX HISTORY: an earlier rev of `Scalars::compute` consumed
+/// `voter_set.registration_count` instead of the curried
+/// `REGISTRATION_VOTE_WEIGHT_SNAPSHOT`. With unit-weight voters the
+/// two values coincide; once collateral_amount > 1 the s2 scalar
+/// no longer matched what the puzzle reconstructs from the snapshot,
+/// so the on-chain assertion would CLVM-raise. Resolved by threading
+/// `registration_vote_weight_snapshot` through
+/// `prepare_finalize_witness_with_threshold`.
 #[tokio::test(flavor = "current_thread")]
 async fn finalize_per_ballot_full_simulator_flow() {
     let vote_close_height: u64 = 5;

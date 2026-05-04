@@ -474,12 +474,19 @@ impl<C: ChainReader> Aggregator<C> {
         ballot_launcher_id: Bytes32,
         votes: &[VoteRecord],
     ) -> VotingResult<FinalizeWitness> {
+        // Legacy variant: no per-ballot threshold and no
+        // `registration_vote_weight_snapshot` available. Falls back
+        // to `voter_set.registration_count` for s2 — useful only for
+        // skeleton tests where snapshot weight == count (unit-weight
+        // voters).
+        let voter_set_weight = self.voter_set()?.registration_count;
         self.prepare_finalize_witness_with_threshold(
             vote_outcome,
             ballot_launcher_id,
             votes,
             0,
             0,
+            voter_set_weight,
         )
     }
 
@@ -498,6 +505,7 @@ impl<C: ChainReader> Aggregator<C> {
         votes: &[VoteRecord],
         vote_threshold_num: u64,
         vote_threshold_den: u64,
+        registration_vote_weight_snapshot: u64,
     ) -> VotingResult<FinalizeWitness> {
         let voter_set = self.voter_set()?;
         let smt = self.merkle_tree()?;
@@ -618,7 +626,7 @@ impl<C: ChainReader> Aggregator<C> {
         // useful for off-chain skeleton tests).
         let scalars = Scalars::compute(
             voter_set.registration_merkle_root,
-            voter_set.registration_count,
+            registration_vote_weight_snapshot,
             &agg_signers,
             vote_message,
             vote_threshold_num,
@@ -696,6 +704,7 @@ impl<C: ChainReader> Aggregator<C> {
             params.votes,
             params.vote_threshold_num,
             params.vote_threshold_den,
+            params.registration_vote_weight_snapshot,
         )?;
 
         // Build the circuit + prove.
@@ -751,6 +760,7 @@ impl<C: ChainReader> Aggregator<C> {
             params.votes,
             params.vote_threshold_num,
             params.vote_threshold_den,
+            params.registration_vote_weight_snapshot,
         )?;
         self.build_finalize_with_proof_for_ballot_inner(&params, witness, proof)
             .await
@@ -910,9 +920,31 @@ impl<C: ChainReader> Aggregator<C> {
 
         let s = &witness.scalars;
         // Scalars: (s1 . (s2 . (s3 . (s4 . (s5 . (s6 . ()))))))
+        //
+        // CLVM Int → Bytes canonical encoding strips leading zero
+        // bytes. The on-chain finalize.rue assertion
+        //   `((zero_pad + sha256(input_i)) as Int % r) as Bytes
+        //    == scalars.s_i as Bytes`
+        // canonicalises the LHS, so the RHS (the Scalars values we
+        // pass in the solution) MUST also be in canonical form to
+        // compare-equal. Bls12-381 Fr is always < 2^254, so the
+        // leading non-zero byte never has its high bit set →
+        // canonical = shortest-BE with no leading zeros.
         let scalars_value = (
-            s.s1,
-            (s.s2, (s.s3, (s.s4, (s.s5, (s.s6, ()))))),
+            canonical_int_bytes32(&s.s1),
+            (
+                canonical_int_bytes32(&s.s2),
+                (
+                    canonical_int_bytes32(&s.s3),
+                    (
+                        canonical_int_bytes32(&s.s4),
+                        (
+                            canonical_int_bytes32(&s.s5),
+                            (canonical_int_bytes32(&s.s6), ()),
+                        ),
+                    ),
+                ),
+            ),
         );
 
         // Top-level finalize solution:
@@ -958,6 +990,46 @@ impl<C: ChainReader> Aggregator<C> {
         // ── 4. Sign + bundle ──────────────────────────────────
         let coin_spends = vec![ballot_singleton_spend];
         if let Err(e) = crate::dry_run_coin_spends(&coin_spends) {
+            if let Ok(dir) = std::env::var("CHIP_VOTING_DUMP_DIR") {
+                let path = std::path::Path::new(&dir).join(format!(
+                    "build-finalize-failed-{}.json",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                ));
+                let json = serde_json::to_string_pretty(&serde_json::json!({
+                    "error": format!("{e:?}"),
+                    "vote_outcome": format!("0x{}", hex::encode(params.vote_outcome)),
+                    "ballot_launcher_id": format!("0x{}", hex::encode(params.ballot_launcher_id)),
+                    "vote_close_height": params.vote_close_height,
+                    "vote_threshold_num": params.vote_threshold_num,
+                    "vote_threshold_den": params.vote_threshold_den,
+                    "registration_merkle_root_snapshot": format!("0x{}", hex::encode(params.registration_merkle_root_snapshot)),
+                    "registration_vote_weight_snapshot": params.registration_vote_weight_snapshot,
+                    "scalars": {
+                        "s1": format!("0x{}", hex::encode(witness.scalars.s1)),
+                        "s2": format!("0x{}", hex::encode(witness.scalars.s2)),
+                        "s3": format!("0x{}", hex::encode(witness.scalars.s3)),
+                        "s4": format!("0x{}", hex::encode(witness.scalars.s4)),
+                        "s5": format!("0x{}", hex::encode(witness.scalars.s5)),
+                        "s6": format!("0x{}", hex::encode(witness.scalars.s6)),
+                    },
+                    "agg_signers": format!("0x{}", hex::encode(witness.agg_signers.to_bytes())),
+                    "agg_sig": format!("0x{}", hex::encode(witness.agg_signature.to_bytes())),
+                    "coin_spends": coin_spends.iter().map(|cs| serde_json::json!({
+                        "coin": {
+                            "parent_coin_info": format!("0x{}", hex::encode(cs.coin.parent_coin_info)),
+                            "puzzle_hash": format!("0x{}", hex::encode(cs.coin.puzzle_hash)),
+                            "amount": cs.coin.amount,
+                        },
+                        "puzzle_reveal_hex": format!("0x{}", hex::encode(cs.puzzle_reveal.as_ref())),
+                        "solution_hex": format!("0x{}", hex::encode(cs.solution.as_ref())),
+                    })).collect::<Vec<_>>(),
+                })).unwrap_or_else(|_| "<json serialise failed>".into());
+                let _ = std::fs::write(&path, json);
+                tracing::warn!(dump_path = %path.display(), "wrote failing bundle to disk");
+            }
             return Err(anyhow_other(format!(
                 "build_finalize_for_ballot dry-run: {e:?}"
             )));
@@ -1935,6 +2007,28 @@ pub async fn find_current_ballot_singleton_via_chain<C: ChainReader>(
         });
         current = next;
     }
+}
+
+/// FN: canonical_int_bytes32 (file-private)
+/// WHAT: convert a `Bytes32` (interpreted as a non-negative big-endian
+///       integer) to its canonical CLVM Int encoding — the shortest
+///       big-endian representation, with no leading zero bytes.
+/// USAGE: encoding the Groth16 `Scalars` for the on-chain
+///        `finalize.rue` solution. The puzzle compares
+///        `((value as Int) % r) as Bytes == scalars.s_i as Bytes`;
+///        the LHS is the canonical encoding, so the RHS we pass
+///        must also be canonical or the equality fails for any
+///        scalar with leading-zero bytes.
+/// HIGH-BIT NOTE: BLS12-381 Fr is always `< r < 2^254`, so the
+///       canonical leading byte is at most `0x73`. The high bit is
+///       never set, so no leading-`0x00` sign pad is needed.
+fn canonical_int_bytes32(b: &Bytes32) -> chia_protocol::Bytes {
+    let raw: &[u8] = b.as_ref();
+    let mut start = 0;
+    while start < raw.len() && raw[start] == 0 {
+        start += 1;
+    }
+    chia_protocol::Bytes::new(raw[start..].to_vec())
 }
 
 /// FN: collect_signature_atoms (file-private)
