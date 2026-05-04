@@ -513,6 +513,23 @@ fn chip_registration_state_has_no_has_voted_or_vote_data() {
 /// in `sdk/tests/voter_cast_vote_e2e.rs::voter_cast_vote_against_simulator_full_flow`,
 /// which builds the membership witness through the SDK's `compute_ballot_root`
 /// helper that mirrors the on-chain puzzle byte-exact (puzzles.rs:481-1525).
+///
+/// CLVM-EXECUTING NEGATIVE COVERAGE — STATUS: deferred.
+///
+/// Target: a behavioral simulator rejection where a voter casts vote
+/// V1 for ballot B1, then attempts a SECOND `cast_vote` reusing the
+/// same registration coin lineage tip — and the simulator REJECTS
+/// because the per-registration ballot SPT now contains B1 (so the
+/// non-membership proof for B1 fails). Wiring this requires either
+/// (a) hand-crafting the second `mint_voting_coin` spend with a stale-
+/// but-validly-witnessed SPT (the SDK's high-level `Voter::cast_vote`
+/// driver re-derives the witness from chain state and would itself
+/// refuse to build a doomed bundle), or (b) extending the e2e harness
+/// in `voter_cast_vote_e2e.rs` (~250 LOC) with a manual second-spend
+/// path. Both are sizable and out of scope for this CLVM-hardening
+/// pass; the structural mathematical contract above plus the green-
+/// path simulator coverage cited above are sufficient to keep this
+/// row aligned per the matrix's "linkage citation" convention.
 #[test]
 fn chip_single_vote_per_ballot_nonmembership_required() {
     use chip_voting_sdk::puzzles::{
@@ -2375,6 +2392,436 @@ fn chip_ballot_announce_finalization_role_idempotent_and_finalized_only() {
         signers_post,
     );
     assert_ne!(msg_first, msg_other_ballot);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// BALLOT-ANNOUNCE-ROLE — CLVM-EXECUTING TESTS (CHIP.md §235)
+// ────────────────────────────────────────────────────────────────────
+//
+// The three tests below escalate `BALLOT-ANNOUNCE-ROLE` coverage
+// from purely structural (SDK helper-equality on
+// `ballot_finalization_msg`) to actual on-chain CLVM execution of
+// the curried `announce_finalization.rue` action puzzle in the
+// simulator. They isolate the action puzzle from the surrounding
+// action-layer/singleton wrappers so we can test the role contract
+// directly:
+//
+//   1. POSITIVE: with a finalized BallotState, the puzzle runs
+//      cleanly and emits exactly one CreateCoinAnnouncement whose
+//      message equals `ballot_finalization_msg(launcher, outcome,
+//      signers)`. Verified by pairing an announcer-asserter coin
+//      that asserts the exact announcement and observing the
+//      simulator accepts the bundle.
+//
+//   2. NEGATIVE (finalized-only): with a NOT-finalized BallotState
+//      (`finalized=false`), the puzzle's `assert State.finalized
+//      == true` traps and the simulator REJECTS the bundle. This is
+//      the on-chain enforcement of "after finalize has run".
+//
+//   3. NEGATIVE (message binding): mutating any of the three
+//      message-deriving inputs (BALLOT_LAUNCHER_ID curry,
+//      vote_outcome, agg_signers) causes the paired
+//      AssertCoinAnnouncement to fail because the emitted message
+//      no longer matches the asserted one. This pins that the
+//      on-chain announcement is *bound* to the finalized state +
+//      curried launcher id, not just any constant.
+//
+// Together these prove BALLOT-ANNOUNCE-ROLE in CLVM execution: the
+// action ONLY emits when finalized, emits the SPEC message, and
+// does so PERMISSIONLESSLY (no signature, no extra solution
+// params).
+//
+// HARNESS DESIGN — why we use the single-arg adapter directly
+// instead of a full singleton + action-layer simulator harness:
+//
+//   - The `announce_finalization` action takes only `Truth` (no
+//     extra solution params). The single-arg adapter
+//     `(r (a 2 (c 5 ())))` (see `common::build_action_wrapper_node`)
+//     wraps the curried action so a coin's puzzle hash IS the
+//     wrapped+curried action and the coin's solution is the
+//     `BallotStateTruth`.
+//
+//   - Stand-alone runs of the action puzzle are sufficient to pin
+//     the role contract (assert + announcement) because (a) the
+//     curry shape is already pinned by
+//     `chip_ballot_announce_finalization_curry_shape_is_single_arg`,
+//     (b) the action-layer dispatch and per-ballot merkle root are
+//     pinned by `chip_ballot_actions_curry_shape_and_merkle_root`,
+//     and (c) `finalize_per_ballot_e2e.rs` covers the singleton-
+//     wrapped finalize path end-to-end. What was MISSING before
+//     these tests was direct CLVM execution proof that the
+//     `announce_finalization` action's body itself behaves per
+//     spec — these tests close that gap.
+
+/// Build the BallotStateTruth wire shape that
+/// `announce_finalization.rue` expects as its solution.
+///
+/// SHAPE per `puzzles/ballot_coin/shared.rue`:
+///
+///   BallotState        = (finalized . (vote_outcome . agg_signers))
+///   BallotStateTruth   = (Ephemeral_State . BallotState)
+///
+/// Both `...agg_signers` and `...State` are Rue rest-arg fields, so
+/// the trailing field is the cdr (no nil terminator). The Rust
+/// representation that produces the exact same cons tree is:
+///
+///   ((), (finalized, (vote_outcome, agg_signers)))
+///
+/// where the trailing unit `()` is *not* present (because the rest
+/// arg replaces it). Mirrors `ballot.rs:614` and
+/// `aggregator.rs:856` which build the same shape on-chain.
+fn build_ballot_state_truth_value(
+    finalized: bool,
+    vote_outcome: Bytes32,
+    agg_signers: Bytes32,
+) -> ((), (u8, (Bytes32, Bytes32))) {
+    ((), (finalized as u8, (vote_outcome, agg_signers)))
+}
+
+/// Build an announcer puzzle that ALWAYS emits exactly one
+/// AssertCoinAnnouncement condition with `expected_announcement_id`,
+/// where `expected_announcement_id = sha256(announcer_coin_id || msg)`.
+///
+/// CLVM source: `(q . ((61 <expected_announcement_id>)))` — opcode 61
+/// is ASSERT_COIN_ANNOUNCEMENT. Quote (opcode 1) returns its cdr
+/// literally, ignoring the solution.
+///
+/// Used to pair-spend with the announce_finalization coin: if the
+/// announce_finalization puzzle emits an announcement whose
+/// `sha256(announce_coin_id || msg)` matches what this asserter
+/// asserts, the bundle passes; otherwise consensus rejects.
+fn build_announcement_asserter(
+    allocator: &mut Allocator,
+    expected_announcement_id: Bytes32,
+) -> NodePtr {
+    type Condition61 = (u8, (Bytes32, ()));
+    type ConditionsList = (Condition61, ());
+    type QuotedPuzzle = (u8, ConditionsList);
+    let condition: Condition61 = (61u8, (expected_announcement_id, ()));
+    let conditions_list: ConditionsList = (condition, ());
+    let puzzle: QuotedPuzzle = (1u8, conditions_list);
+    puzzle.to_clvm(allocator).unwrap()
+}
+
+/// Build the curried+wrapped `announce_finalization` puzzle node.
+///
+/// Steps (mirrors the on-chain flow in
+/// `aggregator.rs::build_finalize_with_proof_for_ballot_inner`):
+///   1. Decode `announce_finalization.rue.hex`.
+///   2. Curry with `BALLOT_LAUNCHER_ID`.
+///   3. Wrap in the single-arg adapter `(r (a 2 (c 5 ())))` so the
+///      coin's solution is just `(Truth,)`.
+fn build_announce_finalization_puzzle_node(
+    allocator: &mut Allocator,
+    ballot_launcher_id: Bytes32,
+) -> NodePtr {
+    use chip_voting_sdk::puzzles::BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX;
+
+    let action_bytes =
+        hex::decode(BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX.trim().trim_start_matches("0x"))
+            .expect("decode announce_finalization.rue.hex");
+    let action_program = Program::from(action_bytes);
+    let action_node = action_program.to_clvm(allocator).unwrap();
+    let curried_action = CurriedProgram {
+        program: action_node,
+        args: clvm_curried_args!(ballot_launcher_id),
+    }
+    .to_clvm(allocator)
+    .unwrap();
+
+    // Single-arg adapter: (r (a 2 (c 5 ())))
+    let bytecode = hex::decode("ff06ffff02ff02ffff04ff05ff80808080").unwrap();
+    let wrapper_program = Program::from(bytecode);
+    let wrapper_node = wrapper_program.to_clvm(allocator).unwrap();
+    CurriedProgram {
+        program: wrapper_node,
+        args: clvm_curried_args!(curried_action),
+    }
+    .to_clvm(allocator)
+    .unwrap()
+}
+
+/// CHIP.md §235 (BALLOT-ANNOUNCE-ROLE), POSITIVE CLVM EXECUTION:
+/// when the Ballot Coin's `BallotState.finalized == true`, the
+/// `announce_finalization` action puzzle runs cleanly and emits
+/// exactly the canonical `ballot_finalization_msg(launcher, outcome,
+/// signers)` as a `CreateCoinAnnouncement`. Verified by pairing an
+/// announcer-asserter coin that asserts the exact expected
+/// announcement id and observing the simulator ACCEPTS the bundle.
+///
+/// This is the on-chain proof of the role's positive contract:
+///   - permissionless (no signature, no extra solution params)
+///   - emits the SPEC message (binding launcher, outcome, signers)
+///
+/// IDEMPOTENCY: the same spend can be replayed against any future
+/// Ballot Coin with the same finalized state and produce the SAME
+/// announcement. We pin this via the deterministic message
+/// derivation already covered by
+/// `chip_ballot_announce_finalization_role_idempotent_and_finalized_only`
+/// plus the curry-determinism property pinned by
+/// `chip_ballot_announce_finalization_curry_shape_is_single_arg`.
+#[test]
+fn chip_ballot_announce_finalization_clvm_succeeds_when_finalized() {
+    use chip_voting_sdk::puzzles::ballot_finalization_msg;
+
+    let ballot_launcher_id = Bytes32::new([0xBA; 32]);
+    let vote_outcome = Bytes32::new([0xCC; 32]);
+    let agg_signers = Bytes32::new([0x55; 32]);
+
+    let mut sim = Simulator::new();
+    let mut allocator = Allocator::new();
+
+    // 1. Build the curried+wrapped announce_finalization puzzle and
+    //    insert a coin at its puzzle hash.
+    let announce_puzzle_node =
+        build_announce_finalization_puzzle_node(&mut allocator, ballot_launcher_id);
+    let announce_puzzle_hash =
+        Bytes32::new(tree_hash(&allocator, announce_puzzle_node).to_bytes());
+    let announce_coin = Coin::new(Bytes32::new([0xDD; 32]), announce_puzzle_hash, 1);
+    sim.insert_coin(announce_coin);
+
+    // 2. Build the expected canonical message and asserter coin.
+    //    AssertCoinAnnouncement asserts on
+    //    `sha256(announcer_coin_id || msg)`.
+    let expected_msg = ballot_finalization_msg(ballot_launcher_id, vote_outcome, agg_signers);
+    let mut h = Sha256::new();
+    h.update(announce_coin.coin_id().as_ref());
+    h.update(expected_msg.as_ref());
+    let expected_announcement_id = Bytes32::new(h.finalize().into());
+
+    let asserter_node =
+        build_announcement_asserter(&mut allocator, expected_announcement_id);
+    let asserter_hash = Bytes32::new(tree_hash(&allocator, asserter_node).to_bytes());
+    let asserter_coin = Coin::new(Bytes32::new([0xEE; 32]), asserter_hash, 1);
+    sim.insert_coin(asserter_coin);
+
+    // 3. Build the BallotStateTruth solution with finalized=true.
+    let truth = build_ballot_state_truth_value(true, vote_outcome, agg_signers);
+    // The single-arg adapter expects the coin's solution to be the
+    // truth wrapped in a 1-element list (the adapter's `(c 5 ())`
+    // wraps env path 5 = first solution element into a 1-list before
+    // passing to the action). So the COIN solution = `(truth,)` =
+    // `(truth . NIL)`.
+    let coin_solution: (((), (u8, (Bytes32, Bytes32))), ()) = (truth, ());
+    let solution_node = coin_solution.to_clvm(&mut allocator).unwrap();
+
+    let announce_spend = common::coin_spend_from_nodes(
+        &allocator,
+        announce_coin,
+        announce_puzzle_node,
+        solution_node,
+    );
+    let asserter_solution_node = ().to_clvm(&mut allocator).unwrap();
+    let asserter_spend = common::coin_spend_from_nodes(
+        &allocator,
+        asserter_coin,
+        asserter_node,
+        asserter_solution_node,
+    );
+
+    let bundle =
+        common::make_bundle(vec![announce_spend, asserter_spend], Signature::default());
+    let res = sim.new_transaction(bundle);
+    assert!(
+        res.is_ok(),
+        "CHIP.md §235 (BALLOT-ANNOUNCE-ROLE): with finalized=true and \
+         a paired asserter on the canonical announcement, the simulator \
+         MUST accept the bundle — proving the action puzzle (a) does \
+         not trap, (b) emits a CreateCoinAnnouncement, and (c) the \
+         message bytes equal `ballot_finalization_msg(launcher, \
+         outcome, signers)`. simulator returned: {:?}",
+        res.err()
+    );
+}
+
+/// CHIP.md §235 (BALLOT-ANNOUNCE-ROLE), NEGATIVE CLVM EXECUTION:
+/// when `BallotState.finalized == false`, the puzzle's
+/// `assert State.finalized == true` (per
+/// `puzzles/ballot_coin/announce_finalization.rue:32`) traps and
+/// the simulator REJECTS the bundle. This is the on-chain mechanism
+/// that enforces "after `finalize` has run".
+///
+/// This test pairs no asserter coin — the spend is rejected by the
+/// puzzle's assert, not by an unmet announcement. To rule out the
+/// announcer-pairing as the rejection cause, the positive test
+/// above already proves the same harness DOES succeed with
+/// finalized=true.
+#[test]
+fn chip_ballot_announce_finalization_clvm_traps_when_not_finalized() {
+    let ballot_launcher_id = Bytes32::new([0xBA; 32]);
+    let vote_outcome = Bytes32::default();
+    let agg_signers = Bytes32::default();
+
+    let mut sim = Simulator::new();
+    let mut allocator = Allocator::new();
+
+    let announce_puzzle_node =
+        build_announce_finalization_puzzle_node(&mut allocator, ballot_launcher_id);
+    let announce_puzzle_hash =
+        Bytes32::new(tree_hash(&allocator, announce_puzzle_node).to_bytes());
+    let announce_coin = Coin::new(Bytes32::new([0xDF; 32]), announce_puzzle_hash, 1);
+    sim.insert_coin(announce_coin);
+
+    // finalized = FALSE — must trap on `assert State.finalized == true`.
+    let truth = build_ballot_state_truth_value(false, vote_outcome, agg_signers);
+    let coin_solution: (((), (u8, (Bytes32, Bytes32))), ()) = (truth, ());
+    let solution_node = coin_solution.to_clvm(&mut allocator).unwrap();
+
+    let announce_spend = common::coin_spend_from_nodes(
+        &allocator,
+        announce_coin,
+        announce_puzzle_node,
+        solution_node,
+    );
+    let bundle = common::make_bundle(vec![announce_spend], Signature::default());
+    let res = sim.new_transaction(bundle);
+    assert!(
+        res.is_err(),
+        "CHIP.md §235 (BALLOT-ANNOUNCE-ROLE): with finalized=false the \
+         action puzzle's `assert State.finalized == true` MUST trap and \
+         the simulator MUST reject the bundle — this is the on-chain \
+         finalized-only guard. If this test reports OK, the action is \
+         silently emitting announcements pre-finalization."
+    );
+}
+
+/// CHIP.md §235 (BALLOT-ANNOUNCE-ROLE), MESSAGE BINDING NEGATIVE:
+/// the action's emitted announcement message is BOUND to
+/// `(ballot_launcher_id, vote_outcome, agg_signers)`. Mutating ANY
+/// of these three MUST cause a paired
+/// `AssertCoinAnnouncement(expected_id_for_unmutated)` to fail
+/// (because the announcement-id no longer matches).
+///
+/// Three sub-cases — each replays the positive harness with the
+/// asserter set to the unmutated announcement id, but the SPEND
+/// uses a mutated state field. Each MUST be rejected by the
+/// simulator.
+#[test]
+fn chip_ballot_announce_finalization_clvm_message_is_bound_to_state() {
+    use chip_voting_sdk::puzzles::ballot_finalization_msg;
+
+    let ballot_launcher_id = Bytes32::new([0xBA; 32]);
+    let vote_outcome = Bytes32::new([0xCC; 32]);
+    let agg_signers = Bytes32::new([0x55; 32]);
+
+    // Helper: run a single mutated-spend scenario and assert it's
+    // rejected by the simulator. `parent_seed` differentiates the
+    // coin parent ids so each sub-case operates on independent
+    // coins.
+    fn run_mutated_case(
+        parent_seed: u8,
+        // The asserter is built for the UNMUTATED expected message.
+        expected_msg: Bytes32,
+        // The announce action is curried with this launcher id.
+        spend_launcher_id: Bytes32,
+        // The truth-state used in the spend.
+        spend_finalized: bool,
+        spend_outcome: Bytes32,
+        spend_signers: Bytes32,
+        case: &str,
+    ) {
+        let mut sim = Simulator::new();
+        let mut allocator = Allocator::new();
+
+        let announce_puzzle_node =
+            build_announce_finalization_puzzle_node(&mut allocator, spend_launcher_id);
+        let announce_puzzle_hash =
+            Bytes32::new(tree_hash(&allocator, announce_puzzle_node).to_bytes());
+        let announce_coin =
+            Coin::new(Bytes32::new([parent_seed; 32]), announce_puzzle_hash, 1);
+        sim.insert_coin(announce_coin);
+
+        let mut h = Sha256::new();
+        h.update(announce_coin.coin_id().as_ref());
+        h.update(expected_msg.as_ref());
+        let expected_announcement_id = Bytes32::new(h.finalize().into());
+
+        let asserter_node =
+            build_announcement_asserter(&mut allocator, expected_announcement_id);
+        let asserter_hash = Bytes32::new(tree_hash(&allocator, asserter_node).to_bytes());
+        // Distinct parent for the asserter coin.
+        let asserter_coin = Coin::new(
+            Bytes32::new([parent_seed.wrapping_add(1); 32]),
+            asserter_hash,
+            1,
+        );
+        sim.insert_coin(asserter_coin);
+
+        let truth =
+            build_ballot_state_truth_value(spend_finalized, spend_outcome, spend_signers);
+        let coin_solution: (((), (u8, (Bytes32, Bytes32))), ()) = (truth, ());
+        let solution_node = coin_solution.to_clvm(&mut allocator).unwrap();
+
+        let announce_spend = common::coin_spend_from_nodes(
+            &allocator,
+            announce_coin,
+            announce_puzzle_node,
+            solution_node,
+        );
+        let asserter_solution_node = ().to_clvm(&mut allocator).unwrap();
+        let asserter_spend = common::coin_spend_from_nodes(
+            &allocator,
+            asserter_coin,
+            asserter_node,
+            asserter_solution_node,
+        );
+
+        let bundle = common::make_bundle(
+            vec![announce_spend, asserter_spend],
+            Signature::default(),
+        );
+        let res = sim.new_transaction(bundle);
+        assert!(
+            res.is_err(),
+            "CHIP.md §235 (BALLOT-ANNOUNCE-ROLE) — case {}: the asserter \
+             expected the canonical message `ballot_finalization_msg \
+             (unmutated)` but the spend mutated a state field, so the \
+             emitted announcement id MUST NOT match and consensus MUST \
+             reject. If accepted, the announcement is not bound to all \
+             three state inputs.",
+            case
+        );
+    }
+
+    let canonical_msg =
+        ballot_finalization_msg(ballot_launcher_id, vote_outcome, agg_signers);
+
+    // Case A: mutate vote_outcome (curry + signers + finalized
+    // unchanged). The spend emits a message for the mutated outcome
+    // → asserter on canonical msg fails.
+    run_mutated_case(
+        0xAA,
+        canonical_msg,
+        ballot_launcher_id,
+        true,
+        Bytes32::new([0xCD; 32]), // mutated outcome
+        agg_signers,
+        "vote_outcome-mutation",
+    );
+
+    // Case B: mutate agg_signers.
+    run_mutated_case(
+        0xAB,
+        canonical_msg,
+        ballot_launcher_id,
+        true,
+        vote_outcome,
+        Bytes32::new([0x56; 32]), // mutated signers
+        "agg_signers-mutation",
+    );
+
+    // Case C: mutate the curried BALLOT_LAUNCHER_ID. The action
+    // computes the message from the curry'd launcher, so the
+    // emitted message bytes change → asserter fails.
+    run_mutated_case(
+        0xAC,
+        canonical_msg,
+        Bytes32::new([0xBB; 32]), // mutated launcher curry
+        true,
+        vote_outcome,
+        agg_signers,
+        "ballot_launcher_id-curry-mutation",
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────
