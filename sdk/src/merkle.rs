@@ -64,13 +64,44 @@ pub struct SparseMerkleTree {
     /// hash of an all-empty subtree spanning `2^L` leaves.
     /// `empty_subtree[0] = EMPTY_LEAF_HASH`. Build cost is O(depth).
     empty_subtree: Vec<Bytes32>,
+
+    /// Per-voter locked CAT mojos that get encoded into each
+    /// occupied leaf's hash per CHIP.md "Sparse Merkle Tree
+    /// (registration set)":
+    ///   `occupied leaf = sha256(pubkey || locked_cat_mojos_be8)`
+    /// In this revision every voter contributes a uniform
+    /// `COLLATERAL_AMOUNT` mojos at register time; the SMT stores
+    /// that single value so `root()` reproduces the on-chain
+    /// `compute_root` exactly.
+    ///
+    /// Empty trees (no occupied leaves) ignore this field — their
+    /// root is the depth-32 empty fold which is collateral-
+    /// independent. So `new()` defaults to 0; callers that insert
+    /// voters MUST construct via `with_collateral_amount` first.
+    collateral_amount: u64,
 }
 
 impl SparseMerkleTree {
     /// FN: new
-    /// WHAT: empty SPT — root equals `empty_subtree[TREE_DEPTH]`.
+    /// WHAT: empty SPT with `collateral_amount = 0`. Root equals
+    ///       `empty_subtree[TREE_DEPTH]` regardless of the
+    ///       collateral value (empty has no occupied leaves).
+    /// USAGE: callers that ONLY need the empty root (deployer
+    ///        genesis hash, pre-registration `Voter::register`
+    ///        local mirror) can use this; callers that insert
+    ///        voters MUST use [`Self::with_collateral_amount`]
+    ///        instead so the leaf hash matches the on-chain formula.
     /// COST: precomputes the empty-subtree table. ~33 sha256 calls.
     pub fn new() -> Self {
+        Self::with_collateral_amount(0)
+    }
+
+    /// FN: with_collateral_amount
+    /// WHAT: empty SPT with the given uniform per-voter
+    ///       `COLLATERAL_AMOUNT`. Required for trees that will
+    ///       have voters inserted — the leaf hash formula is
+    ///       `sha256(pubkey || collateral_amount_be8)` per CHIP.md.
+    pub fn with_collateral_amount(collateral_amount: u64) -> Self {
         let mut empty_subtree = Vec::with_capacity(TREE_DEPTH as usize + 1);
         empty_subtree.push(Bytes32::new(EMPTY_LEAF_HASH));
         for level in 0..TREE_DEPTH {
@@ -81,7 +112,17 @@ impl SparseMerkleTree {
         Self {
             leaves: BTreeMap::new(),
             empty_subtree,
+            collateral_amount,
         }
+    }
+
+    /// FN: collateral_amount
+    /// WHAT: the uniform per-voter collateral this SPT was
+    ///       constructed with. Used by callers that need to
+    ///       reconstruct leaf hashes for a witness without holding
+    ///       the SMT (e.g., the off-chain Groth16 prover).
+    pub fn collateral_amount(&self) -> u64 {
+        self.collateral_amount
     }
 
     /// FN: slot_for_pubkey
@@ -101,13 +142,18 @@ impl SparseMerkleTree {
     }
 
     /// FN: active_leaf_hash
-    /// WHAT: leaf hash for a registered voter — `sha256(pubkey_bytes)`.
-    /// MIRRORS: SMT-003 in the on-chain register action.
-    pub fn active_leaf_hash(pubkey: &PublicKey) -> Bytes32 {
+    /// WHAT: leaf hash for a registered voter — per CHIP.md
+    ///       `sha256(pubkey || locked_cat_mojos_be8)`.
+    /// MIRRORS: `puzzles/election/register.rue` (and `deregister.rue`)
+    ///          which compute the same hash via
+    ///          `sha256(pk_b + int_to_8_bytes_be(COLLATERAL_AMOUNT))`.
+    pub fn active_leaf_hash(pubkey: &PublicKey, collateral_amount: u64) -> Bytes32 {
         let pk_bytes = pubkey.to_bytes();
-        let h = Sha256::digest(pk_bytes);
+        let mut h = Sha256::new();
+        h.update(pk_bytes);
+        h.update(collateral_amount.to_be_bytes());
         let mut arr = [0u8; 32];
-        arr.copy_from_slice(&h);
+        arr.copy_from_slice(&h.finalize());
         Bytes32::new(arr)
     }
 
@@ -175,7 +221,7 @@ impl SparseMerkleTree {
     fn subtree_hash(&self, lo: u64, hi: u64, level: u32) -> Bytes32 {
         if level == 0 {
             return match self.leaves.get(&(lo as u32)) {
-                Some(pk) => active_leaf_hash_bytes(pk),
+                Some(pk) => active_leaf_hash_bytes(pk, self.collateral_amount),
                 None => Bytes32::new(EMPTY_LEAF_HASH),
             };
         }
@@ -231,11 +277,14 @@ impl SparseMerkleTree {
 
 /// FN: active_leaf_hash_bytes (file-private)
 /// WHAT: leaf hash from raw 48-byte pubkey buffer (skip the typed
-///       PublicKey roundtrip — used inside SPT recursion).
-fn active_leaf_hash_bytes(pk_bytes: &[u8; 48]) -> Bytes32 {
-    let h = Sha256::digest(pk_bytes);
+///       PublicKey roundtrip — used inside SPT recursion). Per
+///       CHIP.md: `sha256(pubkey || locked_cat_mojos_be8)`.
+fn active_leaf_hash_bytes(pk_bytes: &[u8; 48], collateral_amount: u64) -> Bytes32 {
+    let mut h = Sha256::new();
+    h.update(pk_bytes);
+    h.update(collateral_amount.to_be_bytes());
     let mut arr = [0u8; 32];
-    arr.copy_from_slice(&h);
+    arr.copy_from_slice(&h.finalize());
     Bytes32::new(arr)
 }
 
@@ -401,7 +450,7 @@ mod tests {
         let pk = pk_at(0);
         tree.insert(&pk).unwrap();
         let slot = SparseMerkleTree::slot_for_pubkey(&pk);
-        let leaf = SparseMerkleTree::active_leaf_hash(&pk);
+        let leaf = SparseMerkleTree::active_leaf_hash(&pk, tree.collateral_amount());
         let proof = tree.prove(slot);
         let root = tree.root();
         assert!(verify_proof(leaf, slot, &proof, root));
@@ -459,7 +508,7 @@ mod tests {
         let proof = tree.prove(slot);
         let root = tree.root();
 
-        let active_leaf = SparseMerkleTree::active_leaf_hash(&pk);
+        let active_leaf = SparseMerkleTree::active_leaf_hash(&pk, tree.collateral_amount());
         let empty_leaf = Bytes32::new(EMPTY_LEAF_HASH);
 
         assert!(verify_proof(active_leaf, slot, &proof, root));

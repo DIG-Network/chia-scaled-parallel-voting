@@ -209,7 +209,7 @@ async fn voter_release_collateral_against_simulator_full_flow() {
     // `Voter::release_collateral` validates that the supplied SMT
     // root matches the on-chain root, so we mirror that here by
     // inserting the voter's pubkey into a local SMT.
-    let mut smt_post_register = SparseMerkleTree::new();
+    let mut smt_post_register = SparseMerkleTree::with_collateral_amount(collateral_amount);
     smt_post_register
         .insert(&voter_pk)
         .expect("local SMT insert must succeed (post-register state)");

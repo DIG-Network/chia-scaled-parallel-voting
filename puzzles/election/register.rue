@@ -185,9 +185,17 @@ fn main(
     );
     assert pre_root == State.registration_merkle_root;
 
-    // Compute the new root with sha256(pubkey) inserted at the slot.
+    // Compute the new root with the canonical SPT leaf inserted at
+    // the slot. Per CHIP.md "Sparse Merkle Tree (registration set)":
+    // occupied leaf = sha256(pubkey || locked_cat_mojos_be8). The
+    // 8-byte BE encoding of COLLATERAL_AMOUNT is the per-voter
+    // locked stake; including it in the leaf carries the weight
+    // through every membership proof and forward-prepares for
+    // per-voter variable weights without changing the SPT geometry.
     let pk_b: Bytes = new_voter_pubkey as Bytes;
-    let active_leaf: Bytes32 = sha256(pk_b);
+    let active_leaf: Bytes32 = sha256(
+        pk_b + int_to_8_bytes_be(COLLATERAL_AMOUNT)
+    );
     let new_root: Bytes32 = compute_root(
         active_leaf, register_leaf_index, register_siblings, TREE_DEPTH,
     );

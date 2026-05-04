@@ -76,9 +76,13 @@ fn main(
     let computed_slot: Int = slot_from_pubkey(voter_pubkey);
     assert deregister_leaf_index == computed_slot;
 
-    // Membership proof: the slot currently holds sha256(pubkey).
+    // Membership proof: the slot currently holds the canonical SPT
+    // leaf — sha256(pubkey || locked_cat_mojos_be8) — matching the
+    // formula register.rue used at registration time.
     let pk_b: Bytes = voter_pubkey as Bytes;
-    let active_leaf: Bytes32 = sha256(pk_b);
+    let active_leaf: Bytes32 = sha256(
+        pk_b + int_to_8_bytes_be(COLLATERAL_AMOUNT)
+    );
     let pre_root: Bytes32 = compute_root(
         active_leaf, deregister_leaf_index, deregister_siblings, TREE_DEPTH,
     );
