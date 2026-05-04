@@ -207,7 +207,7 @@ async fn voter_cast_vote_against_simulator_full_flow() {
     // match what `BallotIssuer::launch_ballot` actually used. After
     // the voter registered, weight = collateral_amount and root =
     // depth-32 SMT containing voter_pk. Mirror locally.
-    let mut smt_post_register = SparseMerkleTree::with_collateral_amount(collateral_amount);
+    let mut smt_post_register = SparseMerkleTree::new();
     smt_post_register.insert(&voter_pk).expect("smt insert");
     let registration_merkle_root_snapshot = smt_post_register.root();
     let registration_vote_weight_snapshot = collateral_amount; // exactly 1 voter post-register

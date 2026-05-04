@@ -1272,11 +1272,11 @@ pub async fn sync_with_chain<C: ChainReader>(
         .await?;
     if candidates.len() == 1 && candidates[0].is_unspent() {
         // Empty SPT root at depth 32 (NOT the leaf hash) — the
-        // root the on-chain register action verifies against.
-        // Carry collateral_amount so callers that insert voters
-        // into the returned SMT compute leaf hashes per CHIP.md
-        // (`sha256(pubkey || COLLATERAL_AMOUNT_be8)`).
-        let smt = SparseMerkleTree::with_collateral_amount(config.collateral_amount);
+        // root the on-chain register action verifies against. Per
+        // CHIP.md §88-91 the occupied leaf is `sha256(pubkey)`; no
+        // per-voter weight is encoded into the leaf, so the SMT
+        // takes no extra parameters.
+        let smt = SparseMerkleTree::new();
         let empty_root = smt.root();
         let state = ElectionState::genesis(empty_root, election_start_height);
         let voter_set = VoterSet {
@@ -1312,10 +1312,10 @@ pub async fn sync_with_chain<C: ChainReader>(
 
     // Walk forward from the eve singleton. Initialise SPT to
     // empty + genesis state with the depth-32 empty SPT root.
-    // CHIP.md leaf formula `sha256(pubkey || COLLATERAL_AMOUNT_be8)`
-    // requires the SMT know the per-voter collateral so it can
-    // recompute leaf hashes during the walk.
-    let mut smt = SparseMerkleTree::with_collateral_amount(config.collateral_amount);
+    // Per CHIP.md §88-91 the occupied leaf is `sha256(pubkey)`,
+    // so the SMT needs no extra parameters; per-voter weight is
+    // tracked on the Election Singleton state instead.
+    let mut smt = SparseMerkleTree::new();
     let mut voters: Vec<chia_bls::PublicKey> = Vec::new();
     let mut state = ElectionState::genesis(smt.root(), election_start_height);
     // Ballot Coin snapshots emitted by the singleton's `create_ballot`
@@ -1468,7 +1468,7 @@ pub async fn find_current_singleton<C: ChainReader>(
             parent_parent_coin_info: launcher_record.coin.parent_coin_info,
             parent_amount: launcher_record.coin.amount,
         });
-        let smt = SparseMerkleTree::with_collateral_amount(config.collateral_amount);
+        let smt = SparseMerkleTree::new();
         let state = ElectionState::genesis(smt.root(), election_start_height);
         let voter_set = VoterSet {
             registration_merkle_root: smt.root(),
@@ -1491,7 +1491,7 @@ pub async fn find_current_singleton<C: ChainReader>(
         .find(|r| r.coin.puzzle_hash == eve_ph)
         .ok_or(VotingError::NotDeployed)?;
 
-    let mut smt = SparseMerkleTree::with_collateral_amount(config.collateral_amount);
+    let mut smt = SparseMerkleTree::new();
     let mut voters: Vec<chia_bls::PublicKey> = Vec::new();
     let mut state = ElectionState::genesis(smt.root(), election_start_height);
     let mut ballots: Vec<BallotCoinSnapshot> = Vec::new();
@@ -3062,7 +3062,7 @@ mod tests {
 
         for (i, pk) in w.signer_pubkeys.iter().enumerate() {
             let slot = SparseMerkleTree::slot_for_pubkey(pk);
-            let leaf = SparseMerkleTree::active_leaf_hash(pk, agg.config.collateral_amount);
+            let leaf = SparseMerkleTree::active_leaf_hash(pk);
             assert!(
                 verify_proof(leaf, slot, &w.merkle_proofs[i], w.registration_merkle_root),
                 "merkle proof for signer #{i} must verify",

@@ -212,7 +212,7 @@ async fn finalize_per_ballot_full_simulator_flow() {
     sim.new_transaction(launched.spend_bundle.clone())
         .expect("simulator accepts launch_ballot");
 
-    let mut smt_post_register = SparseMerkleTree::with_collateral_amount(collateral_amount);
+    let mut smt_post_register = SparseMerkleTree::new();
     smt_post_register.insert(&voter_pk).expect("smt insert");
     let registration_merkle_root_snapshot = smt_post_register.root();
     let registration_vote_weight_snapshot = collateral_amount;
