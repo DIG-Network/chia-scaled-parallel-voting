@@ -501,6 +501,104 @@ pub fn ballot_slot_from_id(ballot_launcher_id: Bytes32) -> u32 {
     u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
 }
 
+/// FN: voted_ballots_root_after_inserts
+/// WHAT: compute the per-registration ballot SPT root after inserting
+///       each `ballot_launcher_id` at its `ballot_slot_from_id` slot,
+///       starting from the all-empty (`empty_ballot_root()`) state.
+/// USAGE: post-cast Registration Coin's `voted_ballots_root`. For an
+///        empty input, returns `empty_ballot_root()`.
+/// IMPL: builds a sparse map slot → leaf (where leaf for an inserted
+///       ballot is `sha256(ballot_launcher_id)`, mirroring the
+///       `occupied_leaf` line in `mint_voting_coin.rue`), then folds
+///       up `BALLOT_TREE_DEPTH` levels using `sha256_concat_b32`. At
+///       each level, missing nodes default to the level-`i` empty
+///       node from `empty_ballot_membership_siblings()`.
+pub fn voted_ballots_root_after_inserts(ballot_launcher_ids: &[Bytes32]) -> Bytes32 {
+    if ballot_launcher_ids.is_empty() {
+        return empty_ballot_root();
+    }
+
+    // Empty-node-per-level cache (level 0 = empty leaf, level i =
+    // sha256(level i-1 || level i-1)). Used to fill missing siblings.
+    let empty_per_level = empty_ballot_membership_siblings();
+
+    // Sparse current-level map: slot → node hash. At level 0 keys are
+    // ballot slots; values are the per-ballot leaf hashes.
+    use std::collections::BTreeMap;
+    let mut current: BTreeMap<u32, Bytes32> = BTreeMap::new();
+    for ballot_launcher_id in ballot_launcher_ids {
+        let slot = ballot_slot_from_id(*ballot_launcher_id);
+        let leaf = {
+            let mut h = Sha256::new();
+            h.update(ballot_launcher_id.as_ref());
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&h.finalize());
+            Bytes32::new(arr)
+        };
+        current.insert(slot, leaf);
+    }
+
+    // Fold up the tree level-by-level. At each level the slot index
+    // halves (right-shift) and pairs of siblings hash together. Bit
+    // 0 of the OLD slot determines left/right ordering for the NEW
+    // node; the puzzle does the same `index % 2 == 0 ?
+    // sha256(node_b + sibling_b) : sha256(sibling_b + node_b)`.
+    for level in 0..BALLOT_TREE_DEPTH {
+        let mut next: BTreeMap<u32, Bytes32> = BTreeMap::new();
+        let level_empty = empty_per_level[level];
+        let mut iter = current.into_iter().peekable();
+        while let Some((slot, node)) = iter.next() {
+            let parent_slot = slot >> 1;
+            let is_left = slot & 1 == 0;
+            // Pair with sibling at `slot ^ 1` if present, else with
+            // the level-`level` empty node.
+            let sibling = if is_left
+                && iter.peek().map(|(s, _)| *s == slot ^ 1).unwrap_or(false)
+            {
+                let (_, n) = iter.next().expect("peeked sibling");
+                n
+            } else {
+                level_empty
+            };
+            let parent = if is_left {
+                sha256_concat_b32(&node, &sibling)
+            } else {
+                sha256_concat_b32(&sibling, &node)
+            };
+            // Multiple inserts may collide at the parent slot
+            // (different children on the same parent's two slots).
+            // BTreeMap iteration is sorted, so this only happens
+            // when two siblings both have explicit nodes — handled
+            // by the peek+consume above. Subsequent inserts at the
+            // same parent_slot would overwrite, which is incorrect
+            // for the rare case where two different sub-paths reach
+            // the same parent — guard against it explicitly.
+            //
+            // BUG-AVOIDANCE: this branch is unreachable for a single
+            // insert pass when input slots are distinct (they
+            // always are — each ballot has its own slot). For
+            // multi-ballot input the peek+consume already handles
+            // adjacent siblings.
+            assert!(
+                !next.contains_key(&parent_slot),
+                "voted_ballots_root_after_inserts: duplicate parent slot {} at level {}",
+                parent_slot,
+                level,
+            );
+            next.insert(parent_slot, parent);
+        }
+        current = next;
+    }
+
+    // After folding `BALLOT_TREE_DEPTH` levels, exactly one node
+    // remains at slot 0 — the SPT root.
+    let (_slot, root) = current
+        .into_iter()
+        .next()
+        .expect("voted_ballots_root_after_inserts: post-fold map must have exactly one entry");
+    root
+}
+
 /// FN: fresh_registration_state_tree_hash
 /// WHAT: tree hash of a `RegistrationState` value with the given
 ///       fields. Field order mirrors the Rue struct in
@@ -534,6 +632,69 @@ pub fn fresh_registration_state_tree_hash(
     hash_pair(pk_hash, pair)
 }
 
+/// FN: registration_inner_hash_for_state
+/// WHAT: action-layer inner puzzle hash for a Registration Coin at an
+///       ARBITRARY (`voted_ballots_root`, `release_destination`) state.
+///       Generalises `fresh_registration_inner_hash` so callers can
+///       predict the on-chain ph for a Registration Coin recreated
+///       post-cast (with `voted_ballots_root` updated) or post-
+///       release (with `release_destination = Some(_)`).
+/// USAGE: `Voter::release_collateral` walks the registration coin's
+///        CAT lineage to recover the post-cast `voted_ballots_root`
+///        and predicts the on-chain ph via this helper.
+pub fn registration_inner_hash_for_state(
+    voter_pubkey: &PublicKey,
+    election_launcher_id: Bytes32,
+    cat_tail_hash: Bytes32,
+    voted_ballots_root: Bytes32,
+    release_destination: Option<Bytes32>,
+) -> Bytes32 {
+    let action_layer_mod_hash = PuzzleHashes::action_layer();
+    let registration_finalizer_mod_hash = PuzzleHashes::registration_finalizer();
+    let registration_merkle_root = registration_actions_merkle_root(cat_tail_hash);
+
+    let hint = voter_hint(election_launcher_id, cat_tail_hash, voter_pubkey);
+    let state_hash = fresh_registration_state_tree_hash(
+        voter_pubkey,
+        election_launcher_id,
+        voted_ballots_root,
+        release_destination,
+    );
+
+    // Finalizer 1st curry: (ACTION_LAYER_MOD_HASH, HINT)
+    let finalizer_first = curry_tree_hash(
+        registration_finalizer_mod_hash,
+        &[hash_atom_b32(&action_layer_mod_hash), hash_atom_b32(&hint)],
+    );
+    // Finalizer 2nd curry: bind self-hash (CHIP-0050 finalizer pattern).
+    let finalizer_full = curry_tree_hash(finalizer_first, &[hash_atom_b32(&finalizer_first)]);
+
+    // Action layer curry: (FINALIZER, MERKLE_ROOT, STATE)
+    curry_tree_hash(
+        action_layer_mod_hash,
+        &[
+            finalizer_full,
+            hash_atom_b32(&registration_merkle_root),
+            state_hash,
+        ],
+    )
+}
+
+/// FN: cat_outer_for_inner_hash
+/// WHAT: CAT-wrapped puzzle hash for an arbitrary inner puzzle hash —
+///       the on-chain ph that appears for a CAT coin whose inner ph
+///       is `inner_ph`. Mirrors the CAT outer's curry composition
+///       (`CatArgs::curry_tree_hash`).
+/// USAGE: paired with `registration_inner_hash_for_state` to predict
+///        the post-cast Registration Coin's on-chain ph.
+pub fn cat_outer_for_inner_hash(cat_tail_hash: Bytes32, inner_ph: Bytes32) -> Bytes32 {
+    use chia_puzzle_types::cat::CatArgs;
+    use clvm_utils::TreeHash;
+    let inner_th = TreeHash::new(inner_ph.to_bytes());
+    let curried = CatArgs::curry_tree_hash(cat_tail_hash, inner_th);
+    Bytes32::new(curried.to_bytes())
+}
+
 /// FN: fresh_registration_inner_hash
 /// WHAT: action-layer inner puzzle hash for a Registration Coin (the
 ///       puzzle hash *inside* the CAT outer wrap). Builds the genesis
@@ -547,44 +708,12 @@ pub fn fresh_registration_inner_hash(
     election_launcher_id: Bytes32,
     cat_tail_hash: Bytes32,
 ) -> Bytes32 {
-    let action_layer_mod_hash = PuzzleHashes::action_layer();
-    let registration_finalizer_mod_hash = PuzzleHashes::registration_finalizer();
-    let registration_merkle_root = registration_actions_merkle_root(cat_tail_hash);
-
-    let hint = voter_hint(election_launcher_id, cat_tail_hash, voter_pubkey);
-    let initial_state_hash = fresh_registration_state_tree_hash(
+    registration_inner_hash_for_state(
         voter_pubkey,
         election_launcher_id,
+        cat_tail_hash,
         empty_ballot_root(),
         None,
-    );
-
-    // Finalizer 1st curry: (ACTION_LAYER_MOD_HASH, HINT)
-    let finalizer_first = curry_tree_hash(
-        registration_finalizer_mod_hash,
-        &[hash_atom_b32(&action_layer_mod_hash), hash_atom_b32(&hint)],
-    );
-    // Finalizer 2nd curry: bind self-hash (CHIP-0050 finalizer pattern).
-    // `finalizer_first` is the *atom* the puzzle curries in (the hash
-    // value, not the program), so wrap it with `hash_atom_b32`.
-    let finalizer_full = curry_tree_hash(finalizer_first, &[hash_atom_b32(&finalizer_first)]);
-
-    // Action layer curry: (FINALIZER, MERKLE_ROOT, STATE)
-    //
-    // Curry-arg convention (matches yakuhito's slot-machine and the
-    // mirrored Rue helper in `election/register.rue`):
-    //   * Atom values   → wrap with `hash_atom_b32(...)`.
-    //   * Tree-hashed   → pass as `Bytes32` directly. `finalizer_full`
-    //                     is a `curry_tree_hash` result so it already
-    //                     represents `tree_hash(finalizer_program)`.
-    //                     Pre-wrapping would double-hash.
-    curry_tree_hash(
-        action_layer_mod_hash,
-        &[
-            finalizer_full,
-            hash_atom_b32(&registration_merkle_root),
-            initial_state_hash,
-        ],
     )
 }
 
@@ -1503,6 +1632,67 @@ mod tests {
         assert_eq!(empty_ballot_root(), node);
         // Idempotent across calls (cache works).
         assert_eq!(empty_ballot_root(), empty_ballot_root());
+    }
+
+    /// WHAT: `voted_ballots_root_after_inserts(&[])` equals
+    ///       `empty_ballot_root()` (vacuous).
+    #[test]
+    fn voted_ballots_root_after_inserts_empty_is_empty_root() {
+        assert_eq!(
+            voted_ballots_root_after_inserts(&[]),
+            empty_ballot_root(),
+        );
+    }
+
+    /// WHAT: `voted_ballots_root_after_inserts(&[ballot_id])` agrees
+    ///       byte-for-byte with the on-chain `mint_voting_coin.rue`
+    ///       `compute_ballot_root` over the empty SPT siblings, using
+    ///       `sha256(ballot_id)` as the inserted leaf and
+    ///       `ballot_slot_from_id(ballot_id)` as the slot.
+    /// WHY:  this is the load-bearing identity for the Gap (3) fix in
+    ///       `Voter::release_collateral` — the SDK must reproduce the
+    ///       on-chain post-cast `voted_ballots_root` so the predicted
+    ///       Registration Coin puzzle hash matches the actual
+    ///       on-chain ph.
+    #[test]
+    fn voted_ballots_root_after_single_insert_matches_compute_ballot_root() {
+        use sha2::{Digest as _, Sha256 as _Sha256};
+        let ballot_id = b32(0xCC);
+
+        // Reference path: mirror the puzzle's
+        // `compute_ballot_root(occupied_leaf, slot, siblings, depth)`
+        // exactly, with `siblings = empty_ballot_membership_siblings()`.
+        let mut h = _Sha256::new();
+        h.update(ballot_id.as_ref());
+        let mut leaf_arr = [0u8; 32];
+        leaf_arr.copy_from_slice(&h.finalize());
+        let occupied_leaf = Bytes32::new(leaf_arr);
+
+        let siblings = empty_ballot_membership_siblings();
+        let mut node = occupied_leaf;
+        let mut idx = ballot_slot_from_id(ballot_id);
+        for sibling in &siblings {
+            let mut hh = _Sha256::new();
+            if idx & 1 == 0 {
+                hh.update(node.as_ref());
+                hh.update(sibling.as_ref());
+            } else {
+                hh.update(sibling.as_ref());
+                hh.update(node.as_ref());
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&hh.finalize());
+            node = Bytes32::new(arr);
+            idx >>= 1;
+        }
+        let expected = node;
+
+        assert_eq!(
+            voted_ballots_root_after_inserts(&[ballot_id]),
+            expected,
+            "single-insert post-cast voted_ballots_root must match \
+             on-chain compute_ballot_root output byte-for-byte",
+        );
     }
 
     /// WHAT: `empty_ballot_membership_siblings()` produces a 32-element

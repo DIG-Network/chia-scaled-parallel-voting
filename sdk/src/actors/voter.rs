@@ -1464,18 +1464,45 @@ impl Voter {
                 hex::encode(registration_coin_id),
             )));
         }
-        let predicted_reg_ph = puzzles::fresh_registration_coin_puzzle_hash(
-            cat_tail_hash,
+        // Walk the registration coin's CAT lineage backward to recover
+        // the list of ballot_launcher_ids the voter has cast on. Each
+        // parent spend's `mint_voting_coin` solution carries a
+        // `ballot_launcher_id` atom; if the parent is the eve CAT
+        // (issuance), we stop. The resulting `voted_ballots_root`
+        // matches the on-chain coin's actual state — fresh
+        // (no votes) maps to `empty_ballot_root()`; post-cast inserts
+        // each ballot id at its `ballot_slot_from_id` slot.
+        let cast_ballot_ids = self
+            .walk_voted_ballots_history(chain, reg_record.coin)
+            .await?;
+        let voted_ballots_root = puzzles::voted_ballots_root_after_inserts(&cast_ballot_ids);
+
+        let predicted_reg_inner_ph = puzzles::registration_inner_hash_for_state(
             &self.keys.pubkey,
             election_id,
+            cat_tail_hash,
+            voted_ballots_root,
+            None,
         );
-        if reg_record.coin.puzzle_hash != predicted_reg_ph {
+        let predicted_reg_outer_ph = puzzles::cat_outer_for_inner_hash(
+            cat_tail_hash,
+            predicted_reg_inner_ph,
+        );
+        if reg_record.coin.puzzle_hash != predicted_reg_outer_ph {
             return Err(voting_other(format!(
                 "Voter::release_collateral: registration coin puzzle hash {} doesn't match \
-                 predicted fresh-state CAT-wrapped ph {} — voter may have already cast votes \
-                 (driver currently assumes a fresh registration state)",
+                 predicted CAT-wrapped ph {} for the voter's recovered state \
+                 (voted_ballots_root = {}; cast_ballot_ids = [{}]) — \
+                 the lineage walk likely missed a cast or update_vote spend; \
+                 ensure all ancestor spends are queryable on the supplied chain reader",
                 hex::encode(reg_record.coin.puzzle_hash),
-                hex::encode(predicted_reg_ph),
+                hex::encode(predicted_reg_outer_ph),
+                hex::encode(voted_ballots_root),
+                cast_ballot_ids
+                    .iter()
+                    .map(|b| hex::encode(b))
+                    .collect::<Vec<_>>()
+                    .join(", "),
             )));
         }
 
@@ -1492,7 +1519,12 @@ impl Voter {
         // Registration coin's action layer is curried with the
         // REGISTRATION action root (NOT the election action root).
         let reg_merkle_root = puzzles::registration_actions_merkle_root(cat_tail_hash);
-        let reg_state = crate::state::RegistrationState::fresh(self.keys.pubkey, election_id);
+        let reg_state = crate::state::RegistrationState {
+            voter_pubkey: self.keys.pubkey,
+            election_launcher_id: election_id,
+            voted_ballots_root,
+            release_destination: None,
+        };
         let reg_state_node = self.registration_state_node(&mut ctx, &reg_state)?;
         let reg_action_layer_node = build_action_layer_puzzle(
             &mut ctx,
@@ -1517,10 +1549,13 @@ impl Voter {
             solution: release_solution,
         }];
         // Registration finalizer takes `..._my_amount: Int` — pass
-        // the registration coin's amount (collateral_amount).
-        let reg_finalizer_solution = self
-            .config
-            .collateral_amount
+        // the on-chain registration coin's CURRENT amount, which
+        // equals `collateral_amount` for a never-cast coin and
+        // `collateral_amount - sum(voting_coin_amounts)` once one or
+        // more cast_vote spends have peeled off voting-coin mojos.
+        let reg_finalizer_solution = reg_record
+            .coin
+            .amount
             .to_clvm(&mut *ctx)
             .map_err(driver_err)?;
         let reg_action_layer_solution = build_action_layer_solution(
@@ -1617,6 +1652,192 @@ impl Voter {
     }
 
     // ── Internal helpers for spend assembly ─────────────────────
+
+    /// Walk the registration coin's CAT lineage backward and recover
+    /// the list of `ballot_launcher_id`s the voter has cast on. The
+    /// resulting `voted_ballots_root_after_inserts(...)` matches the
+    /// on-chain registration coin's actual `voted_ballots_root`.
+    ///
+    /// IMPL: starts at `reg_coin` (the unspent registration coin) and
+    /// walks each spent ancestor by parent_coin_info. At each step:
+    ///   1. Fetch the parent's puzzle + solution.
+    ///   2. If the parent is the eve CAT (a non-CAT spend or a
+    ///      `genesis_by_coin_id` issuance), stop — registration is
+    ///      fresh up to here.
+    ///   3. If the parent is a CAT-wrapped registration coin spend,
+    ///      scan the inner action-layer solution for a 32-byte atom
+    ///      that, when treated as a candidate `ballot_launcher_id`,
+    ///      yields a recreated registration coin ph matching the
+    ///      child we walked from. Append to the recovered ballot
+    ///      list and recurse.
+    ///   4. Continue until the parent is no longer a CAT
+    ///      registration spend (we've hit the eve CAT).
+    ///
+    /// SHAPE: returns the ballots in REGISTRATION-OLDEST-FIRST order
+    /// (chronological cast order). Order doesn't actually matter for
+    /// `voted_ballots_root_after_inserts` (slot-based SPT inserts
+    /// are commutative for distinct slots), but stable order is
+    /// useful for diagnostic output.
+    async fn walk_voted_ballots_history<C: ChainReader>(
+        &self,
+        chain: &C,
+        reg_coin: Coin,
+    ) -> VotingResult<Vec<Bytes32>> {
+        use chia_sdk_driver::{Cat as DriverCat, Puzzle};
+        use clvm_traits::ToClvm;
+        use clvmr::Allocator;
+
+        let cat_tail_hash = self
+            .config
+            .cat_tail_hash()
+            .map_err(|e| voting_other(format!("cat_tail_hash: {e}")))?;
+        let election_id = self
+            .config
+            .election_launcher_id()
+            .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
+        let fresh_outer_ph = puzzles::fresh_registration_coin_puzzle_hash(
+            cat_tail_hash,
+            &self.keys.pubkey,
+            election_id,
+        );
+
+        // Cap the walk at a reasonable depth — voters realistically
+        // cast on at most a few dozen ballots per election.
+        const MAX_LINEAGE_DEPTH: usize = 256;
+
+        let mut ballots: Vec<Bytes32> = Vec::new();
+        let mut current_coin: Coin = reg_coin;
+
+        for _step in 0..MAX_LINEAGE_DEPTH {
+            // If the current coin's ph IS the fresh ph, we've reached
+            // the original (newly-registered) coin — no more cast
+            // votes to recover.
+            if current_coin.puzzle_hash == fresh_outer_ph {
+                ballots.reverse();
+                return Ok(ballots);
+            }
+
+            // Fetch parent record + spend. If parent isn't a CAT spend
+            // (e.g., the eve CAT genesis), `Cat::parse_children` returns
+            // None — meaning we've walked past the cast lineage; the
+            // current coin is the eve registration coin and there are
+            // no more inserts to recover.
+            let parent_id = current_coin.parent_coin_info;
+            let parent_record = chain
+                .coin_record_by_id(parent_id)
+                .await?
+                .ok_or_else(|| {
+                    voting_other(format!(
+                        "Voter::walk_voted_ballots_history: parent coin {} not found",
+                        hex::encode(parent_id),
+                    ))
+                })?;
+            let (puzzle_program, solution_program) = chain
+                .puzzle_and_solution(parent_id)
+                .await?
+                .ok_or_else(|| {
+                    voting_other(format!(
+                        "Voter::walk_voted_ballots_history: parent coin {} unspent",
+                        hex::encode(parent_id),
+                    ))
+                })?;
+
+            let mut allocator = Allocator::new();
+            let parent_puzzle_node = puzzle_program.to_clvm(&mut allocator).map_err(|e| {
+                voting_other(format!(
+                    "walk_voted_ballots_history: parent puzzle to_clvm: {e}",
+                ))
+            })?;
+            let parent_solution_node = solution_program.to_clvm(&mut allocator).map_err(|e| {
+                voting_other(format!(
+                    "walk_voted_ballots_history: parent solution to_clvm: {e}",
+                ))
+            })?;
+            let parent_puzzle = Puzzle::parse(&allocator, parent_puzzle_node);
+
+            let cat_children_opt = DriverCat::parse_children(
+                &mut allocator,
+                parent_record.coin,
+                parent_puzzle,
+                parent_solution_node,
+            )
+            .map_err(|e| {
+                voting_other(format!(
+                    "walk_voted_ballots_history: parse_children for parent {}: {e:?}",
+                    hex::encode(parent_id),
+                ))
+            })?;
+
+            let _cat_children = match cat_children_opt {
+                Some(cs) => cs,
+                None => {
+                    // Parent is not a CAT spend — we've walked past the
+                    // CAT registration lineage. Done.
+                    ballots.reverse();
+                    return Ok(ballots);
+                }
+            };
+
+            // Scan the parent solution for any 32-byte atom that, when
+            // used as a candidate ballot_launcher_id, produces a
+            // recreated registration coin ph matching `current_coin`'s
+            // outer ph (combining with the ballots already recovered
+            // for any DEEPER ancestors). The order we walk is reverse
+            // chronological, so `current_coin`'s ph reflects ALL
+            // ballots cast up through that point — but we only need
+            // ONE more (the most recent cast); the rest will be
+            // recovered as we walk further back.
+            let mut inserted_so_far = ballots.clone();
+            inserted_so_far.reverse(); // chronological order
+            let candidates = collect_32_byte_atoms(&allocator, parent_solution_node);
+
+            let mut found_ballot: Option<Bytes32> = None;
+            for candidate in &candidates {
+                // Build candidate state: previously-recovered ballots
+                // PLUS this candidate (the cast performed at this
+                // parent step).
+                let mut trial = inserted_so_far.clone();
+                trial.push(*candidate);
+                let trial_root = puzzles::voted_ballots_root_after_inserts(&trial);
+                let trial_inner_ph = puzzles::registration_inner_hash_for_state(
+                    &self.keys.pubkey,
+                    election_id,
+                    cat_tail_hash,
+                    trial_root,
+                    None,
+                );
+                let trial_outer_ph = puzzles::cat_outer_for_inner_hash(
+                    cat_tail_hash,
+                    trial_inner_ph,
+                );
+                if trial_outer_ph == current_coin.puzzle_hash {
+                    found_ballot = Some(*candidate);
+                    break;
+                }
+            }
+
+            let ballot = found_ballot.ok_or_else(|| {
+                voting_other(format!(
+                    "Voter::walk_voted_ballots_history: could not match a \
+                     ballot_launcher_id candidate from parent {} solution to recreated \
+                     registration coin ph {} (scanned {} candidates)",
+                    hex::encode(parent_id),
+                    hex::encode(current_coin.puzzle_hash),
+                    candidates.len(),
+                ))
+            })?;
+            ballots.push(ballot);
+
+            // Move to the parent and continue.
+            current_coin = parent_record.coin;
+        }
+
+        Err(voting_other(format!(
+            "Voter::walk_voted_ballots_history: exceeded MAX_LINEAGE_DEPTH ({}) — \
+             registration coin lineage too deep",
+            MAX_LINEAGE_DEPTH,
+        )))
+    }
 
     /// Reconstruct the CAT lineage proof for `cat_coin` by parsing
     /// its parent's actual on-chain spend.
@@ -1825,6 +2046,43 @@ fn parse_hex32(s: &str) -> VotingResult<Bytes32> {
         ))
     })?;
     Ok(Bytes32::new(arr))
+}
+
+/// FN: collect_32_byte_atoms (file-private)
+/// WHAT: walk a CLVM tree (`node` rooted in `allocator`) and return
+///       every 32-byte atom encountered, in pre-order. Used by
+///       `Voter::walk_voted_ballots_history` to enumerate candidate
+///       `ballot_launcher_id`s in a parent registration coin spend's
+///       solution.
+/// SHAPE: returns a Vec — the caller doesn't deduplicate (a 32-byte
+///        atom appearing twice in the tree appears twice here).
+/// PERF:  bounded by the depth of the action-layer solution tree,
+///        which is O(actions × per-action-arg-count) — small.
+fn collect_32_byte_atoms(
+    allocator: &clvmr::Allocator,
+    node: clvmr::NodePtr,
+) -> Vec<Bytes32> {
+    use clvmr::SExp;
+    let mut out: Vec<Bytes32> = Vec::new();
+    let mut stack: Vec<clvmr::NodePtr> = vec![node];
+    while let Some(n) = stack.pop() {
+        match allocator.sexp(n) {
+            SExp::Atom => {
+                let atom = allocator.atom(n);
+                let bytes = atom.as_ref();
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(bytes);
+                    out.push(Bytes32::new(arr));
+                }
+            }
+            SExp::Pair(left, right) => {
+                stack.push(right);
+                stack.push(left);
+            }
+        }
+    }
+    out
 }
 
 /// FN: find_current_ballot_singleton (file-private)
