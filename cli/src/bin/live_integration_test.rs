@@ -123,21 +123,15 @@ struct Args {
     #[arg(long, default_value_t = 1_000)]
     collateral_amount: u64,
 
-    /// XCH registration fee (in mojos). Set to 0 to keep the test's
-    /// XCH footprint minimal.
-    #[arg(long, default_value_t = 0)]
-    registration_fee: u64,
-
     /// XCH network fee attached to the finalize bundle (in mojos).
-    /// The finalize singleton spend itself emits no AGG_SIG conditions
-    /// and the on-chain action only pays accumulated registration
-    /// fees to the finalizer; with `--registration-fee=0` (the
-    /// default), the bundle has zero fee/cost, which mainnet farmers
-    /// de-prioritise so heavily that bundles often sit in mempool
-    /// past the test's `wait_for_spend` timeout.
+    /// The Ballot Coin's `finalize` action emits no AGG_SIG conditions
+    /// and pays no on-chain fees of its own, so without an attached
+    /// fee coin the bundle has zero fee/cost. Mainnet farmers
+    /// de-prioritise zero-fee bundles so heavily that they often
+    /// sit in mempool past the test's `wait_for_spend` timeout.
     ///
     /// Mainnet's typical mempool fee policy is ~5 mojos per CLVM
-    /// cost unit. Our finalize singleton spend has ~88M CLVM cost
+    /// cost unit. Our finalize Ballot Coin spend has ~88M CLVM cost
     /// (Groth16 pairing + BLS pairing identity dominate). The
     /// observed mempool ADMISSION threshold is far below that —
     /// a fee of ~10M mojos (~0.1 mojo / cost) reliably gets the
@@ -147,9 +141,14 @@ struct Args {
     #[arg(long, default_value_t = 10_000_000)]
     finalize_fee: u64,
 
-    /// Election window, in L1 blocks. Mainnet blocks are ~52s.
-    /// Default 4 blocks (~3.5 min) is a reasonable wall-clock budget
-    /// for the full lifecycle.
+    /// Voting window length, in L1 blocks AFTER the Ballot Coin is
+    /// launched. Mainnet blocks are ~52s. Default 4 blocks (~3.5
+    /// min) is a reasonable wall-clock budget for the full
+    /// lifecycle. Used as `vote_close_height = launch_height +
+    /// election_length_blocks` (per CHIP.md §211 the Ballot Coin's
+    /// per-ballot `vote_close_height` curry is what governs voting
+    /// timing in this CHIP revision; the Election Singleton no
+    /// longer carries a global election length).
     #[arg(long, default_value_t = 4)]
     election_length_blocks: u64,
 
@@ -173,15 +172,6 @@ struct Args {
     /// for inspection.
     #[arg(long)]
     skip_release: bool,
-
-    /// Skip the oracle-broadcast phase. The oracle action is the
-    /// last phase of the lifecycle (after release): it spends the
-    /// finalized Election Singleton, emitting a CCA carrying the
-    /// election result so external puzzles can `AssertCoinAnnouncement`
-    /// against it. Skip if you only care about the
-    /// register/vote/finalize/release path.
-    #[arg(long)]
-    skip_oracle: bool,
 
     /// Skip the broadcast confirmation prompt before EVERY phase.
     /// REQUIRED for non-interactive use (CI). Echo'd via tracing so
@@ -839,9 +829,9 @@ fn build_cat_collateral_spend(
 
     // Wrap with StandardLayer + CAT outer; spend the single CAT.
     // The registration coin's CreateCoin attaches `voter_hint` as a
-    // hint memo so subsequent vote/release lookups can find it via
-    // `chain.coin_records_by_hint(voter_hint)`. Without this the
-    // SDK's `Voter::vote` and `Voter::release_collateral` would
+    // hint memo so subsequent cast_vote/release lookups can find it
+    // via `chain.coin_records_by_hint(voter_hint)`. Without this the
+    // SDK's `Voter::cast_vote` and `Voter::release_collateral` would
     // never locate the voter's registration coin lineage.
     let mut ctx = SpendContext::new();
     let voter_hint = puzzles::voter_hint(election_launcher_id, cat_tail_hash, voter_pk);
@@ -1106,6 +1096,7 @@ fn reconstruct_typed_vk(wire: &VerificationKey) -> Result<ArkVerifyingKey> {
 
 // ── Phase 1: Deploy Election Singleton ───────────────────────────────
 
+#[allow(dead_code)] // deploy_height retained for orchestrator-side diagnostics
 struct DeployArtifacts {
     config: ElectionConfig,
     deploy_height: u32,
@@ -1113,6 +1104,16 @@ struct DeployArtifacts {
     /// Spends move the tip — track elections by `election_launcher_id`,
     /// not this id.
     eve_singleton_coin_id: Bytes32,
+    /// `election_start_height` curried into the eve Election
+    /// Singleton's state at deploy time. Per CHIP.md §289-291 this
+    /// is the chain peak height observed immediately before the
+    /// deploy bundle is broadcast and is used by every subsequent
+    /// chain-walk (`compute_eve_inner_puzzle_hash`,
+    /// `find_current_singleton`, `wait_for_current_singleton`,
+    /// `BallotIssuer::create_ballot`, `BallotIssuer::launch_ballot`)
+    /// to derive the eve singleton puzzle hash that started the
+    /// lineage.
+    election_start_height: u64,
 }
 
 async fn phase_deploy(
@@ -1133,15 +1134,32 @@ async fn phase_deploy(
         .context("phase_deploy: no XCH funding coin")?;
     let deploy_funding_input_id: Bytes32 = parent_coin.coin_id().into();
 
+    // CHIP rev 2026-05-02: registration_fee + election_length_blocks
+    // moved to per-Ballot-Coin params (see phase_create_ballot /
+    // phase_launch_ballot). election_start_height is the chain peak
+    // observed immediately BEFORE the deploy bundle is broadcast —
+    // becomes the genesis ElectionState's `election_start_height`
+    // (CHIP.md §291) and is what every subsequent chain walker
+    // passes as `election_start_height` to derive the eve inner
+    // puzzle hash. Snapshotting it once here ensures every later
+    // phase agrees on the same value (passing `0` worked accidentally
+    // when the simulator-only tests didn't track block heights, but
+    // on a live chain a non-zero peak makes any `0` placeholder a
+    // wrong-puzzle-hash chain-walk failure).
+    let election_start_height: u64 =
+        u64::from(current_peak_height(chain).await.context(
+            "phase_deploy: read current peak height to seed election_start_height",
+        )?);
+    info!(
+        election_start_height,
+        "snapshotting current peak as election_start_height curried into eve singleton state"
+    );
+
     let deployer = ElectionDeployer::new(DeployParams {
         verification_key: vk.clone(),
         cat_tail_hash,
         collateral_amount: args.collateral_amount,
-        // CHIP rev 2026-05-02: registration_fee + election_length_blocks
-        // moved to per-Ballot-Coin params (Phase 6). New mandatory
-        // election_start_height; placeholder 0 here since the live
-        // test orchestrator is not yet wired through Phase 6.
-        election_start_height: 0,
+        election_start_height,
         label: Some(format!(
             "live-test-{}",
             chrono::Utc::now().format("%Y%m%dT%H%M%S")
@@ -1181,8 +1199,7 @@ async fn phase_deploy(
     // eve puzzle hash. Compute its coin id deterministically.
     let eve_inner_ph = chip_voting_sdk::actors::aggregator::compute_eve_inner_puzzle_hash(
         &artifacts.config,
-        // TODO(phase-6): plumb the real election_start_height here.
-        0,
+        election_start_height,
     );
     let eve_outer_ph =
         chip_voting_sdk::puzzles::election_singleton_puzzle_hash(launcher_id, eve_inner_ph);
@@ -1195,6 +1212,7 @@ async fn phase_deploy(
         launcher_id = %hex::encode(launcher_id),
         eve_id = %hex::encode(eve_id),
         deploy_height,
+        election_start_height,
         "deploy phase complete"
     );
 
@@ -1202,6 +1220,7 @@ async fn phase_deploy(
         config: artifacts.config,
         deploy_height,
         eve_singleton_coin_id: eve_id,
+        election_start_height,
     })
 }
 
@@ -1381,8 +1400,7 @@ async fn phase_register_voter(
     let _ = wait_for_current_singleton(
         chain,
         &deploy.config,
-        // TODO(phase-6): real election_start_height
-        0,
+        deploy.election_start_height,
         "Election Singleton (CLI pre-flight)",
         Duration::from_secs(30),
         Duration::from_secs(300),
@@ -1494,22 +1512,316 @@ async fn phase_register_voter(
     Ok(reg_id)
 }
 
-// ── Phase 3: Wait election window ────────────────────────────────────
+// ── Phase 2.5: Create + launch the Ballot Coin ───────────────────────
+
+/// Outputs of `phase_create_ballot` and `phase_launch_ballot`. These
+/// thread the per-ballot identity (launcher id, vote_close_height,
+/// outcome_domain_hash, threshold pack, snapshotted registration
+/// state) into the cast_vote / finalize phases. Per CHIP.md §202 +
+/// §211-221 the createBallot action mints a Ballot Coin lineage and
+/// the launcher second-spend mints the eve Ballot Coin curried with
+/// `(VK, IC, BALLOT_LAUNCHER_ID, ELECTION_LAUNCHER_ID,
+/// VOTE_CLOSE_HEIGHT, VOTE_THRESHOLD_NUM, VOTE_THRESHOLD_DEN,
+/// REGISTRATION_MERKLE_ROOT_SNAPSHOT,
+/// REGISTRATION_VOTE_WEIGHT_SNAPSHOT)` for `finalize`. Voter
+/// `cast_vote` and aggregator `build_finalize_for_ballot` MUST mirror
+/// every one of those values exactly.
+#[allow(dead_code)] // eve_ballot_coin_id + outcome_domain_hash retained for diagnostics
+struct BallotArtifacts {
+    /// Launcher id of the per-ballot singleton lineage; identifies
+    /// the ballot stably across its lifetime.
+    ballot_launcher_id: Bytes32,
+    /// Eve Ballot Coin id (= the launcher's child at the predicted
+    /// per-ballot singleton-wrapped puzzle hash).
+    eve_ballot_coin_id: Bytes32,
+    /// Per-ballot vote close height — curried into `finalize`,
+    /// `oracle`, and `update_vote`. Voter cast_vote must echo this
+    /// value.
+    vote_close_height: u64,
+    /// Numerator / denominator of the curried per-ballot quorum
+    /// threshold; mirrored on `cast_vote` and `finalize` calls.
+    vote_threshold_num: u64,
+    vote_threshold_den: u64,
+    /// 32-byte commitment to the allowed outcome set carried in
+    /// the createBallot announcement.
+    outcome_domain_hash: Bytes32,
+    /// Election Singleton's `(registration_merkle_root,
+    /// registration_vote_weight)` snapshot at `launch_ballot`
+    /// time — curried into the per-ballot `finalize` action.
+    /// `cast_vote` and `build_finalize_for_ballot` MUST pass these
+    /// exact values; any drift changes the eve Ballot Coin's puzzle
+    /// hash and breaks the chain walk.
+    registration_merkle_root_snapshot: Bytes32,
+    registration_vote_weight_snapshot: u64,
+}
+
+/// Spend the Election Singleton via its `createBallot` action to mint
+/// a 2-mojo launcher coin for a fresh Ballot Coin lineage.
+///
+/// CHIP.md §202: `createBallot` "Mints Ballot Coin; passes through
+/// `election_launcher_id`, VK/IC, threshold pack, and ballot identity;
+/// sets `vote_close_height` and outcome domain." The action only
+/// produces the launcher eve coin in this spend — the eve Ballot
+/// Coin singleton itself is minted by the launcher second-spend in
+/// `phase_launch_ballot`.
+///
+/// FUNDER COIN: the action requires a 2-mojo input to mint the
+/// launcher; we spend a fresh XCH coin from the funding wallet via
+/// the standard p2 puzzle.
+async fn phase_create_ballot(
+    chain: &CoinsetClient,
+    funding_keys: &WalletKeys,
+    network: NetworkType,
+    args: &Args,
+    deploy: &DeployArtifacts,
+) -> Result<(Bytes32, u64, Bytes32, u64, u64)> {
+    info!("=== PHASE 2.5a: create Ballot Coin (Election Singleton createBallot) ===");
+    confirm_or_bail(args, "Broadcast the createBallot bundle?")?;
+
+    // Per-ballot config: vote_close_height = current_peak +
+    // election_length_blocks (CHIP.md §211 — the on-chain
+    // `update_vote` action's AssertBeforeHeightAbsolute and the
+    // `finalize` action's AssertHeightAbsolute both compare against
+    // this value, so it MUST be expressed as an absolute height).
+    let now_height = current_peak_height(chain).await?;
+    let vote_close_height = u64::from(now_height) + args.election_length_blocks;
+    let ballot_seed = {
+        // 32-byte random nonce — separates concurrent createBallot
+        // spends in the same block (per puzzle docs).
+        let mut buf = [0u8; 32];
+        getrandom::getrandom(&mut buf).context("getrandom for ballot_seed")?;
+        Bytes32::new(buf)
+    };
+    // For the live test we don't pin a structured outcome domain;
+    // a deterministic placeholder keeps the hash stable across the
+    // run. Production deployments would tree-hash the structured
+    // proposal here.
+    let outcome_domain_hash = Bytes32::new([0xCDu8; 32]);
+    let vote_threshold_num: u64 = 1;
+    let vote_threshold_den: u64 = 2;
+
+    info!(
+        now_height,
+        vote_close_height,
+        ballot_seed = %hex::encode(ballot_seed),
+        outcome_domain_hash = %hex::encode(outcome_domain_hash),
+        vote_threshold_num,
+        vote_threshold_den,
+        "createBallot params snapshot"
+    );
+
+    // 2-mojo XCH funder coin to mint the launcher eve coin. The
+    // standard p2 puzzle wraps a quoted-conditions list that emits
+    // exactly the create_coin(SINGLETON_LAUNCHER_HASH, 2) the action
+    // expects.
+    let funder_xch = find_xch_coin(chain, funding_keys.p2_puzzle_hash, 2)
+        .await
+        .context("phase_create_ballot: no XCH funder coin (need ≥2 mojos)")?;
+    let funder_input_id: Bytes32 = funder_xch.coin_id().into();
+    let funder_change = funder_xch.amount.saturating_sub(2);
+
+    // Build the funder spend via the standard p2 puzzle: emit
+    // create_coin(SINGLETON_LAUNCHER_HASH, 2) plus change back to
+    // the funder. The BallotIssuer's createBallot action then asserts
+    // a CCA from the singleton to bind this funder coin into the
+    // bundle.
+    let mut ctx = SpendContext::new();
+    let launcher_ph_b32 = Bytes32::from(chip_voting_sdk::SINGLETON_LAUNCHER_HASH);
+    let mut funder_conditions = Conditions::new().create_coin(launcher_ph_b32, 2, Memos::None);
+    if funder_change > 0 {
+        funder_conditions =
+            funder_conditions.create_coin(funding_keys.p2_puzzle_hash, funder_change, Memos::None);
+    }
+    StandardLayer::new(funding_keys.synthetic_pk)
+        .spend(&mut ctx, funder_xch, funder_conditions)
+        .map_err(|e| anyhow::anyhow!("phase_create_ballot funder spend: {e:?}"))?;
+    let funder_spends = ctx.take();
+    let funder_spend = funder_spends
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("phase_create_ballot: funder StandardLayer produced no spend"))?;
+
+    let issuer = chip_voting_sdk::actors::ballot::BallotIssuer::new(deploy.config.clone(), network);
+    let created = issuer
+        .create_ballot(
+            chain,
+            chip_voting_sdk::actors::ballot::CreateBallotParams {
+                ballot_seed,
+                vote_close_height,
+                outcome_domain_hash,
+            },
+            funder_spend,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("BallotIssuer::create_ballot: {e:?}"))?;
+
+    // The createBallot action emits no AggSig conditions of its own,
+    // but the funder's StandardLayer spend emits an AggSigMe over
+    // the funding wallet's synthetic pk. Re-sign the bundle with the
+    // funder's synthetic SK so the consensus AGG_SIG check passes.
+    let combined_sig = sign_bundle_signature(
+        &created.spend_bundle.coin_spends,
+        std::slice::from_ref(&funding_keys.synthetic_sk),
+        network,
+    )
+    .map_err(|e| anyhow::anyhow!("phase_create_ballot sign: {e:?}"))?;
+    let bundle = SpendBundle::new(created.spend_bundle.coin_spends.clone(), combined_sig);
+    verify_bundle_locally(&bundle, network)?;
+    push_tx(chain, &bundle, "createBallot").await?;
+
+    // Wait for the funder coin to be spent (proof the bundle landed).
+    wait_for_spend(
+        chain,
+        funder_input_id,
+        args,
+        "createBallot funder XCH input",
+    )
+    .await?;
+    // Wait for the launcher eve coin to confirm.
+    wait_for_confirmation(
+        chain,
+        created.ballot_launcher_id,
+        args,
+        "Ballot launcher eve coin",
+    )
+    .await?;
+
+    info!(
+        ballot_launcher_id = %hex::encode(created.ballot_launcher_id),
+        vote_close_height,
+        "createBallot landed; ready for launch_ballot"
+    );
+
+    Ok((
+        created.ballot_launcher_id,
+        vote_close_height,
+        outcome_domain_hash,
+        vote_threshold_num,
+        vote_threshold_den,
+    ))
+}
+
+/// Drive the launcher second-spend that mints the eve Ballot Coin
+/// singleton.
+///
+/// CHIP.md §211-221: the eve Ballot Coin's full puzzle hash is curried
+/// with `(VK, IC, BALLOT_LAUNCHER_ID, ELECTION_LAUNCHER_ID,
+/// VOTE_CLOSE_HEIGHT, VOTE_THRESHOLD_NUM, VOTE_THRESHOLD_DEN,
+/// REGISTRATION_MERKLE_ROOT_SNAPSHOT,
+/// REGISTRATION_VOTE_WEIGHT_SNAPSHOT)` (`finalize`),
+/// `(BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT)` (`oracle`), and
+/// `(BALLOT_LAUNCHER_ID)` (`announce_finalization`). The two
+/// `*_SNAPSHOT` curries pin the ballot to the Election Singleton's
+/// `(registration_merkle_root, registration_vote_weight)` at the
+/// instant `launch_ballot` reads them, so the snapshot we read here
+/// is what every later phase MUST mirror.
+async fn phase_launch_ballot(
+    chain: &CoinsetClient,
+    network: NetworkType,
+    args: &Args,
+    deploy: &DeployArtifacts,
+    ballot_launcher_id: Bytes32,
+    vote_close_height: u64,
+    outcome_domain_hash: Bytes32,
+    vote_threshold_num: u64,
+    vote_threshold_den: u64,
+) -> Result<BallotArtifacts> {
+    info!("=== PHASE 2.5b: launch Ballot Coin (launcher second-spend) ===");
+    confirm_or_bail(args, "Broadcast the launch_ballot bundle?")?;
+
+    // Snapshot the Election Singleton state RIGHT BEFORE we hand it
+    // to BallotIssuer::launch_ballot — the issuer reads the same
+    // value from chain inside, but reading it ourselves lets us
+    // surface it via BallotArtifacts so phase_vote / phase_finalize
+    // pass the matching snapshot to cast_vote /
+    // build_finalize_for_ballot. (The issuer's internal read and
+    // ours observe the same chain tip, so the values agree by
+    // construction; if they ever diverge — e.g. a new register spend
+    // landed mid-phase — the launch_ballot eve PH won't match what
+    // the chain mints and the simulator/consensus will reject.)
+    let pre_launch_singleton = chip_voting_sdk::actors::aggregator::find_current_singleton(
+        chain,
+        &deploy.config,
+        deploy.election_start_height,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("phase_launch_ballot find_current_singleton: {e:?}"))?;
+    let registration_merkle_root_snapshot =
+        pre_launch_singleton.state.registration_merkle_root;
+    let registration_vote_weight_snapshot =
+        pre_launch_singleton.state.registration_vote_weight;
+    info!(
+        registration_merkle_root_snapshot = %hex::encode(registration_merkle_root_snapshot),
+        registration_vote_weight_snapshot,
+        "snapshotted Election Singleton state for launch_ballot"
+    );
+
+    let issuer = chip_voting_sdk::actors::ballot::BallotIssuer::new(deploy.config.clone(), network);
+    let launched = issuer
+        .launch_ballot(
+            chain,
+            ballot_launcher_id,
+            chip_voting_sdk::actors::ballot::LaunchBallotParams {
+                vote_close_height,
+                outcome_domain_hash,
+                vote_threshold_num,
+                vote_threshold_den,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("BallotIssuer::launch_ballot: {e:?}"))?;
+
+    let bundle = launched.spend_bundle.clone();
+    verify_bundle_locally(&bundle, network)?;
+    push_tx(chain, &bundle, "launch_ballot").await?;
+    wait_for_spend(chain, ballot_launcher_id, args, "Ballot launcher (launch_ballot)").await?;
+    let _ = wait_for_confirmation(
+        chain,
+        launched.eve_ballot_coin_id,
+        args,
+        "eve Ballot Coin singleton",
+    )
+    .await?;
+
+    info!(
+        ballot_launcher_id = %hex::encode(launched.ballot_launcher_id),
+        eve_ballot_coin_id = %hex::encode(launched.eve_ballot_coin_id),
+        eve_ballot_puzzle_hash = %hex::encode(launched.eve_ballot_puzzle_hash),
+        "launch_ballot landed; eve Ballot Coin ready for cast_vote"
+    );
+
+    Ok(BallotArtifacts {
+        ballot_launcher_id: launched.ballot_launcher_id,
+        eve_ballot_coin_id: launched.eve_ballot_coin_id,
+        vote_close_height,
+        vote_threshold_num,
+        vote_threshold_den,
+        outcome_domain_hash,
+        registration_merkle_root_snapshot,
+        registration_vote_weight_snapshot,
+    })
+}
+
+// ── Phase 3: Wait for the per-ballot voting window to close ──────────
 
 async fn phase_wait_window(
     chain: &CoinsetClient,
-    deploy: &DeployArtifacts,
+    ballot: &BallotArtifacts,
     args: &Args,
 ) -> Result<()> {
-    info!("=== PHASE 3: wait for election window to elapse ===");
-    let target = deploy
-        .deploy_height
-        .saturating_add(args.election_length_blocks as u32 + 1);
+    info!("=== PHASE 3: wait until chain peak ≥ ballot.vote_close_height ===");
+    // Per CHIP.md §233 the Ballot Coin's `finalize` action gates on
+    // `AssertHeightAbsolute(VOTE_CLOSE_HEIGHT)`; spending it before
+    // that height fails consensus. We add +1 so the next finalize
+    // submission lands AT or after the close height in the same
+    // block. (Chia's AssertHeightAbsolute is "spent height ≥ N",
+    // so reaching height == close_height is sufficient.)
+    let target = u32::try_from(ballot.vote_close_height)
+        .map_err(|_| anyhow::anyhow!("vote_close_height does not fit in u32"))?;
     info!(
-        deploy_height = deploy.deploy_height,
-        election_length_blocks = args.election_length_blocks,
+        vote_close_height = ballot.vote_close_height,
         target_height = target,
-        "election finalize gated by ASSERT_HEIGHT_RELATIVE — waiting"
+        "Ballot finalize gated by AssertHeightAbsolute(VOTE_CLOSE_HEIGHT) — waiting"
     );
     // Generous timeout: each block is ~52s on mainnet, ~18s on
     // testnet11, plus farmer queue. Cap at 60min for safety.
@@ -1525,6 +1837,7 @@ async fn phase_vote(
     network: NetworkType,
     args: &Args,
     deploy: &DeployArtifacts,
+    ballot: &BallotArtifacts,
     voter_label: &str,
     voter_keys: &VoterKeys,
     vote_data: Bytes32,
@@ -1533,24 +1846,30 @@ async fn phase_vote(
     info!("=== PHASE 4.{voter_label}: cast vote ===");
     confirm_or_bail(args, &format!("Broadcast {voter_label}'s vote?"))?;
 
-    // Voter::vote re-queries the registration coin by hint at call time
-    // (never cache coin ids across spends).
+    // Voter::cast_vote re-queries the registration coin by hint at
+    // call time (never cache coin ids across spends).
+    //
+    // CHIP rev 2026-05-02 / per CHIP.md §274-285: cast_vote spends
+    // the Registration Coin via `mint_voting_coin` (CAT inner) AND
+    // co-spends the current Ballot Coin via its `oracle` action so
+    // the on-chain action layer can bind the new Voting Coin to a
+    // real Ballot Coin lineage. Every per-ballot field below comes
+    // from `phase_create_ballot` / `phase_launch_ballot`'s artifacts;
+    // none of them may be defaulted (a stale `Bytes32::default()` /
+    // `0` height would re-curry the Voting Coin's puzzle hash and
+    // break the Ballot Coin co-spend's oracle assertion).
     let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network);
-    // CHIP rev 2026-05-02: Voter::vote → Voter::cast_vote(&CastVoteParams).
-    // The live integration test currently uses placeholder ballot
-    // params — when this test grows real ballot creation/launch
-    // coverage, populate these from the matching `BallotIssuer` calls.
     let cast_result = voter
         .cast_vote(
             chain,
             chip_voting_sdk::actors::voter::CastVoteParams {
-                ballot_launcher_id: Bytes32::default(),
+                ballot_launcher_id: ballot.ballot_launcher_id,
                 vote_data,
-                vote_close_height: 0,
-                vote_threshold_num: 1,
-                vote_threshold_den: 2,
-                registration_merkle_root_snapshot: Bytes32::default(),
-                registration_vote_weight_snapshot: 0,
+                vote_close_height: ballot.vote_close_height,
+                vote_threshold_num: ballot.vote_threshold_num,
+                vote_threshold_den: ballot.vote_threshold_den,
+                registration_merkle_root_snapshot: ballot.registration_merkle_root_snapshot,
+                registration_vote_weight_snapshot: ballot.registration_vote_weight_snapshot,
                 voting_coin_amount: 1,
             },
         )
@@ -1566,35 +1885,44 @@ async fn phase_vote(
         &format!("{voter_label} vote (pre-vote reg coin)"),
     )
     .await?;
+    info!(
+        voter_label,
+        voting_coin_id = %hex::encode(cast_result.voting_coin_id),
+        ballot_launcher_id = %hex::encode(ballot.ballot_launcher_id),
+        "vote cast (Voting Coin minted, Registration Coin recreated)"
+    );
     Ok(())
 }
 
-// ── Phase 5: Finalize ────────────────────────────────────────────────
+// ── Phase 5: Finalize the Ballot Coin ────────────────────────────────
 
-/// Finalize the election. Waits until the finalize spend confirms by
-/// watching the singleton coin id taken from the built bundle (not the
-/// deploy-time eve id).
+/// Finalize the election by spending the Ballot Coin via its
+/// `finalize` action. Per CHIP.md §233 + §296 (post-rev 2026-05-02)
+/// finalize targets the **Ballot Coin** singleton — NOT the Election
+/// Singleton — runs the Groth16 verifier + `bls_verify`, asserts
+/// chain height ≥ `VOTE_CLOSE_HEIGHT`, and recreates the Ballot Coin
+/// at `(finalized=true, vote_outcome, agg_signers)`. The Election
+/// Singleton is not spent. (See FLOW-FINALIZE-NOT-SINGLETON in
+/// `app/docs/chip-compliance.md`.)
 ///
-/// FEE COIN ATTACHMENT: a singleton finalize spend with no XCH fee
-/// is mempool-admissible but mainnet farmers de-prioritise zero-fee
-/// bundles when there's any inclusion competition; we observed
-/// repeated 15-minute timeouts where the bundle sat in mempool
-/// (status=SUCCESS) and was never landed on chain. Attaching a
-/// small `--finalize-fee` XCH spend from the funding wallet
-/// (controlled by `funding_keys`) gives the bundle non-zero
-/// fee/cost and effectively guarantees inclusion in the next
-/// transaction block.
+/// FEE COIN ATTACHMENT: the Ballot Coin's `finalize` action emits no
+/// AGG_SIG conditions and pays no on-chain fees of its own — the
+/// bundle would have zero fee/cost. Mainnet farmers de-prioritise
+/// zero-fee bundles, sometimes leaving them in mempool past the
+/// test's `wait_for_spend` timeout. Attaching a small `--finalize-fee`
+/// XCH spend from the funding wallet effectively guarantees
+/// inclusion in the next transaction block.
 async fn phase_finalize(
     chain: &CoinsetClient,
     funding_keys: &WalletKeys,
     network: NetworkType,
     args: &Args,
     deploy: &DeployArtifacts,
+    ballot: &BallotArtifacts,
     vote_outcome: Bytes32,
-    reward_address: Bytes32,
     proving_key: &ArkProvingKey,
 ) -> Result<()> {
-    info!("=== PHASE 5: aggregate votes + finalize ===");
+    info!("=== PHASE 5: aggregate votes + finalize Ballot Coin ===");
     confirm_or_bail(args, "Broadcast the finalize bundle (runs Groth16 prover)?")?;
 
     let mut agg = Aggregator::new(deploy.config.clone(), make_independent_chain()?, network);
@@ -1612,8 +1940,8 @@ async fn phase_finalize(
     // chain by a block or two; if sync runs against that stale view, it
     // sees only the eve coin and returns `registration_count=0`. Re-sync
     // until the voter_set has the expected number of registrants —
-    // otherwise `collect_votes_with_retry` returns immediately on
-    // `votes.len() >= 0` and we hit BelowThreshold downstream.
+    // otherwise `collect_votes_for_ballot_with_retry` returns immediately
+    // on `votes.len() >= 0` and we hit BelowThreshold downstream.
     //
     // We know the expected count from the CLI's own registration
     // bookkeeping: every successful `phase_register_voter` invocation
@@ -1629,8 +1957,14 @@ async fn phase_finalize(
     )
     .await?;
     let expected_votes = voter_set.registration_count as usize;
-    let votes = collect_votes_with_retry(
+    // CHIP rev 2026-05-02: votes are now collected per Ballot Coin via
+    // `collect_votes_for_ballot` (CHIP.md §284 — aggregator enumerates
+    // the latest Voting Coin per `(registration_coin_id,
+    // ballot_launcher_id)` pair). The legacy `collect_votes` returns
+    // an empty vec by design.
+    let votes = collect_votes_for_ballot_with_retry(
         &mut agg,
+        ballot.ballot_launcher_id,
         expected_votes,
         Duration::from_secs(args.poll_interval_secs.max(20)),
         Duration::from_secs(args.confirmation_timeout_secs.max(600)),
@@ -1641,10 +1975,22 @@ async fn phase_finalize(
         bail!("no votes collected — finalize would fail BelowThreshold");
     }
 
-    let singleton_bundle = agg
-        .build_finalize(vote_outcome, &votes, reward_address, proving_key)
+    let ballot_bundle = agg
+        .build_finalize_for_ballot(
+            chip_voting_sdk::actors::aggregator::BuildFinalizeForBallotParams {
+                ballot_launcher_id: ballot.ballot_launcher_id,
+                vote_outcome,
+                votes: &votes,
+                vote_close_height: ballot.vote_close_height,
+                vote_threshold_num: ballot.vote_threshold_num,
+                vote_threshold_den: ballot.vote_threshold_den,
+                registration_merkle_root_snapshot: ballot.registration_merkle_root_snapshot,
+                registration_vote_weight_snapshot: ballot.registration_vote_weight_snapshot,
+                proving_key,
+            },
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("build_finalize: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("build_finalize_for_ballot: {e:?}"))?;
 
     // Attach an XCH fee coin spend so mainnet farmers prioritise the
     // bundle over zero-fee mempool traffic. See `phase_finalize`'s
@@ -1655,16 +2001,16 @@ async fn phase_finalize(
             funding_keys,
             network,
             args.finalize_fee,
-            singleton_bundle,
+            ballot_bundle,
         )
         .await
         .context("attach finalize fee coin")?
     } else {
-        singleton_bundle
+        ballot_bundle
     };
 
     verify_bundle_locally(&bundle, network)?;
-    let singleton_spent_id: Bytes32 = bundle
+    let ballot_spent_id: Bytes32 = bundle
         .coin_spends
         .first()
         .context("finalize bundle: expected ≥1 coin spend")?
@@ -1674,9 +2020,9 @@ async fn phase_finalize(
     push_tx(chain, &bundle, "finalize").await?;
     wait_for_spend(
         chain,
-        singleton_spent_id,
+        ballot_spent_id,
         args,
-        "Election Singleton (finalize)",
+        "Ballot Coin (finalize)",
     )
     .await?;
     Ok(())
@@ -1785,7 +2131,7 @@ async fn phase_release(
         let current = match chip_voting_sdk::actors::aggregator::find_current_singleton(
             chain,
             &voter.config,
-            0,
+            deploy.election_start_height,
         )
         .await
         {
@@ -1869,121 +2215,29 @@ async fn phase_release(
     Ok(())
 }
 
-// ── Phase 7: Oracle ──────────────────────────────────────────────────
+// ── Oracle action: NOT a separate phase ──────────────────────────────
 //
-// CHIP rev 2026-05-02: the singleton-level Oracle action was removed
-// (per-Ballot-Coin oracle replaces it; see commit 0be3e0b and the
-// Phase-4.6 puzzle work). The block below is compile-out via
-// `#[cfg(any())]` until Phase 6 wires up the per-ballot oracle CLI.
-#[cfg(any())]
-
-/// Spend the Election Singleton via its `oracle` action.
-///
-/// The oracle action is permissionless and state-preserving — it
-/// recreates the singleton at the SAME state and emits a single
-/// CreateCoinAnnouncement carrying the (un)finalized vote result so
-/// external puzzles can `AssertCoinAnnouncement` against it in a
-/// paired spend. Two announcement variants exist (see
-/// `puzzles/election/oracle.rue` for the wire format):
-///
-///   * `State.finalized == true`   →
-///       sha256("oracle_finalized" || vote_outcome || count_be8 || root)
-///   * `State.finalized == false`  →
-///       sha256("oracle_unfinalized" || count_be8 || root)
-///
-/// We expect the FINALIZED variant here because phase 5 already ran.
-/// The bundle has zero AGG_SIG conditions and zero accumulated_fees
-/// to pay, so it goes through with no XCH fee attached — coinset.org
-/// admits it as a free spend immediately, and the singleton is
-/// recreated at the post-finalize state with `amount = 1`.
-async fn phase_oracle(
-    chain: &CoinsetClient,
-    network: NetworkType,
-    args: &Args,
-    deploy: &DeployArtifacts,
-) -> Result<()> {
-    info!("=== PHASE 7: oracle (publish announcement of finalized result) ===");
-    confirm_or_bail(args, "Broadcast the oracle bundle?")?;
-
-    let oracle =
-        chip_voting_sdk::Oracle::new(deploy.config.clone(), make_independent_chain()?, network);
-
-    // Build the spend up-front so we can log the announcement variant
-    // BEFORE broadcasting (useful for operator visibility and for
-    // downstream tools that want to display the announcement id).
-    //
-    // PROPAGATION-AWARE RETRY: `Oracle::build_oracle_spend` walks the
-    // chain via `find_current_singleton`. Coinset's index can briefly
-    // report an OLDER coin (e.g., the eve) as still unspent — the
-    // walker takes the bait, builds against that stale tip, and the
-    // node rejects with DOUBLE_SPEND because the coin is actually
-    // spent. We retry until the assembled spend reflects the actual
-    // post-finalize state (finalized == true; the only state phase 5
-    // can leave the singleton in).
-    let started = std::time::Instant::now();
-    let max_wait = Duration::from_secs(args.confirmation_timeout_secs.max(600));
-    let poll = Duration::from_secs(args.poll_interval_secs.max(15));
-    let oracle_spend = loop {
-        let attempt = oracle
-            .build_oracle_spend()
-            .await
-            .map_err(|e| anyhow::anyhow!("Oracle::build_oracle_spend: {e:?}"))?;
-        if attempt.announcement.is_finalized() {
-            break attempt;
-        }
-        if started.elapsed() >= max_wait {
-            return Err(anyhow::anyhow!(
-                "phase_oracle: chain view never advanced to post-finalize state \
-                 within {}s; oracle would emit `oracle_unfinalized` instead of \
-                 `oracle_finalized` (singleton tip stuck at {} per coinset)",
-                started.elapsed().as_secs(),
-                hex::encode(attempt.singleton_coin_id()),
-            ));
-        }
-        tracing::info!(
-            singleton_coin_id = %hex::encode(attempt.singleton_coin_id()),
-            elapsed_secs = started.elapsed().as_secs(),
-            "oracle: chain still reports pre-finalize tip — retrying"
-        );
-        tokio::time::sleep(poll).await;
-    };
-    let singleton_id = oracle_spend.singleton_coin_id();
-    let announcement_id = oracle_spend.announcement_id;
-    let announcement_msg = oracle_spend.announcement.message();
-    let is_finalized = oracle_spend.announcement.is_finalized();
-    info!(
-        singleton_coin_id = %hex::encode(singleton_id),
-        announcement_id = %hex::encode(announcement_id),
-        announcement_message = %hex::encode(announcement_msg),
-        finalized = is_finalized,
-        registration_count = oracle_spend.state.registration_count,
-        registration_merkle_root = %hex::encode(oracle_spend.state.registration_merkle_root),
-        vote_outcome = %hex::encode(oracle_spend.state.vote_outcome),
-        "oracle spend assembled"
-    );
-
-    // Wrap into a SpendBundle. The oracle action emits NO AggSig
-    // conditions, so the aggregated signature is the BLS identity.
-    // We construct directly from the spend we already validated above
-    // (rather than calling `build_oracle_bundle`, which would re-walk
-    // the chain and might pick up a different tip than what we logged).
-    let coin_spends = vec![oracle_spend.coin_spend.clone()];
-    let agg_sig =
-        chip_voting_sdk::actors::deployer::sign_bundle_signature(&coin_spends, &[], network)
-            .map_err(|e| anyhow::anyhow!("oracle: sign_bundle_signature: {e:?}"))?;
-    let bundle = SpendBundle::new(coin_spends, agg_sig);
-    verify_bundle_locally(&bundle, network)?;
-
-    push_tx(chain, &bundle, "oracle").await?;
-    let spent_height =
-        wait_for_spend(chain, singleton_id, args, "Election Singleton (oracle)").await?;
-    info!(
-        singleton_coin_id = %hex::encode(singleton_id),
-        spent_height,
-        "oracle announcement landed on-chain — singleton recreated at same (post-finalize) state"
-    );
-    Ok(())
-}
+// CHIP rev 2026-05-02 (CHIP.md §234): `oracle` is a Ballot Coin action,
+// NOT an Election Singleton action. The singleton-level Oracle action
+// (and the SDK's `Oracle` actor that drove it) was removed entirely.
+//
+// The Ballot Coin's `oracle` action emits an announcement of
+// `(ballot_launcher_id, vote_close_height, finalized)` that
+// `update_vote` asserts (so re-votes can prove the ballot is still
+// open). It is exercised IMPLICITLY by every successful `cast_vote` /
+// `update_vote` co-spend already broadcast by `phase_vote`; there is
+// no SDK helper today for building a STANDALONE oracle spend (the
+// CHIP.md §234 use case for an external puzzle to
+// `AssertCoinAnnouncement` the post-finalize result is a separate
+// follow-up — `BallotReader` knows how to find the current Ballot
+// Coin but no driver assembles a bare oracle bundle).
+//
+// Coverage: the `voter_revote_e2e.rs` simulator test already pins the
+// oracle's `ballot_oracle_open` announcement assertion; cross-check
+// against the BALLOT-ORACLE-CURRY / BALLOT-ORACLE-ROLE rows in
+// `app/docs/chip-compliance.md`. A standalone "publish post-finalize
+// announcement" CLI phase remains an SDK gap; revisit if/when an
+// external puzzle integration needs it.
 
 // ============================================================================
 // SECTION 7 — Helpers (push_tx, signature verification, prompts)
@@ -2320,8 +2574,18 @@ async fn wait_for_synced_voter_set(
     }
 }
 
-async fn collect_votes_with_retry(
+/// Repeatedly call `Aggregator::collect_votes_for_ballot` until every
+/// voter's post-cast_vote Voting Coin is hint-indexed by the
+/// aggregator's peer pool, OR `max_wait` elapses.
+///
+/// CHIP rev 2026-05-02: votes are scoped per Ballot Coin (CHIP.md
+/// §253-255 + §284). The aggregator enumerates the latest Voting Coin
+/// per `(registration_coin_id, ballot_launcher_id)` pair via
+/// `collect_votes_for_ballot`; the legacy `collect_votes` returns
+/// an empty vec by design.
+async fn collect_votes_for_ballot_with_retry(
     agg: &mut Aggregator<CoinsetClient>,
+    ballot_launcher_id: Bytes32,
     expected: usize,
     poll_interval: Duration,
     max_wait: Duration,
@@ -2331,9 +2595,9 @@ async fn collect_votes_with_retry(
     loop {
         attempt += 1;
         let votes = agg
-            .collect_votes()
+            .collect_votes_for_ballot(ballot_launcher_id)
             .await
-            .map_err(|e| anyhow::anyhow!("collect_votes (attempt {attempt}): {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("collect_votes_for_ballot (attempt {attempt}): {e:?}"))?;
         if votes.len() >= expected {
             return Ok(votes);
         }
@@ -2343,7 +2607,7 @@ async fn collect_votes_with_retry(
                 collected = votes.len(),
                 expected,
                 elapsed_secs = started.elapsed().as_secs(),
-                "collect_votes_with_retry: max_wait exhausted, returning best-effort vote set"
+                "collect_votes_for_ballot_with_retry: max_wait exhausted, returning best-effort vote set"
             );
             return Ok(votes);
         }
@@ -2352,7 +2616,7 @@ async fn collect_votes_with_retry(
             collected = votes.len(),
             expected,
             elapsed_secs = started.elapsed().as_secs(),
-            "collect_votes: not all voters' post-vote coins visible yet, retrying"
+            "collect_votes_for_ballot: not all voters' post-vote coins visible yet, retrying"
         );
         tokio::time::sleep(poll_interval).await;
     }
@@ -2556,8 +2820,31 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    // ── Phase 3: Wait election window ──────────────────────────────
-    phase_wait_window(&chain, &deploy, &args).await?;
+    // ── Phase 2.5a: createBallot ───────────────────────────────────
+    // CHIP rev 2026-05-02 (CHIP.md §202): the Election Singleton's
+    // `createBallot` action mints a per-ballot launcher coin. The
+    // launcher is then consumed in `phase_launch_ballot` to mint
+    // the eve Ballot Coin singleton. cast_vote / finalize bind to
+    // the resulting `ballot_launcher_id` + per-ballot snapshot.
+    let (ballot_launcher_id, vote_close_height, outcome_domain_hash, vthr_n, vthr_d) =
+        phase_create_ballot(&chain, &funding_keys, network, &args, &deploy).await?;
+
+    // ── Phase 2.5b: launch_ballot ──────────────────────────────────
+    let ballot = phase_launch_ballot(
+        &chain,
+        network,
+        &args,
+        &deploy,
+        ballot_launcher_id,
+        vote_close_height,
+        outcome_domain_hash,
+        vthr_n,
+        vthr_d,
+    )
+    .await?;
+
+    // ── Phase 3: Wait until chain peak ≥ ballot.vote_close_height ──
+    phase_wait_window(&chain, &ballot, &args).await?;
 
     // ── Phase 4: Cast votes ────────────────────────────────────────
     let vote_data = Bytes32::new([0x42u8; 32]);
@@ -2566,6 +2853,7 @@ async fn main() -> Result<()> {
         network,
         &args,
         &deploy,
+        &ballot,
         "voter1",
         &voter1_keys,
         vote_data,
@@ -2577,6 +2865,7 @@ async fn main() -> Result<()> {
         network,
         &args,
         &deploy,
+        &ballot,
         "voter2",
         &voter2_keys,
         vote_data,
@@ -2584,7 +2873,7 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    // ── Phase 5: Finalize ──────────────────────────────────────────
+    // ── Phase 5: Finalize the Ballot Coin ──────────────────────────
     let vote_outcome = vote_data; // both voters vote the same way for the test
     phase_finalize(
         &chain,
@@ -2592,8 +2881,8 @@ async fn main() -> Result<()> {
         network,
         &args,
         &deploy,
+        &ballot,
         vote_outcome,
-        funding_keys.p2_puzzle_hash, // reward address: the funding wallet
         &ceremony.proving_key,
     )
     .await?;
@@ -2624,15 +2913,11 @@ async fn main() -> Result<()> {
         info!("--skip-release set: leaving registration coins on-chain");
     }
 
-    // ── Phase 7: Oracle ────────────────────────────────────────────
-    // Phase 7 oracle is compile-stubbed pending Phase 6 (see
-    // `#[cfg(any())] async fn phase_oracle` below).
-    if !args.skip_oracle && false {
-        // phase_oracle(&chain, network, &args, &deploy).await?;
-    } else {
-        info!("--skip-oracle set: not publishing oracle announcement");
-    }
-
+    // CHIP rev 2026-05-02 (CHIP.md §234): the singleton-level oracle
+    // is gone; the Ballot Coin's oracle action is exercised
+    // implicitly by every successful cast_vote co-spend. See the
+    // "Oracle action: NOT a separate phase" comment block for why
+    // this isn't a top-level phase here.
     info!("✓ live election lifecycle complete — every phase confirmed on-chain");
     Ok(())
 }
