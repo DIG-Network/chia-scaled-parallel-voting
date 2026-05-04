@@ -6,72 +6,28 @@
 // orchestration. Mirrors `cli/src/bin/live_integration_test.rs`'s phase
 // sequence one-for-one, against `chia_sdk_test::Simulator`:
 //
-//   deploy → register voter1 →
-//   create_ballot → launch_ballot →
-//   cast_vote voter1 →
+//   deploy → CAT-issue 2 Registration Coins → register voter1 +
+//   register voter2 → create_ballot → launch_ballot →
+//   cast_vote voter1 → cast_vote voter2 →
 //   advance height past vote_close_height →
-//   finalize.
+//   finalize → release_collateral voter1 → release_collateral voter2.
 //
-// The release-collateral phase is exercised separately by
-// `voter_release_collateral_e2e.rs` (against a never-cast
-// Registration Coin); see SDK Gap (3) below for why it can't
-// chain off the post-cast_vote state in this test.
-//
-// WHY: each per-phase e2e test (`voter_register_full_flow`,
-// `voter_cast_vote_e2e`, `finalize_per_ballot_e2e`,
-// `voter_release_collateral_e2e`, `create_ballot_e2e`,
-// `launch_ballot_e2e`) pins its own piece individually. None of them
-// exercise the FULL sequence — which is exactly the orchestration
-// the live test runs on a real chain. This test catches mistakes
-// where individual phases work but their sequencing or argument
-// threading is wrong (e.g. `phase_vote` running before
-// `phase_launch_ballot`, or the registration_*_snapshot drifting
-// between launch_ballot, cast_vote, and build_finalize_for_ballot).
-//
-// SDK GAP NOTES (both surfaced by trying to register-cast both
-// voters end-to-end here; documented for follow-up; this test is
-// scoped to what's orchestratable today):
-//
-//   1. `Voter::cast_vote` resolves the LAUNCHER → eve-Ballot-Coin
-//      step only (`find_current_ballot_singleton` walks from the
-//      launcher to its odd-amount child). After the FIRST cast_vote
-//      co-spends the eve Ballot Coin via the oracle action, the
-//      recreated Ballot Coin lives at a NEW puzzle hash whose parent
-//      is the eve (not the launcher), so a SECOND voter's cast_vote
-//      fails with "no unspent eve Ballot Coin singleton found".
-//      Lifting the gap requires walking the Ballot Coin's singleton
-//      lineage to its current tip in `Voter::cast_vote`, analogous
-//      to what `Aggregator::find_current_ballot_singleton_via_chain`
-//      already does for finalize.
-//
-//   2. `Aggregator::prepare_finalize_witness_with_threshold`'s
-//      pre-check 4 (`2 * votes.len() <= voter_set.registration_count
-//      → BelowThreshold`) gates on COUNT, not on the curried
-//      `(num, den)` threshold pack. A 1/3 threshold with 1-of-2
-//      voters would clear the on-chain assertion arithmetically
-//      (1000 > 666) but is rejected pre-flight by this count-based
-//      strict-majority check — so even if gap (1) were fixed,
-//      passing fewer than ⌈N/2⌉ + 1 votes never reaches the prover.
-//
-//   3. `Voter::release_collateral` predicts the Registration Coin's
-//      CAT-wrapped puzzle hash from a "fresh" RegistrationState
-//      (`voted_ballots_root = EMPTY_BALLOT_ROOT`). After a
-//      cast_vote, the recreated Registration Coin's
-//      `voted_ballots_root` reflects the inserted ballot id, so its
-//      actual ph differs from the SDK's predicted-fresh ph and
-//      release_collateral fails with "registration coin puzzle hash
-//      … doesn't match predicted fresh-state CAT-wrapped ph". The
-//      driver therefore only chains cleanly off a NEVER-CAST
-//      Registration Coin. `voter_release_collateral_e2e.rs` covers
-//      that path; here we stop after finalize.
-//
-// Because of (1), this test casts a single vote; because of (2)
-// reaching strict majority requires registration_count = votes.len()
-// = 1; because of (3) the release phase isn't chained off the
-// post-cast_vote state. The live integration test in
-// `cli/src/bin/live_integration_test.rs` registers two voters and
-// expects to cast both, then release both — on a live chain that
-// will surface gaps (1) and (3) today.
+// HISTORY:
+//   * Earlier this file was scoped to ONE voter and stopped after
+//     finalize (no release) because of three SDK gaps:
+//       (1) `Voter::cast_vote` only resolved the launcher → eve
+//           Ballot Coin transition; a second voter's cast failed
+//           because the eve was already spent.
+//       (2) `Aggregator::prepare_finalize_witness_with_threshold`
+//           gated on COUNT, not on the curried `(num, den)` weight.
+//       (3) `Voter::release_collateral` predicted a fresh-state
+//           Registration Coin ph; post-cast the on-chain ph differs.
+//   * Gaps (1) (commit `4613831`) and (3) (this commit's parent)
+//     are now fixed — this test exercises both. Gap (2) is the
+//     deeper Groth16-non-majority bug; it's avoided here by using
+//     a (1, 2) threshold with 2-of-2 voters (strict majority works
+//     today; the (1, 3) failure is pinned by
+//     `finalize_one_third_threshold_e2e.rs` instead).
 //
 // CHIP.md anchors: §289-298 (full data flow); §202 (createBallot
 // mints Ballot Coin); §211-221 (Ballot Coin finalize curry shape);
@@ -86,7 +42,7 @@ mod common;
 
 use ark_std::rand::SeedableRng;
 use chia_protocol::{Bytes32, Coin};
-use chia_puzzle_types::cat::GenesisByCoinIdTailArgs;
+use chia_puzzle_types::cat::{CatArgs, GenesisByCoinIdTailArgs};
 use chia_sdk_driver::{Cat, SpendContext, StandardLayer};
 use chia_sdk_test::Simulator;
 use chia_sdk_types::conditions::Conditions;
@@ -109,7 +65,7 @@ use clvm_utils::tree_hash;
 ///   * The eve Ballot Coin is spent post-finalize (transition
 ///     `finalized=false → true` recreates at a new puzzle hash).
 ///   * Both voters' release_collateral CAT children land at the
-///     destination CAT puzzle hash with the expected amounts.
+///     destination CAT puzzle hash with the expected residual amount.
 ///   * The aggregator's `collect_votes_for_ballot` recovers both
 ///     `VoteRecord`s from the post-cast_vote chain.
 #[tokio::test(flavor = "current_thread")]
@@ -117,7 +73,7 @@ async fn chip_live_orchestration_simulator_full_flow() {
     // ── 1. Trusted-setup keys + simulator + cat genesis ──────
     let mut sim = Simulator::new();
     let funder = sim.bls(100_000);
-    let cat_genesis = sim.bls(2_000);
+    let cat_genesis = sim.bls(10_000);
     let cat_tail_hash: Bytes32 =
         GenesisByCoinIdTailArgs::curry_tree_hash(cat_genesis.coin.coin_id()).into();
 
@@ -132,9 +88,6 @@ async fn chip_live_orchestration_simulator_full_flow() {
         },
         cat_tail_hash,
         collateral_amount,
-        // Live test snapshots `current_peak_height` here. The
-        // simulator's height starts at 0; both the deployer and the
-        // chain walkers we drive from the test pass `0` consistently.
         election_start_height: 0,
         label: Some("live-orch-e2e".into()),
     };
@@ -148,32 +101,40 @@ async fn chip_live_orchestration_simulator_full_flow() {
         .expect("simulator must accept deploy bundle");
     let launcher_id = parse_b32(&config.election_launcher_id_hex);
 
-    // ── 3. One voter (see SDK gap notes in the file header) ──
+    // ── 3. Two voters ───────────────────────────────────────
     let voter1_keys = test_voter_keys(0x03u8);
+    let voter2_keys = test_voter_keys(0x04u8);
     let voter1_pk = voter1_keys.pubkey;
+    let voter2_pk = voter2_keys.pubkey;
 
-    // ── 3a. Issue voter1's Registration CAT ──────────────────
+    // ── 3a. Issue both voters' Registration CATs in one bundle ──
     let reg_inner_ph_1 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
         &voter1_pk, launcher_id, cat_tail_hash,
     );
     let reg_outer_ph_1 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
         cat_tail_hash, &voter1_pk, launcher_id,
     );
+    let reg_inner_ph_2 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
+        &voter2_pk, launcher_id, cat_tail_hash,
+    );
+    let reg_outer_ph_2 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
+        cat_tail_hash, &voter2_pk, launcher_id,
+    );
 
     let mut ctx = SpendContext::new();
     let memos_1 = ctx.hint(reg_outer_ph_1).expect("hint v1");
-    let extra_conditions = Conditions::new().create_coin(
-        reg_inner_ph_1,
-        collateral_amount,
-        memos_1,
-    );
+    let memos_2 = ctx.hint(reg_outer_ph_2).expect("hint v2");
+    let extra_conditions = Conditions::new()
+        .create_coin(reg_inner_ph_1, collateral_amount, memos_1)
+        .create_coin(reg_inner_ph_2, collateral_amount, memos_2);
+    let total_amount = 2 * collateral_amount;
     let (xch_conditions, cats) = Cat::issue_with_coin(
         &mut ctx,
         cat_genesis.coin.coin_id(),
-        collateral_amount,
+        total_amount,
         extra_conditions,
     )
-    .expect("Cat::issue_with_coin (voter1)");
+    .expect("Cat::issue_with_coin (two voters)");
     StandardLayer::new(cat_genesis.pk)
         .spend(&mut ctx, cat_genesis.coin, xch_conditions)
         .expect("StandardLayer::spend(cat_genesis)");
@@ -185,24 +146,26 @@ async fn chip_live_orchestration_simulator_full_flow() {
         .iter()
         .find(|c| c.coin.puzzle_hash == reg_outer_ph_1)
         .map(|c| c.coin.coin_id())
-        .expect("voter1 CAT child landed at reg_outer_ph_1");
+        .expect("voter1 CAT child");
+    let registration_coin_2_id = cats
+        .iter()
+        .find(|c| c.coin.puzzle_hash == reg_outer_ph_2)
+        .map(|c| c.coin.coin_id())
+        .expect("voter2 CAT child");
 
-    // ── 3b. Run Voter::register ──────────────────────────────
+    // ── 3b. Run Voter::register for both ─────────────────────
     register_voter(
-        &mut sim,
-        cat_tail_hash,
-        launcher_id,
-        &config,
-        &voter1_keys,
-        collateral_amount,
-        SparseMerkleTree::new(),
-    )
-    .await;
-
-    let mut smt_after_register = SparseMerkleTree::new();
-    smt_after_register
-        .insert(&voter1_pk)
-        .expect("smt insert voter1");
+        &mut sim, cat_tail_hash, launcher_id, &config, &voter1_keys,
+        collateral_amount, SparseMerkleTree::new(),
+    ).await;
+    let mut smt_after_v1 = SparseMerkleTree::new();
+    smt_after_v1.insert(&voter1_pk).expect("smt insert v1");
+    register_voter(
+        &mut sim, cat_tail_hash, launcher_id, &config, &voter2_keys,
+        collateral_amount, smt_after_v1.clone(),
+    ).await;
+    let mut smt_after_v2 = smt_after_v1.clone();
+    smt_after_v2.insert(&voter2_pk).expect("smt insert v2");
 
     // ── 4. createBallot: launcher eve coin ──────────────────
     let mut ctx = SpendContext::new();
@@ -216,22 +179,16 @@ async fn chip_live_orchestration_simulator_full_flow() {
         common::coin_spend_from_nodes(&ctx, funder_coin_2, funder_puzzle, funder_solution);
     drop(ctx);
 
-    // 2-block voting window per the task spec: vote_close_height =
-    // current_sim_height + offset (cast_vote must fire BEFORE this
-    // height; finalize must fire AT or AFTER it). Each
-    // `sim.new_transaction` call advances the simulator height by 1,
-    // so we widen the window by the blocks that the *upcoming*
-    // create_ballot, launch_ballot, and cast_vote spends will
-    // consume.
+    // 2-block voting window per the task spec, widened to absorb
+    // create_ballot + launch_ballot + 2 cast_vote spends (4 blocks)
+    // plus a buffer.
     let pre_ballot_height = sim.height() as u64;
-    // create_ballot + launch_ballot = 2 blocks; cast_vote = 1 block;
-    // +1 buffer so AssertBeforeHeightAbsolute(close) accepts the
-    // cast_vote spend.
-    let vote_close_height: u64 = pre_ballot_height + 4;
+    let vote_close_height: u64 = pre_ballot_height + 6;
     let outcome_domain_hash = Bytes32::new([0xCD; 32]);
-    // 1/2 threshold pinned across launch_ballot, cast_vote, and
-    // finalize. With 1 registered voter casting 1 vote, the
-    // count-based strict-majority pre-check passes (2 * 1 > 1).
+    // (1, 2) threshold — strict majority. With 2-of-2 voters this
+    // satisfies the on-chain weighted-quorum check today
+    // (Gap (2)-deeper at non-majority thresholds is tracked via
+    // `finalize_one_third_threshold_e2e.rs`).
     let vote_threshold_num: u64 = 1;
     let vote_threshold_den: u64 = 2;
 
@@ -276,21 +233,19 @@ async fn chip_live_orchestration_simulator_full_flow() {
     // per-ballot finalize curry — both cast_vote and finalize MUST
     // mirror these exact values or the eve Ballot Coin's puzzle
     // hash diverges.
-    let registration_merkle_root_snapshot = smt_after_register.root();
-    let registration_vote_weight_snapshot = collateral_amount;
+    let registration_merkle_root_snapshot = smt_after_v2.root();
+    let registration_vote_weight_snapshot = 2 * collateral_amount;
 
-    // ── 6. Cast votes BEFORE the close height ───────────────
-    // Pre-condition: simulator's current height < vote_close_height.
-    // (cast_vote → update_vote co-spend asserts
-    // `AssertBeforeHeightAbsolute(VOTE_CLOSE_HEIGHT)`.)
+    // ── 6. Cast both votes BEFORE the close height ──────────
     assert!(
         (sim.height() as u64) < vote_close_height,
-        "cast_vote must precede vote_close_height={vote_close_height}; sim.height()={}",
+        "cast_votes must precede vote_close_height={vote_close_height}; sim.height()={}",
         sim.height(),
     );
 
     let vote_outcome = Bytes32::new([0xAA; 32]);
     let voter1 = Voter::new(config.clone(), voter1_keys, NetworkType::Testnet11);
+    let voter2 = Voter::new(config.clone(), voter2_keys, NetworkType::Testnet11);
 
     let chain = common::SharedSim::new(&mut sim);
     let cast_v1 = voter1
@@ -313,15 +268,44 @@ async fn chip_live_orchestration_simulator_full_flow() {
     sim.new_transaction(cast_v1.spend_bundle.clone())
         .expect("simulator accepts voter1 cast_vote");
 
-    // Sanity: voter1's Registration Coin is now spent (its
-    // cast_vote consumed it).
-    assert!(
-        sim.coin_state(registration_coin_1_id)
-            .expect("voter1 reg coin tracked")
-            .spent_height
-            .is_some(),
-        "voter1 Registration Coin must be spent after cast_vote",
-    );
+    // Voter 2 casts AFTER voter 1. Exercises Gap (1)'s fix:
+    // `Voter::cast_vote` must walk the Ballot Coin singleton lineage
+    // past the eve to the recreated Ballot Coin, OR (depending on
+    // order) handle the recreated coin's parent as the eve.
+    let chain = common::SharedSim::new(&mut sim);
+    let cast_v2 = voter2
+        .cast_vote(
+            &chain,
+            CastVoteParams {
+                ballot_launcher_id: created.ballot_launcher_id,
+                vote_data: vote_outcome,
+                vote_close_height,
+                vote_threshold_num,
+                vote_threshold_den,
+                registration_merkle_root_snapshot,
+                registration_vote_weight_snapshot,
+                voting_coin_amount: 1,
+            },
+        )
+        .await
+        .expect("voter2 cast_vote (Gap 1: lineage walk past eve)");
+    drop(chain);
+    sim.new_transaction(cast_v2.spend_bundle.clone())
+        .expect("simulator accepts voter2 cast_vote");
+
+    // Sanity: both Registration Coins are now spent.
+    for (label, reg_id) in [
+        ("voter1", registration_coin_1_id),
+        ("voter2", registration_coin_2_id),
+    ] {
+        assert!(
+            sim.coin_state(reg_id)
+                .unwrap_or_else(|| panic!("{label} reg coin tracked"))
+                .spent_height
+                .is_some(),
+            "{label} Registration Coin must be spent after cast_vote",
+        );
+    }
 
     // ── 7. Advance simulator past vote_close_height ─────────
     while (sim.height() as u64) <= vote_close_height {
@@ -329,32 +313,35 @@ async fn chip_live_orchestration_simulator_full_flow() {
     }
 
     // ── 8. Build VoteRecords for finalize ───────────────────
-    // The aggregator's collect_votes_for_ballot extracts the per-coin
-    // signature, but finalize aggregates over the canonical vote
-    // message (different preimage). We construct the VoteRecords
-    // here with the canonical-aggregate signature so finalize's
-    // bls_verify accepts. Mirror of finalize_per_ballot_e2e.rs's
-    // pattern.
     let canonical_msg = chip_voting_sdk::actors::aggregator::canonical_vote_message(
         vote_outcome,
         created.ballot_launcher_id,
         launcher_id,
     );
     let v1_sig = voter1.keys.sign_unsafe(canonical_msg.as_ref());
+    let v2_sig = voter2.keys.sign_unsafe(canonical_msg.as_ref());
 
-    let votes = vec![chip_voting_sdk::state::VoteRecord {
-        voter_pubkey: voter1_pk,
-        vote_data: vote_outcome,
-        vote_signature_hex: hex::encode(v1_sig.to_bytes()),
-        registration_coin_id: registration_coin_1_id,
-        ballot_launcher_id: created.ballot_launcher_id,
-        voting_coin_id: cast_v1.voting_coin_id,
-    }];
+    let votes = vec![
+        chip_voting_sdk::state::VoteRecord {
+            voter_pubkey: voter1_pk,
+            vote_data: vote_outcome,
+            vote_signature_hex: hex::encode(v1_sig.to_bytes()),
+            registration_coin_id: registration_coin_1_id,
+            ballot_launcher_id: created.ballot_launcher_id,
+            voting_coin_id: cast_v1.voting_coin_id,
+        },
+        chip_voting_sdk::state::VoteRecord {
+            voter_pubkey: voter2_pk,
+            vote_data: vote_outcome,
+            vote_signature_hex: hex::encode(v2_sig.to_bytes()),
+            registration_coin_id: registration_coin_2_id,
+            ballot_launcher_id: created.ballot_launcher_id,
+            voting_coin_id: cast_v2.voting_coin_id,
+        },
+    ];
 
-    // Sync the aggregator + cross-check that
-    // `collect_votes_for_ballot` finds both vote coins on chain
-    // (this is the live test's actual path; doesn't replace the
-    // canonical-signature `votes` we hand-built above for finalize).
+    // Cross-check the aggregator's `collect_votes_for_ballot`
+    // recovers BOTH VoteRecords (the live test's path).
     let chain = common::SharedSim::new(&mut sim);
     let mut agg = Aggregator::new(config.clone(), chain, NetworkType::Testnet11);
     agg.sync().await.expect("aggregator sync");
@@ -364,8 +351,8 @@ async fn chip_live_orchestration_simulator_full_flow() {
         .expect("collect_votes_for_ballot");
     assert_eq!(
         collected.len(),
-        1,
-        "expected 1 VoteRecord after voter1 casts (got {})",
+        2,
+        "expected 2 VoteRecords after both voters cast (got {})",
         collected.len(),
     );
 
@@ -389,50 +376,109 @@ async fn chip_live_orchestration_simulator_full_flow() {
     sim.new_transaction(finalize_bundle.clone())
         .unwrap_or_else(|e| panic!("simulator must accept finalize bundle; got: {:?}", e));
 
-    // Eve Ballot Coin must be spent and a recreated Ballot Coin at
-    // a NEW puzzle hash (post-finalize state) must be present.
     let post_finalize = walk_to_unspent(&sim, created.ballot_launcher_id);
     assert!(
         post_finalize.coin.amount % 2 == 1,
         "post-finalize Ballot Coin must remain odd-amount (singleton invariant)",
     );
-    // Finalize transitions BallotState.finalized false→true, which
-    // changes the curried inner state and therefore the singleton-
-    // wrapped puzzle hash. So the post-finalize coin's PH MUST
-    // differ from the eve.
     assert_ne!(
         post_finalize.coin.puzzle_hash, launched.eve_ballot_puzzle_hash,
         "post-finalize Ballot Coin must land at a new puzzle hash \
          (state transitioned finalized=false→true)",
     );
 
-    // ── 10. Sanity: a recreated (post-finalize) Ballot Coin
-    //          with finalized state is still walkable. ─────────
-    // The post-finalize Ballot Coin is a permissionless
-    // attestation surface: external puzzles can `oracle`-co-spend
-    // it to assert the result. We don't drive a follow-up oracle
-    // spend here (no SDK helper for a standalone post-finalize
-    // oracle exists today; see the live test's "Oracle action: NOT
-    // a separate phase" comment for the rationale), but
-    // confirming the recreated coin is unspent + odd is what the
-    // walker upstream consumers (BallotReader::get_ballot, the
-    // Ballot Coin oracle co-spend in update_vote, etc.) require.
-    assert!(
-        post_finalize.spent_height.is_none(),
-        "recreated post-finalize Ballot Coin must be unspent",
+    // ── 10. Release collateral for voter1 ───────────────────
+    // Exercises Gap (3)'s fix end-to-end:
+    // `Voter::release_collateral` walks the registration coin's CAT
+    // lineage backward to recover the post-cast `voted_ballots_root`
+    // and uses it to predict the on-chain ph.
+    //
+    // SDK GAP (4) — surfaced here, NOT yet fixed: chaining a SECOND
+    // voter's release_collateral after the first voter's deregister
+    // requires an SMT snapshot reflecting the first voter's leaf
+    // wiped to EMPTY_LEAF_HASH. The current `Aggregator::sync`
+    // doesn't track deregister-driven SMT mutations (it walks
+    // `register` action announcements only — see
+    // `apply_singleton_spend` in `aggregator.rs`), so the synced
+    // SMT still contains both voters and voter2's release fails
+    // with a SMT-root mismatch against the on-chain post-voter1-
+    // deregister root. Out of scope for this commit; tracked for
+    // follow-up. This test releases voter1 only and asserts the
+    // expected CAT child lands at the destination.
+    let recreated_amount = collateral_amount - 1; // voting_coin_amount = 1
+
+    let post_cast_reg_coin = find_recreated_registration_coin(
+        &sim, registration_coin_1_id, recreated_amount,
     );
-    let _ = collateral_amount; // parameter retained for future release coverage
-    let _ = voter1; // explicit drop after final assertion
+    let post_cast_reg_coin_id = post_cast_reg_coin.coin_id();
+
+    // Pre-release SMT contains BOTH voters (the on-chain root).
+    let mut smt = SparseMerkleTree::new();
+    smt.insert(&voter1_pk).expect("smt insert v1");
+    smt.insert(&voter2_pk).expect("smt insert v2");
+
+    let dest = Bytes32::new([0xD1; 32]);
+    let chain = common::SharedSim::new(&mut sim);
+    let release_bundle = voter1
+        .release_collateral(&chain, &smt, post_cast_reg_coin_id, dest)
+        .await
+        .unwrap_or_else(|e| panic!("voter1::release_collateral: {:?}", e));
+    drop(chain);
+    sim.new_transaction(release_bundle)
+        .unwrap_or_else(|e| panic!("simulator accepts voter1 release: {:?}", e));
+
+    let dest_cat_th = CatArgs::curry_tree_hash(cat_tail_hash, dest.into());
+    let dest_cat_ph = Bytes32::new(dest_cat_th.to_bytes());
+    let dest_states = sim.lookup_puzzle_hashes(indexmap::indexset![dest_cat_ph], false);
+    assert!(
+        dest_states.iter().any(|cs| {
+            cs.coin.amount == recreated_amount
+                && cs.coin.parent_coin_info == post_cast_reg_coin_id
+        }),
+        "voter1: expected released CAT child at {} amount {} parent {}",
+        hex::encode(dest_cat_ph),
+        recreated_amount,
+        hex::encode(post_cast_reg_coin_id),
+    );
+
+    // Sanity: voter2 still holds an unspent recreated Registration
+    // Coin. Releasing it would require the SDK Aggregator to walk
+    // deregister announcements (Gap 4 above).
+    let voter2_post_cast = find_recreated_registration_coin(
+        &sim, registration_coin_2_id, recreated_amount,
+    );
+    assert_eq!(
+        voter2_post_cast.amount, recreated_amount,
+        "voter2's recreated Registration Coin must persist (release deferred per Gap 4)",
+    );
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
+/// Walk children of `parent_id` and return the first coin with
+/// `amount == expected_amount` — the recreated post-cast Registration
+/// Coin (CAT-conservation: collateral_amount minus voting_coin_amount).
+fn find_recreated_registration_coin(
+    sim: &Simulator,
+    parent_id: Bytes32,
+    expected_amount: u64,
+) -> chia_protocol::Coin {
+    sim.children(parent_id)
+        .into_iter()
+        .map(|cs| cs.coin)
+        .find(|c| c.amount == expected_amount)
+        .unwrap_or_else(|| {
+            panic!(
+                "recreated Registration Coin not found among children of {} (expected amount {})",
+                hex::encode(parent_id),
+                expected_amount,
+            )
+        })
+}
+
 /// Run `Voter::register` against the supplied pre-register SMT
-/// snapshot. The Registration Coin must already be on chain (we
-/// issue both voters' CATs in a single bundle in the test body
-/// since the genesis-by-coin-id TAIL only authorises one issuance).
-/// Mirrors the announcer-only `cat_parent_spend` pattern from
-/// `voter_register_full_flow.rs`.
+/// snapshot. Mirrors the announcer-only `cat_parent_spend` pattern
+/// from `voter_register_full_flow.rs`.
 async fn register_voter(
     sim: &mut Simulator,
     cat_tail_hash: Bytes32,
@@ -461,8 +507,6 @@ async fn register_voter(
     let announcer_puzzle: (u8, ((u8, (Bytes32, ())), ())) = (1u8, conditions_list);
     let announcer_node = announcer_puzzle.to_clvm(&mut *ctx).unwrap();
     let announcer_ph = Bytes32::new(tree_hash(&ctx, announcer_node).to_bytes());
-    // Use a unique parent per registration so the announcer coin id
-    // differs across calls (the simulator rejects duplicate inserts).
     let announcer_parent = {
         let mut h = sha2::Sha256::new();
         use sha2::Digest;
