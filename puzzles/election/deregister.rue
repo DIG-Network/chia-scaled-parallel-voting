@@ -77,12 +77,12 @@ fn main(
     assert deregister_leaf_index == computed_slot;
 
     // Membership proof: the slot currently holds the canonical SPT
-    // leaf — sha256(pubkey || locked_cat_mojos_be8) — matching the
-    // formula register.rue used at registration time.
+    // leaf — sha256(pubkey) per CHIP.md §88-91 "Sparse Merkle Tree
+    // (registration set)" — matching the formula register.rue used
+    // at registration time. Per-voter weight is tracked on Election
+    // Singleton state, not in the leaf.
     let pk_b: Bytes = voter_pubkey as Bytes;
-    let active_leaf: Bytes32 = sha256(
-        pk_b + int_to_8_bytes_be(COLLATERAL_AMOUNT)
-    );
+    let active_leaf: Bytes32 = sha256(pk_b);
     let pre_root: Bytes32 = compute_root(
         active_leaf, deregister_leaf_index, deregister_siblings, TREE_DEPTH,
     );
