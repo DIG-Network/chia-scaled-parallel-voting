@@ -16,17 +16,17 @@
 //   * Post-fix the pre-check mirrors the on-chain inequality and the
 //     positive case below succeeds.
 //
-// KNOWN FAILURE — the second test in this file
-// (`finalize_one_third_full_flow_e2e_known_groth16_failure`) drives
-// the whole `Aggregator::build_finalize_for_ballot` path with (1/3)
-// threshold against the simulator. It currently fails at
-// `bls_pairing_identity` during on-chain verification — a Groth16
-// circuit / proof bug that only surfaces at non-(1/2) thresholds.
-// `finalize_per_ballot_full_simulator_flow` (in
-// `finalize_per_ballot_e2e.rs`) demonstrates that (1/2) works today
-// against the same circuit + scalar pipeline, so the encoding
-// agreements between SDK and on-chain puzzle hold for that case.
-// Tracked under SDK Gap (2)-deeper.
+// CHIP-rev STATUS — the second test in this file
+// (`finalize_one_third_full_flow_e2e`) drives the whole
+// `Aggregator::build_finalize_for_ballot` path with (1/3) threshold
+// against the simulator. Pre-CHIP-rev this case failed at
+// `bls_pairing_identity` because (num, den) were baked into the QAP
+// at trusted-setup time as R1CS coefficients, so a single VK only
+// verified proofs at the shape-circuit's hardcoded (1, 2). The
+// CHIP-rev promotes (num, den) to first-class public inputs s7/s8;
+// the weighted-quorum gadget now consumes them as variable Fr
+// coefficients, so one VK verifies any (num, den). The (1/3) test
+// is therefore unblocked end-to-end and runs without `#[ignore]`.
 
 #![allow(clippy::doc_overindented_list_items)]
 #![allow(clippy::doc_lazy_continuation)]
@@ -139,146 +139,46 @@ async fn finalize_one_third_pre_check_accepts_weighted_quorum() {
     );
 }
 
-/// FN: finalize_one_third_full_flow_e2e_known_groth16_failure
+/// FN: finalize_one_third_full_flow_e2e
 /// WHAT: drives `Aggregator::build_finalize_for_ballot` end-to-end
 ///       with a (1, 3) threshold and 1-of-2 voters.
 ///
-/// KNOWN FAILURE: GROTH16-NON-MAJORITY
-/// ----------------------------------
-/// This call CURRENTLY fails on-chain at `bls_pairing_identity`
+/// CHIP-rev unblock:
+/// ----------------
+/// Pre-CHIP-rev this call failed on-chain at `bls_pairing_identity`
 /// during the Groth16 verification step in
-/// `puzzles/ballot_coin/finalize.rue`. The SDK's
-/// `prepare_finalize_witness_with_threshold` pre-check now passes
-/// (Gap 2 fix), so the bundle reaches the simulator with a
-/// well-formed Groth16 proof — but the on-chain
-/// `bls_pairing_identity(...)` fails.
+/// `puzzles/ballot_coin/finalize.rue`. The root cause was that
+/// `circuit.rs::generate_constraints` baked `(num, den)` into the
+/// R1CS A/B/C matrices as compile-time COEFFICIENTS, so the QAP /
+/// proving-key / VK were shaped at the trusted-setup `(num, den)` —
+/// any other ratio drifted the matrices and the resulting proof
+/// did not verify against the (1,2)-shaped VK.
 ///
-/// ── ROOT CAUSE (investigation 2026-05-03) ────────────────────────
-/// The bug is in `sdk/src/prover/circuit.rs::generate_constraints`.
-/// The weighted-quorum gadget enforces:
+/// The CHIP-rev resolution: promote `(num, den)` from R1CS
+/// coefficients to first-class public inputs s7/s8. The
+/// weighted-quorum gadget now uses arkworks `mul_constant_lc` to
+/// allocate `num_var` and `den_var` as witness variables and binds
+/// them to s7/s8 via direct equality. The on-chain `finalize.rue`
+/// asserts `s7 == Fr::from(VOTE_THRESHOLD_NUM)` and `s8 ==
+/// Fr::from(VOTE_THRESHOLD_DEN)` against the curried threshold —
+/// closing the binding loop. One VK now verifies any (num, den).
 ///
-///   total_signer_weight * den - num * registration_vote_weight - slack == 0
-///
-/// via `cs.enforce_constraint(lc!() + (den_fr, total_signer_weight_var)
-///                                  + (-num_fr, registration_vote_weight_var)
-///                                  + (-Fr::from(1u64), slack_var), ...)`
-///
-/// where `den_fr = Fr::from(self.vote_threshold_den)` and
-/// `num_fr = Fr::from(self.vote_threshold_num)` are passed as the
-/// COEFFICIENT of the linear-combination term — i.e., they are
-/// CONSTANTS in the R1CS A/B/C matrices, not witnesses.
-///
-/// In Groth16, the QAP (and hence the `ProvingKey` / `VerificationKey`
-/// / IC vector) are derived from the matrices A/B/C at SETUP time.
-/// `generate_test_setup` (and any current MPC ceremony) builds the
-/// shape circuit with `vote_threshold_num=1, vote_threshold_den=2`
-/// (see `circuit.rs` ~line 510). Therefore the proving key + VK
-/// commit to a QAP whose threshold-row coefficients are (num=1,den=2).
-///
-/// When `prove()` is later called with `(num=1, den=3)`, arkworks
-/// rebuilds the matrices with the new coefficients, but uses the
-/// SAME proving key (whose toxic-waste polynomial evaluations encode
-/// the OLD coefficients). The resulting proof does not verify against
-/// the (1,2)-shaped VK — neither off-chain nor on-chain.
-///
-/// ── EVIDENCE (captured via temporary debug test, then removed) ───
-///
-/// Same seed, same VK / proving_key generated via generate_test_setup
-/// (i.e., shaped at (num=1, den=2)). Two prove() calls with otherwise
-/// identical inputs differing only in (num, den) and weights:
-///
-///   CASE (1,2):  total=1000 signed=1000 (1 voter)  → verify_offchain: TRUE
-///   CASE (1,3):  total=2000 signed=1000 (1 of 2)   → verify_offchain: FALSE
-///
-/// Scalars diff (only s2, s5 differ as expected — registration weight
-/// + threshold pack):
-///   s1 same: true   (registration_merkle_root unchanged)
-///   s2 same: false  (snapshot weight 1000 vs 2000)
-///   s3 same: true   (agg_signers unchanged)
-///   s4 same: true   (vote_message unchanged)
-///   s5 same: false  (threshold_pack(1,2) vs (1,3))
-///   s6 same: true   (ballot_launcher_id unchanged)
-///
-/// CRITICAL CORRECTION TO PRIOR DOCSTRING: the previous claim that
-/// "off-chain `VotingCircuit::verify_offchain` succeeds with the same
-/// scalars" was wrong. Off-chain ALSO fails for non-(1,2) ratios.
-/// The on-chain failure is downstream of an off-chain-broken proof.
-///
-/// ── WHY (1,2) WORKS ──────────────────────────────────────────────
-/// The shape circuit at line ~510 uses (num=1, den=2). A proof made
-/// with (num=1, den=2) hits the same QAP coefficients that the VK
-/// commits to → verifies. ANY other (num, den) drifts the matrices
-/// and the proof is invalid against the (1,2) VK.
-///
-/// ── FIX OPTIONS (all out-of-scope for this 45-min budget) ────────
-///
-/// (A) Per-deployment trusted setup with deployment-specific
-///     (num, den) baked in. WORKS only if all ballots in an
-///     election share one (num, den). Currently each ballot can
-///     have its own threshold, so this restricts CHIP semantics.
-///
-/// (B) Move (num, den) from R1CS COEFFICIENTS to WITNESS VARIABLES.
-///     Replace the single linear constraint with three R1CS
-///     constraints (two multiplications + one linear):
-///        v1 = total_signer_weight_var * den_var
-///        v2 = num_var * registration_vote_weight_var
-///        v1 - v2 - slack == 0
-///     This makes (num, den) part of the witness, not the QAP. The
-///     proving key then works for ANY (num, den). Soundness then
-///     requires binding the prover's (num, den) witnesses to the
-///     curried on-chain (num, den). The natural binding is via the
-///     existing `s5 = sha256(threshold_pack(num, den))` public
-///     input — but `s5` only commits to the HASH; the prover could
-///     supply (num', den') privately while still presenting a
-///     publicly-correct s5. To re-establish soundness we must add
-///     in-circuit constraints binding the witness (num, den) to s5.
-///     Since we don't have an in-circuit sha256 gadget (the same
-///     reason s2/raw_count is enforced on-chain), the simplest
-///     option is to ALSO promote (num, den) to PUBLIC inputs, so
-///     the IC vector commits to them directly. That requires:
-///       * extending PUBLIC_INPUT_COUNT 6 → 8
-///       * adding ic7, ic8 to `IC` struct in finalize.rue
-///       * adding s7, s8 to `Scalars` (or repurposing s5 to be a
-///         direct commitment to a (num, den) packing as Fr)
-///       * updating VK byte length: 336 + 9*48 = 768 bytes
-///       * updating chia_chunked_bytes consumers
-///       * regenerating fixtures
-///     Blast radius: SDK + Rue puzzle + every config /VK length
-///     assertion + ceremony types. Multi-day refactor.
-///
-/// (C) Repurpose s5 as the BINDING. s5 is already
-///     sha256(threshold_pack(num, den)) mod r. Add witness vars
-///     (num_var, den_var) and additional witness vars for
-///     int_to_8_bytes_be(num) || int_to_8_bytes_be(den), plus an
-///     in-circuit sha256 gadget verifying the hash equals s5_fr.
-///     ark-crypto-primitives provides this; cost is ~25k constraints
-///     per the existing s2 deferral comment. Doable but expensive.
-///
-/// RECOMMENDATION: option (B). Plan it as a CHIP-rev bump (e.g.,
-/// 2026-05-15) since it's spec-affecting (puzzle struct + VK
-/// length both change). Until then, deployments are CONSTRAINED to
-/// (num=1, den=2) thresholds to match the trusted-setup shape.
-/// Optionally, document that constraint in CHIP.md and reject
-/// non-(1,2) thresholds in `BallotIssuer::launch_ballot`.
-///
-/// ── FILES INVOLVED ───────────────────────────────────────────────
-///   * sdk/src/prover/circuit.rs — `generate_constraints` (lines
-///     ~395-415) hardcodes (num, den) as Fr coefficients;
-///     `generate_test_setup` (line ~492) bakes (1, 2) into the QAP.
-///   * puzzles/ballot_coin/finalize.rue — IC + scalar layout
-///     (would need ic7, ic8 + s7, s8 under option B).
-///   * sdk/src/config.rs — VK byte length assertion at line ~159.
-///   * sdk/src/prover/circuit.rs — `chia_chunked_bytes` byte
-///     budget at line ~445.
-///
-/// This test is `#[ignore]`'d under the SDK's
-/// `chip_md_compliance_matrix_complete` "no-ignored-tests" rule —
-/// the single documented exception. It is NOT a defective test;
-/// the underlying bug is real and actively tracked. Re-enable once
-/// the Groth16-non-majority bug is resolved.
+/// ── HISTORICAL CONTEXT ───────────────────────────────────────────
+/// Pre-CHIP-rev the bug was in `circuit.rs::generate_constraints`:
+/// `den_fr = Fr::from(self.vote_threshold_den)` and `num_fr =
+/// Fr::from(self.vote_threshold_num)` were passed as the COEFFICIENT
+/// of the linear-combination term in `cs.enforce_constraint(...)`,
+/// i.e., constants in the R1CS A/B/C matrices. In Groth16 the QAP
+/// (and hence ProvingKey / VK / IC) is derived at SETUP time, so
+/// the trusted-setup shape circuit's `(1, 2)` baked into the matrices
+/// drifted as soon as `prove()` was called with a different ratio.
+/// CHIP-rev resolves this by making `(num, den)` part of the witness
+/// AND public inputs (s7/s8): the gadget allocates `num_var` /
+/// `den_var`, computes `v1 = signed * den_var`, `v2 = num_var *
+/// total`, and asserts `v1 - v2 - slack == 0` — leaving the matrices
+/// shape-only and tying the witness to s7/s8 via direct equality.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "GROTH16-NON-MAJORITY: bls_pairing_identity fails on-chain for (1,3) at 1-of-2; tracked SDK Gap (2)-deeper"]
-async fn finalize_one_third_full_flow_e2e_known_groth16_failure() {
+async fn finalize_one_third_full_flow_e2e() {
     let (mut sim, config, proving_key, voter1_keys, voter1_pk, registration_coin_1_id,
          registration_merkle_root_snapshot, registration_vote_weight_snapshot, launcher_id) =
         build_two_voter_setup(0x0CDEF1, 1, 3).await;
@@ -317,6 +217,77 @@ async fn finalize_one_third_full_flow_e2e_known_groth16_failure() {
 
     sim.new_transaction(finalize_bundle.clone())
         .expect("simulator accepts finalize bundle");
+
+    let post = walk_to_unspent(&sim, ballot_launcher_id);
+    assert!(post.coin.amount % 2 == 1, "post-finalize Ballot Coin must be odd-amount");
+    assert_ne!(
+        post.coin.puzzle_hash,
+        eve_ballot_puzzle_hash,
+        "post-finalize Ballot Coin must transition state finalized=false→true",
+    );
+}
+
+/// FN: finalize_two_third_full_flow_e2e
+/// WHAT: drives `Aggregator::build_finalize_for_ballot` end-to-end
+///       with a (2, 3) threshold and 2-of-3 voters. Three voters
+///       at 1000 collateral each (total weight 3000); voters 1 and
+///       2 sign the canonical message, voter 3 abstains. The
+///       weighted-quorum check is `signed_weight * den >= num *
+///       total_weight` → `2000 * 3 >= 2 * 3000` → `6000 >= 6000`
+///       (boundary equality, ACCEPT).
+///
+/// WHY: complements `finalize_one_third_full_flow_e2e` to demonstrate
+///      that the CHIP-rev makes ANY `(num, den)` verifiable under one
+///      VK — the same circuit shape now handles both <1/2 and >1/2
+///      thresholds. With (num, den) baked into R1CS coefficients (as
+///      pre-CHIP-rev) this test would also fail at
+///      `bls_pairing_identity`; with s7/s8 promoted to public inputs
+///      and the var-mul gadget consuming them as witness Fr values,
+///      one trusted setup covers every ratio.
+#[tokio::test(flavor = "current_thread")]
+async fn finalize_two_third_full_flow_e2e() {
+    let (mut sim, config, proving_key, voter1_keys, voter1_pk, voter2_keys, voter2_pk,
+         voter3_keys, voter3_pk,
+         registration_coin_1_id, registration_coin_2_id,
+         registration_merkle_root_snapshot, registration_vote_weight_snapshot, launcher_id) =
+        build_three_voter_setup(0x0CDEF2).await;
+
+    let (votes, eve_ballot_puzzle_hash, vote_close_height) = cast_two_of_three(
+        &mut sim, &config,
+        &voter1_keys, voter1_pk, registration_coin_1_id,
+        &voter2_keys, voter2_pk, registration_coin_2_id,
+        registration_merkle_root_snapshot,
+        registration_vote_weight_snapshot,
+        launcher_id, 2, 3,
+    ).await;
+    // voter3 is intentionally unused at the cast stage but its keys
+    // are kept live so the registration set's total weight is 3000.
+    let _ = (voter3_keys, voter3_pk);
+    let ballot_launcher_id = votes[0].ballot_launcher_id;
+    let vote_outcome = votes[0].vote_data;
+
+    let chain = common::SharedSim::new(&mut sim);
+    let mut agg = Aggregator::new(config.clone(), chain, NetworkType::Testnet11);
+    agg.sync().await.expect("aggregator sync");
+
+    let finalize_bundle = agg
+        .build_finalize_for_ballot(BuildFinalizeForBallotParams {
+            ballot_launcher_id,
+            vote_outcome,
+            votes: &votes,
+            vote_close_height,
+            vote_threshold_num: 2,
+            vote_threshold_den: 3,
+            registration_merkle_root_snapshot,
+            registration_vote_weight_snapshot,
+            proving_key: &proving_key,
+        })
+        .await
+        .expect("build_finalize_for_ballot (2,3) at 2-of-3");
+    drop(agg);
+
+    sim.new_transaction(finalize_bundle.clone())
+        .expect("simulator accepts (2,3) finalize bundle");
 
     let post = walk_to_unspent(&sim, ballot_launcher_id);
     assert!(post.coin.amount % 2 == 1, "post-finalize Ballot Coin must be odd-amount");
@@ -674,4 +645,311 @@ fn compute_create_reg_msg(
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&h.finalize());
     Bytes32::new(arr)
+}
+
+// ─── (2/3) helpers ─────────────────────────────────────────────────
+
+/// Set up the simulator + 3 registered voters at uniform 1000
+/// collateral. Returns everything the per-test caller needs to drive
+/// a per-ballot flow with a (2, 3) threshold.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+async fn build_three_voter_setup(
+    seed: u64,
+) -> (
+    Simulator,
+    chip_voting_sdk::config::ElectionConfig,
+    chip_voting_sdk::prover::circuit::ArkProvingKey,
+    VoterKeys,
+    chia_bls::PublicKey,
+    VoterKeys,
+    chia_bls::PublicKey,
+    VoterKeys,
+    chia_bls::PublicKey,
+    Bytes32,
+    Bytes32,
+    Bytes32,
+    u64,
+    Bytes32,
+) {
+    let mut sim = Simulator::new();
+    let funder = sim.bls(100_000);
+    let cat_genesis = sim.bls(10_000);
+    let cat_tail_hash: Bytes32 =
+        GenesisByCoinIdTailArgs::curry_tree_hash(cat_genesis.coin.coin_id()).into();
+
+    let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(seed);
+    let (proving_key, vk) = generate_test_setup(&mut rng).expect("generate_test_setup");
+    let vk_bytes = vk.chia_chunked_bytes().expect("vk chunked bytes");
+
+    let collateral_amount: u64 = 1_000;
+    let params = DeployParams {
+        verification_key: VerificationKey { raw_bytes: vk_bytes },
+        cat_tail_hash,
+        collateral_amount,
+        election_start_height: 0,
+        label: None,
+    };
+
+    let deployer = ElectionDeployer::new(params);
+    let (deploy_spends, config) = deployer
+        .build_deploy_bundle(funder.coin, funder.pk)
+        .expect("build_deploy_bundle");
+    sim.spend_coins(deploy_spends, std::slice::from_ref(&funder.sk))
+        .expect("simulator accepts deploy bundle");
+    let launcher_id = parse_b32(&config.election_launcher_id_hex);
+
+    let voter1_keys = test_voter_keys(0x13u8);
+    let voter2_keys = test_voter_keys(0x14u8);
+    let voter3_keys = test_voter_keys(0x15u8);
+    let voter1_pk = voter1_keys.pubkey;
+    let voter2_pk = voter2_keys.pubkey;
+    let voter3_pk = voter3_keys.pubkey;
+
+    let reg_outer_ph_1 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
+        cat_tail_hash, &voter1_pk, launcher_id,
+    );
+    let reg_outer_ph_2 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
+        cat_tail_hash, &voter2_pk, launcher_id,
+    );
+    let reg_outer_ph_3 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
+        cat_tail_hash, &voter3_pk, launcher_id,
+    );
+    let reg_inner_ph_1 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
+        &voter1_pk, launcher_id, cat_tail_hash,
+    );
+    let reg_inner_ph_2 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
+        &voter2_pk, launcher_id, cat_tail_hash,
+    );
+    let reg_inner_ph_3 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
+        &voter3_pk, launcher_id, cat_tail_hash,
+    );
+
+    let mut ctx = SpendContext::new();
+    let memos_1 = ctx.hint(reg_outer_ph_1).expect("hint v1");
+    let memos_2 = ctx.hint(reg_outer_ph_2).expect("hint v2");
+    let memos_3 = ctx.hint(reg_outer_ph_3).expect("hint v3");
+    let extra_conditions = Conditions::new()
+        .create_coin(reg_inner_ph_1, collateral_amount, memos_1)
+        .create_coin(reg_inner_ph_2, collateral_amount, memos_2)
+        .create_coin(reg_inner_ph_3, collateral_amount, memos_3);
+    let total_amount = 3 * collateral_amount;
+    let (xch_conditions, cats) = Cat::issue_with_coin(
+        &mut ctx,
+        cat_genesis.coin.coin_id(),
+        total_amount,
+        extra_conditions,
+    )
+    .expect("Cat::issue_with_coin (three voters)");
+    StandardLayer::new(cat_genesis.pk)
+        .spend(&mut ctx, cat_genesis.coin, xch_conditions)
+        .expect("StandardLayer::spend(cat_genesis)");
+    let issuance_spends = ctx.take();
+    sim.spend_coins(issuance_spends, std::slice::from_ref(&cat_genesis.sk))
+        .expect("simulator accepts CAT issuance bundle (3)");
+
+    let registration_coin_1_id = cats
+        .iter()
+        .find(|c| c.coin.puzzle_hash == reg_outer_ph_1)
+        .map(|c| c.coin.coin_id())
+        .expect("voter1 CAT child");
+    let registration_coin_2_id = cats
+        .iter()
+        .find(|c| c.coin.puzzle_hash == reg_outer_ph_2)
+        .map(|c| c.coin.coin_id())
+        .expect("voter2 CAT child");
+    let _registration_coin_3_id = cats
+        .iter()
+        .find(|c| c.coin.puzzle_hash == reg_outer_ph_3)
+        .map(|c| c.coin.coin_id())
+        .expect("voter3 CAT child");
+
+    // Register all three voters in turn so the SPT root reflects all
+    // three pubkeys at the snapshot we'll use for finalize.
+    let smt_pre_v1 = SparseMerkleTree::new();
+    register_voter(&mut sim, cat_tail_hash, launcher_id, &config, &voter1_keys, collateral_amount, smt_pre_v1).await;
+    let mut smt_post_v1 = SparseMerkleTree::new();
+    smt_post_v1.insert(&voter1_pk).expect("smt insert v1");
+    register_voter(&mut sim, cat_tail_hash, launcher_id, &config, &voter2_keys, collateral_amount, smt_post_v1.clone()).await;
+    let mut smt_post_v2 = smt_post_v1.clone();
+    smt_post_v2.insert(&voter2_pk).expect("smt insert v2");
+    register_voter(&mut sim, cat_tail_hash, launcher_id, &config, &voter3_keys, collateral_amount, smt_post_v2.clone()).await;
+    let mut smt_post_v3 = smt_post_v2.clone();
+    smt_post_v3.insert(&voter3_pk).expect("smt insert v3");
+    let registration_merkle_root_snapshot = smt_post_v3.root();
+    let registration_vote_weight_snapshot = 3 * collateral_amount;
+
+    (
+        sim,
+        config,
+        proving_key,
+        voter1_keys,
+        voter1_pk,
+        voter2_keys,
+        voter2_pk,
+        voter3_keys,
+        voter3_pk,
+        registration_coin_1_id,
+        registration_coin_2_id,
+        registration_merkle_root_snapshot,
+        registration_vote_weight_snapshot,
+        launcher_id,
+    )
+}
+
+/// Cast voters 1 and 2 on a fresh ballot launched against the given
+/// (num, den). Voter 3 abstains. Returns the synthesised vote
+/// records, the eve Ballot Coin's puzzle hash, and the close height.
+#[allow(clippy::too_many_arguments)]
+async fn cast_two_of_three(
+    sim: &mut Simulator,
+    config: &chip_voting_sdk::config::ElectionConfig,
+    voter1_keys: &VoterKeys,
+    voter1_pk: chia_bls::PublicKey,
+    registration_coin_1_id: Bytes32,
+    voter2_keys: &VoterKeys,
+    voter2_pk: chia_bls::PublicKey,
+    registration_coin_2_id: Bytes32,
+    registration_merkle_root_snapshot: Bytes32,
+    registration_vote_weight_snapshot: u64,
+    launcher_id: Bytes32,
+    vote_threshold_num: u64,
+    vote_threshold_den: u64,
+) -> (Vec<chip_voting_sdk::state::VoteRecord>, Bytes32, u64) {
+    let mut ctx = SpendContext::new();
+    let funder_puzzle_value: (u8, ()) = (1u8, ());
+    let funder_puzzle = funder_puzzle_value.to_clvm(&mut *ctx).unwrap();
+    let funder_ph = Bytes32::new(tree_hash(&ctx, funder_puzzle).to_bytes());
+    let funder_coin_2 = Coin::new(Bytes32::new([0xCD; 32]), funder_ph, 2);
+    sim.insert_coin(funder_coin_2);
+    let funder_solution = ().to_clvm(&mut *ctx).unwrap();
+    let funder_spend =
+        common::coin_spend_from_nodes(&ctx, funder_coin_2, funder_puzzle, funder_solution);
+    drop(ctx);
+
+    let pre_ballot_height = sim.height() as u64;
+    let vote_close_height: u64 = pre_ballot_height + 5;
+    let outcome_domain_hash = Bytes32::new([0xCD; 32]);
+
+    let issuer = BallotIssuer::new(config.clone(), NetworkType::Testnet11);
+    let chain = common::SharedSim::new(sim);
+    let created = issuer
+        .create_ballot(
+            &chain,
+            CreateBallotParams {
+                ballot_seed: Bytes32::new([0xbc; 32]),
+                vote_close_height,
+                outcome_domain_hash,
+            },
+            funder_spend,
+        )
+        .await
+        .expect("create_ballot (2/3)");
+    drop(chain);
+    sim.new_transaction(created.spend_bundle.clone())
+        .expect("simulator accepts create_ballot");
+
+    let chain = common::SharedSim::new(sim);
+    let launched = issuer
+        .launch_ballot(
+            &chain,
+            created.ballot_launcher_id,
+            LaunchBallotParams {
+                vote_close_height,
+                outcome_domain_hash,
+                vote_threshold_num,
+                vote_threshold_den,
+            },
+        )
+        .await
+        .expect("launch_ballot (2/3)");
+    drop(chain);
+    sim.new_transaction(launched.spend_bundle.clone())
+        .expect("simulator accepts launch_ballot");
+
+    let voter1 = Voter::new(
+        config.clone(),
+        VoterKeys::new(voter1_keys.secret.clone()),
+        NetworkType::Testnet11,
+    );
+    let voter2 = Voter::new(
+        config.clone(),
+        VoterKeys::new(voter2_keys.secret.clone()),
+        NetworkType::Testnet11,
+    );
+    let vote_outcome = Bytes32::new([0xAA; 32]);
+
+    let chain = common::SharedSim::new(sim);
+    let cast_v1 = voter1
+        .cast_vote(
+            &chain,
+            CastVoteParams {
+                ballot_launcher_id: created.ballot_launcher_id,
+                vote_data: vote_outcome,
+                vote_close_height,
+                vote_threshold_num,
+                vote_threshold_den,
+                registration_merkle_root_snapshot,
+                registration_vote_weight_snapshot,
+                voting_coin_amount: 1,
+            },
+        )
+        .await
+        .expect("voter1 cast_vote");
+    drop(chain);
+    sim.new_transaction(cast_v1.spend_bundle.clone())
+        .expect("simulator accepts voter1 cast_vote");
+
+    let chain = common::SharedSim::new(sim);
+    let cast_v2 = voter2
+        .cast_vote(
+            &chain,
+            CastVoteParams {
+                ballot_launcher_id: created.ballot_launcher_id,
+                vote_data: vote_outcome,
+                vote_close_height,
+                vote_threshold_num,
+                vote_threshold_den,
+                registration_merkle_root_snapshot,
+                registration_vote_weight_snapshot,
+                voting_coin_amount: 1,
+            },
+        )
+        .await
+        .expect("voter2 cast_vote");
+    drop(chain);
+    sim.new_transaction(cast_v2.spend_bundle.clone())
+        .expect("simulator accepts voter2 cast_vote");
+
+    while (sim.height() as u64) <= vote_close_height {
+        sim.create_block();
+    }
+
+    let canonical_msg = chip_voting_sdk::actors::aggregator::canonical_vote_message(
+        vote_outcome,
+        created.ballot_launcher_id,
+        launcher_id,
+    );
+    let v1_sig = voter1.keys.sign_unsafe(canonical_msg.as_ref());
+    let v2_sig = voter2.keys.sign_unsafe(canonical_msg.as_ref());
+    let votes = vec![
+        chip_voting_sdk::state::VoteRecord {
+            voter_pubkey: voter1_pk,
+            vote_data: vote_outcome,
+            vote_signature_hex: hex::encode(v1_sig.to_bytes()),
+            registration_coin_id: registration_coin_1_id,
+            ballot_launcher_id: created.ballot_launcher_id,
+            voting_coin_id: cast_v1.voting_coin_id,
+        },
+        chip_voting_sdk::state::VoteRecord {
+            voter_pubkey: voter2_pk,
+            vote_data: vote_outcome,
+            vote_signature_hex: hex::encode(v2_sig.to_bytes()),
+            registration_coin_id: registration_coin_2_id,
+            ballot_launcher_id: created.ballot_launcher_id,
+            voting_coin_id: cast_v2.voting_coin_id,
+        },
+    ];
+
+    (votes, launched.eve_ballot_puzzle_hash, vote_close_height)
 }
