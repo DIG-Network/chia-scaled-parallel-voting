@@ -3541,6 +3541,239 @@ fn chip_finalize_rejects_threshold_pack_mismatch_run_program() {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// CIRCUIT-INPUT-7-NUM / CIRCUIT-INPUT-8-DEN — CLVM-EXECUTING NEGATIVES
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §158 (CIRCUIT-INPUT-7-NUM): "`vote_threshold_num` —
+/// `Fr::from(VOTE_THRESHOLD_NUM)`, the curried numerator exposed as a
+/// first-class public input so a single VK verifies any `(num, den)`."
+///
+/// On-chain mechanism (per `puzzles/ballot_coin/finalize.rue:155-158`):
+///   ```
+///   let zero_pad_24: Bytes = 0x00...00 (24 bytes);
+///   assert (zero_pad_24 + int_to_8_bytes_be(VOTE_THRESHOLD_NUM))
+///       == (scalars.s7 as Bytes);
+///   ```
+/// The puzzle reconstructs `Fr::from(num)` byte-for-byte from the
+/// CURRIED `VOTE_THRESHOLD_NUM` and asserts it equals the proof's s7
+/// scalar. Mismatch → CLVM raise BEFORE the Groth16 pairing is even
+/// attempted — the on-chain s7 binding is independent of the
+/// in-circuit weighted-quorum gadget that consumes s7 as a witness Fr
+/// coefficient.
+///
+/// HARNESS: CLVM-isolated `clvmr::run_program` against
+/// `BALLOT_COIN_FINALIZE_HEX`, curried with VOTE_THRESHOLD_NUM=1,
+/// VOTE_THRESHOLD_DEN=2. Scalars are computed for the same `(1, 2)`
+/// so s1..s6, s8 all match — but s7 is overridden to
+/// `fr_to_bytes32_be(Fr::from(2))` (mismatched). The puzzle progresses
+/// past s1..s6 (which match) and traps at the s7 equality assertion.
+#[test]
+fn chip_finalize_rejects_s7_mismatch_with_curried_threshold() {
+    use ark_bls12_381::Fr;
+    use chip_voting_sdk::prover::conversions::fr_to_bytes32_be;
+
+    let result = run_finalize_with_overridden_scalars(
+        /* curried_num */ 1,
+        /* curried_den */ 2,
+        /* override_s7 */ Some(Bytes32::new(fr_to_bytes32_be(&Fr::from(2u64)))),
+        /* override_s8 */ None,
+    );
+    assert!(
+        result.is_err(),
+        "CHIP.md §158 (CIRCUIT-INPUT-7-NUM): finalize.rue with curried \
+         (num=1, den=2) and Scalars supplying s7=Fr::from(2) MUST trap \
+         at the on-chain s7 equality assertion. Got Ok which means the \
+         on-chain s7-binding regressed and the curried numerator is no \
+         longer cryptographically tied to the proof's s7 scalar."
+    );
+}
+
+/// CHIP.md §159 (CIRCUIT-INPUT-8-DEN): "`vote_threshold_den` —
+/// `Fr::from(VOTE_THRESHOLD_DEN)`, the curried denominator."
+///
+/// Mirror of the s7 negative; mutates s8 instead. Curries `(1, 2)`,
+/// computes Scalars at `(1, 2)` so s1..s7 match — but s8 is
+/// overridden to `fr_to_bytes32_be(Fr::from(3))` (mismatched). The
+/// puzzle progresses through s1..s7 and traps at the s8 equality
+/// assertion.
+#[test]
+fn chip_finalize_rejects_s8_mismatch_with_curried_threshold() {
+    use ark_bls12_381::Fr;
+    use chip_voting_sdk::prover::conversions::fr_to_bytes32_be;
+
+    let result = run_finalize_with_overridden_scalars(
+        /* curried_num */ 1,
+        /* curried_den */ 2,
+        /* override_s7 */ None,
+        /* override_s8 */ Some(Bytes32::new(fr_to_bytes32_be(&Fr::from(3u64)))),
+    );
+    assert!(
+        result.is_err(),
+        "CHIP.md §159 (CIRCUIT-INPUT-8-DEN): finalize.rue with curried \
+         (num=1, den=2) and Scalars supplying s8=Fr::from(3) MUST trap \
+         at the on-chain s8 equality assertion. Got Ok which means the \
+         on-chain s8-binding regressed and the curried denominator is \
+         no longer cryptographically tied to the proof's s8 scalar."
+    );
+}
+
+/// Shared harness for the s7/s8 mismatch tests. Currys finalize.rue
+/// with `(curried_num, curried_den)`, computes Scalars at the SAME
+/// (num, den) so s1..s6 line up, then optionally overrides s7 or s8
+/// in the solution to a mismatched value before running the puzzle in
+/// a CLVM-isolated allocator.
+fn run_finalize_with_overridden_scalars(
+    curried_num: u64,
+    curried_den: u64,
+    override_s7: Option<Bytes32>,
+    override_s8: Option<Bytes32>,
+) -> Result<clvmr::reduction::Reduction, clvmr::reduction::EvalErr> {
+    use chia_protocol::{Bytes, Program};
+    use chia_sdk_driver::SpendContext;
+    use chip_voting_sdk::action_spends::load_action_puzzle;
+    use chip_voting_sdk::prover::Scalars;
+    use chip_voting_sdk::puzzles::BALLOT_COIN_FINALIZE_HEX;
+    use clvm_traits::{clvm_curried_args, ToClvm};
+    use clvm_utils::CurriedProgram;
+    use clvmr::{run_program, ChiaDialect};
+    use sha2::{Digest, Sha256};
+
+    // ── 1. Inputs that are the SAME on curry side and proof side ────
+    let ballot_launcher_id = Bytes32::new([0xBA; 32]);
+    let election_launcher_id = Bytes32::new([0xEE; 32]);
+    let vote_close_height: u64 = 1_000;
+    let registration_merkle_root_snapshot = Bytes32::new([0x11; 32]);
+    let registration_vote_weight_snapshot: u64 = 1_000;
+
+    let vote_outcome_data = Bytes32::new([0xAA; 32]);
+    let vote_message: Bytes32 = {
+        let mut h = Sha256::new();
+        h.update(vote_outcome_data.as_ref());
+        h.update(ballot_launcher_id.as_ref());
+        h.update(election_launcher_id.as_ref());
+        Bytes32::new(h.finalize().into())
+    };
+
+    let agg_signers_bytes = vec![0x55u8; 48];
+    let agg_signers_pk =
+        chia_bls::PublicKey::from_bytes(&agg_signers_bytes.clone().try_into().unwrap()).unwrap_or(
+            chia_bls::PublicKey::generator(),
+        );
+
+    // ── 2. Compute Scalars at the curried (num, den), then override ─
+    let mut scalars = Scalars::compute(
+        registration_merkle_root_snapshot,
+        registration_vote_weight_snapshot,
+        &agg_signers_pk,
+        vote_message,
+        curried_num,
+        curried_den,
+        ballot_launcher_id,
+    );
+    if let Some(s7) = override_s7 {
+        scalars.s7 = s7;
+    }
+    if let Some(s8) = override_s8 {
+        scalars.s8 = s8;
+    }
+
+    // ── 3. Curry finalize.rue with the matching threshold pair ──────
+    let mut ctx = SpendContext::new();
+    let nil_node = ().to_clvm(&mut *ctx).expect("nil");
+
+    let finalize_program_node = load_action_puzzle(&mut ctx, BALLOT_COIN_FINALIZE_HEX)
+        .expect("load finalize.rue.hex");
+    let finalize_curried = CurriedProgram {
+        program: finalize_program_node,
+        args: clvm_curried_args!(
+            nil_node, // VK (unreached)
+            nil_node, // IC (unreached)
+            ballot_launcher_id,
+            election_launcher_id,
+            vote_close_height,
+            curried_num,
+            curried_den,
+            registration_merkle_root_snapshot,
+            registration_vote_weight_snapshot
+        ),
+    }
+    .to_clvm(&mut *ctx)
+    .expect("curry finalize");
+
+    // ── 4. Build the solution ──────────────────────────────────────
+    let truth_value: (
+        (i32, i32),
+        (u8, (Bytes32, Bytes)),
+    ) = (
+        (0, 0),
+        (
+            0u8, // finalized = false (first puzzle assert)
+            (Bytes32::default(), Bytes::new(vec![0u8; 48])),
+        ),
+    );
+    let truth_node = truth_value.to_clvm(&mut *ctx).expect("truth");
+
+    let proof_node = (
+        Bytes::new(vec![0u8; 48]),
+        (Bytes::new(vec![0u8; 96]), Bytes::new(vec![0u8; 48])),
+    )
+        .to_clvm(&mut *ctx)
+        .expect("proof_node");
+
+    let agg_signers_b = Bytes::new(agg_signers_bytes.clone());
+    let agg_sig_b = Bytes::new(vec![0u8; 96]); // never reached
+
+    // Scalars in solution: s1..s8. The Rue Scalars struct has 8
+    // PublicKey fields; ToClvm of an 8-tuple-list produces the same
+    // wire shape.
+    let scalars_value: (
+        Bytes32,
+        (Bytes32, (Bytes32, (Bytes32, (Bytes32, (Bytes32, (Bytes32, Bytes32)))))),
+    ) = (
+        scalars.s1,
+        (
+            scalars.s2,
+            (
+                scalars.s3,
+                (
+                    scalars.s4,
+                    (
+                        scalars.s5,
+                        (scalars.s6, (scalars.s7, scalars.s8)),
+                    ),
+                ),
+            ),
+        ),
+    );
+    let scalars_node = scalars_value.to_clvm(&mut *ctx).expect("scalars");
+
+    // user_args = (proof . (vote_outcome_data . (agg_signers . (agg_sig . scalars))))
+    let user_args_node = {
+        let agg_sig_atom = ctx.alloc(&agg_sig_b).unwrap();
+        let agg_signers_atom = ctx.alloc(&agg_signers_b).unwrap();
+        let outcome_atom = ctx.alloc(&vote_outcome_data).unwrap();
+        let level5 = ctx.new_pair(agg_sig_atom, scalars_node).unwrap();
+        let level4 = ctx.new_pair(agg_signers_atom, level5).unwrap();
+        let level3 = ctx.new_pair(outcome_atom, level4).unwrap();
+        ctx.new_pair(proof_node, level3).unwrap()
+    };
+
+    // full env = (Truth . user_args)
+    let env_node = ctx.new_pair(truth_node, user_args_node).expect("env");
+
+    // Serialize + run_program in a fresh allocator.
+    let puzzle_bytes = clvmr::serde::node_to_bytes(&ctx, finalize_curried).expect("ser puzzle");
+    let env_bytes = clvmr::serde::node_to_bytes(&ctx, env_node).expect("ser env");
+
+    let mut alloc = clvmr::Allocator::new();
+    let puzzle_n = Program::from(puzzle_bytes).to_clvm(&mut alloc).unwrap();
+    let env_n = Program::from(env_bytes).to_clvm(&mut alloc).unwrap();
+
+    let dialect = ChiaDialect::new(0);
+    run_program(&mut alloc, &dialect, puzzle_n, env_n, 11_000_000_000)
+}
+
+// ────────────────────────────────────────────────────────────────────
 // CI gate (Phase E)
 // ────────────────────────────────────────────────────────────────────
 
