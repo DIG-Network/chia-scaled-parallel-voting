@@ -1982,4 +1982,241 @@ mod tests {
             expected,
         );
     }
+
+    // ── Cat A: focused unit tests for new helpers (`voted_ballots_root_after_inserts`
+    //          multi-insert, `registration_inner_hash_for_state`,
+    //          `cat_outer_for_inner_hash`). The single-insert case is already
+    //          covered by `voted_ballots_root_after_single_insert_matches_compute_ballot_root`;
+    //          here we add the multi-insert correctness identities.
+
+    /// WHAT: `voted_ballots_root_after_inserts(&[a, b])` matches a
+    ///       fold computed by inserting a then b independently into
+    ///       a sparse SPT and recomputing the root via the stock
+    ///       `compute_ballot_root` reference path on each leaf.
+    /// HOW:  build a 2^32-sparse map manually for two ballots whose
+    ///       slots differ; fold up depth-32 mirroring the helper's
+    ///       BTreeMap pair logic. Assert the helper's output equals
+    ///       this independent reference.
+    /// WHY:  guards the post-cast `voted_ballots_root` for any voter
+    ///       who has cast in 2+ ballots — the load-bearing identity
+    ///       for `Voter::release_collateral` after multiple casts.
+    #[test]
+    fn voted_ballots_root_after_inserts_two_ballots_matches_manual_fold() {
+        use sha2::{Digest as _, Sha256 as _Sha256};
+        use std::collections::BTreeMap;
+
+        let b_a = b32(0x11);
+        let b_b = b32(0x22);
+        // Sanity: ballot slot derivation must produce distinct slots
+        // for two distinct ballot ids (otherwise the test is vacuous).
+        let slot_a = ballot_slot_from_id(b_a);
+        let slot_b = ballot_slot_from_id(b_b);
+        assert_ne!(slot_a, slot_b);
+
+        // Reference fold path — independent reimplementation that
+        // does NOT call `voted_ballots_root_after_inserts` internally.
+        fn leaf_for(id: Bytes32) -> Bytes32 {
+            let mut h = _Sha256::new();
+            h.update(id.as_ref());
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&h.finalize());
+            Bytes32::new(arr)
+        }
+        let mut current: BTreeMap<u32, Bytes32> = BTreeMap::new();
+        current.insert(slot_a, leaf_for(b_a));
+        current.insert(slot_b, leaf_for(b_b));
+
+        let empty_per_level = empty_ballot_membership_siblings();
+        for level in 0..BALLOT_TREE_DEPTH {
+            let mut next: BTreeMap<u32, Bytes32> = BTreeMap::new();
+            let level_empty = empty_per_level[level];
+            let mut iter = current.into_iter().peekable();
+            while let Some((slot, node)) = iter.next() {
+                let parent_slot = slot >> 1;
+                let is_left = slot & 1 == 0;
+                let sibling = if is_left
+                    && iter.peek().map(|(s, _)| *s == slot ^ 1).unwrap_or(false)
+                {
+                    iter.next().expect("peeked sibling").1
+                } else {
+                    level_empty
+                };
+                let mut h = _Sha256::new();
+                if is_left {
+                    h.update(node.as_ref());
+                    h.update(sibling.as_ref());
+                } else {
+                    h.update(sibling.as_ref());
+                    h.update(node.as_ref());
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&h.finalize());
+                next.insert(parent_slot, Bytes32::new(arr));
+            }
+            current = next;
+        }
+        let expected = current.into_iter().next().expect("one root").1;
+
+        assert_eq!(
+            voted_ballots_root_after_inserts(&[b_a, b_b]),
+            expected,
+            "two-insert root must match independent reference fold",
+        );
+    }
+
+    /// WHAT: `voted_ballots_root_after_inserts` is order-independent
+    ///       across the input ballot id list — the same set of
+    ///       ballots produces the same root regardless of the input
+    ///       ordering.
+    /// HOW:  hand-built three-ballot input; permute the order and
+    ///       assert all permutations yield the same root, and that
+    ///       root differs from any 2-element subset's root.
+    /// WHY:  the SPT is order-free at the slot level (the mapping is
+    ///       slot → leaf), so the SDK lineage walker MUST be free to
+    ///       discover ballot ids in any order. If a future refactor
+    ///       accidentally introduced order-dependence, this test
+    ///       would surface it.
+    #[test]
+    fn voted_ballots_root_after_inserts_three_ballots_is_order_independent() {
+        let b1 = b32(0x31);
+        let b2 = b32(0x32);
+        let b3 = b32(0x33);
+
+        let r_123 = voted_ballots_root_after_inserts(&[b1, b2, b3]);
+        let r_321 = voted_ballots_root_after_inserts(&[b3, b2, b1]);
+        let r_213 = voted_ballots_root_after_inserts(&[b2, b1, b3]);
+
+        assert_eq!(r_123, r_321, "set-equal inputs must produce equal roots");
+        assert_eq!(r_123, r_213, "set-equal inputs must produce equal roots");
+
+        // Strict subset must produce a different root (the third
+        // ballot's leaf actually changes the SPT — guards against an
+        // accidental no-op insertion path).
+        let r_12 = voted_ballots_root_after_inserts(&[b1, b2]);
+        assert_ne!(
+            r_123, r_12,
+            "adding a third distinct ballot MUST change the SPT root",
+        );
+        // And neither of those equals the empty root.
+        assert_ne!(r_123, empty_ballot_root());
+        assert_ne!(r_12, empty_ballot_root());
+    }
+
+    /// WHAT: `registration_inner_hash_for_state` with the fresh-
+    ///       state arguments (`empty_ballot_root()`, `None`) equals
+    ///       `fresh_registration_inner_hash` — the original helper
+    ///       it generalises.
+    /// HOW:  compute both and assert byte-for-byte equality.
+    /// WHY:  if the generalised helper ever drifted from the fresh-
+    ///       state helper, on-chain ph predictions for newly-minted
+    ///       Registration Coins would fail. Pinning the identity
+    ///       here means callers can safely use either helper for
+    ///       fresh state without a behaviour split.
+    #[test]
+    fn registration_inner_hash_for_state_matches_fresh_helper() {
+        let pk = test_pubkey();
+        let election_id = b32(0xEE);
+        let cat_tail = b32(0x77);
+
+        let fresh = fresh_registration_inner_hash(&pk, election_id, cat_tail);
+        let general = registration_inner_hash_for_state(
+            &pk,
+            election_id,
+            cat_tail,
+            empty_ballot_root(),
+            None,
+        );
+
+        assert_eq!(
+            fresh, general,
+            "fresh-state inputs must produce identical inner ph",
+        );
+    }
+
+    /// WHAT: `registration_inner_hash_for_state` produces a DIFFERENT
+    ///       inner ph for distinct `voted_ballots_root` values, and
+    ///       again for distinct `release_destination` values.
+    /// HOW:  hold every other curry input fixed, vary one field at a
+    ///       time, assert the resulting inner ph differs.
+    /// WHY:  if the helper ever stopped binding a field into the
+    ///       state hash, post-cast or post-release Registration Coin
+    ///       ph predictions would silently fall back to the fresh
+    ///       state. This test pins both fields as load-bearing.
+    #[test]
+    fn registration_inner_hash_for_state_distinguishes_state_fields() {
+        let pk = test_pubkey();
+        let election_id = b32(0xEE);
+        let cat_tail = b32(0x77);
+
+        let fresh = registration_inner_hash_for_state(
+            &pk, election_id, cat_tail, empty_ballot_root(), None,
+        );
+        let with_vbr = registration_inner_hash_for_state(
+            &pk, election_id, cat_tail, b32(0xCC), None,
+        );
+        let with_dest = registration_inner_hash_for_state(
+            &pk, election_id, cat_tail, empty_ballot_root(), Some(b32(0xDD)),
+        );
+
+        assert_ne!(
+            fresh, with_vbr,
+            "voted_ballots_root MUST be bound into the state hash",
+        );
+        assert_ne!(
+            fresh, with_dest,
+            "release_destination MUST be bound into the state hash",
+        );
+        assert_ne!(
+            with_vbr, with_dest,
+            "vbr-bumped state and dest-bumped state MUST be distinct",
+        );
+    }
+
+    /// WHAT: `cat_outer_for_inner_hash(tail, inner)` matches
+    ///       `chia_puzzle_types::cat::CatArgs::curry_tree_hash` on
+    ///       the same inputs (the canonical CAT outer wrap).
+    /// HOW:  delegate to `CatArgs::curry_tree_hash` directly and
+    ///       compare bytes.
+    /// WHY:  the helper is a single-argument convenience over the
+    ///       upstream curry call; if it ever drifted, every post-cast
+    ///       Registration Coin ph prediction in `release_collateral`
+    ///       would be wrong.
+    #[test]
+    fn cat_outer_for_inner_hash_matches_catargs() {
+        use chia_puzzle_types::cat::CatArgs;
+        let cat_tail = b32(0x77);
+        let inner_ph = b32(0xCD);
+        let inner_th = TreeHash::new(inner_ph.to_bytes());
+        let expected = Bytes32::new(CatArgs::curry_tree_hash(cat_tail, inner_th).to_bytes());
+        assert_eq!(cat_outer_for_inner_hash(cat_tail, inner_ph), expected);
+    }
+
+    /// WHAT: composing `registration_inner_hash_for_state` with
+    ///       `cat_outer_for_inner_hash` for fresh-state inputs
+    ///       reproduces `fresh_registration_coin_puzzle_hash`.
+    /// HOW:  build inner via the generalised helper at fresh state,
+    ///       wrap via `cat_outer_for_inner_hash`, compare to the
+    ///       fresh-state ph helper.
+    /// WHY:  callers in `Voter::release_collateral` use this
+    ///       composition to predict the post-cast Registration Coin
+    ///       ph. Pinning the composition equals the fresh-state
+    ///       helper when run at fresh state guards the entire chain.
+    #[test]
+    fn cat_outer_compose_with_inner_state_matches_fresh_full_ph() {
+        let pk = test_pubkey();
+        let election_id = b32(0xEE);
+        let cat_tail = b32(0x77);
+
+        let inner = registration_inner_hash_for_state(
+            &pk, election_id, cat_tail, empty_ballot_root(), None,
+        );
+        let outer = cat_outer_for_inner_hash(cat_tail, inner);
+        let fresh_full = fresh_registration_coin_puzzle_hash(cat_tail, &pk, election_id);
+
+        assert_eq!(
+            outer, fresh_full,
+            "compose(inner_state, cat_outer) at fresh state MUST equal \
+             fresh_registration_coin_puzzle_hash",
+        );
+    }
 }
