@@ -44,14 +44,16 @@ pub const MAX_SIGNERS: usize = 20_000;
 /// CONST: PUBLIC_INPUT_COUNT
 /// WHAT: number of public inputs to the Groth16 circuit. Each input
 ///       contributes one IC point to the verification key.
-/// ORDER: registration_merkle_root, registration_count, agg_signers,
-///        vote_message, threshold_pack, ballot_launcher_id — must match
-///        `prover/circuit.rs::Scalars`. The 6th input
-///        (`ballot_launcher_id`) was added under CHIP rev 2026-05-02
-///        so finalize proofs are bound to a specific Ballot Coin;
-///        threshold_pack stays as input #5 so the on-chain threshold
-///        check is preserved.
-pub const PUBLIC_INPUT_COUNT: usize = 6;
+/// ORDER: registration_merkle_root, registration_vote_weight,
+///        agg_signers, vote_message, threshold_pack,
+///        ballot_launcher_id, vote_threshold_num, vote_threshold_den —
+///        must match `prover/circuit.rs::Scalars`. The 7th and 8th
+///        inputs (`vote_threshold_num` / `vote_threshold_den`) were
+///        added under the CHIP rev that promotes (num, den) from
+///        compile-time R1CS coefficients to first-class public inputs,
+///        so a single VK verifies any (num, den). threshold_pack stays
+///        at input #5 as belt-and-suspenders hash binding.
+pub const PUBLIC_INPUT_COUNT: usize = 8;
 
 /// CONST: EMPTY_LEAF_HASH
 /// WHAT: SHA256(0x00 ⨯ 48) — the canonical empty-leaf marker for the
@@ -98,8 +100,8 @@ pub struct ElectionConfig {
     /// Must equal `MAX_SIGNERS`. Stored explicitly for self-validation.
     pub max_signers: usize,
 
-    /// Hex-encoded Groth16 verification key (672 bytes for our
-    /// 6-input circuit: 336 base + 7 IC * 48). Produced by the MPC
+    /// Hex-encoded Groth16 verification key (768 bytes for our
+    /// 8-input circuit: 336 base + 9 IC * 48). Produced by the MPC
     /// ceremony.
     pub verification_key_hex: String,
 
@@ -141,8 +143,8 @@ impl ElectionConfig {
     ///     compiled puzzles / circuit can't even verify the proofs)
     ///   * launcher / tail hex are decodable Bytes32
     ///   * verification key has the exact length our circuit needs
-    ///     (672 bytes = 336 base + (PUBLIC_INPUT_COUNT + 1) * 48 IC,
-    ///     i.e. 7 * 48 for our 6-input circuit)
+    ///     (768 bytes = 336 base + (PUBLIC_INPUT_COUNT + 1) * 48 IC,
+    ///     i.e. 9 * 48 for our 8-input circuit)
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.tree_depth != TREE_DEPTH {
             return Err("ElectionConfig.tree_depth must equal TREE_DEPTH (32)");
@@ -249,7 +251,7 @@ mod tests {
 
     /// WHAT: `.validate()` rejects a verification key whose byte
     ///       length doesn't match the circuit's expected layout
-    ///       (672 = 336 base + 7 IC * 48 bytes for our 6-input
+    ///       (768 = 336 base + 9 IC * 48 bytes for our 8-input
     ///       circuit).
     /// HOW:  set verification_key_hex to 100-byte zero-buffer, expect
     ///       an `Err`.

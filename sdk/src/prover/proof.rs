@@ -105,26 +105,32 @@ impl Groth16Proof {
 }
 
 /// STRUCT: Scalars
-/// PURPOSE: pre-computed `sha256(public_input_i)` for each of the six
-///          public inputs to our circuit (CHIP rev 2026-05-02).
+/// PURPOSE: pre-computed scalars for each of the eight public inputs
+///          to our circuit (CHIP rev: (num, den) promoted to s7/s8).
 ///
 /// LAYOUT: matches the on-chain `puzzles/ballot_coin/finalize.rue`
 ///         `Scalars` struct order EXACTLY:
-///   s1 = registration_merkle_root
-///   s2 = registration_vote_weight (8-byte big-endian)
-///   s3 = aggregated signers' G1-compressed bytes
-///   s4 = vote_message
-///   s5 = threshold_pack(num, den) — packs the on-chain quorum
-///        threshold so the circuit binds to it (defense in depth)
-///   s6 = ballot_launcher_id — binds the proof to a specific ballot,
-///        preventing cross-ballot replay
+///   s1 = sha256(registration_merkle_root) mod r
+///   s2 = sha256(registration_vote_weight_be8) mod r
+///   s3 = sha256(agg_signers_g1_compressed_48) mod r
+///   s4 = sha256(vote_message) mod r
+///   s5 = sha256(threshold_pack(num, den)) mod r — defense-in-depth
+///        hash binding for the on-chain quorum threshold
+///   s6 = sha256(ballot_launcher_id) mod r — binds the proof to a
+///        specific ballot, preventing cross-ballot replay
+///   s7 = Fr::from(VOTE_THRESHOLD_NUM) — direct equality binding for
+///        the curried numerator. Promotes (num) from a compile-time
+///        R1CS coefficient to a first-class public input so a single
+///        VK verifies any (num, den).
+///   s8 = Fr::from(VOTE_THRESHOLD_DEN) — direct equality binding for
+///        the curried denominator.
 ///
 /// IMMUTABILITY: derived purely from the public inputs; recomputable
 ///               by anyone, no secret data.
 ///
 /// CIRCUIT CONNECTION: convert via
 /// [`crate::prover::conversions::scalars_to_fr_array`] to get the
-/// `[Fr; 6]` form `VotingCircuit::generate_constraints` allocates as
+/// `[Fr; 8]` form `VotingCircuit::generate_constraints` allocates as
 /// public-input variables. The off-chain prover and the on-chain
 /// `IC[0] + Σ s_i * IC[i+1]` linear combination MUST consume identical
 /// scalars — this round-trip is the canonical contract.
@@ -142,21 +148,31 @@ pub struct Scalars {
     /// `sha256(threshold_pack(num, den)) mod r` where the pack is
     /// `int_to_8_bytes_be(num) || int_to_8_bytes_be(den)` — 16 bytes
     /// total, exactly matching `finalize.rue::threshold_pack_bytes`.
+    /// Defense-in-depth hash binding; s7 also binds num via direct
+    /// equality.
     pub s5: Bytes32,
     /// `sha256(ballot_launcher_id) mod r` — pins the proof to a single
     /// ballot. Without this the same proof could finalize a different
     /// ballot whose other inputs happened to coincide.
     pub s6: Bytes32,
+    /// `Fr::from(VOTE_THRESHOLD_NUM)` encoded as 32-byte big-endian Fr.
+    /// First-class numerator public input (CHIP rev) — the on-chain
+    /// finalize action asserts `int_to_be32(num) == s7`.
+    pub s7: Bytes32,
+    /// `Fr::from(VOTE_THRESHOLD_DEN)` encoded as 32-byte big-endian Fr.
+    /// First-class denominator public input (CHIP rev) — the on-chain
+    /// finalize action asserts `int_to_be32(den) == s8`.
+    pub s8: Bytes32,
 }
 
 impl Scalars {
     /// FN: compute
-    /// WHAT: derive all six scalars from the six public inputs.
+    /// WHAT: derive all eight scalars from the public inputs.
     /// USAGE:
     ///   * `Aggregator::prepare_finalize_witness` — populates the
     ///     finalize-action solution.
     ///   * `VotingCircuit::public_inputs_as_fr` — derives the
-    ///     [`Fr; 6`] form the circuit commits to via Groth16's IC.
+    ///     [`Fr; 8`] form the circuit commits to via Groth16's IC.
     /// IDEMPOTENT: same inputs → same scalars; safe to call repeatedly.
     pub fn compute(
         registration_merkle_root: Bytes32,
@@ -167,16 +183,23 @@ impl Scalars {
         vote_threshold_den: u64,
         ballot_launcher_id: Bytes32,
     ) -> Self {
-        // Each scalar = `sha256(input) mod r`, where r is the
-        // BLS12-381 subgroup order. The mod-r reduction is REQUIRED
-        // — without it, raw sha256 outputs whose high bit is set
-        // would be interpreted as NEGATIVE numbers by CLVM's
-        // `bls_g1_multiply` (which uses signed two's-complement
-        // big-endian semantics), producing a different scalar than
-        // the off-chain prover's `Fr::from_be_bytes_mod_order(...)`
-        // commitment. After reducing mod r the value is < r < 2^254,
-        // so the high bit is always 0 and signed/unsigned
-        // interpretations agree.
+        use crate::prover::conversions::fr_to_bytes32_be;
+        use ark_bls12_381::Fr;
+
+        // s1..s6 = `sha256(input) mod r`, where r is the BLS12-381
+        // subgroup order. The mod-r reduction is REQUIRED — without
+        // it, raw sha256 outputs whose high bit is set would be
+        // interpreted as NEGATIVE numbers by CLVM's `bls_g1_multiply`
+        // (which uses signed two's-complement big-endian semantics),
+        // producing a different scalar than the off-chain prover's
+        // `Fr::from_be_bytes_mod_order(...)` commitment. After
+        // reducing mod r the value is < r < 2^254, so the high bit
+        // is always 0 and signed/unsigned interpretations agree.
+        //
+        // s7 = Fr::from(num), s8 = Fr::from(den), encoded as 32-byte
+        // big-endian. These are direct equality public inputs (CHIP
+        // rev), not hashes — the circuit consumes them as the (num,
+        // den) coefficients of the weighted-quorum gadget.
         let s1 = sha256_mod_r(registration_merkle_root.as_ref());
         let s2 = sha256_mod_r(&registration_vote_weight.to_be_bytes());
         let s3 = sha256_mod_r(&agg_signers.to_bytes());
@@ -186,6 +209,8 @@ impl Scalars {
             vote_threshold_den,
         ));
         let s6 = sha256_mod_r(ballot_launcher_id.as_ref());
+        let s7 = Bytes32::new(fr_to_bytes32_be(&Fr::from(vote_threshold_num)));
+        let s8 = Bytes32::new(fr_to_bytes32_be(&Fr::from(vote_threshold_den)));
         Self {
             s1,
             s2,
@@ -193,18 +218,22 @@ impl Scalars {
             s4,
             s5,
             s6,
+            s7,
+            s8,
         }
     }
 
     /// FN: as_array
-    /// WHAT: return the 6 scalars as a `[Bytes32; 6]` in the canonical
-    ///       `(s1, s2, s3, s4, s5, s6)` order.
+    /// WHAT: return the 8 scalars as a `[Bytes32; 8]` in the canonical
+    ///       `(s1, s2, s3, s4, s5, s6, s7, s8)` order.
     /// USAGE: convenient for off-chain serialisation in tests + for
     ///        `chip-voting-sdk` callers that want to feed the scalars
     ///        directly into `VotingCircuit::verify_offchain`'s
-    ///        `&[Bytes32; 6]` parameter.
-    pub fn as_array(&self) -> [Bytes32; 6] {
-        [self.s1, self.s2, self.s3, self.s4, self.s5, self.s6]
+    ///        `&[Bytes32; 8]` parameter.
+    pub fn as_array(&self) -> [Bytes32; 8] {
+        [
+            self.s1, self.s2, self.s3, self.s4, self.s5, self.s6, self.s7, self.s8,
+        ]
     }
 }
 
@@ -427,8 +456,8 @@ mod tests {
         assert_eq!(scalars.s5, expected_mod_r);
     }
 
-    /// WHAT: `Scalars::as_array` returns the 6 scalars in the canonical
-    ///       `(s1, s2, s3, s4, s5, s6)` order.
+    /// WHAT: `Scalars::as_array` returns the 8 scalars in the canonical
+    ///       `(s1, s2, s3, s4, s5, s6, s7, s8)` order.
     /// HOW:  build a recognisable Scalars value and assert each entry.
     /// WHY:  this array is the form `VotingCircuit::verify_offchain`
     ///       takes. Any reordering would silently break verification
@@ -442,6 +471,8 @@ mod tests {
             s4: b32(0x44),
             s5: b32(0x55),
             s6: b32(0x66),
+            s7: b32(0x77),
+            s8: b32(0x88),
         };
         let arr = s.as_array();
         assert_eq!(arr[0], b32(0x11));
@@ -450,6 +481,25 @@ mod tests {
         assert_eq!(arr[3], b32(0x44));
         assert_eq!(arr[4], b32(0x55));
         assert_eq!(arr[5], b32(0x66));
+        assert_eq!(arr[6], b32(0x77));
+        assert_eq!(arr[7], b32(0x88));
+    }
+
+    /// WHAT: scalar `s7` and `s8` are `Fr::from(num/den)` encoded as
+    ///       32-byte big-endian, NOT hashes.
+    /// HOW:  compute Scalars at (num=2, den=3) and assert s7/s8 equal
+    ///       `fr_to_bytes32_be(Fr::from(2))` / `Fr::from(3)`.
+    /// WHY:  the circuit's weighted-quorum gadget multiplies by these
+    ///       values directly. A hash here would silently break
+    ///       verification across all (num, den).
+    #[test]
+    fn s7_s8_are_fr_from_num_den_be32() {
+        use crate::prover::conversions::fr_to_bytes32_be;
+        use ark_bls12_381::Fr;
+        let pk = pk_at(0);
+        let scalars = Scalars::compute(b32(0), 0, &pk, b32(0), 2, 3, b32(0));
+        assert_eq!(scalars.s7, Bytes32::new(fr_to_bytes32_be(&Fr::from(2u64))));
+        assert_eq!(scalars.s8, Bytes32::new(fr_to_bytes32_be(&Fr::from(3u64))));
     }
 
     /// WHAT: `Groth16Proof` serialises through `serde_json` round-

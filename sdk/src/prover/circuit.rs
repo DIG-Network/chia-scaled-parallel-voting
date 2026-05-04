@@ -148,7 +148,7 @@ impl VotingCircuit {
     ///           Fr values via the IC vector, so the pairing equation
     ///           holds iff the prover used `bytes32_to_fr(s_i)` as
     ///           its public inputs — exactly what this method returns.
-    pub fn public_inputs_as_fr(&self) -> [Fr; 6] {
+    pub fn public_inputs_as_fr(&self) -> [Fr; 8] {
         let scalars = crate::prover::Scalars::compute(
             self.registration_merkle_root,
             self.registration_vote_weight,
@@ -217,7 +217,7 @@ impl VotingCircuit {
     pub fn verify_offchain(
         verification_key: &ArkVerifyingKey,
         proof: &Groth16Proof,
-        public_inputs: &[Bytes32; 6],
+        public_inputs: &[Bytes32; 8],
     ) -> VotingResult<bool> {
         let proof = proof.to_arkworks()?;
         let inputs: Vec<Fr> = public_inputs.iter().map(bytes32_to_fr).collect();
@@ -304,6 +304,17 @@ impl ConstraintSynthesizer<Fr> for VotingCircuit {
         // the public-input vector (drift here ⇒ different vk_input ⇒
         // pairing fails).
         let _s6 = cs.new_input_variable(|| Ok(scalars_fr[5]))?;
+        // s7 = Fr::from(num), s8 = Fr::from(den) — first-class public
+        // inputs (CHIP rev). Promoting (num, den) from compile-time
+        // R1CS coefficients to public-input variables means a SINGLE
+        // VK can verify proofs for any (num, den), with the on-chain
+        // finalize action asserting `int_to_be32(num) == s7` and
+        // `int_to_be32(den) == s8` against the curried snapshot.
+        // These vars are USED below in the weighted-quorum gadget
+        // (multiplied by witness weights), so they must be bound to
+        // real Variable handles, not `_`-discarded.
+        let s7_var = cs.new_input_variable(|| Ok(scalars_fr[6]))?;
+        let s8_var = cs.new_input_variable(|| Ok(scalars_fr[7]))?;
 
         // ── Private witnesses for the threshold check ────────────
         //
@@ -382,16 +393,49 @@ impl ConstraintSynthesizer<Fr> for VotingCircuit {
         // Enforce the inequality via the slack identity:
         //   total_signer_weight * den == num * registration_vote_weight + slack
         // i.e.,
-        //   total_signer_weight * den - num * registration_vote_weight - slack == 0
-        let den_fr = Fr::from(self.vote_threshold_den);
-        let num_fr = Fr::from(self.vote_threshold_num);
+        //   (s8_var * total_signer_weight_var) - (s7_var * registration_vote_weight_var)
+        //     == slack_var
+        //
+        // R1CS forbids var*var inside a single linear combination, so
+        // we split each product into its own constraint via a fresh
+        // witness, then a final linear constraint stitches them
+        // together.
+        //
+        // Witness values for the products are computed directly from
+        // the Fr scalars we have at hand (s7/s8 = Fr::from(num/den);
+        // weights are u64). Soundness comes from the enforce_constraint
+        // calls below — the prover can't lie about lhs_var/rhs_var
+        // without violating their multiplicative identities.
+        let s8_fr = Fr::from(self.vote_threshold_den);
+        let s7_fr = Fr::from(self.vote_threshold_num);
+        let total_signer_weight_fr = Fr::from(total_signer_weight);
+        let registration_vote_weight_fr = Fr::from(self.registration_vote_weight);
+
+        // lhs_var = s8_var * total_signer_weight_var
+        let lhs_value = s8_fr * total_signer_weight_fr;
+        let lhs_var = cs.new_witness_variable(|| Ok(lhs_value))?;
         cs.enforce_constraint(
-            lc!()
-                + (den_fr, total_signer_weight_var)
-                + (-num_fr, registration_vote_weight_var)
-                + (-Fr::from(1u64), slack_var),
+            lc!() + s8_var,
+            lc!() + total_signer_weight_var,
+            lc!() + lhs_var,
+        )?;
+
+        // rhs_var = s7_var * registration_vote_weight_var
+        let rhs_value = s7_fr * registration_vote_weight_fr;
+        let rhs_var = cs.new_witness_variable(|| Ok(rhs_value))?;
+        cs.enforce_constraint(
+            lc!() + s7_var,
+            lc!() + registration_vote_weight_var,
+            lc!() + rhs_var,
+        )?;
+
+        // Final slack identity: lhs_var - rhs_var == slack_var.
+        // Encoded as `(lhs_var - rhs_var) * 1 == slack_var` — purely
+        // linear, R1CS-friendly.
+        cs.enforce_constraint(
+            lc!() + lhs_var - rhs_var,
             lc!() + Variable::One,
-            lc!(),
+            lc!() + slack_var,
         )?;
 
         Ok(())
@@ -603,8 +647,8 @@ mod tests {
         let (_pk, vk) = generate_test_setup(&mut rng).unwrap();
         assert_eq!(
             vk.0.gamma_abc_g1.len(),
-            7,
-            "IC must be 1 + PUBLIC_INPUT_COUNT (= 7 for our 6-input circuit)"
+            9,
+            "IC must be 1 + PUBLIC_INPUT_COUNT (= 9 for our 8-input circuit)"
         );
     }
 
@@ -627,14 +671,16 @@ mod tests {
         let proof = circuit.prove(&pk).expect("prove must succeed");
 
         // Convert the public inputs back to Bytes32 form for the
-        // verifier API (which takes a `[Bytes32; 6]`).
-        let inputs_b32: [Bytes32; 6] = [
+        // verifier API (which takes a `[Bytes32; 8]`).
+        let inputs_b32: [Bytes32; 8] = [
             Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[0])),
             Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[1])),
             Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[2])),
             Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[3])),
             Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[4])),
             Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[5])),
+            Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[6])),
+            Bytes32::new(crate::prover::circuit::tests::fr_to_b32(&inputs[7])),
         ];
         assert!(
             VotingCircuit::verify_offchain(&vk, &proof, &inputs_b32).unwrap(),
@@ -666,13 +712,15 @@ mod tests {
         let inputs = circuit.public_inputs_as_fr();
         let proof = circuit.prove(&pk).unwrap();
 
-        let mut inputs_b32: [Bytes32; 6] = [
+        let mut inputs_b32: [Bytes32; 8] = [
             Bytes32::new(fr_to_b32(&inputs[0])),
             Bytes32::new(fr_to_b32(&inputs[1])),
             Bytes32::new(fr_to_b32(&inputs[2])),
             Bytes32::new(fr_to_b32(&inputs[3])),
             Bytes32::new(fr_to_b32(&inputs[4])),
             Bytes32::new(fr_to_b32(&inputs[5])),
+            Bytes32::new(fr_to_b32(&inputs[6])),
+            Bytes32::new(fr_to_b32(&inputs[7])),
         ];
         // Tamper with the registration_merkle_root input.
         inputs_b32[0] = Bytes32::new([0xFF; 32]);
@@ -716,33 +764,35 @@ mod tests {
         let circuit = make_circuit(3, 4); // 2k = 6 > 4 ✓
         let proof = circuit.prove(&pk).unwrap();
         let inputs = circuit.public_inputs_as_fr();
-        let inputs_b32: [Bytes32; 6] = [
+        let inputs_b32: [Bytes32; 8] = [
             Bytes32::new(fr_to_b32(&inputs[0])),
             Bytes32::new(fr_to_b32(&inputs[1])),
             Bytes32::new(fr_to_b32(&inputs[2])),
             Bytes32::new(fr_to_b32(&inputs[3])),
             Bytes32::new(fr_to_b32(&inputs[4])),
             Bytes32::new(fr_to_b32(&inputs[5])),
+            Bytes32::new(fr_to_b32(&inputs[6])),
+            Bytes32::new(fr_to_b32(&inputs[7])),
         ];
         assert!(VotingCircuit::verify_offchain(&vk, &proof, &inputs_b32).unwrap());
     }
 
-    /// WHAT: VK `chia_chunked_bytes` is exactly 672 bytes for our
-    ///       6-input circuit (CHIP rev 2026-05-02).
+    /// WHAT: VK `chia_chunked_bytes` is exactly 768 bytes for our
+    ///       8-input circuit (CHIP rev with s7/s8 promoted).
     /// HOW:  generate setup, call chia_chunked_bytes, assert length.
     /// WHY:  this length is what `ElectionConfig::validate` checks
     ///       against (`expected_vk_bytes = 336 + (PUBLIC_INPUT_COUNT
-    ///       + 1) * 48 = 672`). Drift would mean configs ship with
+    ///       + 1) * 48 = 768`). Drift would mean configs ship with
     ///       wrong-sized VKs and validation breaks.
     #[test]
-    fn vk_chia_chunked_bytes_is_672_bytes() {
+    fn vk_chia_chunked_bytes_is_768_bytes() {
         let mut rng = deterministic_rng();
         let (_pk, vk) = generate_test_setup(&mut rng).unwrap();
         let bytes = vk.chia_chunked_bytes().unwrap();
         assert_eq!(
             bytes.len(),
-            672,
-            "expected layout: alpha_g1+beta_g2+gamma_g2+delta_g2+7*ic"
+            768,
+            "expected layout: alpha_g1+beta_g2+gamma_g2+delta_g2+9*ic"
         );
     }
 
@@ -765,13 +815,15 @@ mod tests {
         let circuit = make_circuit(2, 3);
         let proof = circuit.prove(&pk).unwrap();
         let inputs = circuit.public_inputs_as_fr();
-        let inputs_b32: [Bytes32; 6] = [
+        let inputs_b32: [Bytes32; 8] = [
             Bytes32::new(fr_to_b32(&inputs[0])),
             Bytes32::new(fr_to_b32(&inputs[1])),
             Bytes32::new(fr_to_b32(&inputs[2])),
             Bytes32::new(fr_to_b32(&inputs[3])),
             Bytes32::new(fr_to_b32(&inputs[4])),
             Bytes32::new(fr_to_b32(&inputs[5])),
+            Bytes32::new(fr_to_b32(&inputs[6])),
+            Bytes32::new(fr_to_b32(&inputs[7])),
         ];
         assert!(VotingCircuit::verify_offchain(&vk2, &proof, &inputs_b32).unwrap());
     }
