@@ -84,7 +84,13 @@ This CHIP introduces no changes to CLVM itself. Puzzle layouts, action layers, s
 
 * **Epoch / Election**: Deployment lifetime of the Election Singleton; may contain many ballots.
 
-* **Sparse Merkle Tree (SPT)**: Fixed depth 32 (must match `TREE_DEPTH` in config and puzzles). Slot and leaf semantics remain as in `puzzles/election/register.rue` (`slot` from `sha256(pubkey)`, occupied leaf `sha256(pubkey || locked_cat_mojos_be8)`, empty leaf `EMPTY_LEAF_HASH`). The SPT tracks **eligible voters**, not vote choices—choices live on Voting Coins keyed by ballot.
+* **Sparse Merkle Tree (SPT)**: Fixed depth 32 (must match `TREE_DEPTH` in config and puzzles). Slot and leaf semantics are pinned by `puzzles/election/register.rue`:
+  - **Slot**: `u32::from_be_bytes(sha256(pubkey)[0..4])` — first 4 bytes of the voter pubkey's sha256, treated as a big-endian unsigned 32-bit integer (parity with the ballot SPT below).
+  - **Occupied leaf**: `sha256(pubkey)`. Per-voter weight is tracked on the Election Singleton state (`registration_vote_weight += COLLATERAL_AMOUNT` per `register` action) rather than encoded in the leaf, since this revision uses a uniform per-registration `COLLATERAL_AMOUNT`. A future revision adding per-voter variable weights would extend the leaf to `sha256(pubkey || locked_cat_mojos_be8)` and require the circuit to consume per-signer weight as a private witness.
+  - **Empty leaf**: `EMPTY_LEAF_HASH = sha256(0x00 × 48)`.
+  - **Internal-node hash**: plain `sha256(left || right)` (no CLVM tree-hash prefix), matching `compute_root` in `puzzles/election/register.rue` and `merkle.rs::sha256_concat`.
+
+  The SPT tracks **eligible voters**, not vote choices — choices live on Voting Coins keyed by ballot.
 
 * **Per-Registration Ballot SPT**: A separate, smaller SPT carried in `RegistrationState` whose leaves are `sha256(ballot_launcher_id)`. Used by `mint_voting_coin` to prove non-membership before insertion (single-vote-per-ballot enforcement). Depth, empty-leaf hash, and slot derivation are deployment-tunable; the reference SDK pins depth 32 and `slot = sha256(ballot_launcher_id) mod 2^32` for parity with the registration SPT.
 
@@ -132,7 +138,12 @@ Groth16 + **`bls_verify`** together bind quorum to eligible registered weight an
 
 ### Sparse Merkle Tree (registration set)
 
-Unchanged geometric layout: depth 32, slot from first 8 bytes BE of `sha256(pubkey) mod 2^32`, leaves `sha256(pubkey || locked_cat_mojos_be8)`, empty leaf `EMPTY_LEAF_HASH`.
+Geometric layout (pinned by `puzzles/election/register.rue` and `sdk/src/merkle.rs`):
+- Depth: 32
+- Slot: `u32::from_be_bytes(sha256(pubkey)[0..4])`
+- Occupied leaf: `sha256(pubkey)` (uniform per-registration weight in this revision; per-voter variable weight is forward-compatible as `sha256(pubkey || locked_cat_mojos_be8)` but not yet implemented)
+- Empty leaf: `EMPTY_LEAF_HASH = sha256(0x00 × 48)`
+- Internal nodes: plain `sha256(left || right)` (no `0x02` CLVM tree-hash prefix)
 
 ### Circuit public inputs (Groth16)
 
@@ -203,14 +214,15 @@ The Ballot Coin is the **vote-mechanics container** for a single ballot. It is c
 
 Ballot Coin state: `(finalized: bool, vote_outcome: Bytes32, agg_signers: Bytes32)`.
 
-Ballot Coin curried constants (reference set):
-- `BALLOT_LAUNCHER_ID`
-- `ELECTION_LAUNCHER_ID`
-- `VOTE_CLOSE_HEIGHT`
-- `OUTCOME_DOMAIN_HASH` (commits the allowed outcome set)
-- `VK`, `IC`
-- `VOTE_THRESHOLD_NUM`, `VOTE_THRESHOLD_DEN` (packed into the `threshold_pack` public input)
-- `BALLOT_ACTIONS_MERKLE_ROOT`
+Ballot Coin curried constants (reference set, as implemented in `puzzles/ballot_coin/finalize.rue` + `oracle.rue` + `announce_finalization.rue`):
+
+The Ballot Coin's action layer's `MERKLE_ROOT` is the per-ballot `BALLOT_ACTIONS_MERKLE_ROOT` over the three fully-curried action puzzle hashes. Each action's curried args:
+
+- `finalize`: `(VK, IC, BALLOT_LAUNCHER_ID, ELECTION_LAUNCHER_ID, VOTE_CLOSE_HEIGHT, VOTE_THRESHOLD_NUM, VOTE_THRESHOLD_DEN, REGISTRATION_MERKLE_ROOT_SNAPSHOT, REGISTRATION_VOTE_WEIGHT_SNAPSHOT)`. The two `*_SNAPSHOT` curries are the Election Singleton's state at `launch_ballot` time — they bind the Groth16 proof's `s1` (registration_merkle_root) and `s2` (registration_vote_weight) public inputs to the snapshot the BallotIssuer captured, defending against a finalize spend that lies about the registration set the proof was generated against.
+- `oracle`: `(BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT)`.
+- `announce_finalization`: `(BALLOT_LAUNCHER_ID)`.
+
+`OUTCOME_DOMAIN_HASH` is commitment data: it is included in the `createBallot` `CreateCoinAnnouncement` so off-chain consumers can pin the allowed outcome set, but this revision does not curry it into the Ballot Coin nor enforce on-chain outcome-domain membership — that's deployment-policy off-chain. A future revision MAY add an in-puzzle outcome-membership proof if a deployment requires it.
 
 ### Inner actions (Ballot Coin)
 
@@ -319,6 +331,16 @@ Bundles for **registration**, **createBallot**, and **deregister** serialize wit
 **Trusted setup**: Groth16 trusted setup and MPC requirements unchanged. The 6-input circuit shape requires a **fresh ceremony** producing a new VK; the existing transcript / attestation chain code can be reused.
 
 ---
+
+## Implementation alignment (this revision)
+
+The reference implementation (`chip-voting-sdk` + `puzzles/`) is **substantially aligned** with this spec as of commit `0620819` (2026-05-03). One known divergence and one known incomplete piece:
+
+1. **Threshold gadget in the Groth16 circuit is permissive.** `puzzles/ballot_coin/finalize.rue` curries `VOTE_THRESHOLD_NUM` / `VOTE_THRESHOLD_DEN` and binds them into the s5 scalar via the `threshold_pack` preimage; the off-chain prover commits the same scalars; on-chain the assertion `s5 == sha256(threshold_pack(num, den)) mod r` runs. What's missing is an **in-circuit weighted-quorum constraint** of the form `Σ signer_weights * den >= num * registration_vote_weight`. The current circuit substitutes a non-empty-signer-set check until the per-voter weight witness + corresponding IC point binding land in a follow-up MPC ceremony. Soundness against the threshold-attack class still relies on (a) the `bls_verify` opcode in `finalize.rue` requiring real signatures from the `agg_signers` set and (b) the curried `(num, den)` snapshot being committed via s5 — but a malicious aggregator with sufficient registered-voter cooperation could currently land a finalize at less than `num/den` quorum.
+
+2. **`finalize_per_ballot_e2e` does not yet pass the simulator.** The SDK side of `Aggregator::build_finalize_for_ballot` is fully wired (Groth16 prover, BLS aggregation, action layer + singleton outer wrap, lineage walking); the bundle is structurally valid; the on-chain CLVM dry-run raises in `finalize.rue` execution. The likely cause is a Scalars canonical-encoding mismatch (`(value mod r) as Bytes` strips leading zeros, while the SDK's `Scalars::s_i: Bytes32` is full 32-byte BE). This is a debug pass that needs to land before the Ballot Coin finalize action is operationally proven against a real chain. All other actor methods (`register`, `cast_vote`, `update_vote`, `release_collateral`, `BallotIssuer::create_ballot`, `BallotIssuer::launch_ballot`, `BallotReader::*`, `Aggregator::collect_votes_for_ballot`) have full e2e simulator coverage.
+
+Everything else in this spec — the action sets per coin type, the vote_message preimage, the 6-input circuit shape, the canonical Scalars order, the `bls_verify` form, the SPT structure, the per-registration ballot SPT, the lineage-proof three-link chain, the Election Singleton lane separation, and the actions deleted from the Election Singleton (no `finalize` / `announce_finalization` / `oracle` / `vote` / `change_vote`; no `REGISTRATION_FEE`) — is fully implemented and pinned by simulator e2e tests.
 
 ## Document revision: removed and changed vs. prior CHIP text
 
