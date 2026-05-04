@@ -94,7 +94,7 @@ This CHIP introduces no changes to CLVM itself. Puzzle layouts, action layers, s
 
 * **Per-Registration Ballot SPT**: A separate, smaller SPT carried in `RegistrationState` whose leaves are `sha256(ballot_launcher_id)`. Used by `mint_voting_coin` to prove non-membership before insertion (single-vote-per-ballot enforcement). Depth, empty-leaf hash, and slot derivation are deployment-tunable; the reference SDK pins depth 32 and `slot = sha256(ballot_launcher_id) mod 2^32` for parity with the registration SPT.
 
-* **Groth16 proof**, **Verification Key**: Wire shape unchanged. Public inputs are extended in this revision to **6 scalars** (see Circuit public inputs below) so proofs cannot be replayed across ballots.
+* **Groth16 proof**, **Verification Key**: Wire shape unchanged. Public inputs are extended in this revision to **8 scalars** (see Circuit public inputs below) so proofs cannot be replayed across ballots and a single VK can verify proofs for any `(num, den)` threshold.
 
 ### Summary
 
@@ -147,16 +147,20 @@ Geometric layout (pinned by `puzzles/election/register.rue` and `sdk/src/merkle.
 
 ### Circuit public inputs (Groth16)
 
-This CHIP revision pins **6 public-input scalars**, in order. The on-chain threshold check is preserved—`threshold_pack` is **retained** and `ballot_launcher_id` is **added**. Ordering and IC layout MUST match the Ballot Coin's **`finalize.rue`** and `circuit.rs` for that deployment exactly:
+This CHIP revision pins **8 public-input scalars**, in order. The on-chain threshold check is preserved—`threshold_pack` is **retained** as defense-in-depth and `(num, den)` are now first-class public inputs `s7`/`s8` so a single VK verifies proofs for any threshold. Ordering and IC layout MUST match the Ballot Coin's **`finalize.rue`** and `circuit.rs` for that deployment exactly:
 
 1. `registration_merkle_root` — root of the registration SPT at the height the witness was built.
 2. `registration_vote_weight` — total weighted stake of all registered voters (scalar).
 3. `agg_signers` — packed bitvector / hash of which signers contributed to the aggregate.
 4. `vote_message` — the canonical hash signed by each contributing voter (see preimage below).
-5. `threshold_pack` — packed `(num, den)` quorum threshold; the on-chain Ballot Coin asserts this matches the curried threshold.
+5. `threshold_pack` — packed `(num, den)` quorum threshold (hash binding); the on-chain Ballot Coin asserts this matches `sha256(threshold_pack(num, den)) mod r` for the curried threshold. Retained as defense-in-depth against the prover misencoding `(num, den)`.
 6. `ballot_launcher_id` — 32-byte launcher id of the Ballot Coin being finalized; binds the proof to a single ballot and prevents cross-ballot replay.
+7. `vote_threshold_num` — `Fr::from(VOTE_THRESHOLD_NUM)`, the curried numerator exposed as a first-class public input so a single VK verifies any `(num, den)`. The on-chain Ballot Coin asserts `Fr::from(VOTE_THRESHOLD_NUM) == s7` (direct equality binding).
+8. `vote_threshold_den` — `Fr::from(VOTE_THRESHOLD_DEN)`, the curried denominator. The on-chain Ballot Coin asserts `Fr::from(VOTE_THRESHOLD_DEN) == s8` (direct equality binding).
 
-VK byte length is therefore fixed at `336 + (PUBLIC_INPUT_COUNT + 1) * 48 = 336 + 7 * 48 = 672` bytes for this revision.
+The weighted-quorum gadget consumes `s7`/`s8` as variable Fr coefficients (rather than compile-time R1CS constants), removing the prior limitation that one VK could only verify proofs at the `(num, den)` baked at trusted-setup time. `s5` is retained as belt-and-suspenders: `s5` binds via hash, `s7`/`s8` bind via direct equality.
+
+VK byte length is therefore fixed at `336 + (PUBLIC_INPUT_COUNT + 1) * 48 = 336 + 9 * 48 = 768` bytes for this revision.
 
 ### Vote message preimage (canonical)
 
@@ -216,7 +220,7 @@ Ballot Coin state: `(finalized: bool, vote_outcome: Bytes32, agg_signers: Bytes3
 
 Ballot Coin curried constants (reference set, as implemented in `puzzles/ballot_coin/finalize.rue` + `oracle.rue` + `announce_finalization.rue`):
 
-The Ballot Coin's action layer's `MERKLE_ROOT` is the per-ballot `BALLOT_ACTIONS_MERKLE_ROOT` over the three fully-curried action puzzle hashes. Each action's curried args:
+The Ballot Coin's action layer's `MERKLE_ROOT` is the per-ballot `BALLOT_ACTIONS_MERKLE_ROOT` over the three fully-curried action puzzle hashes. The IC array (Groth16 input commitments) grew to **9 points** in this revision (one base point + one per public-input scalar; with 8 public inputs, IC has 9 points). Each action's curried args:
 
 - `finalize`: `(VK, IC, BALLOT_LAUNCHER_ID, ELECTION_LAUNCHER_ID, VOTE_CLOSE_HEIGHT, VOTE_THRESHOLD_NUM, VOTE_THRESHOLD_DEN, REGISTRATION_MERKLE_ROOT_SNAPSHOT, REGISTRATION_VOTE_WEIGHT_SNAPSHOT)`. The two `*_SNAPSHOT` curries are the Election Singleton's state at `launch_ballot` time — they bind the Groth16 proof's `s1` (registration_merkle_root) and `s2` (registration_vote_weight) public inputs to the snapshot the BallotIssuer captured, defending against a finalize spend that lies about the registration set the proof was generated against.
 - `oracle`: `(BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT)`.
@@ -230,7 +234,7 @@ Each action is dispatched through a CHIP-0050 action layer curried on the Ballot
 
 | Action | Role |
 |--------|------|
-| `finalize` | Verifies Groth16 (6 public inputs including `ballot_launcher_id`) + `bls_verify`; asserts current height ≥ `VOTE_CLOSE_HEIGHT`; commits ballot outcome by recreating Ballot Coin with `finalized=true, vote_outcome=…, agg_signers=…`. |
+| `finalize` | Verifies Groth16 (8 public inputs including `ballot_launcher_id`, `vote_threshold_num`, `vote_threshold_den`) + `bls_verify`; asserts current height ≥ `VOTE_CLOSE_HEIGHT`; commits ballot outcome by recreating Ballot Coin with `finalized=true, vote_outcome=…, agg_signers=…`. |
 | `oracle` | Permissionless attestation that recreates the Ballot Coin unchanged and emits an announcement of `(ballot_launcher_id, vote_close_height, finalized)`. Consumed by Registration Coin `mint_voting_coin` (mint-time validation) and Voting Coin `update_vote` (mid-ballot timing proof) — both **without** spending the Election Singleton. |
 | `announce_finalization` | Re-announce ballot finalization after `finalize` has run; permissionless and idempotent. Lets downstream coins (outcome-gated payout coins, indexers prompting late state recovery, future deployments that react to ballot outcomes) assert the finalization conclusion in any block, not just the block in which `finalize` ran. |
 
@@ -292,7 +296,7 @@ The aggregator enumerates the latest Voting Coin per `(registration_coin_id, bal
 2. **Register (singleton lane)**: Voter runs **`register`** once; Registration Coin created with staked CAT, `voted_ballots_root=EMPTY_BALLOT_ROOT`; SPT updates.
 3. **Create ballots (singleton lane, infrequent)**: Operator calls **`createBallot`**; Ballot Coin mints with curried VK/IC/threshold inherited from the singleton, plus per-ballot `vote_close_height` and outcome domain.
 4. **Vote / change vote (parallel lane)**: Voters spend Registration Coins to **`mint_voting_coin`** per ballot (proving non-membership in the per-registration ballot SPT, then inserting); Voting Coin owners may **`update_vote`** by co-spending the Ballot Coin's `oracle` action; signatures for aggregation emitted on Voting Coin lineage; unlimited concurrent ballots in flight subject to mempool.
-5. **Finalize prep**: For ballot `B`, aggregator indexes Voting Coins linked to `B`, registrations, witnesses; verifies weighted quorum off-chain; proves with the 6-input circuit.
+5. **Finalize prep**: For ballot `B`, aggregator indexes Voting Coins linked to `B`, registrations, witnesses; verifies weighted quorum off-chain; proves with the 8-input circuit.
 6. **Finalize on-chain**: **Ballot Coin** `finalize` action verifies proof + **`bls_verify`** + commits ballot outcome by recreating the Ballot Coin. The Election Singleton is **not** spent.
 7. **Deregister / release (singleton lane)**: When a voter wants to exit, they invoke the singleton's **`deregister`** action (removing them from the SPT), and the Registration Coin's **`release`** action asserts that announcement to unlock collateral. Release is independent of any ballot's finalize state.
 
@@ -328,7 +332,7 @@ Bundles for **registration**, **createBallot**, and **deregister** serialize wit
 
 **No singleton finalize-time DoS**: Because finalize spends the Ballot Coin and not the singleton, a stuck or contested finalize for ballot A cannot block registrations, new ballot creation, or deregistrations.
 
-**Trusted setup**: Groth16 trusted setup and MPC requirements unchanged. The 6-input circuit shape requires a **fresh ceremony** producing a new VK; the existing transcript / attestation chain code can be reused.
+**Trusted setup**: Groth16 trusted setup and MPC requirements unchanged. The 8-input circuit shape requires a **fresh ceremony** producing a new VK; the existing transcript / attestation chain code can be reused. Because `(num, den)` are now first-class public inputs (s7/s8) rather than R1CS coefficients, one VK suffices for **any** `(num, den)` threshold under the same circuit shape.
 
 ---
 
@@ -356,7 +360,7 @@ The following summarizes **intentional** divergences from the immediately preced
 | **oracle** singleton action | Election Singleton oracle authorized `change_vote` on Registration Coins | Replaced by **per-Ballot Coin oracle action**; `update_vote` on a Voting Coin asserts the matching ballot's oracle announcement, never the singleton's |
 | Aggregator enumeration | Aggregators focused on registrations' memo pattern as primary ballot storage | Enumerate **Voting Coins per `ballot_launcher_id`** + registration weight witnesses |
 | **`vote_message` preimage** | `sha256(vote_data \|\| election_launcher_id)` | **Pinned**: `sha256(vote_outcome \|\| ballot_launcher_id \|\| election_launcher_id)` — all three components, this exact order |
-| Circuit public inputs | 5 inputs (`registration_merkle_root`, `registration_vote_weight`, `agg_signers`, `vote_message`, `threshold_pack`) | **6 inputs**: same five PLUS `ballot_launcher_id`. **`threshold_pack` is preserved** so the on-chain threshold check is never lost. VK length: `336 + 7*48 = 672` bytes. Fresh MPC ceremony required. |
+| Circuit public inputs | 5 inputs (`registration_merkle_root`, `registration_vote_weight`, `agg_signers`, `vote_message`, `threshold_pack`) | **8 inputs**: same five PLUS `ballot_launcher_id`, `vote_threshold_num` (s7), `vote_threshold_den` (s8). **`threshold_pack` is preserved** as defense-in-depth so the on-chain threshold check is never lost; s7/s8 add direct equality binding so a single VK verifies any `(num, den)`. VK length: `336 + 9*48 = 768` bytes. Fresh MPC ceremony required. |
 | Release trigger | Registration Coin `release` asserted singleton's `finalization_announcement_msg` | Registration Coin `release` asserts singleton's `deregister` announcement; release is decoupled from any ballot's finalize state |
 | Figures / intuition | Figures retained | Economic and latency story adjusted; pairwise curve intuition unchanged |
 
