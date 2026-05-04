@@ -25,7 +25,7 @@ Four coin types; *votes do not spend the Election Singleton*:
 - **Registration Coin**: *"Does **not** embed per-ballot `vote_data`; instead authorizes minting Voting Coins **per ballot** subject to uniqueness."*
 - **Voting Coin**: Edits gated by ballot's end condition; memos expose BLS material for aggregators; *"One active vote lineage per (registration, ballot)—enforced on the Registration Coin."*
 - **Lineage Proof**: Three-link chain: Election Singleton `register` → Registration Coin; Election Singleton `createBallot` → Ballot Coin; Registration Coin vote → Voting Coin.
-- **SPT**: depth 32, slot from `sha256(pubkey)`, occupied leaf `sha256(pubkey || locked_cat_mojos_be8)`, empty leaf `EMPTY_LEAF_HASH` — *unchanged from current implementation*.
+- **SPT**: depth 32, slot from `sha256(pubkey)`, occupied leaf `sha256(pubkey)`, empty leaf `EMPTY_LEAF_HASH`. *(Updated 2026-05-04: CHIP.md §88-91 / §143-146 specify `sha256(pubkey)` for this revision; the appended-weight form `sha256(pubkey || locked_cat_mojos_be8)` is forward-compatible but not yet implemented. The 2026-05-03 phase-A change to the appended-weight form was reverted by the spec-compliance pass — see `chip-migration-handoff.md`'s "Spec compliance addendum".)*
 - **Groth16 public inputs**: *"public inputs MAY be extended in implementations to bind **`ballot_launcher_id`** or ballot-specific roots if finalize is per-ballot."*
 
 ### 1.3 Inner actions of the singleton (CHIP.md:158–171)
