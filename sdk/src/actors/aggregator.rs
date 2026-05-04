@@ -525,8 +525,32 @@ impl<C: ChainReader> Aggregator<C> {
             }
         }
 
-        // Pre-check 4: strict majority.
-        if 2 * votes.len() <= voter_set.registration_count as usize {
+        // Pre-check 4: weighted-quorum threshold matching the curried
+        // (num, den) pack. Mirrors the on-chain assertion the
+        // weighted-quorum gadget enforces on `signed_weight`:
+        //   signed_weight * den >= num * total_weight
+        // where signed_weight is the sum of per-signer CAT-locked
+        // weights and total_weight is `registration_vote_weight_snapshot`.
+        // CHIP rev 2026-05-02 uses uniform `collateral_amount` per
+        // voter, so signed_weight = votes.len() * collateral_amount.
+        // u128 widening here keeps the multiply overflow-safe for any
+        // realistic CAT mojo amounts (each fits in u64 ≤ 2^64).
+        let collateral_amount = self.config.collateral_amount;
+        let signed_weight = (votes.len() as u128) * (collateral_amount as u128);
+        let total_weight = registration_vote_weight_snapshot as u128;
+        let lhs = signed_weight.checked_mul(vote_threshold_den as u128).ok_or_else(|| {
+            VotingError::Other(anyhow_compat::Error(
+                "prepare_finalize_witness_with_threshold: signed_weight * den overflowed u128"
+                    .into(),
+            ))
+        })?;
+        let rhs = total_weight.checked_mul(vote_threshold_num as u128).ok_or_else(|| {
+            VotingError::Other(anyhow_compat::Error(
+                "prepare_finalize_witness_with_threshold: total_weight * num overflowed u128"
+                    .into(),
+            ))
+        })?;
+        if lhs < rhs {
             return Err(VotingError::BelowThreshold);
         }
 
