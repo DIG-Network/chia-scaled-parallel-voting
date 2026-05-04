@@ -236,11 +236,6 @@ fn tree_depth_constant_is_32() {
 
 use chia_bls::{aggregate, sign, SecretKey, Signature};
 use chia_protocol::{Coin, CoinSpend, Program, SpendBundle};
-// CHIP rev 2026-05-02: ELECTION_ANNOUNCE_FINALIZATION_HEX moved to
-// BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX. Aliased to keep the
-// announce_finalization simulator tests compiling; tests are
-// `#[ignore]`-d below until rewritten in Phase 6.
-use chip_voting_sdk::puzzles::BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX as ELECTION_ANNOUNCE_FINALIZATION_HEX;
 use clvm_traits::{clvm_curried_args, ToClvm};
 use clvm_utils::{tree_hash, CurriedProgram};
 use clvmr::{serde::node_to_bytes, Allocator};
