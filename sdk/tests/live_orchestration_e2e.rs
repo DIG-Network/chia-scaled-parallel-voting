@@ -392,64 +392,87 @@ async fn chip_live_orchestration_simulator_full_flow() {
     // `Voter::release_collateral` walks the registration coin's CAT
     // lineage backward to recover the post-cast `voted_ballots_root`
     // and uses it to predict the on-chain ph.
-    //
-    // SDK GAP (4) — surfaced here, NOT yet fixed: chaining a SECOND
-    // voter's release_collateral after the first voter's deregister
-    // requires an SMT snapshot reflecting the first voter's leaf
-    // wiped to EMPTY_LEAF_HASH. The current `Aggregator::sync`
-    // doesn't track deregister-driven SMT mutations (it walks
-    // `register` action announcements only — see
-    // `apply_singleton_spend` in `aggregator.rs`), so the synced
-    // SMT still contains both voters and voter2's release fails
-    // with a SMT-root mismatch against the on-chain post-voter1-
-    // deregister root. Out of scope for this commit; tracked for
-    // follow-up. This test releases voter1 only and asserts the
-    // expected CAT child lands at the destination.
     let recreated_amount = collateral_amount - 1; // voting_coin_amount = 1
 
-    let post_cast_reg_coin = find_recreated_registration_coin(
+    let post_cast_reg_coin_1 = find_recreated_registration_coin(
         &sim, registration_coin_1_id, recreated_amount,
     );
-    let post_cast_reg_coin_id = post_cast_reg_coin.coin_id();
+    let post_cast_reg_coin_1_id = post_cast_reg_coin_1.coin_id();
 
     // Pre-release SMT contains BOTH voters (the on-chain root).
     let mut smt = SparseMerkleTree::new();
     smt.insert(&voter1_pk).expect("smt insert v1");
     smt.insert(&voter2_pk).expect("smt insert v2");
 
-    let dest = Bytes32::new([0xD1; 32]);
+    let dest1 = Bytes32::new([0xD1; 32]);
     let chain = common::SharedSim::new(&mut sim);
     let release_bundle = voter1
-        .release_collateral(&chain, &smt, post_cast_reg_coin_id, dest)
+        .release_collateral(&chain, &smt, post_cast_reg_coin_1_id, dest1)
         .await
         .unwrap_or_else(|e| panic!("voter1::release_collateral: {:?}", e));
     drop(chain);
     sim.new_transaction(release_bundle)
         .unwrap_or_else(|e| panic!("simulator accepts voter1 release: {:?}", e));
 
-    let dest_cat_th = CatArgs::curry_tree_hash(cat_tail_hash, dest.into());
-    let dest_cat_ph = Bytes32::new(dest_cat_th.to_bytes());
-    let dest_states = sim.lookup_puzzle_hashes(indexmap::indexset![dest_cat_ph], false);
+    let dest1_cat_th = CatArgs::curry_tree_hash(cat_tail_hash, dest1.into());
+    let dest1_cat_ph = Bytes32::new(dest1_cat_th.to_bytes());
+    let dest1_states = sim.lookup_puzzle_hashes(indexmap::indexset![dest1_cat_ph], false);
     assert!(
-        dest_states.iter().any(|cs| {
+        dest1_states.iter().any(|cs| {
             cs.coin.amount == recreated_amount
-                && cs.coin.parent_coin_info == post_cast_reg_coin_id
+                && cs.coin.parent_coin_info == post_cast_reg_coin_1_id
         }),
         "voter1: expected released CAT child at {} amount {} parent {}",
-        hex::encode(dest_cat_ph),
+        hex::encode(dest1_cat_ph),
         recreated_amount,
-        hex::encode(post_cast_reg_coin_id),
+        hex::encode(post_cast_reg_coin_1_id),
     );
 
-    // Sanity: voter2 still holds an unspent recreated Registration
-    // Coin. Releasing it would require the SDK Aggregator to walk
-    // deregister announcements (Gap 4 above).
-    let voter2_post_cast = find_recreated_registration_coin(
+    // ── 11. Release collateral for voter2 ───────────────────
+    // Exercises Gap (4)'s fix: chaining a SECOND voter's release
+    // after voter1's deregister requires an SMT snapshot reflecting
+    // voter1's leaf wiped to EMPTY_LEAF_HASH. Now that
+    // `Aggregator::sync` walks `deregister` announcements (see
+    // `apply_singleton_spend` in `aggregator.rs`), the synced SMT
+    // matches the on-chain post-voter1-deregister root and voter2's
+    // release succeeds.
+    let post_cast_reg_coin_2 = find_recreated_registration_coin(
         &sim, registration_coin_2_id, recreated_amount,
     );
-    assert_eq!(
-        voter2_post_cast.amount, recreated_amount,
-        "voter2's recreated Registration Coin must persist (release deferred per Gap 4)",
+    let post_cast_reg_coin_2_id = post_cast_reg_coin_2.coin_id();
+
+    // Resync the aggregator post-voter1-deregister and use the
+    // resulting SMT (which must reflect voter1's leaf wiped).
+    let chain = common::SharedSim::new(&mut sim);
+    let mut agg2 = Aggregator::new(config.clone(), chain, NetworkType::Testnet11);
+    let snapshot = agg2.sync().await.expect("aggregator sync post-deregister");
+    drop(agg2);
+    let smt_post_v1_deregister = snapshot.smt.clone();
+
+    let dest2 = Bytes32::new([0xD2; 32]);
+    let chain = common::SharedSim::new(&mut sim);
+    let release_bundle_2 = voter2
+        .release_collateral(
+            &chain, &smt_post_v1_deregister, post_cast_reg_coin_2_id, dest2,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("voter2::release_collateral (Gap 4): {:?}", e));
+    drop(chain);
+    sim.new_transaction(release_bundle_2)
+        .unwrap_or_else(|e| panic!("simulator accepts voter2 release: {:?}", e));
+
+    let dest2_cat_th = CatArgs::curry_tree_hash(cat_tail_hash, dest2.into());
+    let dest2_cat_ph = Bytes32::new(dest2_cat_th.to_bytes());
+    let dest2_states = sim.lookup_puzzle_hashes(indexmap::indexset![dest2_cat_ph], false);
+    assert!(
+        dest2_states.iter().any(|cs| {
+            cs.coin.amount == recreated_amount
+                && cs.coin.parent_coin_info == post_cast_reg_coin_2_id
+        }),
+        "voter2: expected released CAT child at {} amount {} parent {}",
+        hex::encode(dest2_cat_ph),
+        recreated_amount,
+        hex::encode(post_cast_reg_coin_2_id),
     );
 }
 
