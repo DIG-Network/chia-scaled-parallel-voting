@@ -289,35 +289,35 @@ fn chip_vote_message_preimage_canonical_order() {
 /// method on `ElectionConfig` applies the length check structurally
 /// (sdk/src/config.rs:155). The CLVM-side check is exercised at the puzzle
 /// layer by `sdk/tests/finalize_per_ballot_e2e.rs::finalize_per_ballot_full_simulator_flow`,
-/// which runs `puzzles/ballot_coin/finalize.rue` with a 672-byte VK and a
-/// real `bls_verify` over the 6-scalar IC linear combination.
+/// which runs `puzzles/ballot_coin/finalize.rue` with a 768-byte VK and a
+/// real `bls_verify` over the 8-scalar IC linear combination.
 #[test]
 fn chip_circuit_public_input_count_is_six() {
     use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
     assert_eq!(
-        PUBLIC_INPUT_COUNT, 6,
-        "CHIP.md §148-150: 6 public-input scalars pinned for this revision"
+        PUBLIC_INPUT_COUNT, 8,
+        "CHIP.md §148-150 (CHIP-rev): 8 public-input scalars pinned for this revision"
     );
 }
 
-/// CHIP.md §159 (positive): VK byte length = 336 + 7 * 48 = 672 bytes.
+/// CHIP.md §163 (positive): VK byte length = 336 + 9 * 48 = 768 bytes.
 #[test]
 fn chip_circuit_vk_length_is_672() {
     use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
     let expected = 336 + (PUBLIC_INPUT_COUNT + 1) * 48;
     assert_eq!(
-        expected, 672,
-        "CHIP.md §159: VK byte length MUST equal 336 + (PUBLIC_INPUT_COUNT + 1) * 48 = 672"
+        expected, 768,
+        "CHIP.md §163: VK byte length MUST equal 336 + (PUBLIC_INPUT_COUNT + 1) * 48 = 768"
     );
 }
 
-/// CHIP.md §159 (negative): an `ElectionConfig` whose `verification_key_hex`
-/// is any length other than 672 bytes MUST be rejected by `validate()`.
+/// CHIP.md §163 (negative): an `ElectionConfig` whose `verification_key_hex`
+/// is any length other than 768 bytes MUST be rejected by `validate()`.
 /// This pins the structural enforcement of the VK-length contract at the
 /// configuration boundary (the same boundary every actor — Voter, Aggregator,
 /// Deployer — funnels through before any chain interaction).
 ///
-/// Quote: > VK byte length is therefore fixed at `336 + (PUBLIC_INPUT_COUNT + 1) * 48 = 336 + 7 * 48 = 672` bytes for this revision.
+/// Quote: > VK byte length is therefore fixed at `336 + (PUBLIC_INPUT_COUNT + 1) * 48 = 336 + 9 * 48 = 768` bytes for this revision.
 #[test]
 fn chip_circuit_vk_length_rejects_wrong_size() {
     use chip_voting_sdk::config::{
@@ -338,10 +338,10 @@ fn chip_circuit_vk_length_rejects_wrong_size() {
 
     // The canonical length passes.
     let canonical_len = 336 + (PUBLIC_INPUT_COUNT + 1) * 48;
-    assert_eq!(canonical_len, 672);
+    assert_eq!(canonical_len, 768);
     assert!(
         make_config(canonical_len).validate().is_ok(),
-        "672-byte VK must validate"
+        "768-byte VK must validate"
     );
 
     // Every non-canonical length is rejected.
@@ -1198,11 +1198,11 @@ fn chip_circuit_inputs_order_and_per_position_binding() {
     // that `public_inputs_as_fr` returns scalars in the same order
     // that `Scalars::as_array` does (which the on-chain finalize.rue
     // assumes byte-exactly). That is: scalars_to_fr_array consumes
-    // (s1..s6) in canonical order.
+    // (s1..s8) in canonical order.
     assert_eq!(
         fr_from_compute.len(),
-        6,
-        "CIRCUIT-IC-MATCH: scalars_to_fr_array MUST produce 6 Fr values"
+        8,
+        "CIRCUIT-IC-MATCH: scalars_to_fr_array MUST produce 8 Fr values"
     );
 
     // SEC-THRESHOLD-PRESERVED: the threshold IS a public input (s5 is
