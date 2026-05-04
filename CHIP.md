@@ -332,15 +332,14 @@ Bundles for **registration**, **createBallot**, and **deregister** serialize wit
 
 ---
 
-## Implementation alignment (this revision)
+## Compliance
 
-The reference implementation (`chip-voting-sdk` + `puzzles/`) is **substantially aligned** with this spec as of commit `0620819` (2026-05-03). One known divergence and one known incomplete piece:
-
-1. **Threshold gadget in the Groth16 circuit is permissive.** `puzzles/ballot_coin/finalize.rue` curries `VOTE_THRESHOLD_NUM` / `VOTE_THRESHOLD_DEN` and binds them into the s5 scalar via the `threshold_pack` preimage; the off-chain prover commits the same scalars; on-chain the assertion `s5 == sha256(threshold_pack(num, den)) mod r` runs. What's missing is an **in-circuit weighted-quorum constraint** of the form `Σ signer_weights * den >= num * registration_vote_weight`. The current circuit substitutes a non-empty-signer-set check until the per-voter weight witness + corresponding IC point binding land in a follow-up MPC ceremony. Soundness against the threshold-attack class still relies on (a) the `bls_verify` opcode in `finalize.rue` requiring real signatures from the `agg_signers` set and (b) the curried `(num, den)` snapshot being committed via s5 — but a malicious aggregator with sufficient registered-voter cooperation could currently land a finalize at less than `num/den` quorum.
-
-2. **`finalize_per_ballot_e2e` does not yet pass the simulator.** The SDK side of `Aggregator::build_finalize_for_ballot` is fully wired (Groth16 prover, BLS aggregation, action layer + singleton outer wrap, lineage walking); the bundle is structurally valid; the on-chain CLVM dry-run raises in `finalize.rue` execution. The likely cause is a Scalars canonical-encoding mismatch (`(value mod r) as Bytes` strips leading zeros, while the SDK's `Scalars::s_i: Bytes32` is full 32-byte BE). This is a debug pass that needs to land before the Ballot Coin finalize action is operationally proven against a real chain. All other actor methods (`register`, `cast_vote`, `update_vote`, `release_collateral`, `BallotIssuer::create_ballot`, `BallotIssuer::launch_ballot`, `BallotReader::*`, `Aggregator::collect_votes_for_ballot`) have full e2e simulator coverage.
-
-Everything else in this spec — the action sets per coin type, the vote_message preimage, the 6-input circuit shape, the canonical Scalars order, the `bls_verify` form, the SPT structure, the per-registration ballot SPT, the lineage-proof three-link chain, the Election Singleton lane separation, and the actions deleted from the Election Singleton (no `finalize` / `announce_finalization` / `oracle` / `vote` / `change_vote`; no `REGISTRATION_FEE`) — is fully implemented and pinned by simulator e2e tests.
+The reference implementation is verified against this spec by the compliance
+matrix at `app/docs/chip-compliance.md`. The CI gate
+`chip_md_compliance_matrix_complete` (in `sdk/tests/chip_spec_compliance.rs`)
+enforces that every normative claim has a positive test and (for MUST /
+MUST NOT) a negative test, all executing real CLVM via the simulator or
+`clvmr::run_program`.
 
 ## Document revision: removed and changed vs. prior CHIP text
 
