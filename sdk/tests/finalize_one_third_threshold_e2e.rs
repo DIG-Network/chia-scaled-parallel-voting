@@ -153,20 +153,123 @@ async fn finalize_one_third_pre_check_accepts_weighted_quorum() {
 /// well-formed Groth16 proof — but the on-chain
 /// `bls_pairing_identity(...)` fails.
 ///
-/// VALUES THAT WORK TODAY: `(num, den) = (1, 2)` against a
-/// strict-majority voter set passes end-to-end via
-/// `finalize_per_ballot_full_simulator_flow`
-/// (`tests/finalize_per_ballot_e2e.rs`).
+/// ── ROOT CAUSE (investigation 2026-05-03) ────────────────────────
+/// The bug is in `sdk/src/prover/circuit.rs::generate_constraints`.
+/// The weighted-quorum gadget enforces:
 ///
-/// VALUES THAT DO NOT WORK TODAY: `(num, den) = (1, 3)` with 1-of-2
-/// signers (this test). The off-chain
-/// `VotingCircuit::verify_offchain` succeeds with the same scalars —
-/// the failure is exclusive to the on-chain pairing check, which
-/// suggests either (a) a circuit-vs-finalize.rue scalar/IC ordering
-/// drift that only manifests when `signed_weight < total_weight`,
-/// (b) a subtle issue in the slack/weight gadget's binding to the
-/// public-input vector, or (c) a Groth16 proof-builder issue at
-/// non-majority signer counts.
+///   total_signer_weight * den - num * registration_vote_weight - slack == 0
+///
+/// via `cs.enforce_constraint(lc!() + (den_fr, total_signer_weight_var)
+///                                  + (-num_fr, registration_vote_weight_var)
+///                                  + (-Fr::from(1u64), slack_var), ...)`
+///
+/// where `den_fr = Fr::from(self.vote_threshold_den)` and
+/// `num_fr = Fr::from(self.vote_threshold_num)` are passed as the
+/// COEFFICIENT of the linear-combination term — i.e., they are
+/// CONSTANTS in the R1CS A/B/C matrices, not witnesses.
+///
+/// In Groth16, the QAP (and hence the `ProvingKey` / `VerificationKey`
+/// / IC vector) are derived from the matrices A/B/C at SETUP time.
+/// `generate_test_setup` (and any current MPC ceremony) builds the
+/// shape circuit with `vote_threshold_num=1, vote_threshold_den=2`
+/// (see `circuit.rs` ~line 510). Therefore the proving key + VK
+/// commit to a QAP whose threshold-row coefficients are (num=1,den=2).
+///
+/// When `prove()` is later called with `(num=1, den=3)`, arkworks
+/// rebuilds the matrices with the new coefficients, but uses the
+/// SAME proving key (whose toxic-waste polynomial evaluations encode
+/// the OLD coefficients). The resulting proof does not verify against
+/// the (1,2)-shaped VK — neither off-chain nor on-chain.
+///
+/// ── EVIDENCE (captured via temporary debug test, then removed) ───
+///
+/// Same seed, same VK / proving_key generated via generate_test_setup
+/// (i.e., shaped at (num=1, den=2)). Two prove() calls with otherwise
+/// identical inputs differing only in (num, den) and weights:
+///
+///   CASE (1,2):  total=1000 signed=1000 (1 voter)  → verify_offchain: TRUE
+///   CASE (1,3):  total=2000 signed=1000 (1 of 2)   → verify_offchain: FALSE
+///
+/// Scalars diff (only s2, s5 differ as expected — registration weight
+/// + threshold pack):
+///   s1 same: true   (registration_merkle_root unchanged)
+///   s2 same: false  (snapshot weight 1000 vs 2000)
+///   s3 same: true   (agg_signers unchanged)
+///   s4 same: true   (vote_message unchanged)
+///   s5 same: false  (threshold_pack(1,2) vs (1,3))
+///   s6 same: true   (ballot_launcher_id unchanged)
+///
+/// CRITICAL CORRECTION TO PRIOR DOCSTRING: the previous claim that
+/// "off-chain `VotingCircuit::verify_offchain` succeeds with the same
+/// scalars" was wrong. Off-chain ALSO fails for non-(1,2) ratios.
+/// The on-chain failure is downstream of an off-chain-broken proof.
+///
+/// ── WHY (1,2) WORKS ──────────────────────────────────────────────
+/// The shape circuit at line ~510 uses (num=1, den=2). A proof made
+/// with (num=1, den=2) hits the same QAP coefficients that the VK
+/// commits to → verifies. ANY other (num, den) drifts the matrices
+/// and the proof is invalid against the (1,2) VK.
+///
+/// ── FIX OPTIONS (all out-of-scope for this 45-min budget) ────────
+///
+/// (A) Per-deployment trusted setup with deployment-specific
+///     (num, den) baked in. WORKS only if all ballots in an
+///     election share one (num, den). Currently each ballot can
+///     have its own threshold, so this restricts CHIP semantics.
+///
+/// (B) Move (num, den) from R1CS COEFFICIENTS to WITNESS VARIABLES.
+///     Replace the single linear constraint with three R1CS
+///     constraints (two multiplications + one linear):
+///        v1 = total_signer_weight_var * den_var
+///        v2 = num_var * registration_vote_weight_var
+///        v1 - v2 - slack == 0
+///     This makes (num, den) part of the witness, not the QAP. The
+///     proving key then works for ANY (num, den). Soundness then
+///     requires binding the prover's (num, den) witnesses to the
+///     curried on-chain (num, den). The natural binding is via the
+///     existing `s5 = sha256(threshold_pack(num, den))` public
+///     input — but `s5` only commits to the HASH; the prover could
+///     supply (num', den') privately while still presenting a
+///     publicly-correct s5. To re-establish soundness we must add
+///     in-circuit constraints binding the witness (num, den) to s5.
+///     Since we don't have an in-circuit sha256 gadget (the same
+///     reason s2/raw_count is enforced on-chain), the simplest
+///     option is to ALSO promote (num, den) to PUBLIC inputs, so
+///     the IC vector commits to them directly. That requires:
+///       * extending PUBLIC_INPUT_COUNT 6 → 8
+///       * adding ic7, ic8 to `IC` struct in finalize.rue
+///       * adding s7, s8 to `Scalars` (or repurposing s5 to be a
+///         direct commitment to a (num, den) packing as Fr)
+///       * updating VK byte length: 336 + 9*48 = 768 bytes
+///       * updating chia_chunked_bytes consumers
+///       * regenerating fixtures
+///     Blast radius: SDK + Rue puzzle + every config /VK length
+///     assertion + ceremony types. Multi-day refactor.
+///
+/// (C) Repurpose s5 as the BINDING. s5 is already
+///     sha256(threshold_pack(num, den)) mod r. Add witness vars
+///     (num_var, den_var) and additional witness vars for
+///     int_to_8_bytes_be(num) || int_to_8_bytes_be(den), plus an
+///     in-circuit sha256 gadget verifying the hash equals s5_fr.
+///     ark-crypto-primitives provides this; cost is ~25k constraints
+///     per the existing s2 deferral comment. Doable but expensive.
+///
+/// RECOMMENDATION: option (B). Plan it as a CHIP-rev bump (e.g.,
+/// 2026-05-15) since it's spec-affecting (puzzle struct + VK
+/// length both change). Until then, deployments are CONSTRAINED to
+/// (num=1, den=2) thresholds to match the trusted-setup shape.
+/// Optionally, document that constraint in CHIP.md and reject
+/// non-(1,2) thresholds in `BallotIssuer::launch_ballot`.
+///
+/// ── FILES INVOLVED ───────────────────────────────────────────────
+///   * sdk/src/prover/circuit.rs — `generate_constraints` (lines
+///     ~395-415) hardcodes (num, den) as Fr coefficients;
+///     `generate_test_setup` (line ~492) bakes (1, 2) into the QAP.
+///   * puzzles/ballot_coin/finalize.rue — IC + scalar layout
+///     (would need ic7, ic8 + s7, s8 under option B).
+///   * sdk/src/config.rs — VK byte length assertion at line ~159.
+///   * sdk/src/prover/circuit.rs — `chia_chunked_bytes` byte
+///     budget at line ~445.
 ///
 /// This test is `#[ignore]`'d under the SDK's
 /// `chip_md_compliance_matrix_complete` "no-ignored-tests" rule —
