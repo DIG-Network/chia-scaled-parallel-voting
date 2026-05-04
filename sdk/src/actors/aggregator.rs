@@ -479,7 +479,29 @@ impl<C: ChainReader> Aggregator<C> {
         // to `voter_set.registration_count` for s2 — useful only for
         // skeleton tests where snapshot weight == count (unit-weight
         // voters).
+        //
+        // Pre-Gap-2 fix this variant gated on count-strict-majority
+        // (`2 * votes.len() > registration_count`). The threshold
+        // variant moved to a weighted-quorum check that uses
+        // `(num, den)`; the legacy variant has no `(num, den)` to
+        // pass, so we re-emulate the strict-majority shape by passing
+        // `(num=1, den=2)` and per-voter unit weight 1 (matching the
+        // pre-fix arithmetic for skeleton callers).
         let voter_set_weight = self.voter_set()?.registration_count;
+        // 0 voters / 0 votes: 1*0 = 0 < 1*0 = 0 is false → would
+        // accept. The strict-majority intent was to REJECT empty
+        // sets, so guard explicitly here for the legacy path.
+        if voter_set_weight == 0 {
+            return Err(VotingError::BelowThreshold);
+        }
+        // Strict-majority emulation: signed_weight = votes.len();
+        // signed_weight * 2 > registration_count
+        // ⇔ signed_weight * 2 >= registration_count + 1
+        // ⇔ pass `(num, den) = (registration_count + 1, 2)` and
+        //   per-voter weight 1. Easier: pre-check inline.
+        if 2 * votes.len() <= voter_set_weight as usize {
+            return Err(VotingError::BelowThreshold);
+        }
         self.prepare_finalize_witness_with_threshold(
             vote_outcome,
             ballot_launcher_id,
