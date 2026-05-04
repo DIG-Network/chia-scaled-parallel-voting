@@ -1052,7 +1052,7 @@ fn run_local_ceremony() -> Result<CeremonyArtifacts> {
     })
 }
 
-/// Reconstruct an `ArkVerifyingKey` from its 672-byte wire form by
+/// Reconstruct an `ArkVerifyingKey` from its 768-byte wire form by
 /// parsing each typed point. Mirrors the inverse of
 /// `ArkVerifyingKey::chia_chunked_bytes`.
 fn reconstruct_typed_vk(wire: &VerificationKey) -> Result<ArkVerifyingKey> {
@@ -1060,10 +1060,17 @@ fn reconstruct_typed_vk(wire: &VerificationKey) -> Result<ArkVerifyingKey> {
     use ark_serialize::CanonicalDeserialize;
 
     let bytes = &wire.raw_bytes;
-    // 6-public-input circuit: ic0..ic6 = 7 G1 points after the
-    // 336-byte (alpha_g1 || beta_g2 || gamma_g2 || delta_g2) prefix.
-    if bytes.len() < 336 + 7 * 48 {
-        bail!("VK wire bytes too short: {}", bytes.len());
+    // 8-public-input circuit (CHIP-rev with s7/s8 = num/den): IC has
+    // `PUBLIC_INPUT_COUNT + 1 = 9` G1 points after the 336-byte
+    // `(alpha_g1 || beta_g2 || gamma_g2 || delta_g2)` prefix.
+    let ic_count = chip_voting_sdk::config::PUBLIC_INPUT_COUNT + 1;
+    let expected_min = 336 + ic_count * 48;
+    if bytes.len() < expected_min {
+        bail!(
+            "VK wire bytes too short: {} (expected ≥ {})",
+            bytes.len(),
+            expected_min
+        );
     }
 
     let alpha_g1 =
@@ -1074,9 +1081,6 @@ fn reconstruct_typed_vk(wire: &VerificationKey) -> Result<ArkVerifyingKey> {
         G2Affine::deserialize_compressed(&bytes[144..240]).context("deserialize gamma_g2")?;
     let delta_g2 =
         G2Affine::deserialize_compressed(&bytes[240..336]).context("deserialize delta_g2")?;
-    // 6-public-input circuit (CHIP rev 2026-05-02): IC has
-    // `PUBLIC_INPUT_COUNT + 1 = 7` G1 points (ic0 + ic1..ic6).
-    let ic_count = chip_voting_sdk::config::PUBLIC_INPUT_COUNT + 1;
     let mut ic = Vec::with_capacity(ic_count);
     for i in 0..ic_count {
         let off = 336 + i * 48;
