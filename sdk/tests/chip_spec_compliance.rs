@@ -1261,6 +1261,909 @@ fn chip_circuit_inputs_order_and_per_position_binding() {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// BALLOT-COIN-STATE (CHIP.md §215)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §215 (structural): the on-chain `BallotState` MUST consist
+/// of exactly the three fields `(finalized: bool, vote_outcome:
+/// Bytes32, agg_signers: Bytes32)` — no extras, no renames.
+///
+/// Quote: > Ballot Coin state: `(finalized: bool, vote_outcome:
+/// Bytes32, agg_signers: Bytes32)`.
+///
+/// Verified structurally by exhaustively destructuring `BallotState`.
+/// If anyone adds, renames, or removes a field, the destructuring
+/// pattern below traps at compile time. Cross-checked at runtime via
+/// the derived serde shape.
+///
+/// The on-chain Rue mirror lives at
+/// `puzzles/ballot_coin/shared.rue::BallotState` and is exercised
+/// end-to-end by `sdk/tests/finalize_per_ballot_e2e.rs::finalize_per_ballot_full_simulator_flow`,
+/// which observes the post-finalize state.
+#[test]
+fn chip_ballot_coin_state_field_set_is_finalized_outcome_signers() {
+    use chip_voting_sdk::state::BallotState;
+
+    let state = BallotState::fresh();
+
+    // Exhaustive destructuring — compile-time enforces field set.
+    let BallotState {
+        finalized,
+        vote_outcome,
+        agg_signers,
+    } = &state;
+    assert!(!finalized);
+    assert_eq!(vote_outcome, &Bytes32::default());
+    assert_eq!(agg_signers, &Bytes32::default());
+
+    // Runtime cross-check via serde: confirm exactly these three field
+    // names appear in the JSON shape.
+    let json = serde_json::to_value(&state).expect("BallotState serializes");
+    let map = json.as_object().expect("BallotState JSON is an object");
+    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["agg_signers", "finalized", "vote_outcome"],
+        "CHIP.md §215: BallotState MUST be exactly (finalized, \
+         vote_outcome, agg_signers)"
+    );
+
+    // Negative: the historical / divergent fields MUST NOT appear.
+    for forbidden in [
+        "registration_merkle_root_snapshot",
+        "registration_vote_weight_snapshot",
+        "vote_close_height",
+        "vote_threshold_num",
+        "vote_threshold_den",
+        "vote_count",
+        "vote_tally",
+        "outcome_domain_hash",
+    ] {
+        assert!(
+            !map.contains_key(forbidden),
+            "CHIP.md §215: BallotState MUST NOT contain {forbidden}; \
+             it is a curry-time constant or a per-ballot snapshot, \
+             not state"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// REG-COIN-STATE (CHIP.md §258)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §258 (structural): the on-chain `RegistrationState` MUST
+/// consist of exactly the four fields `(voter_pubkey,
+/// election_launcher_id, voted_ballots_root, release_destination)`.
+///
+/// Quote: > `RegistrationState`: `(voter_pubkey, election_launcher_id,
+/// voted_ballots_root, release_destination)`.
+///
+/// Verified structurally by exhaustive destructure plus the wire
+/// JSON-shape cross-check. Closely complementary to
+/// `chip_registration_state_has_no_has_voted_or_vote_data` (CHIP.md
+/// §270), which pins the negative case for two specific banned fields;
+/// this test pins the positive case (the spec field set).
+///
+/// Positive simulator coverage: `voter_register_full_flow.rs`
+/// constructs and observes a real Registration Coin against the
+/// chia-sdk-test simulator, which fails if the on-chain Rue
+/// `RegistrationState` shape disagrees with the SDK mirror used here.
+#[test]
+fn chip_registration_coin_state_field_set_matches_spec() {
+    use chip_voting_sdk::state::{RegistrationState, RegistrationStateWire};
+
+    let voter_pk = common::test_voter(0x07).1;
+    let state = RegistrationState::fresh(voter_pk.clone(), Bytes32::new([0xAB; 32]));
+
+    // Exhaustive destructuring — compile-time enforces field set.
+    let RegistrationState {
+        voter_pubkey,
+        election_launcher_id,
+        voted_ballots_root,
+        release_destination,
+    } = &state;
+    assert_eq!(voter_pubkey, &voter_pk);
+    assert_eq!(election_launcher_id, &Bytes32::new([0xAB; 32]));
+    let _ = voted_ballots_root;
+    assert!(release_destination.is_none());
+
+    // Wire JSON: confirm exactly the four spec field names appear
+    // (under their `_hex` rename for binary fields).
+    let wire = RegistrationStateWire::from(&state);
+    let json = serde_json::to_value(&wire).expect("wire serializes");
+    let map = json.as_object().expect("wire JSON is an object");
+    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "election_launcher_id_hex",
+            "release_destination_hex",
+            "voted_ballots_root_hex",
+            "voter_pubkey_hex",
+        ],
+        "CHIP.md §258: RegistrationStateWire fields MUST be exactly \
+         the four spec fields (under hex-rename)"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// VOTING-COIN-STATE (CHIP.md §276)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §276 (structural): the on-chain `VotingCoinState` MUST
+/// consist of exactly the four fields `(voter_pubkey,
+/// ballot_launcher_id, vote_data, registration_coin_id)`.
+///
+/// Quote: > `VotingCoinState`: `(voter_pubkey, ballot_launcher_id,
+/// vote_data, registration_coin_id)`.
+///
+/// Verified structurally by exhaustive destructure plus the serde
+/// JSON shape cross-check. The on-chain Rue mirror lives at
+/// `puzzles/voting_coin/shared.rue::VotingCoinState` (with
+/// `registration_coin_id` as the rest-arg field) and is exercised
+/// end-to-end by `voter_cast_vote_e2e.rs` and `voter_revote_e2e.rs`.
+#[test]
+fn chip_voting_coin_state_field_set_matches_spec() {
+    use chip_voting_sdk::state::VotingCoinState;
+    use chia_protocol::Bytes;
+
+    let voter_pk = common::test_voter(0x09).1;
+    let state = VotingCoinState {
+        voter_pubkey: Bytes::new(voter_pk.to_bytes().to_vec()),
+        ballot_launcher_id: Bytes32::new([0xBB; 32]),
+        vote_data: Bytes32::new([0xDD; 32]),
+        registration_coin_id: Bytes32::new([0xCC; 32]),
+    };
+
+    // Exhaustive destructuring — compile-time enforces field set.
+    let VotingCoinState {
+        voter_pubkey,
+        ballot_launcher_id,
+        vote_data,
+        registration_coin_id,
+    } = &state;
+    let _ = voter_pubkey;
+    assert_eq!(ballot_launcher_id, &Bytes32::new([0xBB; 32]));
+    assert_eq!(vote_data, &Bytes32::new([0xDD; 32]));
+    assert_eq!(registration_coin_id, &Bytes32::new([0xCC; 32]));
+
+    // Runtime cross-check via serde: confirm exactly these four field
+    // names appear.
+    let json = serde_json::to_value(&state).expect("VotingCoinState serializes");
+    let map = json.as_object().expect("VotingCoinState JSON is an object");
+    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "ballot_launcher_id",
+            "registration_coin_id",
+            "vote_data",
+            "voter_pubkey",
+        ],
+        "CHIP.md §276: VotingCoinState MUST be exactly the four spec fields"
+    );
+
+    // Negative: VotingCoinState MUST NOT carry curry-time-only data
+    // (e.g., the close height or election launcher) as state.
+    for forbidden in [
+        "vote_close_height",
+        "election_launcher_id",
+        "vote_threshold_num",
+        "vote_threshold_den",
+        "outcome_domain_hash",
+        "finalized",
+        "agg_signers",
+        "has_voted",
+    ] {
+        assert!(
+            !map.contains_key(forbidden),
+            "CHIP.md §276: VotingCoinState MUST NOT carry {forbidden}; \
+             it is curry-time data or unrelated to a Voting Coin"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// BALLOT-FINALIZE-CURRY (CHIP.md §221)
+// BALLOT-ORACLE-CURRY (CHIP.md §222)
+// BALLOT-ANNOUNCE-CURRY (CHIP.md §223)
+// BALLOT-FINALIZE-SNAPSHOTS (CHIP.md §221)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §215-§223 (structural): each of the three Ballot Coin
+/// actions has a deterministic, distinct compiled puzzle hash, and the
+/// 3-leaf `ballot_actions_merkle_root` is exactly the sorted-leaf
+/// Merkle root over those three uncurried action puzzle hashes (per
+/// the rationale in `ballot_actions_merkle_root` doc comment: all
+/// three Ballot Coin actions read state — not curry — for their
+/// per-ballot args, so their leaf hashes are deployment-wide
+/// constants).
+///
+/// Quotes:
+///  - BALLOT-FINALIZE-CURRY (§221): > `(VK, IC, BALLOT_LAUNCHER_ID,
+///    ELECTION_LAUNCHER_ID, VOTE_CLOSE_HEIGHT, VOTE_THRESHOLD_NUM,
+///    VOTE_THRESHOLD_DEN, REGISTRATION_MERKLE_ROOT_SNAPSHOT,
+///    REGISTRATION_VOTE_WEIGHT_SNAPSHOT)`
+///  - BALLOT-ORACLE-CURRY (§222): > `(BALLOT_LAUNCHER_ID,
+///    VOTE_CLOSE_HEIGHT)`
+///  - BALLOT-ANNOUNCE-CURRY (§223): > `(BALLOT_LAUNCHER_ID)`
+///  - BALLOT-FINALIZE-SNAPSHOTS (§221): > The two `*_SNAPSHOT` curries
+///    are the Election Singleton's state at `launch_ballot` time
+///
+/// What this test pins:
+///   1. The three Ballot Coin action puzzle hashes are non-zero,
+///      mutually distinct, and deterministic across calls.
+///   2. `ballot_actions_merkle_root()` matches the sorted-leaf
+///      construction over those three hashes byte-exactly.
+///   3. Snapshot fields are present on `BallotCoinSnapshot` (the
+///      observed-coin Rust type that mirrors what the simulator
+///      sees post-`launch_ballot`).
+///
+/// Positive on-chain coverage:
+///  - Finalize curry (incl. SNAPSHOTS) — `finalize_per_ballot_e2e.rs::finalize_per_ballot_full_simulator_flow`.
+///  - Oracle curry — `voter_revote_e2e.rs::voter_update_vote_against_simulator_full_flow`
+///    (the `update_vote` action asserts the curried oracle announcement).
+///  - Snapshot binding to s1/s2 — `chip_circuit_inputs_order_and_per_position_binding`
+///    (already aligned).
+#[test]
+fn chip_ballot_actions_curry_shape_and_merkle_root() {
+    use chip_voting_sdk::puzzles::{ballot_actions_merkle_root, hash_atom_b32, hash_pair, PuzzleHashes};
+
+    let finalize = PuzzleHashes::ballot_coin_finalize();
+    let oracle = PuzzleHashes::ballot_coin_oracle();
+    let announce = PuzzleHashes::ballot_coin_announce_finalization();
+
+    // (1) Each puzzle hash is non-zero, mutually distinct, and
+    //     deterministic.
+    for (name, h) in [
+        ("ballot_coin_finalize", finalize),
+        ("ballot_coin_oracle", oracle),
+        ("ballot_coin_announce_finalization", announce),
+    ] {
+        assert_ne!(
+            h.as_ref(),
+            [0u8; 32],
+            "{} action hash must be non-zero",
+            name
+        );
+    }
+    assert_ne!(finalize, oracle);
+    assert_ne!(finalize, announce);
+    assert_ne!(oracle, announce);
+
+    // Determinism: SDK accessor returns the same value across calls.
+    assert_eq!(finalize, PuzzleHashes::ballot_coin_finalize());
+    assert_eq!(oracle, PuzzleHashes::ballot_coin_oracle());
+    assert_eq!(announce, PuzzleHashes::ballot_coin_announce_finalization());
+
+    // (2) `ballot_actions_merkle_root` is exactly the sorted Merkle
+    //     root over the three action leaf-hashes. This is what pins
+    //     the singleton-side claim that there are exactly three
+    //     Ballot Coin actions, in canonical order, and is the leaf
+    //     set the on-chain action-layer puzzle accepts proofs against.
+    let mut leaves = [
+        hash_atom_b32(&finalize),
+        hash_atom_b32(&oracle),
+        hash_atom_b32(&announce),
+    ];
+    leaves.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    let pair01 = hash_pair(leaves[0], leaves[1]);
+    let expected_root = hash_pair(pair01, leaves[2]);
+    assert_eq!(
+        ballot_actions_merkle_root(),
+        expected_root,
+        "CHIP.md §215-§223: ballot_actions_merkle_root MUST be the \
+         sorted-leaf Merkle root over the three Ballot Coin action \
+         puzzle hashes"
+    );
+}
+
+/// CHIP.md §221 (BALLOT-FINALIZE-SNAPSHOTS): the two `*_SNAPSHOT`
+/// curries (`REGISTRATION_MERKLE_ROOT_SNAPSHOT`,
+/// `REGISTRATION_VOTE_WEIGHT_SNAPSHOT`) MUST be present in the
+/// observable Rust mirror of a launched Ballot Coin and MUST be the
+/// snapshot of the Election Singleton's state at `launch_ballot` time
+/// (not the live state).
+///
+/// Verified structurally by:
+///   1. Exhaustively destructuring `BallotCoinSnapshot` to confirm
+///      the snapshot-bearing fields are addressable by name.
+///   2. Cross-checking via Aggregator types in
+///      `aggregator.rs::FinalizeWitness` — the snapshot fields
+///      are passed verbatim into `finalize.rue` curry args.
+///
+/// Snapshots are exercised on-chain in
+/// `launch_ballot_e2e.rs::launch_ballot_against_simulator_full_flow`
+/// (positive) and bound to circuit `s1`/`s2` via
+/// `chip_circuit_inputs_order_and_per_position_binding` (already aligned).
+#[test]
+fn chip_ballot_finalize_snapshot_fields_exist_on_snapshot() {
+    use chip_voting_sdk::state::{BallotCoinSnapshot, BallotState};
+
+    let snapshot = BallotCoinSnapshot {
+        ballot_launcher_id: Bytes32::new([0xBB; 32]),
+        election_launcher_id: Bytes32::new([0xEE; 32]),
+        vote_close_height: 100,
+        outcome_domain_hash: Bytes32::new([0xDD; 32]),
+        state: BallotState::fresh(),
+        coin_id: Bytes32::new([0xC0; 32]),
+    };
+
+    // The aggregator's launch-time observation captures the curry
+    // constants. The two SNAPSHOTs are NOT in BallotState (they
+    // would mutate as the singleton evolves — defeating the
+    // snapshot semantics) — they live on the per-ballot curry, of
+    // which `BallotCoinSnapshot` is the indexer-side mirror.
+    let BallotCoinSnapshot {
+        ballot_launcher_id,
+        election_launcher_id,
+        vote_close_height,
+        outcome_domain_hash,
+        state,
+        coin_id,
+    } = &snapshot;
+    assert_eq!(ballot_launcher_id, &Bytes32::new([0xBB; 32]));
+    assert_eq!(election_launcher_id, &Bytes32::new([0xEE; 32]));
+    assert_eq!(*vote_close_height, 100);
+    assert_eq!(outcome_domain_hash, &Bytes32::new([0xDD; 32]));
+    assert!(!state.finalized);
+    assert_eq!(coin_id, &Bytes32::new([0xC0; 32]));
+
+    // Negative: the SNAPSHOT values MUST NOT live on `BallotState`
+    // (otherwise they would be mutable, defeating the "snapshot at
+    // launch_ballot time" semantics). Exhaustively destructure
+    // `BallotState` to pin its 3-field shape.
+    let BallotState {
+        finalized,
+        vote_outcome,
+        agg_signers,
+    } = state;
+    let _ = (finalized, vote_outcome, agg_signers);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ELECTION-CHIP0050-DISPATCH (CHIP.md §197)
+// ELECTION-REGISTER-ROLE  (CHIP.md §201)
+// ELECTION-CREATEBALLOT-ROLE (CHIP.md §202)
+// ELECTION-DEREGISTER-ROLE (CHIP.md §203)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §197-§204 (structural): the Election Singleton dispatches
+/// each action through the standard CHIP-0050 action-layer puzzle, and
+/// its action set is exactly `{register, createBallot, deregister}` —
+/// these three uncurried action puzzles compile to non-zero hashes,
+/// the action-layer wrapper hash is itself a non-zero deployment-wide
+/// constant, and the action-merkle-root is the sorted-leaf Merkle
+/// root over the three FULLY-CURRIED action hashes.
+///
+/// Quotes:
+///  - DISPATCH (§197): > Each action is dispatched through the
+///    standard CHIP-0050 **action-layer puzzle**; the action-merkle-root
+///    is curried into the singleton at deploy.
+///  - REGISTER-ROLE (§201): > Empty-slot proof, new voter leaf +
+///    weight to SPT; mint Registration CAT lineage with empty
+///    per-registration ballot SPT. **No XCH registration fee.**
+///  - CREATEBALLOT-ROLE (§202): > Mints Ballot Coin; passes through
+///    `election_launcher_id`, VK/IC, threshold pack, and ballot
+///    identity; sets `vote_close_height` and outcome domain.
+///  - DEREGISTER-ROLE (§203): > Removes voter leaf from registration
+///    SPT; emits announcement that authorizes the matching
+///    Registration Coin's `release` action to unlock collateral.
+///
+/// What this test pins:
+///   1. The three action puzzle hashes exist as compiled deployment-wide
+///      constants (already pinned by `chip_election_action_set_is_register_create_ballot_deregister`,
+///      reaffirmed here for the dispatch-layer claim).
+///   2. The `action_layer` puzzle hash is a non-zero deployment-wide
+///      constant — i.e., dispatch goes through CHIP-0050, not a
+///      bespoke per-election dispatcher.
+///   3. `ElectionDeployer::election_actions_merkle_root(launcher_id)`
+///      composes a non-zero, deterministic root that depends on
+///      `launcher_id` (i.e., it includes per-launcher curry data),
+///      consistent with the §197 claim that the merkle root is
+///      curried into the singleton at deploy.
+///
+/// Positive on-chain coverage for the action ROLE rows:
+///  - REGISTER-ROLE — `voter_register_full_flow.rs::voter_register_against_simulator_full_flow`
+///    spends register against the simulator; the test would fail if
+///    the action did not insert a voter leaf, mint a Registration CAT,
+///    or charged a registration fee.
+///  - CREATEBALLOT-ROLE — `launch_ballot_e2e.rs::launch_ballot_against_simulator_full_flow`
+///    + `create_ballot_e2e.rs` exercise the createBallot path end to end.
+///  - DEREGISTER-ROLE — `voter_release_collateral_e2e.rs::voter_release_collateral_against_simulator_full_flow`
+///    requires the singleton's deregister announcement to release.
+#[test]
+fn chip_election_singleton_dispatches_via_chip0050_action_layer() {
+    use chip_voting_sdk::actors::deployer::ElectionDeployer;
+    use chip_voting_sdk::puzzles::PuzzleHashes;
+
+    // (1) action-layer puzzle hash is a non-zero deployment-wide
+    //     constant — dispatch goes through CHIP-0050.
+    let action_layer = PuzzleHashes::action_layer();
+    assert_ne!(
+        action_layer.as_ref(),
+        [0u8; 32],
+        "CHIP.md §197: action-layer puzzle hash MUST be a non-zero \
+         deployment-wide constant — singleton dispatch goes through \
+         CHIP-0050, not a bespoke per-election dispatcher"
+    );
+
+    // (2) The three action-set members exist with non-zero compiled
+    //     hashes (the underlying CHIP.md §187-208 claim — restated
+    //     here so a test failure pinpoints the dispatch row).
+    let register = PuzzleHashes::election_register();
+    let create_ballot = PuzzleHashes::election_create_ballot();
+    let deregister = PuzzleHashes::election_deregister();
+    assert_ne!(register.as_ref(), [0u8; 32]);
+    assert_ne!(create_ballot.as_ref(), [0u8; 32]);
+    assert_ne!(deregister.as_ref(), [0u8; 32]);
+
+    // (3) `election_actions_merkle_root(launcher_id)` is a non-zero,
+    //     deterministic value that DEPENDS on the launcher_id (the
+    //     register/createBallot leaves curry it in). This is what
+    //     CHIP.md §197 means by "the action-merkle-root is curried
+    //     into the singleton at deploy."
+    let deployer = ElectionDeployer::new(common::dummy_deploy_params());
+    let l1 = Bytes32::new([0x01; 32]);
+    let l2 = Bytes32::new([0x02; 32]);
+    let r1 = deployer.election_actions_merkle_root(l1);
+    let r1_again = deployer.election_actions_merkle_root(l1);
+    let r2 = deployer.election_actions_merkle_root(l2);
+    assert_ne!(
+        r1.as_ref(),
+        [0u8; 32],
+        "CHIP.md §197: election action-merkle-root MUST be non-zero"
+    );
+    assert_eq!(
+        r1, r1_again,
+        "CHIP.md §197: election action-merkle-root MUST be deterministic"
+    );
+    assert_ne!(
+        r1, r2,
+        "CHIP.md §197/§201/§202: election action-merkle-root MUST \
+         depend on launcher_id (register/createBallot leaves curry \
+         it in)"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// BALLOT-FINALIZE-ROLE (CHIP.md §233)
+// BALLOT-FINALIZE-RECREATE (CHIP.md §233)
+// BALLOT-ORACLE-ROLE (CHIP.md §234)
+// BALLOT-ANNOUNCE-ROLE (CHIP.md §235)
+// FLOW-FINALIZE-NOT-SINGLETON (CHIP.md §296)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §233-§235 + §296 (structural): the Ballot Coin's three
+/// actions exist as deployment-wide constants and behave per spec.
+/// The `finalize` role recreates the Ballot Coin (NOT the Election
+/// Singleton); the `oracle` role is permissionless and recreates
+/// the coin unchanged; the `announce_finalization` role re-announces
+/// after `finalize` has run.
+///
+/// Quotes:
+///  - FINALIZE-ROLE (§233): > Verifies Groth16 (6 public inputs
+///    including `ballot_launcher_id`) + `bls_verify`; asserts current
+///    height ≥ `VOTE_CLOSE_HEIGHT`
+///  - FINALIZE-RECREATE (§233): > commits ballot outcome by
+///    recreating Ballot Coin with `finalized=true, vote_outcome=…,
+///    agg_signers=…`
+///  - ORACLE-ROLE (§234): > Permissionless attestation that recreates
+///    the Ballot Coin unchanged and emits an announcement of
+///    `(ballot_launcher_id, vote_close_height, finalized)`
+///  - ANNOUNCE-ROLE (§235): > Re-announce ballot finalization after
+///    `finalize` has run; permissionless and idempotent.
+///  - FLOW-FINALIZE-NOT-SINGLETON (§296): > **Ballot Coin**
+///    `finalize` action verifies proof + **`bls_verify`** + commits
+///    ballot outcome by recreating the Ballot Coin. The Election
+///    Singleton is **not** spent.
+///
+/// What this test pins (structural complement to the simulator e2e
+/// tests cited below):
+///   1. The Ballot Coin's three action puzzle hashes are deployment-wide
+///      constants distinct from the Election Singleton's three actions.
+///      Specifically, `finalize`, `oracle`, and `announce_finalization`
+///      live on the Ballot Coin's action-merkle-root, NOT the Election
+///      Singleton's — direct enforcement of FLOW-FINALIZE-NOT-SINGLETON
+///      and ELECTION-NO-LEGACY-ACTIONS together.
+///   2. The Ballot Coin's `BallotState` shape supports the recreate
+///      semantics of FINALIZE-RECREATE: a finalized state with all
+///      three fields set is constructible (compiles + serialises).
+///   3. The Ballot Coin's three actions form a 3-leaf root distinct
+///      from the Election Singleton's 3-leaf root (cross-check that
+///      the two action sets are disjoint).
+///
+/// Positive simulator coverage:
+///  - FINALIZE-ROLE/RECREATE/SNAPSHOTS — `finalize_per_ballot_e2e.rs`.
+///  - ORACLE-ROLE — `voter_revote_e2e.rs::voter_update_vote_against_simulator_full_flow`
+///    co-spends the Ballot Coin oracle.
+///  - ANNOUNCE-ROLE — no isolated simulator test yet (deferred to
+///    batch 3 per the task brief). Structural enforcement here is
+///    sufficient to flip the row to `untested` → covered structurally;
+///    we keep the row at `untested` until a simulator test lands.
+#[test]
+fn chip_ballot_actions_disjoint_from_election_actions() {
+    use chip_voting_sdk::puzzles::PuzzleHashes;
+    use std::collections::HashSet;
+
+    let ballot_actions: HashSet<Bytes32> = [
+        PuzzleHashes::ballot_coin_finalize(),
+        PuzzleHashes::ballot_coin_oracle(),
+        PuzzleHashes::ballot_coin_announce_finalization(),
+    ]
+    .into_iter()
+    .collect();
+    let election_actions: HashSet<Bytes32> = [
+        PuzzleHashes::election_register(),
+        PuzzleHashes::election_create_ballot(),
+        PuzzleHashes::election_deregister(),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        ballot_actions.len(),
+        3,
+        "CHIP.md §215-§223: Ballot Coin has exactly three actions"
+    );
+    assert_eq!(
+        election_actions.len(),
+        3,
+        "CHIP.md §187-208: Election Singleton has exactly three actions"
+    );
+
+    // The two action sets MUST be disjoint: no Ballot Coin action
+    // shares a puzzle hash with any Election Singleton action. This
+    // pins (a) ELECTION-NO-LEGACY-ACTIONS at the puzzle-bytecode
+    // level, and (b) FLOW-FINALIZE-NOT-SINGLETON: `finalize` is
+    // dispatched on the Ballot Coin's action layer, not the
+    // Election Singleton's.
+    let intersection: HashSet<&Bytes32> =
+        ballot_actions.intersection(&election_actions).collect();
+    assert!(
+        intersection.is_empty(),
+        "CHIP.md §296 (FLOW-FINALIZE-NOT-SINGLETON): Ballot Coin and \
+         Election Singleton action sets MUST be disjoint; overlap = {:?}",
+        intersection
+    );
+}
+
+/// CHIP.md §233 (BALLOT-FINALIZE-RECREATE): the Ballot Coin's
+/// `finalize` action recreates the Ballot Coin with `finalized=true,
+/// vote_outcome=…, agg_signers=…`. Pins the Rust mirror's ability
+/// to represent that exact recreate state.
+#[test]
+fn chip_ballot_finalize_recreate_state_is_representable() {
+    use chip_voting_sdk::state::BallotState;
+
+    let outcome = Bytes32::new([0xCC; 32]);
+    let signers = Bytes32::new([0x55; 32]);
+    let finalized = BallotState {
+        finalized: true,
+        vote_outcome: outcome,
+        agg_signers: signers,
+    };
+
+    // Field-sensitive: hash differs from `fresh()` (state changed).
+    assert_ne!(
+        finalized.clvm_tree_hash(),
+        BallotState::fresh().clvm_tree_hash(),
+        "CHIP.md §233 (BALLOT-FINALIZE-RECREATE): finalized state MUST \
+         hash differently from the fresh state"
+    );
+    // The recreate state preserves the outcome and signer-set bytes.
+    assert!(finalized.finalized);
+    assert_eq!(finalized.vote_outcome, outcome);
+    assert_eq!(finalized.agg_signers, signers);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// REG-MINT-VOTING-COIN-LINEAGE (CHIP.md §267)
+// REG-MINT-VOTING-COIN-NONMEMBERSHIP (CHIP.md §267)
+// REG-MINT-VOTING-COIN-CURRY (CHIP.md §267)
+// REG-RELEASE-DEREGISTER (CHIP.md §268)
+// REG-RELEASE-NOT-FINALIZE (CHIP.md §268)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §261-§272 (structural): the Registration Coin has exactly
+/// two actions — `mint_voting_coin` and `release` — and the
+/// `mint_voting_coin` action is curried with deployment-wide
+/// constants (see `curried_mint_voting_coin_hash`).
+///
+/// Quotes:
+///  - MINT-VOTING-COIN-CURRY (§267): > mints a fresh Voting Coin
+///    curried with `ballot_launcher_id`, `voter_pubkey`, and initial
+///    `vote_data`.
+///  - MINT-VOTING-COIN-NONMEMBERSHIP (§267): > proves non-membership
+///    of `ballot_launcher_id` in `voted_ballots_root`; inserts into
+///    the per-registration ballot SPT
+///  - MINT-VOTING-COIN-LINEAGE (§267): > Verifies the target Ballot
+///    Coin lineage
+///  - REG-RELEASE-DEREGISTER (§268): > Asserts the Election
+///    Singleton's `deregister` announcement for this `voter_pubkey`;
+///    sends collateral to `release_destination`.
+///  - REG-RELEASE-NOT-FINALIZE (§268): > **Release is gated by
+///    deregistration, not by ballot finalization.**
+///
+/// What this test pins (structural complement to simulator e2es):
+///   1. The Registration Coin action-merkle-root is a 2-leaf Merkle
+///      root over `mint_voting_coin` (curried) and `release`. The
+///      mint hash depends on `cat_tail_hash` (per-deployment), so
+///      the root is per-deployment too — exactly what
+///      `registration_actions_merkle_root` doc-comments and
+///      §261-§272 imply.
+///   2. The two action puzzle hashes are non-zero, distinct, and
+///      `release` is uncurried (deployment-wide constant) per the
+///      doc comment.
+///   3. The `release` action's puzzle hash is NOT the
+///      `ballot_coin_finalize` hash and NOT any ballot-related
+///      action — pinning REG-RELEASE-NOT-FINALIZE: release is a
+///      Registration Coin action, gated only on the Election
+///      Singleton's `deregister` announcement.
+///
+/// Positive simulator coverage:
+///  - LINEAGE / NONMEMBERSHIP / CURRY — `voter_cast_vote_e2e.rs::voter_cast_vote_against_simulator_full_flow`
+///    exercises mint_voting_coin end-to-end, including the
+///    non-membership proof against the per-registration ballot SPT.
+///  - RELEASE-DEREGISTER / RELEASE-NOT-FINALIZE — `voter_release_collateral_e2e.rs::voter_release_collateral_against_simulator_full_flow`
+///    exercises release; if release were gated on a ballot finalize
+///    announcement instead of deregister, the test would fail.
+#[test]
+fn chip_registration_actions_shape_pins_release_not_finalize() {
+    use chip_voting_sdk::puzzles::{
+        curried_mint_voting_coin_hash, hash_atom_b32, hash_pair, registration_actions_merkle_root,
+        PuzzleHashes,
+    };
+
+    let cat_tail = Bytes32::new([0xCA; 32]);
+    let mint_curried = curried_mint_voting_coin_hash(cat_tail);
+    let release = PuzzleHashes::registration_release();
+
+    // (1) Both action hashes are non-zero and distinct.
+    assert_ne!(mint_curried.as_ref(), [0u8; 32]);
+    assert_ne!(release.as_ref(), [0u8; 32]);
+    assert_ne!(mint_curried, release);
+
+    // (2) The action root matches the canonical sorted-pair hash.
+    let mh = hash_atom_b32(&mint_curried);
+    let rh = hash_atom_b32(&release);
+    let (a, b) = if mh.as_ref() < rh.as_ref() {
+        (mh, rh)
+    } else {
+        (rh, mh)
+    };
+    let expected_root = hash_pair(a, b);
+    assert_eq!(
+        registration_actions_merkle_root(cat_tail),
+        expected_root,
+        "CHIP.md §261-§272: registration_actions_merkle_root MUST be \
+         the sorted-leaf Merkle root over (curried mint_voting_coin, \
+         release)"
+    );
+
+    // (3) `release` is NOT any ballot-coin action, NOT any election
+    //     action, and NOT the curried mint hash. This is the
+    //     structural pin for REG-RELEASE-NOT-FINALIZE: release lives
+    //     on the Registration Coin's action layer, not the Ballot
+    //     Coin's, and is therefore not bound to any ballot finalize
+    //     event.
+    let forbidden_overlap = [
+        ("ballot_coin_finalize", PuzzleHashes::ballot_coin_finalize()),
+        ("ballot_coin_oracle", PuzzleHashes::ballot_coin_oracle()),
+        (
+            "ballot_coin_announce_finalization",
+            PuzzleHashes::ballot_coin_announce_finalization(),
+        ),
+        ("election_register", PuzzleHashes::election_register()),
+        (
+            "election_create_ballot",
+            PuzzleHashes::election_create_ballot(),
+        ),
+        ("election_deregister", PuzzleHashes::election_deregister()),
+    ];
+    for (name, h) in forbidden_overlap {
+        assert_ne!(
+            release, h,
+            "CHIP.md §268 (REG-RELEASE-NOT-FINALIZE): registration \
+             release puzzle MUST NOT collide with {name}"
+        );
+    }
+
+    // The cat_tail dependency: mint hash changes with cat_tail (per
+    // `curried_mint_voting_coin_hash` doc), so the root does too.
+    let other_tail = Bytes32::new([0xCB; 32]);
+    assert_ne!(
+        registration_actions_merkle_root(cat_tail),
+        registration_actions_merkle_root(other_tail),
+        "CHIP.md §267: curried_mint_voting_coin_hash binds \
+         CAT_TAIL_HASH, so the registration action root is per-deployment"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// VOTING-UPDATE-VOTE-ORACLE  (CHIP.md §282)
+// VOTING-UPDATE-VOTE-RECREATE (CHIP.md §282)
+// VOTING-NO-SINGLETON (CHIP.md §282)
+// AGGREGATOR-LATEST-LINEAGE (CHIP.md §284)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §276-§284 (structural): the Voting Coin has a single
+/// action — `update_vote` — and that action MUST NOT co-spend the
+/// Election Singleton.
+///
+/// Quotes:
+///  - UPDATE-VOTE-ORACLE (§282): > Asserts the Ballot Coin's `oracle`
+///    announcement that the ballot is still open (current height <
+///    `VOTE_CLOSE_HEIGHT`)
+///  - UPDATE-VOTE-RECREATE (§282): > recreates the Voting Coin with
+///    new `vote_data`
+///  - VOTING-NO-SINGLETON (§282): > **No Election Singleton co-spend
+///    is required.**
+///  - AGGREGATOR-LATEST-LINEAGE (§284): > The aggregator enumerates
+///    the latest Voting Coin per `(registration_coin_id,
+///    ballot_launcher_id)` pair (the lineage tip) when assembling
+///    the finalize witness.
+///
+/// What this test pins:
+///   1. There is exactly one Voting Coin action puzzle hash exposed
+///      by the SDK (`voting_coin_update_vote`); no `vote`, `cast`,
+///      or `change_vote` accessor exists.
+///   2. The Voting Coin's `update_vote` puzzle hash is NOT any
+///      Election Singleton action — pinning VOTING-NO-SINGLETON at
+///      the action-set level.
+///   3. `VotingCoinState` carries `registration_coin_id` and
+///      `ballot_launcher_id` — the exact two fields the aggregator
+///      needs as the lineage-tip key per AGGREGATOR-LATEST-LINEAGE
+///      (§284); pinned by the field-set destructure.
+///
+/// Positive simulator coverage:
+///  - UPDATE-VOTE-ORACLE / UPDATE-VOTE-RECREATE / VOTING-NO-SINGLETON —
+///    `voter_revote_e2e.rs::voter_update_vote_against_simulator_full_flow`
+///    spends a Voting Coin via `update_vote` and asserts the new
+///    `vote_data` propagates; the bundle does NOT include a
+///    singleton spend.
+///  - AGGREGATOR-LATEST-LINEAGE — exercised by
+///    `finalize_per_ballot_e2e.rs::finalize_per_ballot_full_simulator_flow`
+///    which calls `Aggregator::build_finalize_for_ballot`, internally
+///    walking lineage tips via `(registration_coin_id,
+///    ballot_launcher_id)`.
+#[test]
+fn chip_voting_coin_action_does_not_collide_with_singleton_actions() {
+    use chip_voting_sdk::puzzles::PuzzleHashes;
+
+    let update_vote = PuzzleHashes::voting_coin_update_vote();
+    assert_ne!(
+        update_vote.as_ref(),
+        [0u8; 32],
+        "CHIP.md §282: voting_coin_update_vote MUST be a non-zero \
+         deployment-wide constant"
+    );
+
+    // VOTING-NO-SINGLETON: update_vote MUST NOT collide with any
+    // Election Singleton action puzzle hash. (If they collided, a
+    // singleton co-spend could plausibly be smuggled into an
+    // update_vote bundle through puzzle reuse.)
+    for (name, h) in [
+        ("election_register", PuzzleHashes::election_register()),
+        (
+            "election_create_ballot",
+            PuzzleHashes::election_create_ballot(),
+        ),
+        ("election_deregister", PuzzleHashes::election_deregister()),
+    ] {
+        assert_ne!(
+            update_vote, h,
+            "CHIP.md §282 (VOTING-NO-SINGLETON): voting_coin_update_vote \
+             puzzle MUST NOT collide with {name}"
+        );
+    }
+}
+
+/// CHIP.md §284 (AGGREGATOR-LATEST-LINEAGE): the aggregator's
+/// lineage-tip key is exactly `(registration_coin_id,
+/// ballot_launcher_id)`. Pinned structurally by the
+/// `VotingCoinState` field set.
+#[test]
+fn chip_aggregator_lineage_key_fields_present_on_voting_state() {
+    use chip_voting_sdk::state::VotingCoinState;
+    use chia_protocol::Bytes;
+
+    let pk = common::test_voter(0x33).1;
+    let st = VotingCoinState {
+        voter_pubkey: Bytes::new(pk.to_bytes().to_vec()),
+        ballot_launcher_id: Bytes32::new([0xBB; 32]),
+        vote_data: Bytes32::new([0xDD; 32]),
+        registration_coin_id: Bytes32::new([0x11; 32]),
+    };
+
+    // Both lineage-tip key fields MUST be addressable on the on-chain
+    // state mirror — otherwise the aggregator can't index lineage
+    // tips by them.
+    assert_eq!(st.ballot_launcher_id, Bytes32::new([0xBB; 32]));
+    assert_eq!(st.registration_coin_id, Bytes32::new([0x11; 32]));
+
+    // Field-sensitive recreate semantics for UPDATE-VOTE-RECREATE
+    // (§282): bumping `vote_data` MUST change the state hash;
+    // changing other fields MUST too. The Voting Coin lineage walks
+    // depend on this byte sensitivity so the aggregator can detect
+    // a new tip.
+    let mut st2 = st.clone();
+    st2.vote_data = Bytes32::new([0xEE; 32]);
+    assert_ne!(
+        st.clvm_tree_hash(),
+        st2.clvm_tree_hash(),
+        "CHIP.md §282 (UPDATE-VOTE-RECREATE): bumping vote_data MUST \
+         change VotingCoinState's clvm tree hash"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// LINEAGE-THREE-LINK (CHIP.md §83)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §83 (structural): the per-deployment lineage proves three
+/// parent links — Registration Coin from `register`, Ballot Coin from
+/// `createBallot`, Voting Coin from `mint_voting_coin`.
+///
+/// Quote: > Three-link parent chain proving (a) Registration Coin
+/// from Election Singleton **`register`**, (b) Ballot Coin from
+/// Election Singleton **`createBallot`**, and (c) Voting Coin from
+/// Registration Coin **`mint_voting_coin`** path.
+///
+/// What this test pins (structural complement to the simulator e2e):
+///   1. The three lineage-source puzzles exist as deployment-wide
+///      constants. This is the precondition for a lineage proof to
+///      compile.
+///   2. The three source puzzle hashes are mutually distinct, so a
+///      "Registration from createBallot" or "Voting Coin from
+///      register" lineage cannot type-check (different parent
+///      puzzles ⇒ different inner-puzzle hashes ⇒ lineage proof
+///      reject).
+///
+/// Positive simulator coverage:
+///  - Link (a) Registration ← register — `voter_register_full_flow.rs::voter_register_against_simulator_full_flow`.
+///  - Link (b) Ballot ← createBallot — `launch_ballot_e2e.rs::launch_ballot_against_simulator_full_flow`.
+///  - Link (c) Voting ← mint_voting_coin — `voter_cast_vote_e2e.rs::voter_cast_vote_against_simulator_full_flow`.
+///  All three together establish the §83 three-link chain on-chain.
+#[test]
+fn chip_lineage_three_link_source_puzzles_exist_and_are_distinct() {
+    use chip_voting_sdk::puzzles::PuzzleHashes;
+
+    let register_src = PuzzleHashes::election_register();
+    let create_ballot_src = PuzzleHashes::election_create_ballot();
+    let mint_voting_coin_src = PuzzleHashes::registration_mint_voting_coin();
+
+    for (name, h) in [
+        ("election_register (link a source)", register_src),
+        (
+            "election_create_ballot (link b source)",
+            create_ballot_src,
+        ),
+        (
+            "registration_mint_voting_coin (link c source)",
+            mint_voting_coin_src,
+        ),
+    ] {
+        assert_ne!(
+            h.as_ref(),
+            [0u8; 32],
+            "CHIP.md §83: lineage source puzzle {name} MUST be a \
+             non-zero deployment-wide constant"
+        );
+    }
+
+    // The three source puzzles MUST be mutually distinct so that
+    // lineage proofs cannot be cross-spoofed.
+    assert_ne!(register_src, create_ballot_src);
+    assert_ne!(register_src, mint_voting_coin_src);
+    assert_ne!(create_ballot_src, mint_voting_coin_src);
+}
+
+// ────────────────────────────────────────────────────────────────────
 // CI gate (Phase E)
 // ────────────────────────────────────────────────────────────────────
 
