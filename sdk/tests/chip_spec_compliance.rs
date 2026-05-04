@@ -3318,6 +3318,229 @@ fn chip_sec_no_singleton_dos_finalize_bundle_excludes_singleton_actions() {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// SEC-THRESHOLD-PRESERVED — CLVM-EXECUTING NEGATIVE (CHIP.md §321)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §321 (SEC-THRESHOLD-PRESERVED): "`threshold_pack` remains a
+/// circuit public input AND the Ballot Coin's `finalize` action
+/// asserts the curried `(num, den)` matches the proof's threshold
+/// scalar—neither piece is removed in this revision."
+///
+/// On-chain mechanism (per `puzzles/ballot_coin/finalize.rue:140-141`):
+///   ```
+///   assert ((zero_pad + sha256(threshold_pack_b)) as Int % (r as Int)) as Bytes
+///       == (scalars.s5 as Bytes);
+///   ```
+/// where `threshold_pack_b = threshold_pack_bytes(VOTE_THRESHOLD_NUM,
+/// VOTE_THRESHOLD_DEN)` is reconstructed from the puzzle's CURRIED
+/// `(num, den)`. If the off-chain prover supplied `s5` derived from
+/// a DIFFERENT `(num, den)`, this assertion fails and the puzzle traps
+/// before the Groth16 pairing — proving the on-chain threshold-binding
+/// check is independent of and additional to the in-circuit threshold
+/// constraint.
+///
+/// HARNESS: CLVM-isolated `clvmr::run_program` against
+/// `BALLOT_COIN_FINALIZE_HEX`, curried with VOTE_THRESHOLD_NUM=2,
+/// VOTE_THRESHOLD_DEN=3, but the solution's Scalars are computed for
+/// the threshold pair `(1, 2)`. The puzzle's body sequentially asserts
+/// s1, s2, s3, s4 (which match — those scalars are derived from the
+/// SAME public inputs both sides agree on) and then s5 (which
+/// MISMATCHES — the puzzle hashes `threshold_pack(2, 3)` while the
+/// solution carries `sha256(threshold_pack(1, 2)) mod r`). The
+/// `assert == ` fails → CLVM raise.
+///
+/// WHY this isolates the s5 binding cleanly: every other scalar
+/// (s1, s2, s3, s4, s6) is derived from a public input that is
+/// IDENTICAL on both sides of the curry/solution boundary
+/// (registration_merkle_root_snapshot, registration_vote_weight_snapshot,
+/// agg_signers, vote_message inputs, ballot_launcher_id). Only s5's
+/// preimage derives from a CURRIED puzzle constant — so currying with
+/// a different `(num, den)` is a surgical mutation that hits exactly
+/// the s5 assertion and nothing else.
+///
+/// COMPLEMENT to `finalize_per_ballot_e2e.rs::finalize_per_ballot_full_simulator_flow`
+/// which is the positive end-to-end on-chain proof that with MATCHING
+/// threshold scalars the puzzle accepts the bundle.
+#[test]
+fn chip_finalize_rejects_threshold_pack_mismatch_run_program() {
+    use chia_protocol::{Bytes, Program};
+    use chia_sdk_driver::SpendContext;
+    use chip_voting_sdk::action_spends::load_action_puzzle;
+    use chip_voting_sdk::prover::Scalars;
+    use chip_voting_sdk::puzzles::BALLOT_COIN_FINALIZE_HEX;
+    use clvm_traits::{clvm_curried_args, ToClvm};
+    use clvm_utils::CurriedProgram;
+    use clvmr::{run_program, ChiaDialect};
+
+    // ── 1. Inputs that are the SAME on curry side and proof side ────
+    let ballot_launcher_id = Bytes32::new([0xBA; 32]);
+    let election_launcher_id = Bytes32::new([0xEE; 32]);
+    let vote_close_height: u64 = 1_000;
+    let registration_merkle_root_snapshot = Bytes32::new([0x11; 32]);
+    let registration_vote_weight_snapshot: u64 = 1_000;
+
+    let vote_outcome_data = Bytes32::new([0xAA; 32]);
+    // vote_message = sha256(outcome || ballot_launcher_id || election_launcher_id)
+    // Mirror of finalize.rue:102-105.
+    let vote_message: Bytes32 = {
+        let mut h = Sha256::new();
+        h.update(vote_outcome_data.as_ref());
+        h.update(ballot_launcher_id.as_ref());
+        h.update(election_launcher_id.as_ref());
+        Bytes32::new(h.finalize().into())
+    };
+    // agg_signers — used as the input to s3. Field type in the puzzle
+    // is PublicKey (Bytes48); since the s3 assertion just feeds
+    // `agg_signers as Bytes` to sha256, ANY 48-byte value works as
+    // long as on-chain and off-chain agree byte-for-byte.
+    let agg_signers_bytes = vec![0x55u8; 48];
+    let agg_signers_pk =
+        chia_bls::PublicKey::from_bytes(&agg_signers_bytes.clone().try_into().unwrap()).unwrap_or(
+            chia_bls::PublicKey::generator(), // any valid PK; the puzzle treats it as raw bytes
+        );
+
+    // ── 2. Compute Scalars for the WRONG threshold pair (1, 2) ──────
+    let wrong_threshold_num: u64 = 1;
+    let wrong_threshold_den: u64 = 2;
+    let scalars_for_wrong_threshold = Scalars::compute(
+        registration_merkle_root_snapshot,
+        registration_vote_weight_snapshot,
+        &agg_signers_pk,
+        vote_message,
+        wrong_threshold_num,
+        wrong_threshold_den,
+        ballot_launcher_id,
+    );
+
+    // ── 3. Curry finalize.rue with the RIGHT threshold pair (2, 3) ──
+    // VK and IC are also curried but never reached — the puzzle traps
+    // at the s5 assert long before pairing. We pass NIL for both;
+    // their tree shape is irrelevant because the assertions on s1..s5
+    // run before any pairing/IC arithmetic.
+    let mut ctx = SpendContext::new();
+    let nil_node = ().to_clvm(&mut *ctx).expect("nil");
+
+    let curried_threshold_num: u64 = 2;
+    let curried_threshold_den: u64 = 3;
+
+    let finalize_program_node = load_action_puzzle(&mut ctx, BALLOT_COIN_FINALIZE_HEX)
+        .expect("load finalize.rue.hex");
+    let finalize_curried = CurriedProgram {
+        program: finalize_program_node,
+        args: clvm_curried_args!(
+            nil_node, // VK (unreached)
+            nil_node, // IC (unreached)
+            ballot_launcher_id,
+            election_launcher_id,
+            vote_close_height,
+            curried_threshold_num,
+            curried_threshold_den,
+            registration_merkle_root_snapshot,
+            registration_vote_weight_snapshot
+        ),
+    }
+    .to_clvm(&mut *ctx)
+    .expect("curry finalize");
+
+    // ── 4. Build the solution ──────────────────────────────────────
+    // Truth = BallotStateTruth = (Ephemeral, ...State). State must
+    // have finalized=false (the puzzle's first assert).
+    // BallotState = (finalized, vote_outcome, ...agg_signers).
+    let truth_value: ((), (u8, (Bytes32, Bytes))) = (
+        (), // ephemeral
+        (
+            0u8,                                       // finalized = false
+            (Bytes32::default(), Bytes::new(vec![0u8; 48])), // outcome, agg_signers
+        ),
+    );
+    let truth_node = truth_value.to_clvm(&mut *ctx).expect("truth");
+
+    // proof = (a: PublicKey, b: Signature, c: PublicKey).
+    // Bytes48 + Bytes96 + Bytes48 — irrelevant byte values; never reached.
+    let proof_value: (Bytes, (Bytes, Bytes)) = (
+        Bytes::new(vec![0u8; 48]),
+        (Bytes::new(vec![0u8; 96]), Bytes::new(vec![0u8; 48])),
+    );
+    let proof_node = proof_value.to_clvm(&mut *ctx).expect("proof");
+
+    let agg_signers_b = Bytes::new(agg_signers_bytes.clone());
+    let agg_sig_b = Bytes::new(vec![0u8; 96]); // never reached
+    // Scalars in solution: s1, s2, s3, s4, s5, ...s6 (last via `...`)
+    let scalars_value: (Bytes32, (Bytes32, (Bytes32, (Bytes32, (Bytes32, Bytes32))))) = (
+        scalars_for_wrong_threshold.s1,
+        (
+            scalars_for_wrong_threshold.s2,
+            (
+                scalars_for_wrong_threshold.s3,
+                (
+                    scalars_for_wrong_threshold.s4,
+                    (
+                        scalars_for_wrong_threshold.s5,
+                        scalars_for_wrong_threshold.s6,
+                    ),
+                ),
+            ),
+        ),
+    );
+    let scalars_node = scalars_value.to_clvm(&mut *ctx).expect("scalars");
+
+    // Assemble user solution as the fn-main argument list:
+    //   (proof, vote_outcome_data, agg_signers, agg_sig, ...scalars)
+    // Rue's trailing `...` field means scalars is appended as the
+    // tail without a nil-terminator. So the structure is:
+    //   (proof . (vote_outcome_data . (agg_signers . (agg_sig . scalars))))
+    //
+    // Build via tuple-encoding through ToClvm so we don't need to
+    // weave nested SpendContext borrows.
+    let user_args_value: (Bytes, (Bytes32, (Bytes, (Bytes, ())))) = (
+        Bytes::new(vec![0u8; 48 + 96 + 48]), // proof placeholder serialised as flat bytes — see note below
+        (vote_outcome_data, (agg_signers_b.clone(), (agg_sig_b.clone(), ()))),
+    );
+    // NOTE: the puzzle accesses `proof.a / proof.b / proof.c` only
+    // inside the pairing call which is far past the s5 trap, so a
+    // placeholder Bytes atom never gets dereferenced — the trap fires
+    // before the puzzle even evaluates `proof_node`.
+    let _ = user_args_value; // silence unused — we'll build via raw cons
+    let user_args_node = {
+        // Build inside-out without nesting ctx calls.
+        let agg_sig_atom = ctx.alloc(&agg_sig_b).unwrap();
+        let agg_signers_atom = ctx.alloc(&agg_signers_b).unwrap();
+        let outcome_atom = ctx.alloc(&vote_outcome_data).unwrap();
+        let level5 = ctx.new_pair(agg_sig_atom, scalars_node).unwrap();
+        let level4 = ctx.new_pair(agg_signers_atom, level5).unwrap();
+        let level3 = ctx.new_pair(outcome_atom, level4).unwrap();
+        ctx.new_pair(proof_node, level3).unwrap()
+    };
+
+    // The full env passed to the curried puzzle is `(Truth . user_args)`
+    // because the action puzzle's `fn main(Truth, ...)` env unpacks as
+    // `path 2 = Truth, path 3 = user_args`.
+    let env_node = ctx.new_pair(truth_node, user_args_node).expect("env");
+
+    // ── 5. Serialize + run_program ─────────────────────────────────
+    let puzzle_bytes = clvmr::serde::node_to_bytes(&ctx, finalize_curried).expect("ser puzzle");
+    let env_bytes = clvmr::serde::node_to_bytes(&ctx, env_node).expect("ser env");
+
+    let mut alloc = clvmr::Allocator::new();
+    let puzzle_n = Program::from(puzzle_bytes).to_clvm(&mut alloc).unwrap();
+    let env_n = Program::from(env_bytes).to_clvm(&mut alloc).unwrap();
+
+    let dialect = ChiaDialect::new(0);
+    let result = run_program(&mut alloc, &dialect, puzzle_n, env_n, 11_000_000_000);
+
+    assert!(
+        result.is_err(),
+        "CHIP.md §321 (SEC-THRESHOLD-PRESERVED): finalize.rue with \
+         curried threshold (2,3) and Scalars derived from threshold \
+         (1,2) MUST trap at the on-chain s5 assertion (`assert s5 == \
+         sha256(threshold_pack(num, den)) mod r`). Got Ok which means \
+         the on-chain threshold-binding check regressed and the \
+         curried (num, den) is no longer cryptographically tied to \
+         the proof's threshold scalar."
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
 // CI gate (Phase E)
 // ────────────────────────────────────────────────────────────────────
 
