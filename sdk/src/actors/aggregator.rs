@@ -699,10 +699,18 @@ impl<C: ChainReader> Aggregator<C> {
         )?;
 
         // Build the circuit + prove.
+        // Per CHIP.md every voter contributes a uniform
+        // COLLATERAL_AMOUNT weight in this revision; future deployments
+        // with per-voter variable weights would derive the weight from
+        // the registration record (currently the SPT leaf hash binds
+        // `sha256(pk || COLLATERAL_AMOUNT_be8)`, so the on-chain leaf
+        // already commits to this weight).
+        let per_signer_weight = self.config.collateral_amount;
         let mut signers: Vec<crate::prover::circuit::SignerWitness> = Vec::new();
         for (pk, mp) in witness.signer_pubkeys.iter().zip(witness.merkle_proofs.iter()) {
             signers.push(crate::prover::circuit::SignerWitness {
                 pubkey: *pk,
+                weight: per_signer_weight,
                 leaf_index: SparseMerkleTree::slot_for_pubkey(pk),
                 merkle_proof: mp.clone(),
             });

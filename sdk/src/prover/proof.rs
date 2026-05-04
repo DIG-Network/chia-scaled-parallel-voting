@@ -493,12 +493,16 @@ mod tests {
             registration_vote_weight: 3,
             agg_signers: pk_at(0),
             vote_message: b32(0x42),
-            vote_threshold_num: 2,
-            vote_threshold_den: 3,
+            // Threshold (num, den) MUST match `generate_test_setup`'s
+            // shape circuit (1, 2), since QAP coefficients are baked
+            // in at setup time.
+            vote_threshold_num: 1,
+            vote_threshold_den: 2,
             ballot_launcher_id: b32(0x77),
             signers: (0..2)
                 .map(|i| SignerWitness {
                     pubkey: pk_at(i + 1),
+                    weight: 1,
                     leaf_index: i,
                     merkle_proof: vec![Bytes32::default(); 32],
                 })

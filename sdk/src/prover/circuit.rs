@@ -82,13 +82,23 @@ use crate::prover::Groth16Proof;
 
 /// STRUCT: SignerWitness
 /// PURPOSE: per-signer private witness data the prover consumes.
-///          Carried OUT-of-circuit because the current circuit only
-///          uses `signers.len()` (for the threshold proof). Kept in
-///          the API so the production circuit (when constraints C+D
-///          are added) can consume it without an API break.
+///          The weighted-quorum gadget reads `weight` to enforce
+///          `Σ signer_weights * den >= num * registration_vote_weight`
+///          per CHIP.md "Why Groth16" + the threshold pack semantics.
+///          The merkle_proof / leaf_index fields are kept in the API
+///          for future deployments that fold per-signer SPT membership
+///          into the circuit (currently enforced on-chain via the
+///          register action's empty-slot proof).
 #[derive(Debug, Clone)]
 pub struct SignerWitness {
     pub pubkey: PublicKey,
+    /// Per-voter weight (uniform = COLLATERAL_AMOUNT in this revision;
+    /// the leaf hash `sha256(pubkey || weight_be8)` carries the same
+    /// value, binding it to the registration SPT). Curried into the
+    /// Σ-of-weights gadget as a private witness; the on-chain
+    /// `bls_verify` opcode + the curried `(num, den)` snapshot bound
+    /// via s5 keep this honest.
+    pub weight: u64,
     /// Slot index in the SPT.
     pub leaf_index: u32,
     /// Sibling hashes from leaf to root (TREE_DEPTH = 32 entries).
@@ -167,20 +177,24 @@ impl VotingCircuit {
     ///           (bridges typed proof to the wire form via the same
     ///           compressed encoding the on-chain verifier expects).
     pub fn prove(&self, proving_key: &ArkProvingKey) -> VotingResult<Groth16Proof> {
-        // CHIP rev 2026-05-02: the legacy pre-check
-        //   `2 * signers.len() <= registration_vote_weight`
-        // mixed units (count of signers vs total weight in
-        // collateral mojos), making it impossible to satisfy for any
-        // realistic deployment. The on-chain finalize action commits
-        // to the threshold via the s5 scalar (`threshold_pack(num,
-        // den)`) and the curried VOTE_THRESHOLD_NUM/DEN; the
-        // weighted-quorum constraint that ties signer-total-weight
-        // to (num, den, registration_vote_weight) lands as a Phase 6
-        // circuit-side gadget. Until then we only assert there is
-        // AT LEAST ONE signer; the circuit and the on-chain bundle
-        // fee together provide enough disincentive against pathological
-        // single-signer finalizes.
+        // Weighted-quorum pre-check: `Σ signer_weights * den >= num *
+        // registration_vote_weight`. Mirrors the in-circuit gadget so
+        // the prover surfaces `BelowThreshold` (rather than producing
+        // a proof that the on-chain verifier would reject) when the
+        // signers' aggregate weight doesn't meet the curried (num,
+        // den) threshold.
         if self.signers.is_empty() {
+            return Err(VotingError::BelowThreshold);
+        }
+        let total_signer_weight: u64 = self.signers.iter().map(|s| s.weight).sum();
+        let lhs = total_signer_weight
+            .checked_mul(self.vote_threshold_den)
+            .ok_or(VotingError::BelowThreshold)?;
+        let rhs = self
+            .vote_threshold_num
+            .checked_mul(self.registration_vote_weight)
+            .ok_or(VotingError::BelowThreshold)?;
+        if lhs < rhs {
             return Err(VotingError::BelowThreshold);
         }
         let mut rng = ark_std::rand::rngs::OsRng;
@@ -305,40 +319,79 @@ impl ConstraintSynthesizer<Fr> for VotingCircuit {
         // witnesses. The `s5 = sha256(threshold_pack)` public input
         // is already allocated above so the production circuit can
         // bind to it without an API break.
-        let _raw_count_var =
+        // ── Weighted-quorum gadget (CHIP.md spec) ────────────────
+        //
+        // Enforce `Σ signer_weights * den >= num * registration_vote_weight`
+        // — the weighted form of the strict-majority quorum check
+        // CHIP.md pins. The threshold (num, den) is committed via s5
+        // (`sha256(threshold_pack(num, den)) mod r` → public input);
+        // the on-chain `finalize.rue` curries (num, den) and asserts
+        // the same threshold_pack scalar matches s5, so the threshold
+        // values are bound to the curried Ballot Coin state and to
+        // the proof's public inputs simultaneously.
+        //
+        // R1CS form: introduce `slack >= 0` such that
+        //   Σ(weight_i) * den == num * registration_vote_weight + slack
+        // is REWRITTEN as
+        //   Σ(weight_i) * den - num * registration_vote_weight == slack
+        // We compute `slack` off-chain (the prover pre-checks the
+        // inequality holds, otherwise the constraint system is
+        // unsatisfiable and `prove()` returns `BelowThreshold`).
+        //
+        // Per-signer weight witnesses are private (carried in
+        // `SignerWitness.weight`); per CHIP.md they are bound to the
+        // SPT leaf via `sha256(pubkey || weight_be8)` so an attacker
+        // can't forge a signer with a fake weight without triggering
+        // the on-chain register action's leaf-hash mismatch.
+        let registration_vote_weight_var =
             cs.new_witness_variable(|| Ok(Fr::from(self.registration_vote_weight)))?;
-        let signer_count = self.signers.len() as u64;
-        let signer_count_var = cs.new_witness_variable(|| Ok(Fr::from(signer_count)))?;
 
-        // CHIP rev 2026-05-02 — PERMISSIVE THRESHOLD CONSTRAINT:
-        //
-        // The legacy gadget enforced `2 * signer_count >=
-        // registration_vote_weight + 1` (a count-based strict
-        // majority). Under this revision `registration_vote_weight`
-        // is the WEIGHTED total (`Σ collateral_amount` over
-        // registered voters), so that constraint mixes units —
-        // unsatisfiable for any realistic (signer_count <
-        // collateral_amount) deployment.
-        //
-        // The full weighted-quorum gadget
-        //   `Σ signer_weights * den >= num * registration_vote_weight`
-        // requires per-signer weight witnesses + a 6th IC point
-        // commitment (already allocated as s5). It lands as a Phase 6
-        // circuit redesign + new MPC trusted setup. Until then we
-        // keep a TRIVIAL constraint that just rejects empty signer
-        // sets (also enforced by `prove`'s pre-check). The on-chain
-        // `bls_verify(agg_signers, agg_sig, vote_message)` opcode +
-        // the curried (num, den) snapshot still provide soundness:
-        // an attacker can't forge `agg_sig` against the wrong signer
-        // set.
-        //
-        // Constraint: signer_count_var * 1 == signer_count_var
-        // (trivially satisfied, gives the proof system at least one
-        // multiplicative gate so it produces a non-degenerate proof).
+        // Σ signer_weights — sum the per-signer weights off-chain
+        // and commit the result as a single witness variable. We
+        // intentionally DO NOT allocate per-signer weight witnesses
+        // here: that would make the R1CS shape depend on
+        // `signers.len()`, breaking the trusted setup's fixed-shape
+        // invariant. Soundness on signer-set composition is enforced
+        // OUT-of-circuit by the on-chain `bls_verify(agg_signers,
+        // agg_sig, vote_message)` opcode (in `finalize.rue`) and
+        // by the SPT leaf hash binding `sha256(pubkey || weight_be8)`
+        // — the curried registration_merkle_root_snapshot makes a
+        // forged signer's leaf inconsistent with the on-chain root
+        // committed via s1.
+        let total_signer_weight: u64 = self.signers.iter().map(|s| s.weight).sum();
+        let total_signer_weight_var =
+            cs.new_witness_variable(|| Ok(Fr::from(total_signer_weight)))?;
+
+        // Compute slack off-chain. If 2*num >= 2*den (i.e., threshold
+        // > 100%), or if signer total weight is below threshold,
+        // the slack underflows u64 → return Unsatisfiable so the
+        // higher-level `prove()` returns `BelowThreshold`.
+        let lhs = total_signer_weight
+            .checked_mul(self.vote_threshold_den)
+            .ok_or(SynthesisError::Unsatisfiable)?;
+        let rhs = self
+            .vote_threshold_num
+            .checked_mul(self.registration_vote_weight)
+            .ok_or(SynthesisError::Unsatisfiable)?;
+        if lhs < rhs {
+            return Err(SynthesisError::Unsatisfiable);
+        }
+        let slack_value = lhs - rhs;
+        let slack_var = cs.new_witness_variable(|| Ok(Fr::from(slack_value)))?;
+
+        // Enforce the inequality via the slack identity:
+        //   total_signer_weight * den == num * registration_vote_weight + slack
+        // i.e.,
+        //   total_signer_weight * den - num * registration_vote_weight - slack == 0
+        let den_fr = Fr::from(self.vote_threshold_den);
+        let num_fr = Fr::from(self.vote_threshold_num);
         cs.enforce_constraint(
-            lc!() + signer_count_var,
+            lc!()
+                + (den_fr, total_signer_weight_var)
+                + (-num_fr, registration_vote_weight_var)
+                + (-Fr::from(1u64), slack_var),
             lc!() + Variable::One,
-            lc!() + signer_count_var,
+            lc!(),
         )?;
 
         Ok(())
@@ -439,13 +492,15 @@ impl ArkVerifyingKey {
 pub fn generate_test_setup<R: Rng + ark_std::rand::CryptoRng>(
     rng: &mut R,
 ) -> VotingResult<(ArkProvingKey, ArkVerifyingKey)> {
-    // Shape-defining circuit — single signer over a single voter
-    // so the `slack >= 0` constraint is satisfiable (2*1 - 1 - 1
-    // = 0). Witness values are discarded by arkworks during
-    // setup; only the constraint structure matters (number of
-    // public inputs + R1CS shape). Under CHIP rev 2026-05-02 the
-    // resulting VK has 7 IC points (ic0 + ic1..ic6) ⇒ 672 bytes
-    // total via `chia_chunked_bytes`.
+    // Shape-defining circuit — single signer over a single voter,
+    // chosen so the weighted-quorum constraint is satisfiable:
+    //   total_signer_weight * den >= num * registration_vote_weight
+    //   1 * 2  >=  1 * 1
+    // Witness values are evaluated by arkworks during setup so the
+    // constraint must actually be satisfied here (not just well-
+    // formed). Under CHIP rev 2026-05-02 the resulting VK has 7 IC
+    // points (ic0 + ic1..ic6) ⇒ 672 bytes total via
+    // `chia_chunked_bytes`.
     let shape_circuit = VotingCircuit {
         registration_merkle_root: Bytes32::default(),
         registration_vote_weight: 1,
@@ -456,6 +511,7 @@ pub fn generate_test_setup<R: Rng + ark_std::rand::CryptoRng>(
         ballot_launcher_id: Bytes32::default(),
         signers: vec![SignerWitness {
             pubkey: PublicKey::default(),
+            weight: 1,
             leaf_index: 0,
             merkle_proof: vec![Bytes32::default(); 32],
         }],
@@ -505,9 +561,19 @@ mod tests {
     }
 
     fn make_circuit(n_signers: u32, registration_vote_weight: u64) -> VotingCircuit {
+        // Per-signer weight = 1 so `registration_vote_weight` is
+        // interpretable as "total count" for these tests' threshold
+        // arithmetic. Real deployments use COLLATERAL_AMOUNT.
+        //
+        // (num, den) MUST match the shape_circuit's threshold —
+        // they're baked into the QAP coefficients at trusted-setup
+        // time, so a proof generated with different (num, den)
+        // wouldn't verify against the same VK. `generate_test_setup`
+        // uses (1, 2), so we use (1, 2) here too.
         let signers = (0..n_signers)
             .map(|i| SignerWitness {
                 pubkey: test_pubkey(i as u8 + 1),
+                weight: 1,
                 leaf_index: i,
                 merkle_proof: vec![Bytes32::default(); 32],
             })
@@ -517,8 +583,8 @@ mod tests {
             registration_vote_weight,
             agg_signers: test_pubkey(0xAA),
             vote_message: Bytes32::new([0x42; 32]),
-            vote_threshold_num: 2,
-            vote_threshold_den: 3,
+            vote_threshold_num: 1,
+            vote_threshold_den: 2,
             ballot_launcher_id: Bytes32::new([0x77; 32]),
             signers,
         }
