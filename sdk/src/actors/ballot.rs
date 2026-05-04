@@ -697,39 +697,43 @@ impl BallotIssuer {
 }
 
 /// FN: build_vk_ic_nodes (file-private)
-/// WHAT: parse the deployment's `verification_key_hex` (672 bytes)
-///       into the on-chain `VK` + `IC` cons trees expected by
-///       `puzzles/ballot_coin/finalize.rue`.
+/// WHAT: parse the deployment's `verification_key_hex` (768 bytes
+///       under the 8-input CHIP rev) into the on-chain `VK` + `IC`
+///       cons trees expected by `puzzles/ballot_coin/finalize.rue`.
 /// LAYOUT:
 ///   * VK (336 bytes): alpha (PublicKey, 48) + beta (Signature, 96)
 ///     + gamma (Signature, 96) + delta (Signature, 96).
 ///     Encoded as a 4-field struct WITHOUT `...` → cons shape
 ///     `(alpha . (beta . (gamma . (delta . ()))))`.
-///   * IC (336 bytes): 7 G1 points × 48 bytes each (`PUBLIC_INPUT_COUNT
-///     + 1 = 7`). Encoded as a 7-field struct WITHOUT `...` → cons
-///     shape `(ic0 . (ic1 . ... (ic6 . ())))`.
+///   * IC (`(PUBLIC_INPUT_COUNT + 1) * 48` bytes = 432 bytes for 8
+///     inputs): 9 G1 points × 48 bytes each. Encoded as a 9-field
+///     struct WITHOUT `...` → cons shape
+///     `(ic0 . (ic1 . ... (ic8 . ())))`.
 /// MIRROR: the rest-arg-less Rue struct encoding is what
 ///         `clvm_traits` produces for nil-terminated nested tuples /
 ///         `Vec`. We use `Vec<Bytes>::to_clvm` for both the VK list
-///         (4 entries) and the IC list (7 entries).
+///         (4 entries) and the IC list (`PUBLIC_INPUT_COUNT + 1`
+///         entries).
 pub(crate) fn build_vk_ic_nodes(
     ctx: &mut SpendContext,
     config: &ElectionConfig,
 ) -> VotingResult<(NodePtr, NodePtr)> {
     use chia_protocol::Bytes;
 
+    let ic_count = crate::config::PUBLIC_INPUT_COUNT + 1;
     let vk_bytes = hex::decode(config.verification_key_hex.trim()).map_err(|e| {
         VotingError::Other(anyhow_compat::Error(
             format!("decoding verification_key_hex: {e}").into(),
         ))
     })?;
-    let expected = 336 + 7 * 48;
+    let expected = 336 + ic_count * 48;
     if vk_bytes.len() != expected {
         return Err(VotingError::Other(anyhow_compat::Error(
             format!(
-                "verification_key has {} bytes; expected {} (336 base + 7 IC * 48)",
+                "verification_key has {} bytes; expected {} (336 base + {} IC * 48)",
                 vk_bytes.len(),
                 expected,
+                ic_count,
             )
             .into(),
         )));
@@ -742,8 +746,8 @@ pub(crate) fn build_vk_ic_nodes(
     let vk_fields: Vec<Bytes> = vec![alpha, beta, gamma, delta];
     let vk_node = vk_fields.to_clvm(&mut **ctx).map_err(driver_err)?;
 
-    let mut ic_fields: Vec<Bytes> = Vec::with_capacity(7);
-    for i in 0..7 {
+    let mut ic_fields: Vec<Bytes> = Vec::with_capacity(ic_count);
+    for i in 0..ic_count {
         let start = 336 + i * 48;
         ic_fields.push(Bytes::new(vk_bytes[start..start + 48].to_vec()));
     }

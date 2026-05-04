@@ -13,13 +13,15 @@
 // Time lock: emits ASSERT_HEIGHT_ABSOLUTE(VOTE_CLOSE_HEIGHT) so the
 // ballot must have closed before finalize can run.
 //
-// Six public inputs (ordering MUST match `circuit.rs` exactly):
+// Eight public inputs (ordering MUST match `circuit.rs` exactly):
 //   s1  ←  sha256(registration_merkle_root)             mod r
 //   s2  ←  sha256(registration_vote_weight_be8)         mod r
 //   s3  ←  sha256(agg_signers)                          mod r
 //   s4  ←  sha256(vote_message)                         mod r
-//   s5  ←  sha256(threshold_pack(num, den))             mod r   ← preserved on-chain threshold check
+//   s5  ←  sha256(threshold_pack(num, den))             mod r   ← preserved on-chain threshold check (defense-in-depth)
 //   s6  ←  sha256(ballot_launcher_id)                   mod r   ← prevents cross-ballot replay
+//   s7  ←  Fr::from(num)                                (raw, 32-byte BE)
+//   s8  ←  Fr::from(den)                                (raw, 32-byte BE)
 //
 // State transitions:
 //   finalized    → true
@@ -44,6 +46,8 @@ struct IC {
     ic4: PublicKey,    // multiplied by scalar(vote_message)
     ic5: PublicKey,    // multiplied by scalar(threshold_pack)
     ic6: PublicKey,    // multiplied by scalar(ballot_launcher_id)
+    ic7: PublicKey,    // multiplied by Fr::from(num)
+    ic8: PublicKey,    // multiplied by Fr::from(den)
 }
 
 struct Proof {
@@ -59,6 +63,8 @@ struct Scalars {
     s4: PublicKey,    // sha256(vote_message) mod r
     s5: PublicKey,    // sha256(threshold_pack) mod r
     s6: PublicKey,    // sha256(ballot_launcher_id) mod r
+    s7: PublicKey,    // Fr::from(num) raw 32-byte BE
+    s8: PublicKey,    // Fr::from(den) raw 32-byte BE
 }
 
 /// Pack (num, den) into a 16-byte BE blob; both are u64 / 8-byte BE.
@@ -144,14 +150,27 @@ fn main(
     assert ((zero_pad + sha256(ballot_b)) as Int % (r as Int)) as Bytes
         == (scalars.s6 as Bytes);
 
-    // VK input: IC[0] + IC[1]*s1 + ... + IC[6]*s6.
+    // s7 / s8: direct equality bindings to Fr::from(num) / Fr::from(den).
+    // The SDK side uses `fr_to_bytes32_be(Fr::from(n))` which, for u64
+    // values < r, is simply the 32-byte big-endian encoding (24 zero
+    // bytes followed by 8 BE bytes of n).
+    let zero_pad_24: Bytes =
+        0x000000000000000000000000000000000000000000000000;
+    assert (zero_pad_24 + int_to_8_bytes_be(VOTE_THRESHOLD_NUM))
+        == (scalars.s7 as Bytes);
+    assert (zero_pad_24 + int_to_8_bytes_be(VOTE_THRESHOLD_DEN))
+        == (scalars.s8 as Bytes);
+
+    // VK input: IC[0] + IC[1]*s1 + ... + IC[8]*s8.
     let vk_input: PublicKey = IC.ic0
         + IC.ic1 * scalars.s1
         + IC.ic2 * scalars.s2
         + IC.ic3 * scalars.s3
         + IC.ic4 * scalars.s4
         + IC.ic5 * scalars.s5
-        + IC.ic6 * scalars.s6;
+        + IC.ic6 * scalars.s6
+        + IC.ic7 * scalars.s7
+        + IC.ic8 * scalars.s8;
 
     // Groth16 pairing identity.
     bls_pairing_identity(

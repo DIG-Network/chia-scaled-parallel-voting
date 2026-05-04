@@ -965,10 +965,10 @@ impl<C: ChainReader> Aggregator<C> {
         let agg_sig_bytes = Bytes::new(witness.agg_signature.to_bytes().to_vec());
 
         let s = &witness.scalars;
-        // Scalars: (s1 . (s2 . (s3 . (s4 . (s5 . (s6 . ()))))))
+        // Scalars: (s1 . (s2 . (s3 . (s4 . (s5 . (s6 . (s7 . (s8 . ()))))))))
         //
-        // CLVM Int → Bytes canonical encoding strips leading zero
-        // bytes. The on-chain finalize.rue assertion
+        // s1..s6: CLVM Int → Bytes canonical encoding strips leading
+        // zero bytes. The on-chain finalize.rue assertion
         //   `((zero_pad + sha256(input_i)) as Int % r) as Bytes
         //    == scalars.s_i as Bytes`
         // canonicalises the LHS, so the RHS (the Scalars values we
@@ -976,6 +976,14 @@ impl<C: ChainReader> Aggregator<C> {
         // compare-equal. Bls12-381 Fr is always < 2^254, so the
         // leading non-zero byte never has its high bit set →
         // canonical = shortest-BE with no leading zeros.
+        //
+        // s7/s8: bound by direct byte equality
+        //   `(zero_pad_24 + int_to_8_bytes_be(num)) == scalars.s7 as Bytes`
+        // which is a literal 32-byte concatenation (24 zero bytes +
+        // 8 BE bytes) — NOT canonicalised. So we MUST pass the full
+        // 32-byte big-endian form here for the byte-equality to hold.
+        let s7_bytes = chia_protocol::Bytes::new(s.s7.as_ref().to_vec());
+        let s8_bytes = chia_protocol::Bytes::new(s.s8.as_ref().to_vec());
         let scalars_value = (
             canonical_int_bytes32(&s.s1),
             (
@@ -986,7 +994,10 @@ impl<C: ChainReader> Aggregator<C> {
                         canonical_int_bytes32(&s.s4),
                         (
                             canonical_int_bytes32(&s.s5),
-                            (canonical_int_bytes32(&s.s6), ()),
+                            (
+                                canonical_int_bytes32(&s.s6),
+                                (s7_bytes, (s8_bytes, ())),
+                            ),
                         ),
                     ),
                 ),
