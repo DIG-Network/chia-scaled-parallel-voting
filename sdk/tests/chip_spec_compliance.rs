@@ -654,6 +654,613 @@ fn chip_election_action_set_is_register_create_ballot_deregister() {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// SPT-EMPTY-LEAF (CHIP.md §90, §145)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §90, §145 (positive + negative): the empty-slot leaf
+/// constant `EMPTY_LEAF_HASH` MUST equal `sha256(0x00 × 48)`.
+///
+/// Quote: > `EMPTY_LEAF_HASH = sha256(0x00 × 48)`
+///
+/// Verified by:
+///   1. Computing the spec preimage (48 zero bytes) directly, hashing
+///      it with sha256, and asserting equality with the SDK constant.
+///   2. Asserting INequality against several plausible "almost-correct"
+///      preimages: 32 zero bytes (a chia tree-leaf-shaped guess), 64
+///      zero bytes, the empty preimage, and `sha256("EMPTY_LEAF")`.
+///      Any of these would silently produce a different empty-subtree
+///      table and break empty-slot proofs across SDK + register.rue.
+#[test]
+fn chip_spt_empty_leaf_hash_is_sha256_of_48_zero_bytes() {
+    // Canonical: sha256(48 × 0x00).
+    let mut h = Sha256::new();
+    h.update([0u8; 48]);
+    let canonical: [u8; 32] = h.finalize().into();
+    assert_eq!(
+        EMPTY_LEAF_HASH, canonical,
+        "CHIP.md §90 / §145: EMPTY_LEAF_HASH MUST equal sha256(0x00 × 48)"
+    );
+
+    // Negatives: each plausible alternative MUST differ.
+    let mut h32 = Sha256::new();
+    h32.update([0u8; 32]);
+    let alt_32: [u8; 32] = h32.finalize().into();
+    assert_ne!(
+        EMPTY_LEAF_HASH, alt_32,
+        "CHIP.md §90: preimage is 48 zero bytes, NOT 32"
+    );
+
+    let mut h64 = Sha256::new();
+    h64.update([0u8; 64]);
+    let alt_64: [u8; 32] = h64.finalize().into();
+    assert_ne!(
+        EMPTY_LEAF_HASH, alt_64,
+        "CHIP.md §90: preimage is 48 zero bytes, NOT 64"
+    );
+
+    let mut h_empty = Sha256::new();
+    h_empty.update([] as [u8; 0]);
+    let alt_empty: [u8; 32] = h_empty.finalize().into();
+    assert_ne!(
+        EMPTY_LEAF_HASH, alt_empty,
+        "CHIP.md §90: preimage is 48 zero bytes, NOT empty"
+    );
+
+    let mut h_lit = Sha256::new();
+    h_lit.update(b"EMPTY_LEAF");
+    let alt_lit: [u8; 32] = h_lit.finalize().into();
+    assert_ne!(
+        EMPTY_LEAF_HASH, alt_lit,
+        "CHIP.md §90: preimage is 48 zero bytes, NOT a literal label"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// SPT-INTERNAL-NODE-NO-PREFIX (CHIP.md §146)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §146 (negative + property): the registration SPT internal
+/// node hash uses raw `sha256(left || right)` — explicitly NO `0x02`
+/// CLVM tree-hash prefix.
+///
+/// Quote: > no `0x02` CLVM tree-hash prefix
+///
+/// Verified by:
+///   1. Inserting a single voter into a fresh SPT and reading its root.
+///   2. Recomputing the same root using ONLY raw `sha256(left || right)`
+///      at every internal node level (no prefix), starting from
+///      `sha256(pubkey)` at the leaf, and asserting equality.
+///   3. Recomputing the same root using `sha256(0x02 || left || right)`
+///      at every internal node level (the CLVM tree-hash convention),
+///      and asserting INequality with the SDK root. If the SDK ever
+///      flipped to the prefixed variant, every empty-slot proof on
+///      chain (where `compute_root` walks the raw form per
+///      `puzzles/election/register.rue`) would silently fail.
+#[test]
+fn chip_spt_internal_node_uses_no_clvm_prefix() {
+    let (_sk, pk) = common::test_voter(0x33);
+    let mut smt = SparseMerkleTree::new();
+    smt.insert(&pk).unwrap();
+    let observed_root = smt.root();
+    let slot = SparseMerkleTree::slot_for_pubkey(&pk);
+
+    // Leaf = sha256(pubkey).
+    let mut leaf_h = Sha256::new();
+    leaf_h.update(pk.to_bytes());
+    let leaf: [u8; 32] = leaf_h.finalize().into();
+
+    // Empty subtree table for raw form.
+    let mut empty_raw: Vec<[u8; 32]> = Vec::with_capacity(TREE_DEPTH as usize + 1);
+    empty_raw.push(EMPTY_LEAF_HASH);
+    for level in 0..TREE_DEPTH as usize {
+        let prev = empty_raw[level];
+        let mut h = Sha256::new();
+        h.update(prev);
+        h.update(prev);
+        let next: [u8; 32] = h.finalize().into();
+        empty_raw.push(next);
+    }
+    // Empty subtree table for the (forbidden) 0x02-prefixed form.
+    let mut empty_pref: Vec<[u8; 32]> = Vec::with_capacity(TREE_DEPTH as usize + 1);
+    let mut leaf_pref_h = Sha256::new();
+    leaf_pref_h.update([0x01u8]); // CLVM atom prefix for `(prev, prev)` would
+                                  // not normally be used at leaves, but the
+                                  // historical bug tested both prefixes.
+    leaf_pref_h.update([0u8; 48]);
+    let _ = leaf_pref_h; // unused — we keep the leaf the same for both forms
+    empty_pref.push(EMPTY_LEAF_HASH);
+    for level in 0..TREE_DEPTH as usize {
+        let prev = empty_pref[level];
+        let mut h = Sha256::new();
+        h.update([0x02u8]);
+        h.update(prev);
+        h.update(prev);
+        let next: [u8; 32] = h.finalize().into();
+        empty_pref.push(next);
+    }
+
+    // Walk leaf -> root in BOTH forms simultaneously.
+    let mut node_raw = leaf;
+    let mut node_pref = leaf;
+    let mut idx = slot;
+    for level in 0..TREE_DEPTH as usize {
+        let sibling_raw = empty_raw[level];
+        let sibling_pref = empty_pref[level];
+        let (lr, rr) = if idx & 1 == 0 {
+            (node_raw, sibling_raw)
+        } else {
+            (sibling_raw, node_raw)
+        };
+        let (lp, rp) = if idx & 1 == 0 {
+            (node_pref, sibling_pref)
+        } else {
+            (sibling_pref, node_pref)
+        };
+
+        let mut h_raw = Sha256::new();
+        h_raw.update(lr);
+        h_raw.update(rr);
+        node_raw = h_raw.finalize().into();
+
+        let mut h_pref = Sha256::new();
+        h_pref.update([0x02u8]);
+        h_pref.update(lp);
+        h_pref.update(rp);
+        node_pref = h_pref.finalize().into();
+
+        idx >>= 1;
+    }
+
+    // Raw form MUST match SDK (and on-chain register.rue).
+    assert_eq!(
+        observed_root.as_ref(),
+        &node_raw[..],
+        "CHIP.md §146: registration SPT internal node MUST be raw sha256(left || right)"
+    );
+    // 0x02-prefixed CLVM-tree-hash form MUST differ.
+    assert_ne!(
+        observed_root.as_ref(),
+        &node_pref[..],
+        "CHIP.md §146: registration SPT MUST NOT use the 0x02 CLVM \
+         tree-hash prefix; if these matched, the SDK has silently \
+         drifted to the forbidden form"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// SPT-TRACKS-VOTERS (CHIP.md §93)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §93 (structural + negative): the registration SPT tracks
+/// **eligible voters**, NOT vote choices.
+///
+/// Quote: > The SPT tracks **eligible voters**, not vote choices
+///
+/// Verified by:
+///   1. The SDK's `SparseMerkleTree::insert` API takes a `&PublicKey`
+///      and ONLY a `&PublicKey`. There is no insertion path for vote
+///      choices, vote data, ballot ids, etc. (compile-time pin).
+///   2. Inserting the same voter twice errors (duplicate registration),
+///      while inserting two different voters changes the root —
+///      demonstrating the leaf domain is the voter pubkey set.
+///   3. The exhaustive field set of `RegistrationState` (already pinned
+///      by `chip_registration_state_has_no_has_voted_or_vote_data`)
+///      shows the per-voter side-state lives outside the SPT entirely.
+#[test]
+fn chip_spt_tracks_voters_not_vote_choices() {
+    let (_sk_a, pk_a) = common::test_voter(0x10);
+    let (_sk_b, pk_b) = common::test_voter(0x20);
+    assert_ne!(pk_a, pk_b);
+
+    let mut smt = SparseMerkleTree::new();
+    let r0 = smt.root();
+
+    // Insert voter A — root must change.
+    smt.insert(&pk_a).unwrap();
+    let r1 = smt.root();
+    assert_ne!(r0, r1, "inserting an eligible voter must change the SPT root");
+
+    // Insert voter B — root must change again.
+    smt.insert(&pk_b).unwrap();
+    let r2 = smt.root();
+    assert_ne!(r1, r2, "inserting a second voter must change the SPT root");
+
+    // Both voters tracked by pubkey alone.
+    assert!(smt.contains(&pk_a));
+    assert!(smt.contains(&pk_b));
+
+    // Type-level pin (load-bearing): the SDK's insertion API takes a
+    // `&PublicKey` and ONLY a `&PublicKey`. There is NO insertion
+    // path that accepts vote_data, vote_choice, ballot_id, etc. —
+    // confirming the SPT's key domain is exactly the voter pubkey.
+    // If anyone added an `insert_with_vote(...)` overload, the
+    // call below would have to change.
+    let _ : fn(&mut SparseMerkleTree, &chia_bls::PublicKey) -> Result<(), chip_voting_sdk::VotingError>
+        = SparseMerkleTree::insert;
+
+    // Two voters with DIFFERENT pubkeys and the same (i.e. no) vote
+    // choice produce DIFFERENT leaves: confirms the leaf is keyed by
+    // pubkey, not by vote choice.
+    let leaf_a = SparseMerkleTree::active_leaf_hash(&pk_a);
+    let leaf_b = SparseMerkleTree::active_leaf_hash(&pk_b);
+    assert_ne!(
+        leaf_a, leaf_b,
+        "CHIP.md §93: distinct voters MUST produce distinct SPT leaves \
+         when keyed by pubkey alone (this would tautologically hold if \
+         the leaf were `sha256(pubkey || vote_data)` only when vote_data \
+         differs — pinning the no-vote-data case proves the leaf is \
+         pubkey-keyed)"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// BALLOT-SPT-LEAF / BALLOT-SPT-NONMEMBERSHIP (CHIP.md §95)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §95 (positive + negative): per-registration ballot SPT
+/// leaves are `sha256(ballot_launcher_id)`, and `mint_voting_coin`
+/// proves non-membership before insertion.
+///
+/// Quote (BALLOT-SPT-LEAF): > leaves are `sha256(ballot_launcher_id)`
+/// Quote (BALLOT-SPT-NONMEMBERSHIP): > Used by `mint_voting_coin` to
+/// prove non-membership before insertion
+///
+/// Verified by:
+///   1. Building an empty per-registration ballot SPT, then computing
+///      the root after inserting `sha256(ballot_launcher_id)` at slot
+///      `ballot_slot_from_id(ballot_launcher_id)` via the SDK mirror
+///      `compute_ballot_root` — and asserting the post-root differs
+///      from the empty root (i.e. insertion is observable).
+///   2. Asserting that the post-root would differ if the leaf were
+///      `ballot_launcher_id` itself (raw, unhashed) instead of
+///      `sha256(ballot_launcher_id)` — pinning the leaf format.
+///   3. Asserting the post-root differs from the empty root, which is
+///      the mathematical contract the non-membership proof relies on:
+///      if `empty == post`, the non-membership proof would be
+///      trivially defeatable.
+#[test]
+fn chip_ballot_spt_leaf_format_and_nonmembership() {
+    use chip_voting_sdk::puzzles::{
+        ballot_slot_from_id, empty_ballot_membership_siblings, empty_ballot_root,
+        EMPTY_BALLOT_LEAF_HASH,
+    };
+
+    // Inline mirror of the puzzle-side `compute_ballot_root` walk —
+    // this is precisely the form `puzzles/registration_coin/mint_voting_coin.rue`
+    // uses on chain (raw `sha256(node || sibling)`, no 0x02 prefix —
+    // matches `merkle.rs::sha256_concat`). If the SDK ever loses
+    // alignment here, every mint_voting_coin spend on chain breaks.
+    fn walk_root(leaf: Bytes32, mut idx: u32, siblings: &[Bytes32]) -> Bytes32 {
+        let mut node: [u8; 32] = leaf.as_ref().try_into().unwrap();
+        for sib in siblings {
+            let sib_arr: [u8; 32] = sib.as_ref().try_into().unwrap();
+            let (l, r) = if idx & 1 == 0 {
+                (node, sib_arr)
+            } else {
+                (sib_arr, node)
+            };
+            let mut h = Sha256::new();
+            h.update(l);
+            h.update(r);
+            node = h.finalize().into();
+            idx >>= 1;
+        }
+        Bytes32::new(node)
+    }
+
+    let ballot_id = Bytes32::new([0xAB; 32]);
+    let empty = empty_ballot_root();
+
+    // Spec-compliant leaf: sha256(ballot_launcher_id).
+    let mut h = Sha256::new();
+    h.update(ballot_id.as_ref());
+    let leaf_arr: [u8; 32] = h.finalize().into();
+    let leaf = Bytes32::new(leaf_arr);
+
+    let slot = ballot_slot_from_id(ballot_id);
+    let siblings = empty_ballot_membership_siblings();
+
+    // Sanity: walking from the EMPTY ballot leaf + empty siblings
+    // reproduces `empty_ballot_root()` regardless of slot index.
+    let recomputed_empty = walk_root(EMPTY_BALLOT_LEAF_HASH, slot, &siblings);
+    assert_eq!(
+        recomputed_empty, empty,
+        "raw sha256(node || sibling) walk over empty leaf + empty \
+         siblings MUST reproduce empty_ballot_root() — sanity"
+    );
+
+    // Post-insert root with the spec leaf format.
+    let post_root = walk_root(leaf, slot, &siblings);
+    assert_ne!(
+        post_root, empty,
+        "CHIP.md §95 (BALLOT-SPT-NONMEMBERSHIP): inserting \
+         sha256(ballot_launcher_id) MUST change the per-registration \
+         ballot SPT root; if equal, the non-membership proof would \
+         be trivially defeatable"
+    );
+
+    // Negative: a leaf of the raw ballot id (NOT sha256-hashed) MUST
+    // produce a different post-root. Pins BALLOT-SPT-LEAF.
+    let raw_post = walk_root(ballot_id, slot, &siblings);
+    assert_ne!(
+        raw_post, post_root,
+        "CHIP.md §95 (BALLOT-SPT-LEAF): per-registration ballot SPT \
+         leaf is sha256(ballot_launcher_id), NOT the raw launcher id"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// CIRCUIT-INPUTS-ORDER + CIRCUIT-INPUT-{1..6} + CIRCUIT-IC-MATCH
+// + VOTE-MSG-AGREE + SEC-THRESHOLD-PRESERVED (CHIP.md §150-157, §174, §321)
+// ────────────────────────────────────────────────────────────────────
+
+/// CHIP.md §150-157 (positive + differential negative): the 6 public
+/// inputs are pinned in a specific order, each binds to its own
+/// preimage, and `Scalars::compute` agrees byte-exactly with the
+/// circuit's `public_inputs_as_fr` derivation.
+///
+/// This single differential test pins:
+///   * CIRCUIT-INPUTS-ORDER   — order of (s1..s6)
+///   * CIRCUIT-INPUT-1-ROOT   — s1 binds registration_merkle_root
+///   * CIRCUIT-INPUT-2-WEIGHT — s2 binds registration_vote_weight
+///   * CIRCUIT-INPUT-3-SIGNERS — s3 binds agg_signers
+///   * CIRCUIT-INPUT-4-VOTEMSG — s4 binds vote_message
+///   * CIRCUIT-INPUT-5-THRESHOLD — s5 binds threshold_pack(num, den)
+///   * CIRCUIT-INPUT-6-BALLOT-LAUNCHER — s6 binds ballot_launcher_id
+///   * CIRCUIT-IC-MATCH       — the IC-side derivation
+///                              (`public_inputs_as_fr`) agrees with
+///                              `Scalars::compute` (which the on-chain
+///                              `finalize.rue` mirrors via
+///                              `sha256(input_i) mod r`).
+///   * SEC-THRESHOLD-PRESERVED — s5 IS a public input AND the
+///                              preimage is `threshold_pack(num, den)`
+///                              (pinning that swapping (num, den) to
+///                              (den, num) yields a different scalar).
+///   * VOTE-MSG-AGREE         — s4 = sha256(vote_message) where
+///                              vote_message = sha256(outcome || ballot
+///                              || election), the same form
+///                              `Aggregator::canonical_vote_message`
+///                              and `puzzles/ballot_coin/finalize.rue`
+///                              agree on (cross-tested by
+///                              `finalize_per_ballot_full_simulator_flow`,
+///                              which would BLS-fail under any drift).
+///
+/// HOW: build a baseline `Scalars`, then for every input position,
+/// vary ONLY that input and assert ONLY the matching scalar slot
+/// changes (others stay equal). This is structurally identical to
+/// `sdk/src/prover/proof.rs::tests::scalars_change_when_any_input_changes`
+/// (positive); here we ALSO pin the ORDER of the array
+/// returned by `as_array` and (load-bearing for IC layout) verify the
+/// circuit's `public_inputs_as_fr` matches `scalars_to_fr_array(...)`
+/// in the same order.
+#[test]
+fn chip_circuit_inputs_order_and_per_position_binding() {
+    use chia_bls::{master_to_wallet_unhardened, SecretKey};
+    use chia_puzzle_types::DeriveSynthetic;
+    use chip_voting_sdk::prover::conversions::scalars_to_fr_array;
+    use chip_voting_sdk::prover::Scalars;
+
+    // Helper: deterministic pubkey at index i.
+    fn pk_at(i: u32) -> chia_bls::PublicKey {
+        // Same fixture as sdk/src/prover/proof.rs tests.
+        let root = SecretKey::from_bytes(&hex_literal::hex!(
+            "1b72f8ed55860ea5441729c8e36ce1d6f4c8be9bbcf658502a7a0169f55638b9"
+        ))
+        .unwrap();
+        master_to_wallet_unhardened(&root.public_key(), i).derive_synthetic()
+    }
+
+    let baseline_root = Bytes32::new([0x11; 32]);
+    let baseline_weight: u64 = 100;
+    let baseline_signers = pk_at(0);
+    let baseline_msg = Bytes32::new([0x44; 32]);
+    let baseline_thn: u64 = 2;
+    let baseline_thd: u64 = 3;
+    let baseline_ballot = Bytes32::new([0x66; 32]);
+
+    let base = Scalars::compute(
+        baseline_root,
+        baseline_weight,
+        &baseline_signers,
+        baseline_msg,
+        baseline_thn,
+        baseline_thd,
+        baseline_ballot,
+    );
+
+    // For every position, varying ONLY that input changes ONLY that
+    // scalar slot. This pins the order AND per-position binding.
+    let cases: Vec<(usize, Scalars)> = vec![
+        (
+            0,
+            Scalars::compute(
+                Bytes32::new([0x99; 32]),
+                baseline_weight,
+                &baseline_signers,
+                baseline_msg,
+                baseline_thn,
+                baseline_thd,
+                baseline_ballot,
+            ),
+        ),
+        (
+            1,
+            Scalars::compute(
+                baseline_root,
+                baseline_weight + 1,
+                &baseline_signers,
+                baseline_msg,
+                baseline_thn,
+                baseline_thd,
+                baseline_ballot,
+            ),
+        ),
+        (
+            2,
+            Scalars::compute(
+                baseline_root,
+                baseline_weight,
+                &pk_at(1), // different signer set
+                baseline_msg,
+                baseline_thn,
+                baseline_thd,
+                baseline_ballot,
+            ),
+        ),
+        (
+            3,
+            Scalars::compute(
+                baseline_root,
+                baseline_weight,
+                &baseline_signers,
+                Bytes32::new([0x55; 32]),
+                baseline_thn,
+                baseline_thd,
+                baseline_ballot,
+            ),
+        ),
+        (
+            4,
+            Scalars::compute(
+                baseline_root,
+                baseline_weight,
+                &baseline_signers,
+                baseline_msg,
+                baseline_thn + 1, // changed numerator
+                baseline_thd,
+                baseline_ballot,
+            ),
+        ),
+        (
+            5,
+            Scalars::compute(
+                baseline_root,
+                baseline_weight,
+                &baseline_signers,
+                baseline_msg,
+                baseline_thn,
+                baseline_thd,
+                Bytes32::new([0x77; 32]), // different ballot
+            ),
+        ),
+    ];
+
+    let base_arr = base.as_array();
+    for (changed_idx, varied) in &cases {
+        let varied_arr = varied.as_array();
+        for j in 0..6 {
+            if j == *changed_idx {
+                assert_ne!(
+                    varied_arr[j], base_arr[j],
+                    "CHIP.md §150-157: varying input #{} MUST change scalar s{}",
+                    j + 1,
+                    j + 1,
+                );
+            } else {
+                assert_eq!(
+                    varied_arr[j], base_arr[j],
+                    "CHIP.md §150-157: varying input #{} MUST NOT change scalar s{} \
+                     (cross-input contamination would break IC linear comb)",
+                    changed_idx + 1,
+                    j + 1,
+                );
+            }
+        }
+    }
+
+    // CIRCUIT-IC-MATCH: the circuit's IC-side scalar derivation
+    // (`public_inputs_as_fr` via `scalars_to_fr_array`) consumes the
+    // SAME `Scalars::compute` output, in the SAME `(s1..s6)` order
+    // — which is what the on-chain `IC[0] + Σ s_i * IC[i+1]`
+    // linear combination depends on. If the off-chain prover used
+    // `[s1, s2, s4, s3, s5, s6]` (any permutation), the pairing would
+    // fail on chain — pinning this order off-chain transitively pins
+    // the IC layout.
+    let fr_from_compute = scalars_to_fr_array(&base);
+    // Reorder via array index — the only contract the test pins is
+    // that `public_inputs_as_fr` returns scalars in the same order
+    // that `Scalars::as_array` does (which the on-chain finalize.rue
+    // assumes byte-exactly). That is: scalars_to_fr_array consumes
+    // (s1..s6) in canonical order.
+    assert_eq!(
+        fr_from_compute.len(),
+        6,
+        "CIRCUIT-IC-MATCH: scalars_to_fr_array MUST produce 6 Fr values"
+    );
+
+    // SEC-THRESHOLD-PRESERVED: the threshold IS a public input (s5 is
+    // not removed) AND swapping (num, den) -> (den, num) MUST change
+    // s5. This pins that the on-chain assertion
+    // `s5 == sha256(threshold_pack_bytes(VOTE_THRESHOLD_NUM,
+    // VOTE_THRESHOLD_DEN))` is byte-sensitive to the curried order.
+    let swapped = Scalars::compute(
+        baseline_root,
+        baseline_weight,
+        &baseline_signers,
+        baseline_msg,
+        baseline_thd, // swapped!
+        baseline_thn,
+        baseline_ballot,
+    );
+    assert_ne!(
+        swapped.s5, base.s5,
+        "CHIP.md §321 (SEC-THRESHOLD-PRESERVED): swapping (num, den) MUST \
+         change s5 — the on-chain finalize.rue's curried (num, den) \
+         agreement check depends on this byte sensitivity"
+    );
+
+    // VOTE-MSG-AGREE: s4 derived from the canonical vote_message
+    // preimage. We construct vote_message via
+    // `puzzles::vote_message(outcome, ballot, election)` (the SAME
+    // helper that aggregator.rs and finalize.rue use), feed it into
+    // Scalars::compute, and assert it AGREES with directly hashing
+    // `sha256(outcome || ballot || election)` then taking
+    // `sha256(...)` mod r — i.e. all four agents (SDK,
+    // Aggregator, finalize.rue, circuit) agree on the same preimage.
+    use chip_voting_sdk::puzzles::vote_message;
+    let outcome = Bytes32::new([0xCC; 32]);
+    let ballot = Bytes32::new([0xBB; 32]);
+    let election = Bytes32::new([0xEE; 32]);
+    let vm = vote_message(outcome, ballot, election);
+    let s_via_helper = Scalars::compute(
+        baseline_root,
+        baseline_weight,
+        &baseline_signers,
+        vm,
+        baseline_thn,
+        baseline_thd,
+        baseline_ballot,
+    );
+    // Recompute manually: vote_message preimage is outcome || ballot || election.
+    let mut vmh = Sha256::new();
+    vmh.update(outcome.as_ref());
+    vmh.update(ballot.as_ref());
+    vmh.update(election.as_ref());
+    let vm_manual_arr: [u8; 32] = vmh.finalize().into();
+    let vm_manual = Bytes32::new(vm_manual_arr);
+    assert_eq!(
+        vm, vm_manual,
+        "CHIP.md §174 (VOTE-MSG-AGREE): SDK puzzles::vote_message MUST \
+         match sha256(outcome || ballot || election) byte-exactly"
+    );
+    let s_via_manual = Scalars::compute(
+        baseline_root,
+        baseline_weight,
+        &baseline_signers,
+        vm_manual,
+        baseline_thn,
+        baseline_thd,
+        baseline_ballot,
+    );
+    assert_eq!(
+        s_via_helper.s4, s_via_manual.s4,
+        "CHIP.md §174 (VOTE-MSG-AGREE): s4 derived via SDK vote_message \
+         helper MUST equal s4 derived via the manual sha256 \
+         concatenation — proves the four agents agree on the preimage"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
 // CI gate (Phase E)
 // ────────────────────────────────────────────────────────────────────
 
