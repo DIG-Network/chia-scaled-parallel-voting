@@ -36,6 +36,10 @@ import {
   deriveSyntheticFromMnemonic,
 } from "./walletKeys.mjs";
 import { pushSpendBundleBytes, pollUntilConfirmed } from "./push.mjs";
+import {
+  readDeployArtifacts,
+  writeDeployArtifacts,
+} from "./artifacts.mjs";
 
 // ---------------------------------------------------------------------------
 // Argv parsing
@@ -49,7 +53,11 @@ function parseArgs(argv) {
     configPath: null,
     runDeploy: false,
     pushDeploy: false,
-    catTailHashHex: "0x" + "00".repeat(32),
+    forceRedeploy: false,
+    // Default CAT TAIL: DIG token (per app/app/create/page.tsx default).
+    // Voters will need a balance of this CAT to register. Override
+    // with --cat-tail <hex> for a different election currency.
+    catTailHashHex: "0xa406d3a9de984d03c9591c10d917593b434d5263cabe2b42f6b367df16832f81",
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -68,6 +76,8 @@ function parseArgs(argv) {
       out.runDeploy = true;
     } else if (a === "--cat-tail") {
       out.catTailHashHex = argv[++i];
+    } else if (a === "--force-redeploy") {
+      out.forceRedeploy = true;
     }
   }
   return out;
@@ -315,6 +325,26 @@ async function phaseWalletCeremony(opts) {
 async function phaseDeploy(opts) {
   step("Phase 4: deploy a fresh Election Singleton");
 
+  // Reuse a previously-deployed election if its launcher is still on chain.
+  // Subsequent phases (register / vote / finalize / release) need this to
+  // be stable across runs; redeploying every run would burn 10 mojos per
+  // invocation and create stranded singletons.
+  if (!opts.forceRedeploy) {
+    const cached = await readDeployArtifacts();
+    if (cached && cached.launcherIdHex) {
+      const launcher = await coinRecordByName(cached.launcherIdHex);
+      if (launcher) {
+        ok(
+          `Reusing cached election: launcher_id=${cached.launcherIdHex.slice(0, 18)}… ` +
+            `(deployed at height ${cached.mainnetConfirmedHeight ?? "?"})`
+        );
+        info("(Pass --force-redeploy to deploy a fresh election anyway)");
+        return cached;
+      }
+      info(`Cached launcher ${cached.launcherIdHex} no longer resolves on chain; redeploying`);
+    }
+  }
+
   if (!opts.runDeploy) {
     info("Skipping deploy (default). Pass --run-deploy to build the bundle");
     info("locally; pass --push to also push it to mainnet.");
@@ -432,6 +462,20 @@ async function phaseDeploy(opts) {
     ok(
       `eve singleton confirmed at height ${rec.confirmedHeight} (parent=${rec.parentCoinInfo.slice(0, 16)}…)`
     );
+
+    // Persist artifacts so register / vote / finalize phases can reuse
+    // this election without redeploying.
+    const persisted = {
+      launcherIdHex: artifacts.launcherIdHex,
+      eveSingletonCoinIdHex: artifacts.eveSingletonCoinIdHex,
+      configJson: artifacts.configJson,
+      electionStartHeight: peak,
+      catTailHashHex: opts.catTailHashHex,
+      mainnetConfirmedHeight: rec.confirmedHeight,
+      provingKeyBytesB64: Buffer.from(ceremony.provingKeyBytes).toString("base64"),
+    };
+    await writeDeployArtifacts(persisted);
+    ok("deploy artifacts saved to .artifacts/deploy.json");
   } else {
     info("Dry-run only (default). Re-run with --push to broadcast to mainnet.");
   }
