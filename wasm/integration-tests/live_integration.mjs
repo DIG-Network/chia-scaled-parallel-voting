@@ -30,8 +30,11 @@
 import wasm from "chip-voting-wasm";
 import { createChainBackend } from "./chainBackend.mjs";
 import { parseCredentials } from "./credentials.mjs";
-import { peakHeight } from "./coinset.mjs";
-import { assertWalletMatchesAddress } from "./walletKeys.mjs";
+import { coinRecordsByPuzzleHash, coinRecordByName, peakHeight } from "./coinset.mjs";
+import {
+  assertWalletMatchesAddress,
+  deriveSyntheticFromMnemonic,
+} from "./walletKeys.mjs";
 
 // ---------------------------------------------------------------------------
 // Argv parsing
@@ -43,6 +46,9 @@ function parseArgs(argv) {
     credentials: null,
     verbose: false,
     configPath: null,
+    runDeploy: false,
+    pushDeploy: false,
+    catTailHashHex: "0x" + "00".repeat(32),
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -54,6 +60,13 @@ function parseArgs(argv) {
       out.configPath = argv[++i];
     } else if (a === "--verbose" || a === "-v") {
       out.verbose = true;
+    } else if (a === "--run-deploy") {
+      out.runDeploy = true;
+    } else if (a === "--push") {
+      out.pushDeploy = true;
+      out.runDeploy = true;
+    } else if (a === "--cat-tail") {
+      out.catTailHashHex = argv[++i];
     }
   }
   return out;
@@ -294,17 +307,142 @@ async function phaseWalletCeremony(opts) {
   }
 }
 
-function phaseWriteSideTodo() {
-  step("Phase 4+: full write-side phases (deploy / register / vote / finalize)");
-  info(
-    "STAGE B — pending. With wallet ceremony (Phase 3) working, the remaining pieces are:"
+// ---------------------------------------------------------------------------
+// Phase 4 — phase_deploy (build + optionally push a fresh Election Singleton)
+// ---------------------------------------------------------------------------
+
+async function phaseDeploy(opts) {
+  step("Phase 4: deploy a fresh Election Singleton");
+
+  if (!opts.runDeploy) {
+    info("Skipping deploy (default). Pass --run-deploy to build the bundle");
+    info("locally; pass --push to also push it to mainnet.");
+    return null;
+  }
+  if (!opts.credentials) {
+    throw new Error("phase_deploy requires --credentials <path-to-.test-credentials>");
+  }
+
+  const creds = await parseCredentials(opts.credentials);
+  if (!creds.funding.mnemonic) {
+    throw new Error(
+      "phase_deploy: funder mnemonic missing from .test-credentials (expected `# Mnemonic: ...` after WALLET_*)"
+    );
+  }
+
+  // ── 1. Derive funder synthetic secret + p2 puzzle hash ────────
+  const funder = deriveSyntheticFromMnemonic(creds.funding.mnemonic);
+  info(`funder p2 puzzle_hash = 0x${funder.puzzleHashHex}`);
+
+  // ── 2. Find an unspent funder coin ────────────────────────────
+  const funderPh = "0x" + funder.puzzleHashHex;
+  const coins = await coinRecordsByPuzzleHash(funderPh, false);
+  const candidates = coins
+    .filter((c) => c.spentHeight === 0 && c.amount >= 100)
+    .sort((a, b) => b.amount - a.amount); // largest first
+  if (candidates.length === 0) {
+    throw new Error(
+      `phase_deploy: no unspent funder coins (≥100 mojos) at ${funderPh}. ` +
+        `Funder may need topping up.`
+    );
+  }
+  const parent = candidates[0];
+  ok(
+    `funder coin: amount=${parent.amount} mojos parent=${parent.parentCoinInfo.slice(0, 16)}…`
   );
-  info("  • XCH funder pre-spend construction (StandardLayer puzzle + sign)");
-  info("  • CAT issuance/transfer pre-spend construction (chia-sdk-driver Cat)");
-  info("  • SpendBundle assembly via wasm.assembleSpendBundle");
-  info("  • Bundle push via coinset.org /push_tx");
-  info("  • Confirmation polling via coinRecordByName");
-  info("Wiring this mirrors live_integration_test.rs phase_deploy → phase_release.");
+
+  // ── 3. Run the trusted-setup ceremony ─────────────────────────
+  step(" → trusted-setup ceremony (SimulatedBackend)");
+  const ceremony = wasm.runSingleParticipantCeremony();
+  ok(
+    `ceremony complete: vk=${ceremony.verificationKeyHex.slice(0, 18)}… (${ceremony.verificationKeyHex.length / 2 - 1} bytes)`
+  );
+
+  // ── 4. Read peak height for election_start_height ─────────────
+  const peak = await peakHeight();
+  if (peak === null || peak < 1) throw new Error("could not read chain peak");
+  info(`election_start_height = ${peak}`);
+
+  // ── 5. Build the deploy bundle ────────────────────────────────
+  step(" → buildDeployBundle");
+  const params = {
+    verificationKeyHex: ceremony.verificationKeyHex,
+    catTailHashHex: opts.catTailHashHex,
+    collateralAmount: 1, // 1 CAT mojo per voter (placeholder; voters need actual CATs to register)
+    electionStartHeight: peak,
+    label: "wasm-integration-smoke",
+  };
+  // Pass parent coin in JsCoinRecord shape (bare hex, no 0x).
+  const parentJs = {
+    parentCoinInfo: parent.parentCoinInfo,
+    puzzleHash: parent.puzzleHash,
+    amount: parent.amount,
+    spentHeight: parent.spentHeight,
+    confirmedHeight: parent.confirmedHeight,
+  };
+  const artifactsRaw = wasm.buildDeployBundle(params, parentJs, funder.syntheticPkHex);
+  // serde_wasm_bindgen::to_value emits a JS Map for #[serde(with = "serde_bytes")]-bearing
+  // structs (camelCase field naming applies, but Map keys instead of object props).
+  const artifacts = artifactsRaw instanceof Map
+    ? Object.fromEntries(artifactsRaw)
+    : artifactsRaw;
+  ok(`launcher_id     = ${artifacts.launcherIdHex}`);
+  ok(`eve_singleton   = ${artifacts.eveSingletonCoinIdHex}`);
+  info(`coin_spends_bytes len = ${artifacts.coinSpendsBytes.length} (length-prefixed Streamable)`);
+  info(`config_json len       = ${artifacts.configJson.length} chars`);
+
+  // ── 6. Sign the coin_spends with the funder's synthetic secret ─
+  step(" → signCoinSpends");
+  const sigBytes = wasm.signCoinSpends(
+    artifacts.coinSpendsBytes,
+    funder.syntheticSecretBytes,
+    wasm.WasmNetwork.Mainnet
+  );
+  ok(`signature: ${sigBytes.length} bytes (expected 96 = BLS G2)`);
+
+  // ── 7. Assemble the SpendBundle ───────────────────────────────
+  step(" → assembleSpendBundle");
+  const bundleBytes = wasm.assembleSpendBundle(artifacts.coinSpendsBytes, sigBytes);
+  ok(`bundle: ${bundleBytes.length} bytes (Streamable SpendBundle)`);
+
+  // ── 8. Local validation (CLVM dry-run) ────────────────────────
+  step(" → verifyBundleLocally (CLVM dry-run)");
+  wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
+  ok("bundle validates locally — CLVM run_program succeeded for every coin spend");
+
+  // ── 9. Push (opt-in) ──────────────────────────────────────────
+  if (opts.pushDeploy) {
+    step(" → POST /push_tx (live mainnet — costs ~10 mojos)");
+    info("(Push not yet wired in this harness — would convert the streamable");
+    info("SpendBundle bytes to coinset.org's JSON shape and POST /push_tx, then");
+    info("poll coinRecordByName(eveSingletonCoinIdHex) until confirmed_height>0)");
+    info("");
+    info("Skipping push for now. Bundle is verified-locally and ready.");
+  } else {
+    info("Dry-run only (default). Re-run with --push to broadcast to mainnet.");
+  }
+
+  return {
+    launcherIdHex: artifacts.launcherIdHex,
+    configJson: artifacts.configJson,
+    eveSingletonCoinIdHex: artifacts.eveSingletonCoinIdHex,
+    ceremony,
+    funder,
+  };
+}
+
+function phaseWriteSideTodo() {
+  step("Phase 5+: register / vote / finalize / release (TODO)");
+  info(
+    "Phase 4 (deploy) builds + dry-runs end-to-end. The remaining write-side"
+  );
+  info("phases follow the same shape (build → sign → assemble → push):");
+  info("  • register     — needs CAT issuance pre-spend (chia-sdk-driver Cat)");
+  info("  • create/launch ballot — operator flow");
+  info("  • cast/update vote — voter flow with their secret + Voting Coin");
+  info("  • finalize     — Groth16 prove + ballot finalize");
+  info("  • release      — voter deregister + collateral return");
+  info("Each builds on phase_deploy's pattern (creds → derive → wasm export → sign → assemble).");
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +464,8 @@ async function main() {
     await phaseBallotReads(opts);
     console.log("");
     await phaseWalletCeremony(opts);
+    console.log("");
+    await phaseDeploy(opts);
     console.log("");
     phaseWriteSideTodo();
     console.log("");
