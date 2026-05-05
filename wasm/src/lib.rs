@@ -617,6 +617,168 @@ pub fn build_xch_funder_spend_js(
 }
 
 // ============================================================================
+// SECTION 5a2 — CAT registration spend builder (`buildCatRegistrationSpend`)
+// ============================================================================
+
+/// Build the Streamable-encoded CAT parent CoinSpend that funds a
+/// voter's Registration Coin. Mirrors `cli/src/bin/live_integration_test
+/// .rs::build_cat_collateral_spend` but takes a `JsChainBackend` and
+/// reconstructs the CAT lineage proof on chain.
+///
+/// SHAPE — single CAT input → up to two CAT outputs:
+///   1. Registration coin → at `fresh_registration_coin_puzzle_hash`
+///      with `collateral_amount` (CAT outer wraps inner ph emitted by
+///      the standard p2 spend).
+///   2. Change → back to validator's CAT-wrapped p2 ph (skipped if
+///      change == 0).
+///
+/// Inner conditions emitted by the standard p2 spend:
+///   * `CreateCoin(reg_inner_ph, collateral, [voter_hint memo])`
+///   * `CreateCoinAnnouncement(create_reg_msg)` — what
+///      `register.rue` asserts.
+///   * `CreateCoin(synthetic_p2, change)` if change > 0.
+///
+/// The resulting CoinSpend is the `cat_parent_spend` arg
+/// `Voter::register` (and `wasm.registerBuildSpends`) consumes.
+#[wasm_bindgen(js_name = "buildCatRegistrationSpend")]
+pub async fn build_cat_registration_spend_js(
+    backend: JsChainBackend,
+    voter_secret_hex: String,
+    cat_input_coin_id_hex: String,
+    election_launcher_id_hex: String,
+    cat_tail_hash_hex: String,
+    collateral_amount: u64,
+) -> Result<Vec<u8>, JsError> {
+    use chia_puzzle_types::standard::StandardArgs;
+    use chia_puzzle_types::DeriveSynthetic;
+    use chia_puzzle_types::Memos;
+    use chia_sdk_driver::{Cat as DriverCat, CatSpend, Puzzle, SpendContext, SpendWithConditions, StandardLayer};
+    use chip_voting_sdk::clvm_traits::ToClvm;
+    use chip_voting_sdk::clvmr::Allocator;
+    use chip_voting_sdk::Conditions;
+    use sha2::{Digest, Sha256};
+
+    let voter_secret = parse_secret_hex(&voter_secret_hex, "voter_secret_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let voter_pk = voter_secret.public_key();
+    // The voter_secret IS the account-path key (caller already derived
+    // m/12381'/8444'/2'/0); synthesise from there.
+    let synthetic_secret = voter_secret.derive_synthetic();
+    let synthetic_pk = synthetic_secret.public_key();
+    let p2_puzzle_hash =
+        chia_protocol::Bytes32::new(StandardArgs::curry_tree_hash(synthetic_pk).to_bytes());
+
+    let election_launcher_id = parse_hex32(&election_launcher_id_hex)
+        .map_err(|e| JsError::new(&format!("election_launcher_id_hex: {e}")))?;
+    let cat_tail_hash = parse_hex32(&cat_tail_hash_hex)
+        .map_err(|e| JsError::new(&format!("cat_tail_hash_hex: {e}")))?;
+    let cat_input_coin_id = parse_hex32(&cat_input_coin_id_hex)
+        .map_err(|e| JsError::new(&format!("cat_input_coin_id_hex: {e}")))?;
+
+    let chain = JsChainReader::new(backend);
+
+    // ── 1. Find CAT input coin
+    let cat_input_record = chain
+        .coin_record_by_id(cat_input_coin_id)
+        .await
+        .map_err(|e| JsError::new(&format!("coin_record_by_id: {e}")))?
+        .ok_or_else(|| JsError::new("buildCatRegistrationSpend: CAT input coin not found"))?;
+    let cat_input_coin = cat_input_record.coin;
+    if cat_input_coin.amount < collateral_amount {
+        return Err(JsError::new(&format!(
+            "CAT input amount {} < required collateral {}",
+            cat_input_coin.amount, collateral_amount,
+        )));
+    }
+
+    // ── 2. Reconstruct CAT lineage proof from parent's spend
+    let parent_id = cat_input_coin.parent_coin_info;
+    let parent_record = chain
+        .coin_record_by_id(parent_id)
+        .await
+        .map_err(|e| JsError::new(&format!("parent_coin_record: {e}")))?
+        .ok_or_else(|| JsError::new("CAT parent coin not found"))?;
+    let (puzzle_program, solution_program) = chain
+        .puzzle_and_solution(parent_id)
+        .await
+        .map_err(|e| JsError::new(&format!("parent puzzle_and_solution: {e}")))?
+        .ok_or_else(|| JsError::new("CAT parent coin is unspent — cannot derive lineage"))?;
+    let mut allocator = Allocator::new();
+    let parent_puzzle_node = puzzle_program
+        .to_clvm(&mut allocator)
+        .map_err(|e| JsError::new(&format!("parent puzzle to_clvm: {e}")))?;
+    let parent_solution_node = solution_program
+        .to_clvm(&mut allocator)
+        .map_err(|e| JsError::new(&format!("parent solution to_clvm: {e}")))?;
+    let parent_puzzle = Puzzle::parse(&allocator, parent_puzzle_node);
+    let children = DriverCat::parse_children(
+        &mut allocator,
+        parent_record.coin,
+        parent_puzzle,
+        parent_solution_node,
+    )
+    .map_err(|e| JsError::new(&format!("Cat::parse_children: {e:?}")))?
+    .ok_or_else(|| JsError::new("CAT parent is not a CAT spend"))?;
+    let cat_input = children
+        .into_iter()
+        .find(|c| c.coin.coin_id() == cat_input_coin_id)
+        .ok_or_else(|| JsError::new("CAT child not found among parent's CAT children"))?;
+
+    // ── 3. Compute the inner / outer puzzle hashes + create_reg_msg
+    let reg_inner_ph = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
+        &voter_pk,
+        election_launcher_id,
+        cat_tail_hash,
+    );
+    let reg_outer_ph = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
+        cat_tail_hash,
+        &voter_pk,
+        election_launcher_id,
+    );
+    let mut h = Sha256::new();
+    h.update(b"create_reg");
+    h.update(election_launcher_id.as_ref());
+    h.update(voter_pk.to_bytes());
+    h.update(reg_outer_ph.as_ref());
+    h.update(collateral_amount.to_be_bytes());
+    let create_reg_msg: [u8; 32] = h.finalize().into();
+
+    let voter_hint =
+        chip_voting_sdk::puzzles::voter_hint(election_launcher_id, cat_tail_hash, &voter_pk);
+
+    // ── 4. Build the inner spend (StandardLayer + Conditions)
+    let mut ctx = SpendContext::new();
+    let voter_hint_memos = ctx
+        .hint(voter_hint)
+        .map_err(|e| JsError::new(&format!("ctx.hint: {e:?}")))?;
+    let change_amount = cat_input.coin.amount.saturating_sub(collateral_amount);
+    let mut inner_conditions = Conditions::new()
+        .create_coin(reg_inner_ph, collateral_amount, voter_hint_memos)
+        .create_coin_announcement(chia_protocol::Bytes::new(create_reg_msg.to_vec()));
+    if change_amount > 0 {
+        inner_conditions = inner_conditions.create_coin(p2_puzzle_hash, change_amount, Memos::None);
+    }
+    let inner_spend = StandardLayer::new(synthetic_pk)
+        .spend_with_conditions(&mut ctx, inner_conditions)
+        .map_err(|e| JsError::new(&format!("StandardLayer::spend_with_conditions: {e:?}")))?;
+
+    // ── 5. Wrap as Cat spend, run Cat::spend_all
+    let cat_spend = CatSpend::new(cat_input, inner_spend);
+    DriverCat::spend_all(&mut ctx, &[cat_spend])
+        .map_err(|e| JsError::new(&format!("Cat::spend_all: {e:?}")))?;
+
+    // ── 6. Find the spend whose input is our CAT coin
+    let coin_spends = ctx.take();
+    let parent_spend = coin_spends
+        .into_iter()
+        .find(|cs| cs.coin.coin_id() == cat_input_coin_id)
+        .ok_or_else(|| JsError::new("CAT spend list missing the input we passed in"))?;
+
+    let bytes = encode_streamable(&parent_spend)?;
+    Ok(bytes)
+}
+
+// ============================================================================
 // SECTION 5b — Trusted-setup ceremony (`runSingleParticipantCeremony`)
 // ============================================================================
 

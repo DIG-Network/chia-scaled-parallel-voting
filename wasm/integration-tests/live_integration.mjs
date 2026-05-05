@@ -61,6 +61,7 @@ function parseArgs(argv) {
     pushDeploy: false,
     forceRedeploy: false,
     runCreateBallot: false,
+    runRegister: false,
     // Default CAT TAIL: DIG token (per app/app/create/page.tsx default).
     // Voters will need a balance of this CAT to register. Override
     // with --cat-tail <hex> for a different election currency.
@@ -87,6 +88,8 @@ function parseArgs(argv) {
       out.forceRedeploy = true;
     } else if (a === "--run-create-ballot") {
       out.runCreateBallot = true;
+    } else if (a === "--run-register") {
+      out.runRegister = true;
     }
   }
   return out;
@@ -827,8 +830,160 @@ async function phaseLaunchBallot(opts, deploy, createdBallot) {
   return launched;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 8 — phase_register_voter (each ready validator joins the SPT)
+// ---------------------------------------------------------------------------
+
+async function phaseRegisterVoter(opts, deploy) {
+  step("Phase 8: register validators against the deployed election");
+
+  if (!opts.runRegister) {
+    info("Skipping register (default). Pass --run-register to attempt.");
+    return null;
+  }
+  if (!deploy?.configJson) throw new Error("register needs deploy artifacts");
+  if (!opts.credentials) throw new Error("register needs --credentials");
+
+  const cfg = JSON.parse(deploy.configJson);
+  const catTail = "0x" + cfg.cat_tail_hash_hex.replace(/^0x/, "");
+  const collateral = cfg.collateral_amount;
+  const electionLauncherIdHex = "0x" + cfg.election_launcher_id_hex.replace(/^0x/, "");
+
+  const creds = await parseCredentials(opts.credentials);
+  const validatorsToRegister = [];
+
+  // Collect raw pubkeys for the SMT — register's non-membership proof
+  // requires the SMT NOT to include the voter being registered.
+  const allValidatorPubkeysHex = [];
+  for (const v of creds.validators) {
+    if (!v.mnemonic) continue;
+    const d = deriveSyntheticFromMnemonic(v.mnemonic);
+    // The "voter pubkey" used for SPT slot derivation is the RAW BLS
+    // pubkey at m/12381'/8444'/2'/0 (NOT the synthetic). Recompute
+    // separately.
+    const { Mnemonic, SecretKey } = await import("chia-wallet-sdk-wasm");
+    const mn = new Mnemonic(v.mnemonic);
+    const seed = mn.toSeed("");
+    const master = SecretKey.fromSeed(seed);
+    const account = master.deriveUnhardenedPath(new Uint32Array([12381, 8444, 2, 0]));
+    const accountSk = account.toBytes();
+    const accountPkHex = "0x" + bytesToHex(account.publicKey().toBytes());
+    allValidatorPubkeysHex.push(accountPkHex);
+    validatorsToRegister.push({
+      v,
+      derived: d,
+      accountSecretBytes: accountSk,
+      accountPkHex,
+      p2: "0x" + d.puzzleHashHex,
+    });
+  }
+
+  const registered = [];
+  for (const entry of validatorsToRegister) {
+    info(`\n--- Registering ${entry.v.name} (${entry.accountPkHex.slice(0, 18)}…) ---`);
+    // Find a CAT coin owned by this validator
+    const catOuter = wasm.catOuterPuzzleHash(catTail, entry.p2);
+    const catCoins = await coinRecordsByPuzzleHash(catOuter, false);
+    const ready = catCoins
+      .filter((c) => c.spentHeight === 0 && c.amount >= collateral)
+      .sort((a, b) => a.amount - b.amount);
+    if (ready.length === 0) {
+      info(`  no CAT coin >= ${collateral} mojos for ${entry.v.name}; skipping`);
+      continue;
+    }
+    const catCoin = ready[0];
+    // Compute coin id manually: sha256(parent || ph || amount_be8)
+    const catCoinIdHex = await computeCoinId(catCoin);
+    ok(`  CAT input coin: amount=${catCoin.amount} id=${catCoinIdHex.slice(0, 18)}…`);
+
+    // Build the CAT registration parent spend
+    step("   → wasm.buildCatRegistrationSpend");
+    const backend = createChainBackend({ verbose: opts.verbose });
+    const catParentSpendBytes = await wasm.buildCatRegistrationSpend(
+      backend,
+      "0x" + bytesToHex(entry.accountSecretBytes),
+      "0x" + catCoinIdHex,
+      electionLauncherIdHex,
+      catTail,
+      BigInt(collateral)
+    );
+    ok(`  CAT parent spend: ${catParentSpendBytes.length} streamable bytes`);
+
+    // Pubkeys for SMT — exclude the voter being registered (non-membership)
+    const otherPubkeys = allValidatorPubkeysHex.filter((p) => p !== entry.accountPkHex);
+
+    // Call wasm.registerBuildSpends
+    step("   → wasm.registerBuildSpends");
+    const backend2 = createChainBackend({ verbose: opts.verbose });
+    const bundleHex = await wasm.registerBuildSpends(
+      backend2,
+      deploy.configJson,
+      "0x" + bytesToHex(entry.accountSecretBytes),
+      JSON.stringify(otherPubkeys),
+      catParentSpendBytes,
+      wasm.WasmNetwork.Mainnet,
+      BigInt(deploy.electionStartHeight)
+    );
+    const bundleBytes = hexToBytesU8(bundleHex);
+    ok(`  register bundle: ${bundleBytes.length} bytes`);
+
+    step("   → verifyBundleLocally");
+    wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
+    ok("  bundle validates locally");
+
+    if (opts.pushDeploy) {
+      step("   → push register bundle");
+      const response = await pushSpendBundleBytes(bundleBytes, { network: "mainnet" });
+      if (response.status !== "SUCCESS" && response.status !== 1) {
+        throw new Error(`push: ${response.status} (${response.error ?? "(none)"})`);
+      }
+      ok(`  push_tx accepted: ${response.status}`);
+
+      // Poll for the registration coin to confirm: its predicted ph is
+      // freshRegistrationCoinPuzzleHash(config, voter_pk).
+      const regPh = wasm.freshRegistrationCoinPuzzleHash(
+        deploy.configJson,
+        entry.accountPkHex
+      );
+      info(`  predicted reg coin ph: ${regPh.slice(0, 18)}…`);
+      // Wait for any unspent coin at this ph (the reg coin)
+      const started = Date.now();
+      let regCoin = null;
+      while (Date.now() - started < 600_000) {
+        const coins = await coinRecordsByPuzzleHash(regPh, false);
+        const unspent = coins.find((c) => c.spentHeight === 0);
+        if (unspent) {
+          regCoin = unspent;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 30_000));
+      }
+      if (!regCoin) {
+        throw new Error(`reg coin for ${entry.v.name} not visible after 600s`);
+      }
+      ok(`  reg coin confirmed: amount=${regCoin.amount} (height ${regCoin.confirmedHeight})`);
+      registered.push({ ...entry, regCoin, regPh });
+    } else {
+      info("  Dry-run only — pass --push to broadcast");
+    }
+  }
+
+  return registered;
+}
+
+/** Compute coin id via chia-wallet-sdk-wasm's canonical Coin.coinId(). */
+async function computeCoinId(coinRecord) {
+  const { Coin } = await import("chia-wallet-sdk-wasm");
+  const coin = new Coin(
+    hexToBytesU8(coinRecord.parentCoinInfo),
+    hexToBytesU8(coinRecord.puzzleHash),
+    BigInt(coinRecord.amount)
+  );
+  return bytesToHex(coin.coinId());
+}
+
 function phaseWriteSideTodo() {
-  step("Phase 8+: register / vote / finalize / release (TODO)");
+  step("Phase 9+: vote / finalize / release (TODO)");
   info(
     "Phase 4 (deploy) builds + dry-runs end-to-end. The remaining write-side"
   );
@@ -868,6 +1023,8 @@ async function main() {
     const createdBallot = await phaseCreateBallot(opts, deploy);
     console.log("");
     await phaseLaunchBallot(opts, deploy, createdBallot);
+    console.log("");
+    await phaseRegisterVoter(opts, deploy);
     console.log("");
     phaseWriteSideTodo();
     console.log("");
