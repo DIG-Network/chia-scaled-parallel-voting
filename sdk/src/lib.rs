@@ -102,6 +102,18 @@ pub fn dry_run_coin_spends(coin_spends: &[chia_protocol::CoinSpend]) -> error::V
     use clvmr::{run_program, Allocator, ChiaDialect};
 
     let dialect = ChiaDialect::new(0);
+    // Bundle-balance accumulator. The on-chain consensus rejects any
+    // bundle whose total CreateCoin output exceeds total coin input
+    // with `MINTING_COIN`. `dry_run_coin_spends` is the SDK's last
+    // safety net before a bundle hits the network — surface that
+    // class of error here, while the bundle is in memory and we know
+    // exactly which spend's CreateCoins put us over.
+    //
+    // (Net positive `total_input - total_output` is the bundle fee
+    // — allowed; consensus accepts it.)
+    let total_input: u128 = coin_spends.iter().map(|cs| cs.coin.amount as u128).sum();
+    let mut total_output: u128 = 0;
+    let mut create_coin_breakdown: Vec<String> = Vec::new();
     for (i, cs) in coin_spends.iter().enumerate() {
         let mut allocator = Allocator::new();
         let puzzle_node = cs.puzzle_reveal.to_clvm(&mut allocator).map_err(|e| {
@@ -140,14 +152,14 @@ pub fn dry_run_coin_spends(coin_spends: &[chia_protocol::CoinSpend]) -> error::V
                 .into(),
             ))
         })?;
-        match run_program(
+        let conditions_node = match run_program(
             &mut allocator,
             &dialect,
             puzzle_node,
             solution_node,
             11_000_000_000,
         ) {
-            Ok(_) => {} // success, conditions discarded
+            Ok(reduction) => reduction.1,
             Err(e) => {
                 return Err(error::VotingError::Other(error::anyhow_compat::Error(
                     format!(
@@ -158,7 +170,53 @@ pub fn dry_run_coin_spends(coin_spends: &[chia_protocol::CoinSpend]) -> error::V
                     .into(),
                 )));
             }
+        };
+        // Walk the conditions list and sum CreateCoin (opcode 51) amounts
+        // contributed by THIS spend. Catches bundle imbalances (MINTING_COIN)
+        // before broadcast.
+        let mut spend_output: u128 = 0;
+        let mut node = conditions_node;
+        while let Some((cond, rest)) = allocator.next(node) {
+            // Each cond should be a list `(opcode puzzle_hash amount [hint ...])`.
+            if let Some((op, args1)) = allocator.next(cond) {
+                let opcode = allocator.small_number(op).unwrap_or(0);
+                if opcode == 51 {
+                    // CreateCoin: args1 = (puzzle_hash, (amount, ...))
+                    if let Some((_ph, args2)) = allocator.next(args1) {
+                        if let Some((amount_node, _rest)) = allocator.next(args2) {
+                            let amount_atom = allocator.atom(amount_node);
+                            let mut amount: u128 = 0;
+                            for &b in amount_atom.as_ref() {
+                                amount = (amount << 8) | u128::from(b);
+                            }
+                            spend_output = spend_output.saturating_add(amount);
+                        }
+                    }
+                }
+            }
+            node = rest;
         }
+        if spend_output > 0 {
+            create_coin_breakdown.push(format!(
+                "spend[{i}] (coin {}, amount {}) → CreateCoin total {}",
+                hex::encode(cs.coin.coin_id()),
+                cs.coin.amount,
+                spend_output
+            ));
+        }
+        total_output = total_output.saturating_add(spend_output);
+    }
+    if total_output > total_input {
+        return Err(error::VotingError::Other(error::anyhow_compat::Error(
+            format!(
+                "dry_run: BUNDLE IMBALANCE — would create {} mojos but only consume {} \
+                 (MINTING_COIN class). Per-spend CreateCoin breakdown:\n  {}",
+                total_output,
+                total_input,
+                create_coin_breakdown.join("\n  ")
+            )
+            .into(),
+        )));
     }
     Ok(())
 }

@@ -1616,24 +1616,34 @@ async fn phase_create_ballot(
         "createBallot params snapshot"
     );
 
-    // 2-mojo XCH funder coin to mint the launcher eve coin. The
-    // standard p2 puzzle wraps a quoted-conditions list that emits
-    // exactly the create_coin(SINGLETON_LAUNCHER_HASH, 2) the action
-    // expects.
+    // XCH funder coin that provides 2 mojos to the bundle (consumed by
+    // the singleton's CreateCoin(SINGLETON_LAUNCHER_HASH, 2) for the
+    // launcher eve coin). The funder MUST NOT itself emit the
+    // launcher CreateCoin — only the createBallot action's puzzle
+    // does, with parent = singleton_coin_id (per
+    // ballot.rs::create_ballot's `eve_coin_id` formula). If the
+    // funder ALSO emitted CreateCoin(SINGLETON_LAUNCHER, 2), the
+    // bundle would have two outputs amount-2 each (one from the
+    // funder, one from the singleton), totalling 4 mojos of launcher
+    // outputs while the singleton only consumes 1 mojo of input —
+    // bundle would be net-MINT 2 mojos and consensus rejects with
+    // MINTING_COIN. Mirror of the simulator pattern in
+    // tests/create_ballot_e2e.rs (a bare 2-mojo coin with empty
+    // conditions); we use a real funder XCH and emit only change so
+    // the bundle balances exactly:
+    //   funder in:    funder_xch.amount
+    //   funder out:   funder_xch.amount - 2  (change)
+    //   singleton in: 1
+    //   singleton out: launcher(2) + recreation(1) = 3
+    //   total:        funder_xch.amount + 1 in, funder_xch.amount + 1 out
     let funder_xch = find_xch_coin(chain, funding_keys.p2_puzzle_hash, 2)
         .await
         .context("phase_create_ballot: no XCH funder coin (need ≥2 mojos)")?;
     let funder_input_id: Bytes32 = funder_xch.coin_id().into();
     let funder_change = funder_xch.amount.saturating_sub(2);
 
-    // Build the funder spend via the standard p2 puzzle: emit
-    // create_coin(SINGLETON_LAUNCHER_HASH, 2) plus change back to
-    // the funder. The BallotIssuer's createBallot action then asserts
-    // a CCA from the singleton to bind this funder coin into the
-    // bundle.
     let mut ctx = SpendContext::new();
-    let launcher_ph_b32 = Bytes32::from(chip_voting_sdk::SINGLETON_LAUNCHER_HASH);
-    let mut funder_conditions = Conditions::new().create_coin(launcher_ph_b32, 2, Memos::None);
+    let mut funder_conditions = Conditions::new();
     if funder_change > 0 {
         funder_conditions =
             funder_conditions.create_coin(funding_keys.p2_puzzle_hash, funder_change, Memos::None);
