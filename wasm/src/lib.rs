@@ -864,6 +864,68 @@ impl WasmUpdateVoteParams {
     }
 }
 
+/// JS-side input mirror of [`chip_voting_sdk::actors::ballot::CreateBallotParams`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmCreateBallotParams {
+    pub ballot_seed_hex: String,
+    pub vote_close_height: u64,
+    pub outcome_domain_hash_hex: String,
+}
+
+impl WasmCreateBallotParams {
+    fn into_sdk(self) -> VotingResult<chip_voting_sdk::actors::ballot::CreateBallotParams> {
+        Ok(chip_voting_sdk::actors::ballot::CreateBallotParams {
+            ballot_seed: parse_hex32(&self.ballot_seed_hex)?,
+            vote_close_height: self.vote_close_height,
+            outcome_domain_hash: parse_hex32(&self.outcome_domain_hash_hex)?,
+        })
+    }
+}
+
+/// JS-side input mirror of [`chip_voting_sdk::actors::ballot::LaunchBallotParams`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmLaunchBallotParams {
+    pub vote_close_height: u64,
+    pub outcome_domain_hash_hex: String,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+}
+
+impl WasmLaunchBallotParams {
+    fn into_sdk(self) -> VotingResult<chip_voting_sdk::actors::ballot::LaunchBallotParams> {
+        Ok(chip_voting_sdk::actors::ballot::LaunchBallotParams {
+            vote_close_height: self.vote_close_height,
+            outcome_domain_hash: parse_hex32(&self.outcome_domain_hash_hex)?,
+            vote_threshold_num: self.vote_threshold_num,
+            vote_threshold_den: self.vote_threshold_den,
+        })
+    }
+}
+
+/// JSON-friendly result of a `createBallotBundle` call. Mirrors
+/// [`chip_voting_sdk::actors::ballot::CreatedBallot`] with hex
+/// strings for the on-chain ids and the SpendBundle as Streamable bytes.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmCreatedBallot {
+    pub ballot_launcher_id_hex: String,
+    pub ballot_coin_id_hex: String,
+    pub spend_bundle_hex: String,
+}
+
+/// JSON-friendly result of a `launchBallotBundle` call. Mirrors
+/// [`chip_voting_sdk::actors::ballot::LaunchedBallot`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmLaunchedBallot {
+    pub ballot_launcher_id_hex: String,
+    pub eve_ballot_coin_id_hex: String,
+    pub eve_ballot_puzzle_hash_hex: String,
+    pub spend_bundle_hex: String,
+}
+
 /// JSON-friendly result of a cast/update-vote build call. The
 /// SpendBundle is encoded as length-prefixed Streamable bytes (the
 /// canonical chia wire form, identical to what `encodeBundle` /
@@ -965,38 +1027,105 @@ pub fn register_build_spends_js(
 }
 
 /// Mint a fresh Ballot Coin launcher (per CHIP rev §211-253). Wraps
-/// `BallotIssuer::create_ballot`. Mirrors `phase_create_ballot`.
+/// [`chip_voting_sdk::actors::ballot::BallotIssuer::create_ballot`].
+/// Mirrors `phase_create_ballot` in the live integration test.
+///
+/// `funder_spend_bytes` is a Streamable-encoded `CoinSpend` the
+/// dApp pre-builds (and externally signs if its puzzle requires it)
+/// to provide the 2 mojos the Ballot Coin launcher eve needs. The
+/// returned bundle's aggregated signature only covers AGG_SIG
+/// conditions emitted by the singleton spend itself; the funder's
+/// signature must be aggregated in JS-side via `assembleSpendBundle`
+/// before pushing.
+///
+/// Returns a JSON-serialised [`WasmCreatedBallot`].
 #[wasm_bindgen(js_name = "createBallotBundle")]
-pub fn create_ballot_bundle_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-    _operator_sk_hex: &str,
-    _ballot_seed_hex: &str,
-    _vote_close_height: u64,
-    _outcome_domain_hash_hex: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "createBallotBundle: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
-    ))
+pub async fn create_ballot_bundle_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    funder_spend_bytes: Vec<u8>,
+    params_json: String,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let funder_spend: chia_protocol::CoinSpend = decode_streamable(&funder_spend_bytes)?;
+    let wasm_params: WasmCreateBallotParams = serde_json::from_str(&params_json)
+        .map_err(|e| JsError::new(&format!("CreateBallotParams parse: {e}")))?;
+    let sdk_params = wasm_params
+        .into_sdk()
+        .map_err(|e| JsError::new(&format!("CreateBallotParams decode: {e}")))?;
+    let issuer = chip_voting_sdk::actors::ballot::BallotIssuer::new(
+        cfg,
+        wasm_network_to_sdk(network),
+    )
+    .with_election_start_height(election_start_height);
+    let chain = JsChainReader::new(backend);
+    let result = issuer
+        .create_ballot(&chain, sdk_params, funder_spend)
+        .await
+        .map_err(|e| JsError::new(&format!("create_ballot: {e}")))?;
+    let bundle_bytes = encode_streamable(&result.spend_bundle)?;
+    let out = WasmCreatedBallot {
+        ballot_launcher_id_hex: hex::encode(result.ballot_launcher_id),
+        ballot_coin_id_hex: hex::encode(result.ballot_coin_id),
+        spend_bundle_hex: hex::encode(&bundle_bytes),
+    };
+    serde_json::to_string(&out)
+        .map_err(|e| JsError::new(&format!("encode WasmCreatedBallot: {e}")))
 }
 
 /// Second-spend the ballot launcher → eve Ballot Coin (per CHIP
-/// rev §211-253). Wraps `BallotIssuer::launch_ballot`. Mirrors
-/// `phase_launch_ballot`.
+/// rev §211-253). Wraps
+/// [`chip_voting_sdk::actors::ballot::BallotIssuer::launch_ballot`].
+/// Mirrors `phase_launch_ballot` in the live integration test.
+///
+/// The `launcher_coin_id_hex` is the `ballot_launcher_id` returned
+/// by an earlier `createBallotBundle` call.
+///
+/// Returns a JSON-serialised [`WasmLaunchedBallot`].
 #[wasm_bindgen(js_name = "launchBallotBundle")]
-pub fn launch_ballot_bundle_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-    _operator_sk_hex: &str,
-    _launcher_coin_id_hex: &str,
-    _vote_close_height: u64,
-    _outcome_domain_hash_hex: &str,
-    _vote_threshold_num: u64,
-    _vote_threshold_den: u64,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "launchBallotBundle: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
-    ))
+pub async fn launch_ballot_bundle_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    launcher_coin_id_hex: String,
+    params_json: String,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let launcher_coin_id = parse_hex32(&launcher_coin_id_hex)
+        .map_err(|e| JsError::new(&format!("launcher_coin_id_hex: {e}")))?;
+    let wasm_params: WasmLaunchBallotParams = serde_json::from_str(&params_json)
+        .map_err(|e| JsError::new(&format!("LaunchBallotParams parse: {e}")))?;
+    let sdk_params = wasm_params
+        .into_sdk()
+        .map_err(|e| JsError::new(&format!("LaunchBallotParams decode: {e}")))?;
+    let issuer = chip_voting_sdk::actors::ballot::BallotIssuer::new(
+        cfg,
+        wasm_network_to_sdk(network),
+    )
+    .with_election_start_height(election_start_height);
+    let chain = JsChainReader::new(backend);
+    let result = issuer
+        .launch_ballot(&chain, launcher_coin_id, sdk_params)
+        .await
+        .map_err(|e| JsError::new(&format!("launch_ballot: {e}")))?;
+    let bundle_bytes = encode_streamable(&result.spend_bundle)?;
+    let out = WasmLaunchedBallot {
+        ballot_launcher_id_hex: hex::encode(result.ballot_launcher_id),
+        eve_ballot_coin_id_hex: hex::encode(result.eve_ballot_coin_id),
+        eve_ballot_puzzle_hash_hex: hex::encode(result.eve_ballot_puzzle_hash),
+        spend_bundle_hex: hex::encode(&bundle_bytes),
+    };
+    serde_json::to_string(&out)
+        .map_err(|e| JsError::new(&format!("encode WasmLaunchedBallot: {e}")))
 }
 
 /// Build (preview) the cast-vote spend without attaching the voter's
