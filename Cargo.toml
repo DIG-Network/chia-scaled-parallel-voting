@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "sdk",
     "cli",
+    "wasm",
 ]
 
 # Hoist common dependency versions here so the SDK and CLI stay in

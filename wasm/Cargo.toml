@@ -1,0 +1,79 @@
+[package]
+name        = "chip-voting-wasm"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Browser / WalletConnect bindings for the Chia voting CHIP SDK. Exposes pure SDK helpers via wasm-bindgen and ships a JsChainReader that proxies chain reads through caller-supplied JS callbacks (typically wired to WalletConnect / Sage RPC / coinset.org fetch in the dApp)."
+
+# `cdylib` for the wasm artefact; `rlib` so other Rust crates can
+# depend on this for tests / integration.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# `console-panic-hook` installs a JS-friendly panic hook so Rust
+# panics surface in the browser console instead of being swallowed
+# inside the wasm boundary. Enabled by default in `wasm-pack build`
+# pipelines; disable for size-sensitive deploys.
+console-panic-hook = ["console_error_panic_hook"]
+
+[dependencies]
+# Core SDK with NO native chain features — pure CLVM / BLS / Groth16
+# / puzzle math only. Browser callers cannot pull in `chia-query`
+# (peer pool + native-tls) or `dig-l1-wallet` (openssl + tokio
+# sockets); both are gated behind the SDK's `native` feature.
+chip-voting-sdk = { path = "../sdk", default-features = false }
+
+# wasm-bindgen surface.
+wasm-bindgen          = "0.2"
+wasm-bindgen-futures  = "0.4"
+js-sys                = "0.3"
+serde-wasm-bindgen    = "0.6"
+console_error_panic_hook = { version = "0.1", optional = true }
+
+# Re-exported by the SDK but we also need direct types for the JS
+# bridge (Bytes32 / Coin / SpendBundle conversions).
+chia-protocol     = "0.26"
+chia-bls          = "0.26"
+chia-traits       = "0.26"   # Streamable trait — for byte-encoding round-trips
+chia-puzzle-types = "0.26"   # StandardArgs::curry_tree_hash — used by standardPuzzleHash export
+chia-sdk-driver   = "0.30"   # Cat / CatInfo — used by buildCatCollateralSpend
+clvm-utils        = "0.26"   # TreeHash — used by catOuterPuzzleHash
+sha2              = "0.10"   # used by registrationMessage helper
+
+# Groth16 prover — needed by buildFinalizeBundle (browser proves).
+ark-groth16   = { version = "0.4", default-features = false, features = ["std"] }
+ark-bls12-381 = { version = "0.4", default-features = false, features = ["std", "curve"] }
+ark-serialize = { version = "0.4", default-features = false, features = ["std"] }
+
+# Async glue for the JsChainReader (which polls JS Promises).
+async-trait = "0.1"
+
+# `getrandom` with the `js` feature so the SDK's prover / ceremony
+# code can call `getrandom::getrandom` from inside wasm. Without
+# this, every random-byte call panics at runtime in the browser.
+getrandom = { version = "0.2", features = ["js"] }
+
+# Standard utility.
+hex         = "0.4"
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+serde_bytes = "0.11"   # `#[serde(with = "serde_bytes")]` on Vec<u8> fields ⇒ JS Uint8Array
+thiserror   = "2.0"
+tracing     = "0.1"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# ── BUILD PREREQUISITE ──────────────────────────────────────────────
+#
+# This crate transitively pulls in `blst` (the BLS12-381 C library
+# used by `chia-bls`). Compiling `blst` for wasm32-unknown-unknown
+# requires **clang** (or LLVM) on PATH:
+#   * Windows : `choco install llvm`  →  ensure `C:\Program Files\LLVM\bin` on PATH
+#   * macOS   : `brew install llvm`
+#   * Linux   : `apt install clang lld` / `dnf install clang lld` / etc.
+#
+# The Rust toolchain target itself: `rustup target add wasm32-unknown-unknown`.
+# Recommended runner: `wasm-pack build --target web --release`.
