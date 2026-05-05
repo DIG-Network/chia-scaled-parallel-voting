@@ -1911,44 +1911,58 @@ async fn phase_vote(
         "vote cast (Voting Coin minted, Registration Coin recreated)"
     );
 
-    // Compute the post-cast Registration Coin id directly from SDK
-    // helpers — no chain query needed, so propagation lag in
-    // coinset.org's parent-id secondary index doesn't block us.
+    // Find the post-cast Registration Coin id by querying the chain
+    // for children of the spent pre-vote reg coin, then filtering by
+    // amount. Two children: the Voting Coin (amount=voting_coin_amount=1)
+    // and the recreated Registration Coin (amount=collateral_amount−1).
+    // We pick the one whose amount is NOT 1 — that's the reg coin.
     //
-    // The post-cast reg coin's PARENT is the spent pre-vote reg coin
-    // id; its PUZZLE HASH is the CAT-wrapped predicted hash for a
-    // RegistrationState whose `voted_ballots_root` now contains the
-    // ballot just cast for; its AMOUNT is collateral_amount.
-    let cat_tail_hash = deploy
-        .config
-        .cat_tail_hash()
-        .map_err(|e| anyhow::anyhow!("cat_tail_hash: {e:?}"))?;
-    let election_launcher_id = deploy
-        .config
-        .election_launcher_id()
-        .map_err(|e| anyhow::anyhow!("election_launcher_id: {e:?}"))?;
-    let post_cast_voted_root =
-        chip_voting_sdk::puzzles::voted_ballots_root_after_inserts(&[ballot.ballot_launcher_id]);
-    let post_cast_inner_hash = chip_voting_sdk::puzzles::registration_inner_hash_for_state(
-        &voter_keys.pubkey,
-        election_launcher_id,
-        cat_tail_hash,
-        post_cast_voted_root,
-        None,
-    );
-    let post_cast_outer_ph = chip_voting_sdk::puzzles::cat_outer_for_inner_hash(
-        cat_tail_hash,
-        post_cast_inner_hash,
-    );
-    let post_cast_reg_coin =
-        chia_protocol::Coin::new(reg_coin_id, post_cast_outer_ph, args.collateral_amount);
-    let post_cast_reg_coin_id: Bytes32 = post_cast_reg_coin.coin_id().into();
-    info!(
-        voter_label,
-        post_cast_reg_coin_id = %hex::encode(post_cast_reg_coin_id),
-        "computed post-cast Registration Coin id (predicted via SDK helpers)"
-    );
-    Ok(post_cast_reg_coin_id)
+    // Note: this uses coinset.org's parent-id secondary index which can
+    // lag the chain by 1-3 blocks on mainnet. Poll with a generous
+    // timeout (3 min) before bailing.
+    let voting_coin_amount: u64 = 1;
+    let started = std::time::Instant::now();
+    let max_wait = Duration::from_secs(args.confirmation_timeout_secs.max(180));
+    let poll = Duration::from_secs(args.poll_interval_secs.max(10));
+    loop {
+        match chain
+            .get_coin_records_by_parent_ids(
+                &[format!("0x{}", hex::encode(reg_coin_id))],
+                None,
+                None,
+                true,
+            )
+            .await
+        {
+            Ok(records) => {
+                if let Some(post_cast) =
+                    records.iter().find(|r| r.coin.amount != voting_coin_amount)
+                {
+                    let parent = parse_b32_str(&post_cast.coin.parent_coin_info)?;
+                    let ph = parse_b32_str(&post_cast.coin.puzzle_hash)?;
+                    let coin = chia_protocol::Coin::new(parent, ph, post_cast.coin.amount);
+                    let post_cast_id: Bytes32 = coin.coin_id().into();
+                    info!(
+                        voter_label,
+                        post_cast_reg_coin_id = %hex::encode(post_cast_id),
+                        amount = post_cast.coin.amount,
+                        "located post-cast Registration Coin"
+                    );
+                    return Ok(post_cast_id);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "post-cast reg coin lookup transient error — retry");
+            }
+        }
+        if started.elapsed() >= max_wait {
+            return Err(anyhow::anyhow!(
+                "phase_vote: post-cast Registration Coin not visible after {}s",
+                started.elapsed().as_secs()
+            ));
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 // ── Phase 5: Finalize the Ballot Coin ────────────────────────────────
