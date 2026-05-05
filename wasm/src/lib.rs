@@ -557,17 +557,75 @@ pub fn derive_launcher_id_js(
 /// `JsError`.
 #[wasm_bindgen(js_name = "buildDeployBundle")]
 pub fn build_deploy_bundle_js(
-    _params: JsValue,
-    _parent_coin: JsValue,
-    _funder_pk_hex: &str,
+    params: JsValue,
+    parent_coin: JsValue,
+    funder_pk_hex: &str,
 ) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "buildDeployBundle: not yet wired in the wasm build. \
-         `ElectionDeployer` / `DeployParams` and the eve-singleton \
-         coin-id helpers live behind the SDK's `native` feature. \
-         The puzzle-build path is wasm-portable in principle and \
-         is the next planned follow-up.",
-    ))
+    use chip_voting_sdk::actors::aggregator::compute_eve_inner_puzzle_hash;
+    use chip_voting_sdk::actors::deployer::{derive_launcher_id, DeployParams, ElectionDeployer};
+    use chip_voting_sdk::ceremony::VerificationKey;
+    use chip_voting_sdk::puzzles::election_singleton_puzzle_hash;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsDeployParams {
+        verification_key_hex: String,
+        cat_tail_hash_hex: String,
+        collateral_amount: u64,
+        election_start_height: u64,
+        #[serde(default)]
+        label: Option<String>,
+    }
+    let p: JsDeployParams = serde_wasm_bindgen::from_value(params)
+        .map_err(|e| JsError::new(&format!("DeployParams decode: {e}")))?;
+    let pc: JsCoinRecord = serde_wasm_bindgen::from_value(parent_coin)
+        .map_err(|e| JsError::new(&format!("parent_coin decode: {e}")))?;
+
+    let vk_bytes = hex::decode(p.verification_key_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("verification_key_hex decode: {e}")))?;
+    let cat_tail = parse_hex32(&p.cat_tail_hash_hex)
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
+    let parent_coin_obj = coin_from_js(&pc)
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
+
+    let pk_bytes = hex::decode(funder_pk_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("funder_pk_hex decode: {e}")))?;
+    let pk_arr: [u8; 48] = pk_bytes
+        .try_into()
+        .map_err(|_| JsError::new("funder_pk_hex must be 48 bytes"))?;
+    let funder_pk = PublicKey::from_bytes(&pk_arr)
+        .map_err(|e| JsError::new(&format!("PublicKey::from_bytes: {e:?}")))?;
+
+    let deployer = ElectionDeployer::new(DeployParams {
+        verification_key: VerificationKey { raw_bytes: vk_bytes },
+        cat_tail_hash: cat_tail,
+        collateral_amount: p.collateral_amount,
+        election_start_height: p.election_start_height,
+        label: p.label,
+    });
+    let (coin_spends, config) = deployer
+        .build_deploy_bundle(parent_coin_obj, funder_pk)
+        .map_err(|e| JsError::new(&format!("build_deploy_bundle: {e:?}")))?;
+
+    let launcher_id = derive_launcher_id(parent_coin_obj.coin_id(), 1);
+    let eve_inner_ph = compute_eve_inner_puzzle_hash(&config, p.election_start_height);
+    let eve_outer_ph = election_singleton_puzzle_hash(launcher_id, eve_inner_ph);
+    let eve_coin = chia_protocol::Coin::new(launcher_id, eve_outer_ph, 1);
+    let eve_id = eve_coin.coin_id();
+
+    let coin_spends_bytes = encode_coin_spends(&coin_spends)?;
+
+    let config_json = serde_json::to_string(&config)
+        .map_err(|e| JsError::new(&format!("config serialize: {e}")))?;
+
+    let result = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "coinSpendsBytes": coin_spends_bytes,
+        "launcherIdHex": format!("0x{}", hex::encode(launcher_id)),
+        "configJson": config_json,
+        "eveSingletonCoinIdHex": format!("0x{}", hex::encode(eve_id)),
+    }))
+    .map_err(|e| JsError::new(&format!("result encode: {e}")))?;
+    Ok(result)
 }
 
 // ============================================================================
