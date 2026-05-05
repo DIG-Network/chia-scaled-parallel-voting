@@ -72,7 +72,7 @@ use chia_sdk_test::Simulator;
 use chip_voting_sdk::actors::voter::VoterKeys;
 use chip_voting_sdk::merkle::SparseMerkleTree;
 use chip_voting_sdk::{Aggregator, ElectionDeployer, Indexer, Voter, VotingError};
-use dig_l1_wallet::NetworkType;
+use chip_voting_sdk::NetworkType;
 
 // ── ElectionDeployer ────────────────────────────────────────────────
 

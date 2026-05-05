@@ -19,6 +19,58 @@
 use chia_protocol::Bytes32;
 use serde::{Deserialize, Serialize};
 
+/// ENUM: NetworkType
+/// WHAT: SDK-native network selector. Identifies which Chia network the
+///       election runs against — selects the `agg_sig_me_additional_data`
+///       (genesis challenge) used when augmenting AGG_SIG conditions
+///       at signing time, and the network_id ("mainnet" / "testnet11")
+///       for RPC endpoints.
+/// USAGE: held by every actor (`Voter`, `Aggregator`, `BallotIssuer`,
+///        `ElectionDeployer`); travels through the chain-IO boundary as-is.
+/// PORTABILITY: deliberately wasm-buildable — does NOT depend on
+///              `dig_l1_wallet` or `chia_query`. Bidirectional `From`
+///              conversions to/from `dig_l1_wallet::NetworkType` /
+///              `chia_query::NetworkType` are provided behind the
+///              `native` feature so callers can interop with the
+///              upstream signing / RPC libraries on the host target.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkType {
+    Mainnet,
+    Testnet11,
+}
+
+impl NetworkType {
+    /// Network identifier string used by Chia node RPCs.
+    pub fn network_id(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet11 => "testnet11",
+        }
+    }
+}
+
+// `dig_l1_wallet::NetworkType` is a re-export of `chia_query::NetworkType`,
+// so a single pair of From impls covers both upstream callers.
+#[cfg(feature = "native")]
+impl From<chia_query::NetworkType> for NetworkType {
+    fn from(n: chia_query::NetworkType) -> Self {
+        match n {
+            chia_query::NetworkType::Mainnet => Self::Mainnet,
+            chia_query::NetworkType::Testnet11 => Self::Testnet11,
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl From<NetworkType> for chia_query::NetworkType {
+    fn from(n: NetworkType) -> Self {
+        match n {
+            NetworkType::Mainnet => Self::Mainnet,
+            NetworkType::Testnet11 => Self::Testnet11,
+        }
+    }
+}
+
 /// FN: parse_bytes32 (file-private)
 /// WHAT: hex string → `Bytes32` with sane error reporting.
 /// TRIM: strips surrounding whitespace for ergonomic JSON.

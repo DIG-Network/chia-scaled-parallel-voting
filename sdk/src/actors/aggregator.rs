@@ -27,7 +27,7 @@
 
 use chia_bls::{aggregate, PublicKey, SecretKey, Signature};
 use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
-use dig_l1_wallet::NetworkType;
+use crate::config::NetworkType;
 
 use crate::actors::deployer::sign_bundle_signature;
 use crate::chain::ChainReader;

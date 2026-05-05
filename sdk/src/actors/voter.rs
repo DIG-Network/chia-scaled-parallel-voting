@@ -52,7 +52,7 @@ use chia_bls::{PublicKey, SecretKey, Signature};
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_sdk_driver::SpendContext;
 use clvm_traits::ToClvm;
-use dig_l1_wallet::NetworkType;
+use crate::config::NetworkType;
 
 use crate::action_spends::{
     build_action_layer_puzzle, build_action_layer_solution, build_election_finalizer_full,

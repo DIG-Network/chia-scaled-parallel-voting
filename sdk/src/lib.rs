@@ -76,7 +76,7 @@ pub use actors::deployer::{DeployParams, DeploymentArtifacts};
 pub use actors::voter::VoterKeys;
 #[cfg(feature = "native")]
 pub use actors::{Aggregator, ElectionDeployer, Indexer, Voter};
-pub use config::{ElectionConfig, MAX_SIGNERS, PUBLIC_INPUT_COUNT, TREE_DEPTH};
+pub use config::{ElectionConfig, NetworkType, MAX_SIGNERS, PUBLIC_INPUT_COUNT, TREE_DEPTH};
 pub use error::{VotingError, VotingResult};
 pub use state::{ElectionState, RegistrationState, VoteRecord, VoterSet};
 
@@ -307,13 +307,13 @@ pub fn validate_bundle_for_consensus(
 #[cfg(feature = "native")]
 pub fn verify_bundle_signatures(
     bundle: &chia_protocol::SpendBundle,
-    network: chia_query::NetworkType,
+    network: config::NetworkType,
 ) -> error::VotingResult<()> {
     use chia_sdk_signer::{AggSigConstants, RequiredSignature};
     use clvmr::Allocator;
     use dig_l1_wallet::transaction::get_agg_sig_data;
 
-    let agg = AggSigConstants::new(get_agg_sig_data(network));
+    let agg = AggSigConstants::new(get_agg_sig_data(network.into()));
     let mut allocator = Allocator::new();
     let required = RequiredSignature::from_coin_spends(&mut allocator, &bundle.coin_spends, &agg)
         .map_err(|e| {
@@ -354,7 +354,7 @@ pub use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 pub use actors::aggregator::wait_for_current_singleton;
 pub use chain::wait_for_unspent_coin_at_puzzle_hash;
 #[cfg(feature = "native")]
-pub use chia_query::{ChiaQuery, ChiaQueryConfig, NetworkType};
+pub use chia_query::{ChiaQuery, ChiaQueryConfig};
 // Re-export the coinset.org HTTP client. `chia_query`'s router does
 // peer → peer-retry → coinset, returning the FIRST peer's TxStatus
 // even when that status is `FAILED` (which is `Ok(TxStatus { status:

@@ -39,9 +39,8 @@ use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_puzzles::SINGLETON_LAUNCHER_HASH;
 use chia_sdk_driver::{Launcher, SpendContext, StandardLayer};
 use dig_l1_wallet::transaction::{assemble_spend_bundle, get_agg_sig_data, sign_coin_spends};
-use dig_l1_wallet::NetworkType;
 
-use crate::config::ElectionConfig;
+use crate::config::{ElectionConfig, NetworkType};
 use crate::error::{anyhow_compat, VotingError, VotingResult};
 use crate::puzzles::{self, PuzzleHashes};
 use crate::state::ElectionState;
@@ -380,7 +379,7 @@ pub fn sign_bundle_signature(
     secret_keys: &[SecretKey],
     network: NetworkType,
 ) -> VotingResult<Signature> {
-    let agg_sig_data = get_agg_sig_data(network);
+    let agg_sig_data = get_agg_sig_data(network.into());
     sign_coin_spends(coin_spends, secret_keys, agg_sig_data).map_err(|e| {
         VotingError::Other(anyhow_compat::Error(
             format!("sign_coin_spends failed: {e}").into(),
