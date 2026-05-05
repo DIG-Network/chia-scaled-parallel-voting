@@ -493,6 +493,8 @@ async function phaseDeploy(opts) {
     launcherIdHex: artifacts.launcherIdHex,
     configJson: artifacts.configJson,
     eveSingletonCoinIdHex: artifacts.eveSingletonCoinIdHex,
+    electionStartHeight: peak,
+    catTailHashHex: opts.catTailHashHex,
     ceremony,
     funder,
   };
@@ -714,7 +716,12 @@ async function phaseCreateBallot(opts, deploy) {
     info("Dry-run only. Pass --push to broadcast.");
   }
 
-  return created;
+  return {
+    ...created,
+    voteCloseHeight,
+    outcomeDomainHashHex,
+    ballotSeedHex,
+  };
 }
 
 // Inline hex helpers (avoid pulling chia-wallet-sdk-wasm just for fromHex).
@@ -730,8 +737,98 @@ function bytesToHex(bytes) {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ---------------------------------------------------------------------------
+// Phase 7 — phase_launch_ballot (second-spend the ballot launcher → eve)
+// ---------------------------------------------------------------------------
+
+async function phaseLaunchBallot(opts, deploy, createdBallot) {
+  step("Phase 7: launch the ballot eve singleton");
+
+  if (!opts.runCreateBallot) {
+    info("Skipping launch (default — paired with --run-create-ballot)");
+    return null;
+  }
+  if (!createdBallot?.ballotLauncherIdHex) {
+    info("Skipping launch — phase_create_ballot didn't produce a launcher");
+    return null;
+  }
+
+  // Wait until the ballot launcher coin is itself spendable (it must
+  // exist on chain). createBallot already polled for confirmation
+  // when --push was used; in dry-run the coin doesn't exist so we
+  // skip.
+  if (!opts.pushDeploy) {
+    info("(create_ballot wasn't pushed; skipping launch — re-run with --push)");
+    return null;
+  }
+
+  const ballotLauncherIdHex = createdBallot.ballotLauncherIdHex.startsWith("0x")
+    ? createdBallot.ballotLauncherIdHex
+    : "0x" + createdBallot.ballotLauncherIdHex;
+  info(`launching ballot ${ballotLauncherIdHex.slice(0, 18)}…`);
+
+  // Per-ballot params: same vote_close_height + outcome_domain we used
+  // at create. Threshold = 1/2 (strict majority of weight).
+  const params = {
+    voteCloseHeight: createdBallot.voteCloseHeight ?? deploy.electionStartHeight + 50,
+    outcomeDomainHashHex: createdBallot.outcomeDomainHashHex ?? "0x" + "01".repeat(32),
+    voteThresholdNum: 1,
+    voteThresholdDen: 2,
+  };
+
+  const backend = createChainBackend({ verbose: opts.verbose });
+  step(" → wasm.launchBallotBundle");
+  const resultJson = await wasm.launchBallotBundle(
+    backend,
+    deploy.configJson,
+    ballotLauncherIdHex,
+    JSON.stringify(params),
+    wasm.WasmNetwork.Mainnet,
+    BigInt(deploy.electionStartHeight)
+  );
+  const launched = JSON.parse(resultJson);
+  ok(`eve_ballot_coin_id    = ${launched.eveBallotCoinIdHex}`);
+  ok(`eve_ballot_puzzle_hash = ${launched.eveBallotPuzzleHashHex}`);
+
+  // The launcher spend has no AGG_SIG conditions — the bundle's
+  // identity sig is sufficient. Just verify + push.
+  step(" → verifyBundleLocally");
+  const bundleBytes = hexToBytesU8(launched.spendBundleHex);
+  wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
+  ok("launch_ballot bundle validates locally");
+
+  step(" → push launchBallot bundle");
+  const response = await pushSpendBundleBytes(bundleBytes, { network: "mainnet" });
+  if (response.status !== "SUCCESS" && response.status !== 1) {
+    throw new Error(`push_tx returned: ${response.status} (${response.error ?? "(none)"})`);
+  }
+  ok(`push_tx accepted: ${response.status}`);
+
+  step(" → poll for eve ballot coin confirmation");
+  const rec = await pollUntilConfirmed(launched.eveBallotCoinIdHex, {
+    label: "eveBallotCoin",
+    pollIntervalMs: 30_000,
+    timeoutMs: 600_000,
+  });
+  ok(`eve ballot coin confirmed at height ${rec.confirmedHeight}`);
+
+  // Persist the launched ballot's eve info alongside the createBallot record.
+  const ballots = await readBallotArtifacts();
+  const target = ballots.find(
+    (b) => b.ballotLauncherIdHex === createdBallot.ballotLauncherIdHex
+  );
+  if (target) {
+    target.eveBallotCoinIdHex = launched.eveBallotCoinIdHex;
+    target.eveBallotPuzzleHashHex = launched.eveBallotPuzzleHashHex;
+    target.launchedAtHeight = rec.confirmedHeight;
+    await writeBallotArtifacts(ballots);
+    ok("ballot artifact updated with launch info");
+  }
+  return launched;
+}
+
 function phaseWriteSideTodo() {
-  step("Phase 7+: launch_ballot / register / vote / finalize / release (TODO)");
+  step("Phase 8+: register / vote / finalize / release (TODO)");
   info(
     "Phase 4 (deploy) builds + dry-runs end-to-end. The remaining write-side"
   );
@@ -768,7 +865,9 @@ async function main() {
     console.log("");
     await phaseVoterReadiness(opts, deploy);
     console.log("");
-    await phaseCreateBallot(opts, deploy);
+    const createdBallot = await phaseCreateBallot(opts, deploy);
+    console.log("");
+    await phaseLaunchBallot(opts, deploy, createdBallot);
     console.log("");
     phaseWriteSideTodo();
     console.log("");
