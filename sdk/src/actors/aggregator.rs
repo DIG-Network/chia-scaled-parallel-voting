@@ -155,6 +155,11 @@ impl<C: ChainReader> Aggregator<C> {
     /// scoped, so callers needing per-ballot state read from
     /// `ballots`.
     pub async fn sync(&mut self) -> VotingResult<SyncSnapshot> {
+        tracing::info!(
+            eve_singleton_puzzle_hash = %hex::encode(self.eve_singleton_puzzle_hash),
+            election_start_height = self.election_start_height,
+            "Aggregator::sync DIAG: querying"
+        );
         let snapshot = sync_with_chain(
             &self.chain,
             &self.config,
@@ -1327,6 +1332,12 @@ pub async fn sync_with_chain<C: ChainReader>(
     let candidates = chain
         .coin_records_by_puzzle_hash(eve_singleton_puzzle_hash)
         .await?;
+    tracing::info!(
+        eve_ph = %hex::encode(eve_singleton_puzzle_hash),
+        candidates = candidates.len(),
+        unspent = candidates.iter().filter(|c| c.is_unspent()).count(),
+        "sync_with_chain DIAG: fast-path query"
+    );
     if candidates.len() == 1 && candidates[0].is_unspent() {
         // Empty SPT root at depth 32 (NOT the leaf hash) — the
         // root the on-chain register action verifies against. Per
@@ -1362,6 +1373,14 @@ pub async fn sync_with_chain<C: ChainReader>(
     // Find the eve singleton by querying for children of the
     // launcher coin.
     let eve_children = chain.coin_records_by_parent_ids(&[launcher_id]).await?;
+    tracing::info!(
+        launcher_id = %hex::encode(launcher_id),
+        children = eve_children.len(),
+        ph_matches = eve_children.iter().filter(|r| r.coin.puzzle_hash == eve_singleton_puzzle_hash).count(),
+        target_ph = %hex::encode(eve_singleton_puzzle_hash),
+        actual_ph = ?eve_children.iter().map(|r| hex::encode(r.coin.puzzle_hash)).collect::<Vec<_>>(),
+        "sync_with_chain DIAG: slow-path query"
+    );
     let eve_record = eve_children
         .into_iter()
         .find(|r| r.coin.puzzle_hash == eve_singleton_puzzle_hash)

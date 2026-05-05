@@ -1416,7 +1416,8 @@ async fn phase_register_voter(
     // proof. For the FIRST voter the SMT is empty; for the second,
     // the first voter's pubkey must be inserted.
     let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network);
-    let mut agg = Aggregator::new(deploy.config.clone(), make_independent_chain()?, network);
+    let mut agg = Aggregator::new(deploy.config.clone(), make_independent_chain()?, network)
+        .with_election_start_height(deploy.election_start_height);
     sync_aggregator_with_retry(
         &mut agg,
         &format!("phase_register_voter[{voter_label}] SPT"),
@@ -1929,7 +1930,8 @@ async fn phase_finalize(
     info!("=== PHASE 5: aggregate votes + finalize Ballot Coin ===");
     confirm_or_bail(args, "Broadcast the finalize bundle (runs Groth16 prover)?")?;
 
-    let mut agg = Aggregator::new(deploy.config.clone(), make_independent_chain()?, network);
+    let mut agg = Aggregator::new(deploy.config.clone(), make_independent_chain()?, network)
+        .with_election_start_height(deploy.election_start_height);
     sync_aggregator_with_retry(
         &mut agg,
         "phase_finalize",
