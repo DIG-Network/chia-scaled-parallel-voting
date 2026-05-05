@@ -1529,8 +1529,25 @@ pub async fn find_current_singleton<C: ChainReader>(
         .map_err(|e| anyhow_other(format!("election_launcher_id: {e}")))?;
 
     // ── Fast path: eve unspent ──────────────────────────────────
+    // SECONDARY-INDEX HAZARD: coinset.org's `coin_records_by_puzzle_hash`
+    // index lags behind the primary `coin_record_by_id` view by 1-3
+    // blocks during high-rate spending (e.g., back-to-back register +
+    // create_ballot on the same singleton). We confirm via the primary
+    // index before treating any "unspent" candidate as authoritative —
+    // otherwise the walker returns a stale tip and the next spend gets
+    // MINTING_COIN/DOUBLE_SPEND on the chain.
     let eve_records = chain.coin_records_by_puzzle_hash(eve_ph).await?;
-    if let Some(unspent) = eve_records.iter().find(|r| r.is_unspent()) {
+    let eve_candidate = match eve_records.iter().find(|r| r.is_unspent()) {
+        Some(c) => match chain.coin_record_by_id(c.coin.coin_id()).await? {
+            Some(authoritative) if authoritative.is_unspent() => Some(c),
+            // Primary disagrees — the index returned a stale "unspent"
+            // record. Treat as no fast-path hit so we fall to the slow
+            // walker, which honours `coin_record_by_id` per step.
+            _ => None,
+        },
+        None => None,
+    };
+    if let Some(unspent) = eve_candidate {
         let launcher_record = chain
             .coin_record_by_id(unspent.coin.parent_coin_info)
             .await?
@@ -1579,7 +1596,25 @@ pub async fn find_current_singleton<C: ChainReader>(
     let mut prev: Option<(chia_protocol::Coin, ElectionState)> = None;
 
     loop {
-        if current.is_unspent() {
+        // Re-verify via primary `coin_record_by_id` before returning.
+        // The `coin_records_by_parent_ids` secondary index can return
+        // a "spent_block_index=0" (= unspent) record for a coin that
+        // primary index has already marked spent — happens during
+        // back-to-back singleton spends within the same propagation
+        // window. Trusting the secondary index here would return a
+        // stale tip; the next spend that targets it gets a consensus
+        // error (MINTING_COIN / DOUBLE_SPEND).
+        let truly_unspent = if current.is_unspent() {
+            match chain.coin_record_by_id(current.coin.coin_id()).await? {
+                Some(authoritative) => authoritative.is_unspent(),
+                // Primary doesn't know about this coin yet — keep the
+                // optimistic "unspent" view and proceed.
+                None => true,
+            }
+        } else {
+            false
+        };
+        if truly_unspent {
             let lineage_proof = match prev {
                 None => {
                     // We never advanced past the eve coin — but the
