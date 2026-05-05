@@ -390,26 +390,91 @@ pub fn sign_bundle_signature(
     })
 }
 
-/// Wasm-target stub. Actor methods that build signed bundles (`Voter::
-/// cast_vote`, `BallotIssuer::create_ballot`, etc.) call this; in a
-/// wasm build the dependencies needed for native signing
-/// (`dig_l1_wallet::transaction::sign_coin_spends`) aren't available,
-/// so the call-site methods compile but error at runtime if invoked.
-/// Wasm callers should use the SDK's host bridge / wallet flow to sign
-/// externally and assemble the bundle JS-side.
+/// Wasm-target equivalent of [`sign_bundle_signature`] (native).
+///
+/// Drives the same `chia_sdk_signer::RequiredSignature::from_coin_spends`
+/// walk that the native path uses (via `dig_l1_wallet::transaction::
+/// sign_coin_spends`), but without pulling in `dig_l1_wallet` / openssl.
+/// The two impls produce byte-identical aggregate signatures for the
+/// same `(coin_spends, secret_keys, network)` input.
+///
+/// `agg_sig_me_additional_data` is hard-coded for mainnet / testnet11
+/// because `chia_consensus` 0.26 doesn't expose pre-built
+/// `MAINNET_CONSTANTS` / `TESTNET11_CONSTANTS` statics; the AGG_SIG_*
+/// derivations (parent, puzzle, amount, etc.) come from
+/// [`chia_sdk_signer::AggSigConstants::new`], which takes the
+/// agg-sig-me seed and SHA256-derives the other six.
+///
+/// Returns the BLS identity (zero) when no `AGG_SIG_*` conditions are
+/// emitted by any coin spend (the empty-key + no-conditions case
+/// `BallotIssuer::create_ballot` exercises).
+///
+/// Returns an error if a SECP signature is required (the wasm build
+/// only supports BLS today; secp would need a separate JS-side
+/// signing flow). Errors also surface for any AGG_SIG condition whose
+/// public key has no matching secret in `secret_keys` — same contract
+/// as the native path.
 #[cfg(not(feature = "native"))]
 pub fn sign_bundle_signature(
-    _coin_spends: &[CoinSpend],
-    _secret_keys: &[SecretKey],
-    _network: NetworkType,
+    coin_spends: &[CoinSpend],
+    secret_keys: &[SecretKey],
+    network: NetworkType,
 ) -> VotingResult<Signature> {
-    Err(VotingError::Other(anyhow_compat::Error(
-        "sign_bundle_signature: not available in wasm builds. Sign the \
-         bundle's coin_spends externally (e.g. via WalletConnect) and \
-         assemble the SpendBundle JS-side."
-            .to_string()
-            .into(),
-    )))
+    use chia_protocol::Bytes32;
+    use chia_sdk_signer::{AggSigConstants, RequiredSignature};
+
+    let agg_sig_me_hex: &str = match network {
+        NetworkType::Mainnet => {
+            "ccd5bb71183532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbb"
+        }
+        NetworkType::Testnet11 => {
+            "37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615"
+        }
+    };
+    let mut seed_arr = [0u8; 32];
+    hex::decode_to_slice(agg_sig_me_hex, &mut seed_arr).expect("constant hex literal");
+    let constants = AggSigConstants::new(Bytes32::new(seed_arr));
+
+    let mut allocator = clvmr::Allocator::new();
+    let required = RequiredSignature::from_coin_spends(&mut allocator, coin_spends, &constants)
+        .map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("RequiredSignature::from_coin_spends: {e:?}").into(),
+            ))
+        })?;
+
+    let mut agg = Signature::default();
+    for req in required {
+        match req {
+            RequiredSignature::Bls(b) => {
+                let target_pk = b.public_key.clone();
+                let secret = secret_keys
+                    .iter()
+                    .find(|sk| sk.public_key() == target_pk)
+                    .ok_or_else(|| {
+                        VotingError::Other(anyhow_compat::Error(
+                            format!(
+                                "sign_bundle_signature: no secret key matching AGG_SIG public key {}",
+                                hex::encode(target_pk.to_bytes())
+                            )
+                            .into(),
+                        ))
+                    })?;
+                let msg = b.message();
+                let sig = chia_bls::sign(secret, &msg);
+                agg += &sig;
+            }
+            RequiredSignature::Secp(_) => {
+                return Err(VotingError::Other(anyhow_compat::Error(
+                    "sign_bundle_signature: SECP signatures are not supported in wasm builds; \
+                     sign the affected coin externally and aggregate the result"
+                        .to_string()
+                        .into(),
+                )));
+            }
+        }
+    }
+    Ok(agg)
 }
 
 /// FN: uint_atom_hash
