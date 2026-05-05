@@ -2122,6 +2122,13 @@ async fn phase_release(
     deploy: &DeployArtifacts,
     voter_label: &str,
     voter_keys: &VoterKeys,
+    // Fresh post-register Registration Coin id from
+    // `phase_register_voter`. The SDK's `release_collateral` walks
+    // the lineage forward from this id to the current tip (which has
+    // been advanced by every cast_vote / update_vote in the meantime)
+    // before computing the CAT-wrapped predicted puzzle hash. Passing
+    // the post-register id (NOT the post-cast id) is correct.
+    reg_id: Bytes32,
     destination: Bytes32,
 ) -> Result<()> {
     info!("=== PHASE 6.{voter_label}: release collateral ===");
@@ -2159,11 +2166,8 @@ async fn phase_release(
             Ok(c) => c,
             Err(e) => return Err(anyhow::anyhow!("find_current_singleton: {e:?}")),
         };
-        // Registration coin id placeholder remains until the live
-        // integration test plumbs the actual id through; the SDK
-        // surfaces a clear error if `Bytes32::default()` is not on chain.
         match voter
-            .release_collateral(chain, &current.smt, Bytes32::default(), destination)
+            .release_collateral(chain, &current.smt, reg_id, destination)
             .await
         {
             Ok(b) => break b,
@@ -2917,6 +2921,7 @@ async fn main() -> Result<()> {
             &deploy,
             "voter1",
             &voter1_keys,
+            reg1,
             validator1_keys.p2_puzzle_hash,
         )
         .await?;
@@ -2927,6 +2932,7 @@ async fn main() -> Result<()> {
             &deploy,
             "voter2",
             &voter2_keys,
+            reg2,
             validator2_keys.p2_puzzle_hash,
         )
         .await?;
