@@ -448,21 +448,30 @@ pub fn sign_bundle_signature(
         match req {
             RequiredSignature::Bls(b) => {
                 let target_pk = b.public_key.clone();
-                let secret = secret_keys
-                    .iter()
-                    .find(|sk| sk.public_key() == target_pk)
-                    .ok_or_else(|| {
-                        VotingError::Other(anyhow_compat::Error(
-                            format!(
-                                "sign_bundle_signature: no secret key matching AGG_SIG public key {}",
-                                hex::encode(target_pk.to_bytes())
-                            )
-                            .into(),
-                        ))
-                    })?;
-                let msg = b.message();
-                let sig = chia_bls::sign(secret, &msg);
-                agg += &sig;
+                let secret = secret_keys.iter().find(|sk| sk.public_key() == target_pk);
+                match secret {
+                    Some(sk) => {
+                        let msg = b.message();
+                        let sig = chia_bls::sign(sk, &msg);
+                        agg += &sig;
+                    }
+                    None => {
+                        // Caller didn't supply a key for this AGG_SIG.
+                        // Match dig_l1_wallet's native behaviour: skip
+                        // silently. The intended use is partial-sign
+                        // workflows where one party signs their portion
+                        // and another aggregates the rest externally
+                        // (e.g. BallotIssuer::create_ballot signs the
+                        // singleton with empty keys, then the caller
+                        // re-signs with the funder's synthetic SK to
+                        // satisfy the funder StandardLayer's AggSigMe).
+                        // If the bundle ends up missing a required sig
+                        // at push time, chia consensus will reject it.
+                        // Run `verifyBundleLocally` (or an external
+                        // BLS aggregate verify) before pushing to
+                        // catch missing sigs early.
+                    }
+                }
             }
             RequiredSignature::Secp(_) => {
                 return Err(VotingError::Other(anyhow_compat::Error(

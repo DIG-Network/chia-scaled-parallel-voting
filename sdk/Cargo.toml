@@ -120,6 +120,16 @@ async-trait  = "0.1"
 indexmap     = "2"
 hex-literal  = "0.4"
 tokio        = { version = "1", default-features = false, features = ["macros", "sync", "time"] }
+# `web_time::Instant` works on both native (re-exports `std::time`) and
+# wasm32-unknown-unknown (uses the browser/Node `performance.now()`
+# API). Drop-in replacement for `std::time::Instant`.
+web-time     = "1"
+
+# wasm32-only async sleep that uses `setTimeout` under the hood. The
+# native target keeps using `tokio::time::sleep` (so the chia simulator
+# tests don't change behaviour).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers  = { version = "0.3", features = ["futures"] }
 
 [build-dependencies]
 hex = "0.4"

@@ -203,7 +203,7 @@ pub async fn wait_for_unspent_coin_at_puzzle_hash<C: ChainReader>(
     max_wait: std::time::Duration,
     expected_min: usize,
 ) -> VotingResult<Vec<ChainCoinRecord>> {
-    let started = std::time::Instant::now();
+    let started = web_time::Instant::now();
     let mut last_peak: Option<u32> = None;
     let mut attempt = 0u32;
 
@@ -260,7 +260,23 @@ pub async fn wait_for_unspent_coin_at_puzzle_hash<C: ChainReader>(
             "{} not visible yet — sleeping before retry",
             label
         );
-        tokio::time::sleep(poll_interval).await;
+        compat_sleep(poll_interval).await;
+    }
+}
+
+/// Cross-target async sleep. Native uses `tokio::time::sleep` (so
+/// existing simulator tests don't change behaviour). wasm32 uses
+/// `gloo_timers::future::TimeoutFuture` (driven by `setTimeout`,
+/// works in both browser and Node).
+pub(crate) async fn compat_sleep(d: std::time::Duration) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::time::sleep(d).await;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ms = u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
+        gloo_timers::future::TimeoutFuture::new(ms).await;
     }
 }
 

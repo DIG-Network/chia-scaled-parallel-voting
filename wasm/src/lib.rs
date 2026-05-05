@@ -369,7 +369,6 @@ fn encode_streamable<T: chia_traits::Streamable>(v: &T) -> Result<Vec<u8>, JsErr
 
 /// Encode a `Vec<CoinSpend>` to length-prefixed streamable bytes.
 /// Layout: `[u32 BE count] ([u32 BE len] [coin_spend streamable])*`.
-#[allow(dead_code)] // Re-attached when buildDeployBundle is un-stubbed.
 fn encode_coin_spends(coin_spends: &[chia_protocol::CoinSpend]) -> Result<Vec<u8>, JsError> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&(coin_spends.len() as u32).to_be_bytes());
@@ -414,6 +413,26 @@ fn decode_coin_spends(bytes: &[u8]) -> Result<Vec<chia_protocol::CoinSpend>, JsE
 pub fn encode_bundle(bundle_bytes: &[u8]) -> Result<Box<[u8]>, JsError> {
     let bundle: SpendBundle = decode_bundle(bundle_bytes)?;
     let bytes = encode_streamable(&bundle)?;
+    Ok(bytes.into_boxed_slice())
+}
+
+/// Extract the `Vec<CoinSpend>` from a Streamable-encoded SpendBundle
+/// and re-emit it in the length-prefixed list format the
+/// `signCoinSpends` / `assembleSpendBundle` exports consume.
+///
+/// USAGE: round-tripping a bundle through wasm — e.g. take the bundle
+/// produced by `createBallotBundle` (which has zero AGG_SIG sig
+/// because the SDK calls sign_bundle_signature with empty keys),
+/// extract its coin_spends, sign with a funder/voter secret via
+/// `signCoinSpends`, then `assembleSpendBundle` the result. Keeps the
+/// Streamable bytes within the wasm boundary so JS doesn't have to
+/// re-implement chia_protocol's Bytes / Program encoding.
+#[wasm_bindgen(js_name = "extractCoinSpendsFromBundle")]
+pub fn extract_coin_spends_from_bundle_js(
+    bundle_bytes: &[u8],
+) -> Result<Box<[u8]>, JsError> {
+    let bundle: SpendBundle = decode_bundle(bundle_bytes)?;
+    let bytes = encode_coin_spends(&bundle.coin_spends)?;
     Ok(bytes.into_boxed_slice())
 }
 

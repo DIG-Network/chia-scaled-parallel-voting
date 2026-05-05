@@ -1727,7 +1727,7 @@ pub async fn wait_for_current_singleton<C: ChainReader>(
     poll_interval: std::time::Duration,
     max_wait: std::time::Duration,
 ) -> VotingResult<CurrentSingleton> {
-    let started = std::time::Instant::now();
+    let started = web_time::Instant::now();
     let mut last_peak: Option<u32> = None;
     let mut attempt = 0u32;
 
@@ -1780,7 +1780,7 @@ pub async fn wait_for_current_singleton<C: ChainReader>(
                     error = %e,
                     "Election Singleton not visible / lineage incomplete — retry"
                 );
-                tokio::time::sleep(poll_interval).await;
+                crate::chain::compat_sleep(poll_interval).await;
             }
         }
     }

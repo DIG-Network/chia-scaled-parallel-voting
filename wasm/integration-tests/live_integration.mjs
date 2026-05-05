@@ -663,12 +663,13 @@ async function phaseCreateBallot(opts, deploy) {
   // StandardLayer spend emits AGG_SIG_ME(synthPk, msg). Re-sign so
   // chia consensus accepts.
   step(" → re-sign bundle with funder synthetic SK");
-  const { SpendBundle } = await import("chia-wallet-sdk-wasm");
   const bundleHex = created.spendBundleHex;
   const bundleBytes = hexToBytesU8(bundleHex);
-  const bundle = SpendBundle.fromBytes(bundleBytes);
-  const allCoinSpends = bundle.coinSpends;
-  const coinSpendsBytesLP = encodeCoinSpendListLengthPrefixed(allCoinSpends);
+  // Round-trip the bundle's coin_spends through wasm so the
+  // length-prefixed list bytes are byte-identical to what wasm's
+  // decode_coin_spends expects (avoids any JS encoding quirks
+  // around chia_protocol::Program's Streamable form).
+  const coinSpendsBytesLP = wasm.extractCoinSpendsFromBundle(bundleBytes);
   const sigBytes = wasm.signCoinSpends(
     coinSpendsBytesLP,
     funder.syntheticSecretBytes,
