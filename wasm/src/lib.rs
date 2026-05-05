@@ -533,6 +533,87 @@ pub fn parse_election_config_js(config_json: &str) -> Result<JsValue, JsError> {
 }
 
 // ============================================================================
+// SECTION 5b — Trusted-setup ceremony (`runSingleParticipantCeremony`)
+// ============================================================================
+
+/// Result of [`run_single_participant_ceremony_js`]. The wire-format
+/// VK hex goes straight into [`WasmDeployParams::verification_key_hex`];
+/// the proving key bytes are the arkworks-compressed
+/// `ProvingKey<Bls12_381>` payload that
+/// [`buildBallotFinalizeBundle`] consumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmCeremonyArtifacts {
+    /// 768-byte verification key (`alpha||beta||gamma||delta||IC[0..9]`),
+    /// hex-encoded with `0x` prefix.
+    pub verification_key_hex: String,
+    /// Compressed `ProvingKey<Bls12_381>` bytes (arkworks
+    /// CanonicalSerialize). Hand to `buildBallotFinalizeBundle` at
+    /// finalize time. Many MB — cache to IndexedDB / disk.
+    #[serde(with = "serde_bytes")]
+    pub proving_key_bytes: Vec<u8>,
+}
+
+/// Run a single-participant trusted-setup ceremony using
+/// [`SimulatedBackend`](chip_voting_sdk::SimulatedBackend) and return
+/// `(verificationKeyHex, provingKeyBytes)`.
+///
+/// SECURITY: the simulated backend is a deterministic toy — anyone
+/// can recompute the keys, so the resulting setup is **not** secure
+/// against forgery. It produces structurally identical artefacts to
+/// a real MPC ceremony, so deploy / finalize plumbing is validated
+/// end-to-end. For production, replace with a multi-party ceremony.
+///
+/// Mirrors `run_local_ceremony` in `cli/src/bin/live_integration_test.rs`.
+#[wasm_bindgen(js_name = "runSingleParticipantCeremony")]
+pub fn run_single_participant_ceremony_js() -> Result<JsValue, JsError> {
+    use chip_voting_sdk::ceremony::{CeremonyCoordinator, CeremonyParticipant, MpcBackend};
+    use chip_voting_sdk::SimulatedBackend;
+
+    let mut coord = CeremonyCoordinator::new(Box::new(SimulatedBackend));
+    coord
+        .start("chip-voting-v1".into())
+        .map_err(|e| JsError::new(&format!("ceremony start: {e:?}")))?;
+
+    let alice = CeremonyParticipant::new(
+        Box::new(SimulatedBackend),
+        "wasm-single-participant".into(),
+        Some("wasm runSingleParticipantCeremony".into()),
+    );
+    let pre = coord
+        .current_transcript()
+        .map_err(|e| JsError::new(&format!("current_transcript: {e:?}")))?
+        .clone();
+
+    let mut entropy = [0u8; 32];
+    getrandom::getrandom(&mut entropy)
+        .map_err(|e| JsError::new(&format!("getrandom: {e}")))?;
+
+    let contribution = alice
+        .contribute(&pre, entropy)
+        .map_err(|e| JsError::new(&format!("ceremony contribute: {e:?}")))?;
+    coord
+        .accept_contribution(contribution.transcript)
+        .map_err(|e| JsError::new(&format!("accept_contribution: {e:?}")))?;
+
+    let final_transcript = coord
+        .current_transcript()
+        .map_err(|e| JsError::new(&format!("current_transcript: {e:?}")))?;
+    let backend = SimulatedBackend;
+    let (pk_wire, vk_wire) = backend
+        .extract_keys(final_transcript)
+        .map_err(|e| JsError::new(&format!("extract_keys: {e:?}")))?;
+
+    let artifacts = WasmCeremonyArtifacts {
+        verification_key_hex: format!("0x{}", hex::encode(&vk_wire.raw_bytes)),
+        proving_key_bytes: pk_wire.raw_bytes,
+    };
+    serde_wasm_bindgen::to_value(&artifacts).map_err(|e| {
+        JsError::new(&format!("serialise WasmCeremonyArtifacts: {e}"))
+    })
+}
+
+// ============================================================================
 // SECTION 6 — Election deployment (`buildDeployBundle`)
 // ============================================================================
 
