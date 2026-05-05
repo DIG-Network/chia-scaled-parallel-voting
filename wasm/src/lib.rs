@@ -54,7 +54,8 @@
 #![allow(clippy::doc_overindented_list_items)]
 #![allow(clippy::doc_lazy_continuation)]
 
-use chip_voting_sdk::chain::ChainCoinRecord;
+use async_trait::async_trait;
+use chip_voting_sdk::chain::{ChainCoinRecord, ChainReader};
 use chip_voting_sdk::error::{anyhow_compat, VotingError, VotingResult};
 // `NetworkType` (originally `pub use dig_l1_wallet::NetworkType` in
 // the SDK) is gated behind the SDK's `native` feature. The wasm
@@ -186,24 +187,18 @@ extern "C" {
     fn js_peak_height(this: &JsChainBackend) -> Promise;
 }
 
-/// `JsChainReader` is a placeholder for the planned wasm
-/// `ChainReader` adapter.
+/// `JsChainReader` is the wasm-side `ChainReader` adapter. Each
+/// trait method awaits the matching JS callback (Promise) on the
+/// dApp-supplied backend and decodes the resolved value into the
+/// SDK's record types.
 ///
-/// FEATURE-GATE BLOCKER (2026-05-03): The SDK's `ChainReader` trait
-/// is currently declared `Send + Sync` and uses `#[async_trait]`
-/// (which adds a `+ Send` bound to the returned future). `JsValue`
-/// (which the JS callbacks below produce) is `!Send`, so we cannot
-/// `impl ChainReader for JsChainReader` against today's SDK. The
-/// SDK needs to expose a `?Send` variant of the trait (or relax
-/// the bound under a `wasm` cargo feature) before this adapter
-/// can be wired into the chain-walking exports.
-///
-/// Until then, this struct is exposed for type-shape stability —
-/// the JS side can already construct it via `new JsChainReader(backend)`
-/// and pass it to wasm exports, but those exports currently return
-/// "pending feature-gate" errors (see Section 9).
+/// The SDK declares `ChainReader` as `?Send` on `target_arch =
+/// "wasm32"` (see `chain::ChainReaderBounds`), so this `JsValue`-
+/// holding adapter can stand in for `chia_query::ChiaQuery` /
+/// `SharedSimulator` in any actor method (`Voter::register`,
+/// `Aggregator::collect_votes_for_ballot`, `BallotReader::list_ballots`,
+/// etc.) without restructuring callers.
 pub struct JsChainReader {
-    #[allow(dead_code)]
     backend: JsChainBackend,
 }
 
@@ -259,44 +254,90 @@ fn record_from_js(r: JsCoinRecord) -> VotingResult<ChainCoinRecord> {
     })
 }
 
-fn fmt_hex32(b: &chia_protocol::Bytes32) -> String {
-    format!("0x{}", hex::encode(b))
+/// Decode a hex string (with or without `0x` prefix) into a
+/// `chia_protocol::Program`. Used by `puzzle_and_solution` to lift
+/// the JS-side hex blobs back into typed CLVM programs.
+fn parse_program_hex(hex_str: &str, label: &str) -> VotingResult<chia_protocol::Program> {
+    let trimmed = hex_str.trim().trim_start_matches("0x");
+    let bytes = hex::decode(trimmed).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("{label}: hex decode failed: {e}").into(),
+        ))
+    })?;
+    Ok(chia_protocol::Program::from(bytes))
 }
 
-// NOTE: a real `impl ChainReader for JsChainReader` cannot be written
-// against today's SDK because the trait is `Send + Sync`, while
-// `JsValue` (and any wasm-bindgen handle that holds one) is `!Send`.
-// The SDK needs to expose a `?Send` chain trait under a `wasm`
-// feature before this adapter can be functional. The helpers below
-// (`await_decode`, `record_from_js`, etc.) are kept for use by the
-// future ChainReader impl, but the trait wiring itself is gone for
-// now. See Section 9 for the per-export status.
+#[async_trait(?Send)]
+impl ChainReader for JsChainReader {
+    async fn coin_records_by_puzzle_hash(
+        &self,
+        puzzle_hash: chia_protocol::Bytes32,
+    ) -> VotingResult<Vec<ChainCoinRecord>> {
+        let promise = self
+            .backend
+            .js_coin_records_by_puzzle_hash(hex::encode(puzzle_hash));
+        let records: Vec<JsCoinRecord> =
+            await_decode(promise, "coin_records_by_puzzle_hash").await?;
+        records.into_iter().map(record_from_js).collect()
+    }
 
-// Suppress unused-warning for helpers that exist for the planned
-// ChainReader impl — they're tested by the encode/decode helpers
-// above (which use serde_wasm_bindgen / chia_protocol::Bytes32) and
-// will be wired in once the SDK feature-gate lands.
-#[allow(dead_code)]
-async fn _await_decode_placeholder<T: for<'de> Deserialize<'de>>(
-    p: Promise,
-    op: &str,
-) -> VotingResult<T> {
-    await_decode(p, op).await
+    async fn coin_records_by_hint(
+        &self,
+        hint: chia_protocol::Bytes32,
+    ) -> VotingResult<Vec<ChainCoinRecord>> {
+        let promise = self.backend.js_coin_records_by_hint(hex::encode(hint));
+        let records: Vec<JsCoinRecord> =
+            await_decode(promise, "coin_records_by_hint").await?;
+        records.into_iter().map(record_from_js).collect()
+    }
+
+    async fn puzzle_and_solution(
+        &self,
+        coin_id: chia_protocol::Bytes32,
+    ) -> VotingResult<Option<(chia_protocol::Program, chia_protocol::Program)>> {
+        let promise = self.backend.js_puzzle_and_solution(hex::encode(coin_id));
+        let opt: Option<JsPuzzleSolution> =
+            await_decode(promise, "puzzle_and_solution").await?;
+        match opt {
+            None => Ok(None),
+            Some(ps) => Ok(Some((
+                parse_program_hex(&ps.puzzle_hex, "puzzle_and_solution.puzzle_hex")?,
+                parse_program_hex(&ps.solution_hex, "puzzle_and_solution.solution_hex")?,
+            ))),
+        }
+    }
+
+    async fn coin_records_by_parent_ids(
+        &self,
+        parent_ids: &[chia_protocol::Bytes32],
+    ) -> VotingResult<Vec<ChainCoinRecord>> {
+        let parent_hex: Vec<String> = parent_ids.iter().map(hex::encode).collect();
+        let parent_ids_val = serde_wasm_bindgen::to_value(&parent_hex).map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("coin_records_by_parent_ids: encode parents: {e}").into(),
+            ))
+        })?;
+        let promise = self.backend.js_coin_records_by_parent_ids(parent_ids_val);
+        let records: Vec<JsCoinRecord> =
+            await_decode(promise, "coin_records_by_parent_ids").await?;
+        records.into_iter().map(record_from_js).collect()
+    }
+
+    async fn coin_record_by_id(
+        &self,
+        coin_id: chia_protocol::Bytes32,
+    ) -> VotingResult<Option<ChainCoinRecord>> {
+        let promise = self.backend.js_coin_record_by_name(hex::encode(coin_id));
+        let opt: Option<JsCoinRecord> =
+            await_decode(promise, "coin_record_by_id").await?;
+        opt.map(record_from_js).transpose()
+    }
+
+    async fn peak_height(&self) -> VotingResult<Option<u32>> {
+        let promise = self.backend.js_peak_height();
+        await_decode::<Option<u32>>(promise, "peak_height").await
+    }
 }
-#[allow(dead_code)]
-fn _record_from_js_placeholder(r: JsCoinRecord) -> VotingResult<ChainCoinRecord> {
-    record_from_js(r)
-}
-#[allow(dead_code)]
-fn _coin_from_js_placeholder(r: &JsCoinRecord) -> VotingResult<chia_protocol::Coin> {
-    coin_from_js(r)
-}
-#[allow(dead_code)]
-fn _fmt_hex32_placeholder(b: &chia_protocol::Bytes32) -> String {
-    fmt_hex32(b)
-}
-#[allow(dead_code)]
-fn _puzzle_solution_placeholder(_: JsPuzzleSolution) {}
 
 // ============================================================================
 // SECTION 4 — Streamable encode/decode helpers
@@ -922,28 +963,55 @@ pub fn collect_votes_for_ballot_js(
 }
 
 /// Enumerate every Ballot Coin minted under this election. Wraps
-/// `BallotReader::list_ballots`.
+/// [`chip_voting_sdk::actors::ballot::list_ballots_via_chain`].
+///
+/// Returns the snapshot list as JSON-serialized text (each entry has
+/// `ballot_launcher_id`, `election_launcher_id`, `vote_close_height`,
+/// `outcome_domain_hash`, `state`, `coin_id`). Caller does
+/// `JSON.parse(result)` on the JS side.
 #[wasm_bindgen(js_name = "listBallots")]
-pub fn list_ballots_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "listBallots: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
-    ))
+pub async fn list_ballots_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let chain = JsChainReader::new(backend);
+    let snapshots = chip_voting_sdk::actors::ballot::list_ballots_via_chain(&cfg, &chain)
+        .await
+        .map_err(|e| JsError::new(&format!("list_ballots: {e}")))?;
+    serde_json::to_string(&snapshots)
+        .map_err(|e| JsError::new(&format!("encode snapshots: {e}")))
 }
 
 /// Look up a single Ballot Coin by its launcher id. Wraps
-/// `BallotReader::get_ballot`.
+/// [`chip_voting_sdk::actors::ballot::get_ballot_via_chain`]. Returns
+/// the JSON-serialized snapshot (or the literal string `"null"` when
+/// no ballot with that launcher id exists under the election).
 #[wasm_bindgen(js_name = "getBallot")]
-pub fn get_ballot_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-    _ballot_launcher_id_hex: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "getBallot: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
-    ))
+pub async fn get_ballot_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    ballot_launcher_id_hex: String,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let ballot_launcher_id = parse_hex32(&ballot_launcher_id_hex)
+        .map_err(|e| JsError::new(&format!("ballot_launcher_id_hex: {e}")))?;
+    let chain = JsChainReader::new(backend);
+    let snapshot = chip_voting_sdk::actors::ballot::get_ballot_via_chain(
+        &cfg,
+        &chain,
+        ballot_launcher_id,
+    )
+    .await
+    .map_err(|e| JsError::new(&format!("get_ballot: {e}")))?;
+    serde_json::to_string(&snapshot)
+        .map_err(|e| JsError::new(&format!("encode snapshot: {e}")))
 }
 
 /// Announce a ballot finalization (the Ballot Coin's
