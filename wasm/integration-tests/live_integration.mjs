@@ -909,8 +909,12 @@ async function phaseRegisterVoter(opts, deploy) {
     );
     ok(`  CAT parent spend: ${catParentSpendBytes.length} streamable bytes`);
 
-    // Pubkeys for SMT — exclude the voter being registered (non-membership)
-    const otherPubkeys = allValidatorPubkeysHex.filter((p) => p !== entry.accountPkHex);
+    // Pubkeys for SMT — only those ALREADY registered on-chain (so
+    // the SMT root we compute matches the on-chain registration_merkle_root).
+    // The voter being registered must NOT be in the list (non-membership
+    // proof). `registered` is the list of voters confirmed earlier in
+    // THIS run; for the first register against a fresh singleton it's empty.
+    const otherPubkeys = registered.map((r) => r.accountPkHex);
 
     // Call wasm.registerBuildSpends
     step("   → wasm.registerBuildSpends");
@@ -934,10 +938,15 @@ async function phaseRegisterVoter(opts, deploy) {
     if (opts.pushDeploy) {
       step("   → push register bundle");
       const response = await pushSpendBundleBytes(bundleBytes, { network: "mainnet" });
-      if (response.status !== "SUCCESS" && response.status !== 1) {
+      // ALREADY_INCLUDING_TRANSACTION means the bundle is already in
+      // mempool (e.g. from a prior attempt that lost the response) —
+      // treat as success and proceed to poll for the reg coin.
+      const isAlreadyIncluded =
+        typeof response.error === "string" && response.error.includes("ALREADY_INCLUDING_TRANSACTION");
+      if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded) {
         throw new Error(`push: ${response.status} (${response.error ?? "(none)"})`);
       }
-      ok(`  push_tx accepted: ${response.status}`);
+      ok(`  push_tx accepted: ${isAlreadyIncluded ? "ALREADY_IN_MEMPOOL" : response.status}`);
 
       // Poll for the registration coin to confirm: its predicted ph is
       // freshRegistrationCoinPuzzleHash(config, voter_pk).

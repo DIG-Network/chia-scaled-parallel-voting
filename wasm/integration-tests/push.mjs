@@ -38,17 +38,61 @@ export function clientForNetwork(network) {
  * Push a Streamable-bytes-encoded SpendBundle and return the
  * `pushTx` response (`{ status, error? }` shape per coinset.org).
  *
- * Throws on transport / 4xx / 5xx errors — the caller surfaces those
- * as test failures. A 200 OK with `status="SUCCESS"` means the
- * bundle was admitted to the mempool; a 200 OK with `status="PENDING"`
- * or `"FAILED"` is also possible (consensus rejection) — caller
- * should inspect the response.
+ * Tries chia-wallet-sdk-wasm's `CoinsetClient.pushTx` first (handles
+ * the JSON shape conversion); falls back to manual JSON-shape
+ * construction + direct fetch if the SDK's reqwest layer chokes on
+ * the response decode (occasionally happens for large bundles).
  */
 export async function pushSpendBundleBytes(bundleBytes, { network = "mainnet" } = {}) {
+  // chia-wallet-sdk-wasm's CoinsetClient.pushTx works for small
+  // bundles but its reqwest response-decoder chokes on coinset.org's
+  // larger responses (e.g. 7996-byte register bundles return a
+  // response whose JSON shape the SDK can't parse). Always go the
+  // manual route — convert SpendBundle → coinset.org's JSON shape
+  // via chia-wallet-sdk-wasm accessors, then POST directly.
   const bundle = spendBundleFromStreamableBytes(bundleBytes);
-  const client = clientForNetwork(network);
-  const response = await client.pushTx(bundle);
-  return response;
+  const baseUrl =
+    network === "mainnet"
+      ? "https://api.coinset.org"
+      : "https://api-testnet11.coinset.org";
+  const json = bundleToJson(bundle);
+  const r = await fetch(`${baseUrl}/push_tx`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ spend_bundle: json }),
+  });
+  const text = await r.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(
+      `pushSpendBundleBytes: non-JSON response from /push_tx: ${text.slice(0, 200)}`
+    );
+  }
+  return parsed;
+}
+
+function bytesToHex(bytes) {
+  return (
+    "0x" + Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("")
+  );
+}
+
+/** chia-wallet-sdk-wasm SpendBundle → coinset.org push_tx JSON shape. */
+function bundleToJson(bundle) {
+  return {
+    coin_spends: bundle.coinSpends.map((cs) => ({
+      coin: {
+        parent_coin_info: bytesToHex(cs.coin.parentCoinInfo),
+        puzzle_hash: bytesToHex(cs.coin.puzzleHash),
+        amount: Number(cs.coin.amount),
+      },
+      puzzle_reveal: bytesToHex(cs.puzzleReveal),
+      solution: bytesToHex(cs.solution),
+    })),
+    aggregated_signature: bytesToHex(bundle.aggregatedSignature.toBytes()),
+  };
 }
 
 /**
