@@ -1133,16 +1133,66 @@ pub fn build_ballot_finalize_bundle_js(
 }
 
 /// Walk the chain to collect every Voting Coin that targets the
-/// supplied ballot. Wraps `Aggregator::collect_votes_for_ballot`.
+/// supplied ballot. Wraps
+/// [`chip_voting_sdk::actors::aggregator::collect_votes_for_ballot_via_chain`].
+///
+/// `voter_pubkeys_hex_json` is a JSON array of 48-byte BLS G1
+/// pubkeys as hex strings (with or without `0x` prefix). The dApp
+/// typically obtains this list from a prior `Aggregator::sync` /
+/// indexer pass over the Election Singleton's registration history.
+///
+/// Returns a JSON-serialised array of [`VoteRecordWire`] (each entry
+/// has `voterPubkeyHex`, `voteDataHex`, `voteSignatureHex`,
+/// `registrationCoinIdHex`, `ballotLauncherIdHex`, `votingCoinIdHex`).
 #[wasm_bindgen(js_name = "collectVotesForBallot")]
-pub fn collect_votes_for_ballot_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-    _ballot_launcher_id_hex: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "collectVotesForBallot: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
-    ))
+pub async fn collect_votes_for_ballot_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    ballot_launcher_id_hex: String,
+    voter_pubkeys_hex_json: String,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let ballot_launcher_id = parse_hex32(&ballot_launcher_id_hex)
+        .map_err(|e| JsError::new(&format!("ballot_launcher_id_hex: {e}")))?;
+    let voter_hex_list: Vec<String> = serde_json::from_str(&voter_pubkeys_hex_json)
+        .map_err(|e| JsError::new(&format!("voter_pubkeys_hex_json parse: {e}")))?;
+    let mut voters: Vec<PublicKey> = Vec::with_capacity(voter_hex_list.len());
+    for (idx, h) in voter_hex_list.iter().enumerate() {
+        let trimmed = h.trim().trim_start_matches("0x");
+        let bytes = hex::decode(trimmed)
+            .map_err(|e| JsError::new(&format!("voter_pubkeys[{idx}] hex decode: {e}")))?;
+        let arr: [u8; 48] = bytes.as_slice().try_into().map_err(|_| {
+            JsError::new(&format!(
+                "voter_pubkeys[{idx}]: expected 48-byte G1 pubkey, got {}",
+                bytes.len()
+            ))
+        })?;
+        let pk = PublicKey::from_bytes(&arr).map_err(|e| {
+            JsError::new(&format!("voter_pubkeys[{idx}] PublicKey::from_bytes: {e:?}"))
+        })?;
+        voters.push(pk);
+    }
+    let voter_set = chip_voting_sdk::state::VoterSet {
+        registration_merkle_root: chia_protocol::Bytes32::default(),
+        registration_count: voters.len() as u64,
+        voters,
+    };
+    let chain = JsChainReader::new(backend);
+    let records = chip_voting_sdk::actors::aggregator::collect_votes_for_ballot_via_chain(
+        &cfg,
+        &chain,
+        ballot_launcher_id,
+        &voter_set,
+    )
+    .await
+    .map_err(|e| JsError::new(&format!("collect_votes_for_ballot: {e}")))?;
+    let wire: Vec<chip_voting_sdk::state::VoteRecordWire> =
+        records.iter().map(Into::into).collect();
+    serde_json::to_string(&wire)
+        .map_err(|e| JsError::new(&format!("encode VoteRecordWire list: {e}")))
 }
 
 /// Enumerate every Ballot Coin minted under this election. Wraps
