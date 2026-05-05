@@ -530,16 +530,14 @@ pub struct WasmDeployArtifacts {
 /// SDK change; until then, this returns a typed `JsError`.
 #[wasm_bindgen(js_name = "deriveLauncherId")]
 pub fn derive_launcher_id_js(
-    _parent_coin_id_hex: &str,
-    _amount: u64,
+    parent_coin_id_hex: &str,
+    amount: u64,
 ) -> Result<String, JsError> {
-    Err(JsError::new(
-        "deriveLauncherId: not yet wired in the wasm build. \
-         The helper lives in `chip_voting_sdk::actors::deployer`, \
-         which is gated behind the SDK's `native` feature. \
-         Promoting it to a wasm-callable surface is a planned \
-         follow-up.",
-    ))
+    use chip_voting_sdk::actors::deployer::derive_launcher_id;
+    let parent = parse_hex32(parent_coin_id_hex)
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
+    let launcher = derive_launcher_id(parent, amount);
+    Ok(format!("0x{}", hex::encode(launcher)))
 }
 
 /// Build the (unsigned) deploy spend bundle for a new election.
