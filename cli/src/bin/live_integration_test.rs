@@ -1415,7 +1415,8 @@ async fn phase_register_voter(
     // Sync the SMT off-chain so we can build the empty-slot
     // proof. For the FIRST voter the SMT is empty; for the second,
     // the first voter's pubkey must be inserted.
-    let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network);
+    let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network)
+        .with_election_start_height(deploy.election_start_height);
     let mut agg = Aggregator::new(deploy.config.clone(), make_independent_chain()?, network)
         .with_election_start_height(deploy.election_start_height);
     sync_aggregator_with_retry(
@@ -1646,7 +1647,8 @@ async fn phase_create_ballot(
         .next()
         .ok_or_else(|| anyhow::anyhow!("phase_create_ballot: funder StandardLayer produced no spend"))?;
 
-    let issuer = chip_voting_sdk::actors::ballot::BallotIssuer::new(deploy.config.clone(), network);
+    let issuer = chip_voting_sdk::actors::ballot::BallotIssuer::new(deploy.config.clone(), network)
+        .with_election_start_height(deploy.election_start_height);
     let created = issuer
         .create_ballot(
             chain,
@@ -1761,7 +1763,8 @@ async fn phase_launch_ballot(
         "snapshotted Election Singleton state for launch_ballot"
     );
 
-    let issuer = chip_voting_sdk::actors::ballot::BallotIssuer::new(deploy.config.clone(), network);
+    let issuer = chip_voting_sdk::actors::ballot::BallotIssuer::new(deploy.config.clone(), network)
+        .with_election_start_height(deploy.election_start_height);
     let launched = issuer
         .launch_ballot(
             chain,
@@ -1863,7 +1866,8 @@ async fn phase_vote(
     // none of them may be defaulted (a stale `Bytes32::default()` /
     // `0` height would re-curry the Voting Coin's puzzle hash and
     // break the Ballot Coin co-spend's oracle assertion).
-    let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network);
+    let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network)
+        .with_election_start_height(deploy.election_start_height);
     let cast_result = voter
         .cast_vote(
             chain,
@@ -2113,7 +2117,8 @@ async fn phase_release(
     info!("=== PHASE 6.{voter_label}: release collateral ===");
     confirm_or_bail(args, &format!("Broadcast {voter_label}'s release?"))?;
 
-    let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network);
+    let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network)
+        .with_election_start_height(deploy.election_start_height);
     // Wait until the queried peer pool sees the post-finalize singleton tip.
     //
     // `Voter::release_collateral` walks the singleton lineage to find the

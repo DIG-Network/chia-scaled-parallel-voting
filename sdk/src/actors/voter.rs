@@ -102,6 +102,13 @@ pub struct Voter {
     pub config: ElectionConfig,
     pub keys: VoterKeys,
     pub network: NetworkType,
+    /// Height curried into the eve singleton's genesis state by the
+    /// deployer. Defaults to `0` for backwards compatibility, but EVERY
+    /// real chain (mainnet, testnet11) uses the chain peak observed at
+    /// `phase_deploy` time — failing to plumb that real value here makes
+    /// every launcher-lineage walker predict the wrong eve puzzle hash
+    /// and silently retry until timeout. Use [`Voter::with_election_start_height`].
+    pub election_start_height: u64,
 }
 
 /// STRUCT: CastVoteParams
@@ -236,7 +243,18 @@ impl Voter {
             config,
             keys,
             network,
+            election_start_height: 0,
         }
+    }
+
+    /// Bind the deployer's curried `election_start_height` so launcher-
+    /// lineage walks compute the correct eve singleton puzzle hash.
+    /// MUST be called for any deployment that used a non-zero start
+    /// height — otherwise `register`, `cast_vote`, `update_vote`,
+    /// `release_collateral` will fail to resolve the singleton.
+    pub fn with_election_start_height(mut self, h: u64) -> Self {
+        self.election_start_height = h;
+        self
     }
 
     /// FN: slot
@@ -341,17 +359,15 @@ impl Voter {
         // ── 1. Find the current Election Singleton ──────────────
         // After CHIP rev 2026-05-02 the launcher walker requires an
         // `election_start_height` to predict the eve singleton's
-        // puzzle hash for the fast path. Pass 0 here — the slow
-        // path (`coin_records_by_parent_ids`) succeeds regardless,
-        // and the eve fast path only matters before any singleton
-        // spend has confirmed (in which case
-        // `ElectionState::genesis(_, 0)` matches the deployer's
-        // default in [`Aggregator::new`]).
-        let election_start_height: u64 = 0;
+        // puzzle hash. Both fast path and slow path filter children by
+        // that hash — using 0 when the deployer used a non-zero peak
+        // (e.g. mainnet) makes both lookups silently miss the on-chain
+        // coin. Always plumb `self.election_start_height` (set via
+        // `Voter::with_election_start_height`).
         let current = crate::actors::aggregator::wait_for_current_singleton(
             chain,
             &self.config,
-            election_start_height,
+            self.election_start_height,
             "Election Singleton (launcher lineage)",
             std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(300),
@@ -1351,11 +1367,12 @@ impl Voter {
             .map_err(|e| voting_other(format!("cat_tail_hash: {e}")))?;
 
         // ── 1. Find the current Election Singleton ──────────────
-        let election_start_height: u64 = 0;
+        // See Voter::register for why `self.election_start_height`
+        // (not 0) MUST be plumbed through to the launcher walker.
         let current = crate::actors::aggregator::wait_for_current_singleton(
             chain,
             &self.config,
-            election_start_height,
+            self.election_start_height,
             "Election Singleton (release_collateral)",
             std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(300),
@@ -2249,6 +2266,7 @@ mod tests {
             config: good_config(),
             keys: voter_keys(),
             network: NetworkType::Testnet11,
+            election_start_height: 0,
         };
         let election_id = voter.config.election_launcher_id().unwrap();
         let destination = Bytes32::new([0xCC; 32]);

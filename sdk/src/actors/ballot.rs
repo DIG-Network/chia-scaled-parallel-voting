@@ -158,13 +158,30 @@ pub struct CreatedBallot {
 pub struct BallotIssuer {
     pub config: ElectionConfig,
     pub network: NetworkType,
+    /// See [`crate::actors::Voter::election_start_height`] — same
+    /// invariant: every launcher-lineage walk inside this issuer's
+    /// methods needs the deployer's curried start height. Defaults to
+    /// 0 for back-compat; set via [`BallotIssuer::with_election_start_height`].
+    pub election_start_height: u64,
 }
 
 impl BallotIssuer {
     /// FN: new
     /// WHAT: construct from a validated config + network.
     pub fn new(config: ElectionConfig, network: NetworkType) -> Self {
-        Self { config, network }
+        Self {
+            config,
+            network,
+            election_start_height: 0,
+        }
+    }
+
+    /// Bind the deployer's curried `election_start_height` so the
+    /// launcher-lineage walker (used by `create_ballot` /
+    /// `launch_ballot`) computes the correct eve singleton puzzle hash.
+    pub fn with_election_start_height(mut self, h: u64) -> Self {
+        self.election_start_height = h;
+        self
     }
 
     /// Build a `createBallot` spend bundle.
@@ -237,11 +254,10 @@ impl BallotIssuer {
 
         // ── 1. Find the current Election Singleton ──────────────
         // Same launcher lineage walker `Voter::register` uses.
-        let election_start_height: u64 = 0;
         let current = crate::actors::aggregator::wait_for_current_singleton(
             chain,
             &self.config,
-            election_start_height,
+            self.election_start_height,
             "Election Singleton (create_ballot)",
             std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(300),
@@ -523,11 +539,10 @@ impl BallotIssuer {
         // get curried into the per-ballot `finalize` action so the
         // ballot is permanently bound to the registration state at
         // launch time.
-        let election_start_height: u64 = 0;
         let current = crate::actors::aggregator::wait_for_current_singleton(
             chain,
             &self.config,
-            election_start_height,
+            self.election_start_height,
             "Election Singleton (launch_ballot)",
             std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(300),
