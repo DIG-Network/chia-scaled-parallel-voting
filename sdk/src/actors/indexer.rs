@@ -20,9 +20,10 @@
 //   `vote_outcome()` accessors have therefore been removed; their
 //   replacements are the per-ballot async accessors below
 //   (`is_finalized_for(launcher_id)`, `vote_outcome_for(launcher_id)`,
-//   etc.). Several of these are stubbed pending Phase 6 ballot-lineage
-//   walker test infrastructure — the surface exists today so callers
-//   can compile against the final API.
+//   `ballots()`, `ballot_state()`, `votes_for_ballot()`). All are
+//   fully implemented and exercised end-to-end by sdk/tests/
+//   ballot_reader_e2e.rs and the multi-ballot live integration test
+//   on mainnet.
 
 use chia_bls::PublicKey;
 use chia_protocol::Bytes32;
@@ -187,9 +188,9 @@ impl<C: ChainReader> Indexer<C> {
     // used to live here have been removed: under multi-ballot
     // semantics, both are properties of an individual Ballot Coin and
     // are not meaningful at the election scope. The accessors below
-    // replace them. Several are stubbed pending Phase 6 (ballot-
-    // lineage walker test infrastructure) — the surface exists today
-    // so callers can begin compiling against the final API.
+    // replace them. All are fully implemented and proven by
+    // sdk/tests/ballot_reader_e2e.rs (and the multi-voter
+    // live_orchestration_e2e.rs harness).
 
     /// FN: ballots
     /// WHAT: list every Ballot Coin (or its launcher eve coin) for

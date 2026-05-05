@@ -8,26 +8,34 @@
 //          * the shared ElectionConfig
 //          * the network type (selects mainnet/testnet AGG_SIG additional data)
 //
-// SUPPORTED FLOWS (CHIP rev 2026-05-02):
+// SUPPORTED FLOWS (CHIP rev 2026-05-02 — all fully implemented and
+// proven end-to-end by sdk/tests/voter_*_e2e.rs and confirmed on
+// mainnet by cli/src/bin/live_integration_test.rs run #11):
 //   * register          — register-action spend on the Election
 //                         Singleton. Mints a CAT-wrapped Registration
 //                         Coin at the voter's predicted puzzle hash.
 //                         No XCH fee output (fees were dropped in
 //                         this revision).
-//   * cast_vote         — STUB. Mints the per-(voter, ballot)
-//                         Voting Coin via the Registration Coin's
-//                         `mint_voting_coin` action. Full
-//                         implementation lands in Phase 6 once the
-//                         test infrastructure can drive a simulator
-//                         end-to-end.
-//   * update_vote       — STUB. Updates a Voting Coin's vote
-//                         payload via its `update_vote` action,
-//                         gated by the Ballot Coin oracle.
-//   * release_collateral — STUB. Co-spends the Election Singleton's
-//                         `deregister` action with the Registration
-//                         Coin's `release` action, sending the CAT
-//                         collateral to a destination chosen by the
-//                         voter.
+//   * cast_vote         — Mints the per-(voter, ballot) Voting Coin
+//                         via the Registration Coin's
+//                         `mint_voting_coin` action. Co-spends the
+//                         Ballot Coin's oracle action so the new
+//                         Voting Coin is bound to a specific ballot
+//                         identity + close height. Recreates the
+//                         Registration Coin with `voted_ballots_root`
+//                         updated to mark the ballot as voted.
+//   * update_vote       — Updates a Voting Coin's vote payload via
+//                         its `update_vote` action; co-spends the
+//                         Ballot Coin's oracle action to re-affirm
+//                         the ballot is still open. Re-emits the BLS
+//                         signature memo over the new vote message.
+//   * release_collateral — Co-spends the Election Singleton's
+//                         `deregister` action with the (post-cast)
+//                         Registration Coin's `release` action,
+//                         sending the CAT collateral to a destination
+//                         chosen by the voter. Walks the registration
+//                         coin's lineage forward from the supplied id
+//                         so callers can pass the post-cast tip.
 //
 // SIGNING: every spend bundle is signed via the upstream
 //   `dig_l1_wallet::transaction::sign_coin_spends`

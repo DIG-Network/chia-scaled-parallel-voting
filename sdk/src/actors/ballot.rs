@@ -23,11 +23,15 @@
 //   (not properties of the global ElectionState). Reading them lives
 //   here rather than on the Indexer's election-scope accessors.
 //
-// STUB STATUS: full singleton spend assembly (createBallot) and the
-//   on-chain ballot lineage walker land in Phase 6 once the test
-//   infrastructure can drive a simulator end-to-end. The public
-//   surface is in place today so callers can compile against the
-//   final API.
+// IMPLEMENTATION STATUS: BallotIssuer::create_ballot, ::launch_ballot
+//   and BallotReader's per-ballot accessors are fully implemented and
+//   proven end-to-end. Coverage:
+//     * sdk/tests/create_ballot_e2e.rs / launch_ballot_e2e.rs (simulator)
+//     * sdk/tests/ballot_reader_e2e.rs (simulator)
+//     * cli/src/bin/live_integration_test.rs run #11 (mainnet)
+//   The on-chain ballot lineage walker reused inside BallotReader walks
+//   the full singleton-launcher → eve-Ballot-Coin → recreated lineage,
+//   matching the mainnet behavior already exercised.
 
 use chia_protocol::{Bytes32, SpendBundle};
 use chia_sdk_driver::SpendContext;
@@ -964,8 +968,13 @@ pub async fn get_ballot_via_chain<C: ChainReader>(
 // Tests
 // ============================================================================
 //
-// The mutating / chain-walking methods above are stubs pending Phase 6,
-// so there is nothing to unit-test in isolation today. End-to-end
-// coverage of `BallotIssuer::create_ballot` and `BallotReader::*` lives
-// in `tests/integration.rs` once Phase 6 stands up the simulator
-// harness.
+// End-to-end coverage of `BallotIssuer::create_ballot`,
+// `BallotIssuer::launch_ballot`, and `BallotReader::{list_ballots,
+// get_ballot}` lives in:
+//   * sdk/tests/create_ballot_e2e.rs  — create flow on simulator
+//   * sdk/tests/launch_ballot_e2e.rs  — launcher second-spend
+//   * sdk/tests/ballot_reader_e2e.rs  — read accessors
+//   * sdk/tests/finalize_per_ballot_e2e.rs — full lifecycle (deploy
+//     → register → create_ballot → launch_ballot → cast → finalize)
+//   * sdk/tests/live_orchestration_e2e.rs — multi-voter orchestration
+//   * cli/src/bin/live_integration_test.rs run #11 — mainnet end-to-end
