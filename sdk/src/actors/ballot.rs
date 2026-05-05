@@ -964,6 +964,289 @@ pub async fn get_ballot_via_chain<C: ChainReader>(
     }))
 }
 
+/// STRUCT: AnnounceFinalizationParams
+/// PURPOSE: typed bundle for [`build_announce_finalization_bundle`]
+///          arguments. Carries the per-ballot curry data needed to
+///          reconstruct the FINALIZED Ballot Coin's puzzle hash, plus
+///          the post-finalize state pair (`vote_outcome`,
+///          `agg_signers`) the action solution requires.
+/// FIELDS:
+///   * `ballot_launcher_id` — singleton launcher id of the Ballot Coin
+///     to spend.
+///   * `vote_close_height`, `vote_threshold_num`, `vote_threshold_den`,
+///     `registration_merkle_root_snapshot`,
+///     `registration_vote_weight_snapshot` — same per-ballot curries
+///     used by `Aggregator::build_finalize_for_ballot`. Must match
+///     what the prior `BallotIssuer::launch_ballot` recorded;
+///     mismatched curries will fail the on-chain ph sanity check
+///     before any spend is built.
+///   * `vote_outcome`, `agg_signers` — the FINALIZED state values
+///     (the prior `Aggregator::build_finalize_for_ballot` write).
+///     The action's solution carries these as a state-truth, and the
+///     Ballot Coin's full puzzle hash is derived from them — passing
+///     the wrong values will fail the on-chain ph sanity check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnounceFinalizationParams {
+    pub ballot_launcher_id: Bytes32,
+    pub vote_close_height: u64,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+    pub registration_merkle_root_snapshot: Bytes32,
+    pub registration_vote_weight_snapshot: u64,
+    pub vote_outcome: Bytes32,
+    pub agg_signers: Bytes32,
+}
+
+/// FN: build_announce_finalization_bundle
+/// WHAT: spend the Ballot Coin running its `announce_finalization`
+///       action (per CHIP rev §211-253). The action's only effect is
+///       to emit a `CreateCoinAnnouncement` whose message is
+///       `sha256("ballot_finalized" || ballot_launcher_id ||
+///       vote_outcome || agg_signers)` — the on-chain trigger
+///       downstream consumers (treasuries, etc.) latch onto.
+/// PRE:  the ballot must already have been finalized via
+///       `Aggregator::build_finalize_for_ballot`. The action
+///       puzzle traps if the curried `BallotState` has
+///       `finalized = false`.
+/// FLOW:
+///   1. Build the 3 per-ballot action puzzles (finalize, oracle,
+///      announce_finalization) with the SAME curries the prior
+///      `Aggregator::build_finalize_for_ballot` used. Compute their
+///      tree hashes + the merkle root.
+///   2. Build the action layer with the FINALIZED state truth
+///      `((), (1u8, (vote_outcome, agg_signers)))` — this is what
+///      makes the Ballot Coin's inner / full ph differ from the
+///      pre-finalize layout.
+///   3. Compute the predicted Ballot Coin full ph and walk the
+///      lineage to find the current unspent Ballot Coin singleton.
+///      Bail with a clear error if the predicted ph doesn't match
+///      (means caller's `params` don't match the on-chain state).
+///   4. Build the action layer solution running
+///      `announce_finalization` with solution `()` — the action
+///      reads the state truth from the layer's curried args, no
+///      additional input needed.
+///   5. Wrap as a singleton spend (Eve or Lineage proof per the
+///      walker's return) and dry-run check.
+///   6. Sign with empty keys — `announce_finalization` emits no
+///      `AggSig*` conditions, so `sign_bundle_signature` returns
+///      the BLS identity element (zero G2 point), which is the
+///      canonical aggregate when no signatures are required.
+/// POST: returns a single-coin-spend `SpendBundle` ready to push.
+pub async fn build_announce_finalization_bundle<C: ChainReader>(
+    config: &ElectionConfig,
+    chain: &C,
+    network: crate::config::NetworkType,
+    params: AnnounceFinalizationParams,
+) -> VotingResult<SpendBundle> {
+    use chia_puzzle_types::singleton::SingletonArgs;
+    use chia_puzzle_types::{LineageProof, Proof};
+    use chia_sdk_driver::SpendContext;
+    use clvm_traits::{clvm_curried_args, ToClvm};
+    use clvm_utils::{tree_hash, CurriedProgram, TreeHash};
+
+    let election_id = config.election_launcher_id().map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("election_launcher_id: {e}").into(),
+        ))
+    })?;
+
+    // ── 1. Compute per-ballot finalize / oracle / announce hashes ──
+    // Same curries as `Aggregator::build_finalize_for_ballot`. If any
+    // diverges, the resulting ballot_actions_root won't match what
+    // launch_ballot recorded, the predicted ph will be wrong, and
+    // the on-chain check in step 3 will surface a clear error.
+    let mut ctx = SpendContext::new();
+    let (vk_node, ic_node) = build_vk_ic_nodes(&mut ctx, config)?;
+
+    let finalize_program_node = crate::action_spends::load_action_puzzle(
+        &mut ctx,
+        crate::puzzles::BALLOT_COIN_FINALIZE_HEX,
+    )?;
+    let finalize_curried = CurriedProgram {
+        program: finalize_program_node,
+        args: clvm_curried_args!(
+            vk_node,
+            ic_node,
+            params.ballot_launcher_id,
+            election_id,
+            params.vote_close_height,
+            params.vote_threshold_num,
+            params.vote_threshold_den,
+            params.registration_merkle_root_snapshot,
+            params.registration_vote_weight_snapshot,
+        ),
+    }
+    .to_clvm(&mut *ctx)
+    .map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("currying ballot finalize: {e}").into(),
+        ))
+    })?;
+    let finalize_full_hash = Bytes32::new(tree_hash(&ctx, finalize_curried).to_bytes());
+
+    let oracle_program_node = crate::action_spends::load_action_puzzle(
+        &mut ctx,
+        crate::puzzles::BALLOT_COIN_ORACLE_HEX,
+    )?;
+    let oracle_curried = CurriedProgram {
+        program: oracle_program_node,
+        args: clvm_curried_args!(params.ballot_launcher_id, params.vote_close_height),
+    }
+    .to_clvm(&mut *ctx)
+    .map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("currying oracle: {e}").into(),
+        ))
+    })?;
+    let oracle_full_hash = Bytes32::new(tree_hash(&ctx, oracle_curried).to_bytes());
+
+    let announce_program_node = crate::action_spends::load_action_puzzle(
+        &mut ctx,
+        crate::puzzles::BALLOT_COIN_ANNOUNCE_FINALIZATION_HEX,
+    )?;
+    let announce_curried = CurriedProgram {
+        program: announce_program_node,
+        args: clvm_curried_args!(params.ballot_launcher_id),
+    }
+    .to_clvm(&mut *ctx)
+    .map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("currying announce_finalization: {e}").into(),
+        ))
+    })?;
+    let announce_full_hash = Bytes32::new(tree_hash(&ctx, announce_curried).to_bytes());
+
+    let ballot_actions_root = crate::puzzles::per_ballot_actions_merkle_root(
+        finalize_full_hash,
+        oracle_full_hash,
+        announce_full_hash,
+    );
+    let ballot_root_leaves = crate::puzzles::per_ballot_action_root_leaves(
+        finalize_full_hash,
+        oracle_full_hash,
+        announce_full_hash,
+    );
+
+    // ── 2. Build the action layer with the FINALIZED state ────────
+    // BallotState shape (per `puzzles/ballot_coin/state.rue`):
+    //   `(finalized . (vote_outcome . agg_signers))`
+    // CLVM-encoded as `(u8, (Bytes32, Bytes32))`. The action layer
+    // wraps it under an empty-list "truth" cell:
+    //   `((), state)`
+    // Post-finalize, finalized = 1.
+    let ballot_finalizer_node =
+        crate::action_spends::build_ballot_finalizer_full(&mut ctx, params.ballot_launcher_id)?;
+    let finalized_state_value: ((), (u8, (Bytes32, Bytes32))) =
+        ((), (1u8, (params.vote_outcome, params.agg_signers)));
+    let ballot_state_node = finalized_state_value.to_clvm(&mut *ctx).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("finalized ballot state to_clvm: {e}").into(),
+        ))
+    })?;
+    let ballot_inner_node = crate::action_spends::build_action_layer_puzzle(
+        &mut ctx,
+        ballot_finalizer_node,
+        ballot_actions_root,
+        ballot_state_node,
+    )?;
+    let ballot_inner_ph = Bytes32::new(tree_hash(&ctx, ballot_inner_node).to_bytes());
+
+    // ── 3. Find the current Ballot Coin singleton ─────────────────
+    let (ballot_coin, ballot_lineage_proof) =
+        crate::actors::aggregator::find_current_ballot_singleton_via_chain(
+            chain,
+            params.ballot_launcher_id,
+            ballot_inner_ph,
+        )
+        .await?;
+
+    let inner_th = TreeHash::new(ballot_inner_ph.to_bytes());
+    let predicted_full_ph = Bytes32::new(
+        SingletonArgs::curry_tree_hash(params.ballot_launcher_id, inner_th).to_bytes(),
+    );
+    if ballot_coin.puzzle_hash != predicted_full_ph {
+        return Err(VotingError::Other(anyhow_compat::Error(
+            format!(
+                "build_announce_finalization_bundle: Ballot Coin ph {} doesn't match predicted \
+                 {} — params don't match the on-chain ballot (post-finalize) state",
+                hex::encode(ballot_coin.puzzle_hash),
+                hex::encode(predicted_full_ph),
+            )
+            .into(),
+        )));
+    }
+    let ballot_lineage_proof: Proof = match ballot_lineage_proof {
+        Proof::Eve(e) => Proof::Eve(e),
+        Proof::Lineage(l) => Proof::Lineage(LineageProof {
+            parent_parent_coin_info: l.parent_parent_coin_info,
+            parent_inner_puzzle_hash: l.parent_inner_puzzle_hash,
+            parent_amount: l.parent_amount,
+        }),
+    };
+
+    // ── 4. Build the action layer solution ───────────────────────
+    // announce_finalization's action solution is `()` — the action
+    // reads the FINALIZED state from the layer's curried truth and
+    // emits the announcement; no per-spend args needed.
+    let announce_solution = ().to_clvm(&mut *ctx).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("announce_finalization solution: {e}").into(),
+        ))
+    })?;
+    let action_spends = vec![crate::action_spends::ActionSpend {
+        puzzle: announce_curried,
+        solution: announce_solution,
+    }];
+    let ballot_finalizer_solution = ().to_clvm(&mut *ctx).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("ballot finalizer solution: {e}").into(),
+        ))
+    })?;
+    let action_layer_solution = crate::action_spends::build_action_layer_solution(
+        &mut ctx,
+        &ballot_root_leaves,
+        &action_spends,
+        ballot_finalizer_solution,
+    )?;
+
+    // ── 5. Wrap as singleton spend + dry-run ─────────────────────
+    let ballot_singleton_spend = crate::action_spends::build_singleton_spend(
+        &mut ctx,
+        ballot_coin,
+        params.ballot_launcher_id,
+        ballot_inner_node,
+        action_layer_solution,
+        ballot_lineage_proof,
+    )?;
+
+    let coin_spends = vec![ballot_singleton_spend];
+    crate::dry_run_coin_spends(&coin_spends).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("build_announce_finalization_bundle dry-run: {e:?}").into(),
+        ))
+    })?;
+
+    // ── 6. Sign + bundle ─────────────────────────────────────────
+    // announce_finalization emits zero AggSig conditions, so the
+    // empty-keys path returns the BLS identity (zero G2 point) —
+    // which is the canonical aggregate when nothing requires signing.
+    let signature = crate::actors::deployer::sign_bundle_signature(&coin_spends, &[], network)?;
+    Ok(SpendBundle::new(coin_spends, signature))
+}
+
+impl BallotIssuer {
+    /// FN: announce_finalization
+    /// Delegates to [`build_announce_finalization_bundle`] using this
+    /// issuer's stored config + network.
+    pub async fn announce_finalization<C: ChainReader>(
+        &self,
+        chain: &C,
+        params: AnnounceFinalizationParams,
+    ) -> VotingResult<SpendBundle> {
+        build_announce_finalization_bundle(&self.config, chain, self.network, params).await
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

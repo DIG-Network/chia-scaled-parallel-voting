@@ -1249,10 +1249,25 @@ pub async fn launch_ballot_bundle_js(
         .map_err(|e| JsError::new(&format!("encode WasmLaunchedBallot: {e}")))
 }
 
-/// Build (preview) the cast-vote spend without attaching the voter's
-/// final BLS signature — useful for showing the dApp user the
-/// canonical vote message they'll be signing. Wraps a partial
-/// `Voter::cast_vote` invocation.
+/// Hardware-wallet preview variant of `castVoteBuildFinalBundle`.
+///
+/// SDK-BLOCKED: this entry point is reserved for the hardware-wallet
+/// flow where the voter's BLS secret never enters the browser. A
+/// usable implementation needs the SDK to expose `Voter::cast_vote`
+/// split into two halves:
+///   1. `cast_vote_build_with_initial_sig(chain, params, voter_pk,
+///      initial_signature) -> { coin_spends, augmented_aggsig_messages }`
+///      — builds the on-chain solution embedding the caller-provided
+///      `sign_unsafe(vote_message)` signature, returns the unsigned
+///      coin_spends + the augmented `(pk, msg)` pairs the wallet must
+///      sign for the bundle aggregate.
+///   2. `assembleSpendBundle(coin_spends, agg_signature)` (already
+///      exported) — attaches the wallet-supplied aggregate.
+///
+/// Until the SDK ships that split, browsers must use
+/// `castVoteBuildFinalBundle` with a browser-held secret. Hardware-
+/// wallet integrations should drive `chip-voting-cli phase_vote`
+/// out-of-band.
 #[wasm_bindgen(js_name = "castVoteBuildPreviewSpend")]
 pub fn cast_vote_build_preview_spend_js(
     _backend: JsChainBackend,
@@ -1261,7 +1276,10 @@ pub fn cast_vote_build_preview_spend_js(
     _params_json: &str,
 ) -> Result<JsValue, JsError> {
     Err(JsError::new(
-        "castVoteBuildPreviewSpend: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
+        "castVoteBuildPreviewSpend: not implemented — needs SDK to expose a no-secret \
+         build_with_initial_sig variant of Voter::cast_vote (browser preview for \
+         hardware-wallet voters). Use castVoteBuildFinalBundle with a browser-held \
+         secret today, or drive chip-voting-cli phase_vote out-of-band.",
     ))
 }
 
@@ -1308,8 +1326,13 @@ pub async fn cast_vote_build_final_bundle_js(
     serde_json::to_string(&out).map_err(|e| JsError::new(&format!("encode WasmVoteResult: {e}")))
 }
 
-/// Build (preview) the update-vote spend without attaching the voter's
-/// final BLS signature.
+/// Hardware-wallet preview variant of `updateVoteBuildFinalBundle`.
+///
+/// SDK-BLOCKED: same shape as `castVoteBuildPreviewSpend` —
+/// `Voter::update_vote` needs an analogous
+/// `update_vote_build_with_initial_sig` split before this can be
+/// wired. See the `castVoteBuildPreviewSpend` doc-comment for the
+/// full contract.
 #[wasm_bindgen(js_name = "updateVoteBuildPreviewSpend")]
 pub fn update_vote_build_preview_spend_js(
     _backend: JsChainBackend,
@@ -1318,7 +1341,10 @@ pub fn update_vote_build_preview_spend_js(
     _params_json: &str,
 ) -> Result<JsValue, JsError> {
     Err(JsError::new(
-        "updateVoteBuildPreviewSpend: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
+        "updateVoteBuildPreviewSpend: not implemented — needs SDK to expose a no-secret \
+         build_with_initial_sig variant of Voter::update_vote (browser preview for \
+         hardware-wallet voters). Use updateVoteBuildFinalBundle with a browser-held \
+         secret today, or drive chip-voting-cli phase_update_vote out-of-band.",
     ))
 }
 
@@ -1553,24 +1579,81 @@ pub async fn get_ballot_js(
         .map_err(|e| JsError::new(&format!("encode snapshot: {e}")))
 }
 
+/// JS-side input mirror of
+/// [`chip_voting_sdk::actors::ballot::AnnounceFinalizationParams`].
+/// The `voteOutcomeHex` and `aggSignersHex` are the FINALIZED state
+/// values (returned by an earlier `buildBallotFinalizeBundle` call);
+/// the per-ballot curry data must match what was used at
+/// `launchBallotBundle` time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmAnnounceFinalizationParams {
+    pub ballot_launcher_id_hex: String,
+    pub vote_close_height: u64,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+    pub registration_merkle_root_snapshot_hex: String,
+    pub registration_vote_weight_snapshot: u64,
+    pub vote_outcome_hex: String,
+    pub agg_signers_hex: String,
+}
+
+impl WasmAnnounceFinalizationParams {
+    fn into_sdk(self) -> VotingResult<chip_voting_sdk::actors::ballot::AnnounceFinalizationParams> {
+        Ok(chip_voting_sdk::actors::ballot::AnnounceFinalizationParams {
+            ballot_launcher_id: parse_hex32(&self.ballot_launcher_id_hex)?,
+            vote_close_height: self.vote_close_height,
+            vote_threshold_num: self.vote_threshold_num,
+            vote_threshold_den: self.vote_threshold_den,
+            registration_merkle_root_snapshot: parse_hex32(
+                &self.registration_merkle_root_snapshot_hex,
+            )?,
+            registration_vote_weight_snapshot: self.registration_vote_weight_snapshot,
+            vote_outcome: parse_hex32(&self.vote_outcome_hex)?,
+            agg_signers: parse_hex32(&self.agg_signers_hex)?,
+        })
+    }
+}
+
 /// Announce a ballot finalization (the Ballot Coin's
 /// `announce_finalization` action). Per CHIP rev §211-253 this is
 /// the on-chain trigger for downstream consumers (treasuries, etc.)
 /// to read the finalized vote outcome.
 ///
-/// TODO: SDK currently has no standalone `announce_finalization`
-/// helper exposed on the Ballot Coin actor; once `BallotIssuer`
-/// gains an `announce_finalization` method, wire it through here.
-/// Until then this returns an error — defer with DONE_WITH_CONCERNS.
+/// PRE: the ballot must already have been finalized via
+/// `buildBallotFinalizeBundle` (the action puzzle traps if the
+/// curried `BallotState.finalized` is `false`).
+///
+/// Wraps
+/// [`chip_voting_sdk::actors::ballot::build_announce_finalization_bundle`].
+/// Returns the Streamable-encoded `SpendBundle` as a hex string.
 #[wasm_bindgen(js_name = "announceBallotFinalization")]
-pub fn announce_ballot_finalization_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-    _ballot_launcher_id_hex: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "announceBallotFinalization: SDK does not yet expose a standalone announce_finalization helper; tracked in CHIP §211-253",
-    ))
+pub async fn announce_ballot_finalization_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    params_json: String,
+    network: WasmNetwork,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let wasm_params: WasmAnnounceFinalizationParams = serde_json::from_str(&params_json)
+        .map_err(|e| JsError::new(&format!("AnnounceFinalizationParams parse: {e}")))?;
+    let sdk_params = wasm_params
+        .into_sdk()
+        .map_err(|e| JsError::new(&format!("AnnounceFinalizationParams decode: {e}")))?;
+    let chain = JsChainReader::new(backend);
+    let bundle = chip_voting_sdk::actors::ballot::build_announce_finalization_bundle(
+        &cfg,
+        &chain,
+        wasm_network_to_sdk(network),
+        sdk_params,
+    )
+    .await
+    .map_err(|e| JsError::new(&format!("build_announce_finalization_bundle: {e}")))?;
+    let bundle_bytes = encode_streamable(&bundle)?;
+    Ok(hex::encode(&bundle_bytes))
 }
 
 /// Build the release-collateral spend bundle for a voter. Wraps
