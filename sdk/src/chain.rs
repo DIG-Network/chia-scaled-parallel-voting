@@ -59,14 +59,37 @@ impl ChainCoinRecord {
     }
 }
 
+/// TRAIT: ChainReaderBounds (private super-trait)
+/// WHAT: thread-safety bounds switch for ChainReader. On native
+///       targets requires `Send + Sync` (callers spawn async work
+///       across tokio threads); on wasm32 the bound is empty
+///       because `JsValue`-holding adapters can't be `Send`. Auto-
+///       impl'd for any type meeting the per-target bound, so
+///       existing native impls (`chia_query::ChiaQuery`,
+///       `chia_sdk_test::Simulator`) continue to work without
+///       changes.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait ChainReaderBounds: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> ChainReaderBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait ChainReaderBounds {}
+#[cfg(target_arch = "wasm32")]
+impl<T> ChainReaderBounds for T {}
+
 /// TRAIT: ChainReader
 /// WHAT: minimum chain-read surface needed by Aggregator + Indexer.
 /// IMPL: provided for `chia_query::ChiaQuery` (production) and
 ///       `&chia_sdk_test::Simulator` (tests; gated on a peer-simulator
 ///       feature... actually the Simulator type is unconditional in
 ///       chia-sdk-test 0.30 so no feature gate needed).
-#[async_trait]
-pub trait ChainReader: Send + Sync {
+/// THREAD-SAFETY: `Send + Sync` on native; relaxed on wasm32 to
+///                support `JsValue`-holding adapters. See
+///                `ChainReaderBounds`.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait ChainReader: ChainReaderBounds {
     /// FN: coin_records_by_puzzle_hash
     /// WHAT: return every unspent coin currently at `puzzle_hash`.
     /// USAGE: locate the latest unspent Election Singleton coin —
