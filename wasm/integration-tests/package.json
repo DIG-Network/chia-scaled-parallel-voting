@@ -1,0 +1,17 @@
+{
+  "name": "chip-voting-wasm-integration-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js port of cli/src/bin/live_integration_test.rs that exercises the wasm bindings instead of calling the SDK directly. Validates that every wasm export round-trips correctly against live mainnet via coinset.org + a JS-side JsChainBackend.",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "test": "node live_integration.mjs",
+    "smoke": "node smoke_test.mjs"
+  },
+  "dependencies": {
+    "chip-voting-wasm": "file:../pkg-node"
+  }
+}
