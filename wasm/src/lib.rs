@@ -961,6 +961,53 @@ pub struct WasmVoteResult {
     pub vote_signature_hex: String,
 }
 
+/// Decode a 48-byte BLS G1 public key from hex (with or without
+/// `0x` prefix). Used by the chain-walking exports to deserialise
+/// voter pubkey lists from the dApp.
+fn parse_pubkey_hex(s: &str, label: &str) -> VotingResult<PublicKey> {
+    let trimmed = s.trim().trim_start_matches("0x");
+    let bytes = hex::decode(trimmed).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("{label}: hex decode: {e}").into(),
+        ))
+    })?;
+    let arr: [u8; 48] = bytes.as_slice().try_into().map_err(|_| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("{label}: expected 48-byte G1 pubkey, got {}", bytes.len()).into(),
+        ))
+    })?;
+    PublicKey::from_bytes(&arr).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("{label}: PublicKey::from_bytes: {e:?}").into(),
+        ))
+    })
+}
+
+/// Build a [`SparseMerkleTree`](chip_voting_sdk::merkle::SparseMerkleTree)
+/// from a JSON array of voter pubkey hex strings.
+///
+/// Used by `registerBuildSpends` (caller passes the SMT WITHOUT the
+/// new voter — proving non-membership) and
+/// `releaseCollateralBuildSpends` (caller passes the SMT WITH the
+/// voter — proving membership). The dApp obtains the appropriate
+/// pubkey list from a prior aggregator/indexer pass.
+fn build_smt_from_pubkey_json(
+    voter_pubkeys_hex_json: &str,
+    label: &str,
+) -> VotingResult<chip_voting_sdk::merkle::SparseMerkleTree> {
+    let voter_hex_list: Vec<String> = serde_json::from_str(voter_pubkeys_hex_json).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("{label}: JSON parse: {e}").into(),
+        ))
+    })?;
+    let mut smt = chip_voting_sdk::merkle::SparseMerkleTree::new();
+    for (idx, h) in voter_hex_list.iter().enumerate() {
+        let pk = parse_pubkey_hex(h, &format!("{label}[{idx}]"))?;
+        smt.insert(&pk)?;
+    }
+    Ok(smt)
+}
+
 /// Decode a 32-byte BLS secret key from hex (with or without `0x`
 /// prefix). Used by the cast / update wrappers to sign the spend
 /// bundle inside wasm.
@@ -1017,29 +1064,53 @@ fn wasm_network_to_sdk(n: WasmNetwork) -> chip_voting_sdk::NetworkType {
 //   "not yet wired through wasm" error pending the next migration
 //   pass once SDK feature-gating lands (see top-of-file note).
 
-/// Build the register spend bundle for a voter. Mirrors
+/// Build the register spend bundle for a voter. Wraps
+/// [`chip_voting_sdk::actors::voter::Voter::register`]. Mirrors
 /// `phase_register_voter` in the live integration test.
 ///
 /// Per CHIP rev 2026-05-02: NO `registration_fee_coin_spend` argument
 /// (CHIP §191 forbids the curry). Caller may still attach a mempool
 /// fee separately if desired.
+///
+/// `voter_pubkeys_hex_json` is a JSON array of currently-registered
+/// voter pubkeys (NOT including the voter being registered now —
+/// register's non-membership proof requires the slot to be empty
+/// in the supplied SMT).
+///
+/// `cat_parent_spend_bytes` is the Streamable-encoded `CoinSpend`
+/// the dApp pre-builds (and externally signs if necessary) to mint
+/// the Registration Coin at its predicted CAT-wrapped puzzle hash.
+///
+/// Returns the Streamable-encoded SpendBundle as a hex string.
 #[wasm_bindgen(js_name = "registerBuildSpends")]
-pub fn register_build_spends_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-    _voter_secret_hex: &str,
-    _cat_parent_spend_bytes: &[u8],
-    _registration_coin_id_hex: &str,
-) -> Result<JsValue, JsError> {
-    // STUB — the underlying `Voter::register` is async and chain-driven,
-    // and properly wiring its 5-argument SMT-snapshot signature through
-    // wasm-bindgen requires the pending SDK feature-gate work. Returning
-    // a clear error from JS is preferable to silently building a bad
-    // bundle. Callers that need full register today should drive the
-    // CLI's `phase_register_voter` directly.
-    Err(JsError::new(
-        "registerBuildSpends: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
-    ))
+pub async fn register_build_spends_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    voter_secret_hex: String,
+    voter_pubkeys_hex_json: String,
+    cat_parent_spend_bytes: Vec<u8>,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let secret = parse_secret_hex(&voter_secret_hex, "voter_secret_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let keys = chip_voting_sdk::actors::voter::VoterKeys::new(secret);
+    let smt = build_smt_from_pubkey_json(&voter_pubkeys_hex_json, "voter_pubkeys_hex_json")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let cat_parent_spend: chia_protocol::CoinSpend = decode_streamable(&cat_parent_spend_bytes)?;
+    let voter = chip_voting_sdk::actors::voter::Voter::new(cfg, keys, wasm_network_to_sdk(network))
+        .with_election_start_height(election_start_height);
+    let chain = JsChainReader::new(backend);
+    let bundle = voter
+        .register(&smt, cat_parent_spend, &chain)
+        .await
+        .map_err(|e| JsError::new(&format!("register: {e}")))?;
+    let bundle_bytes = encode_streamable(&bundle)?;
+    Ok(hex::encode(&bundle_bytes))
 }
 
 /// Mint a fresh Ballot Coin launcher (per CHIP rev §211-253). Wraps
@@ -1306,18 +1377,8 @@ pub async fn collect_votes_for_ballot_js(
         .map_err(|e| JsError::new(&format!("voter_pubkeys_hex_json parse: {e}")))?;
     let mut voters: Vec<PublicKey> = Vec::with_capacity(voter_hex_list.len());
     for (idx, h) in voter_hex_list.iter().enumerate() {
-        let trimmed = h.trim().trim_start_matches("0x");
-        let bytes = hex::decode(trimmed)
-            .map_err(|e| JsError::new(&format!("voter_pubkeys[{idx}] hex decode: {e}")))?;
-        let arr: [u8; 48] = bytes.as_slice().try_into().map_err(|_| {
-            JsError::new(&format!(
-                "voter_pubkeys[{idx}]: expected 48-byte G1 pubkey, got {}",
-                bytes.len()
-            ))
-        })?;
-        let pk = PublicKey::from_bytes(&arr).map_err(|e| {
-            JsError::new(&format!("voter_pubkeys[{idx}] PublicKey::from_bytes: {e:?}"))
-        })?;
+        let pk = parse_pubkey_hex(h, &format!("voter_pubkeys[{idx}]"))
+            .map_err(|e| JsError::new(&format!("{e}")))?;
         voters.push(pk);
     }
     let voter_set = chip_voting_sdk::state::VoterSet {
@@ -1413,23 +1474,54 @@ pub fn announce_ballot_finalization_js(
 }
 
 /// Build the release-collateral spend bundle for a voter. Wraps
-/// `Voter::release_collateral`. Mirrors `phase_release` in the live
-/// integration test.
+/// [`chip_voting_sdk::actors::voter::Voter::release_collateral`].
+/// Mirrors `phase_release` in the live integration test.
 ///
 /// Per CHIP rev 2026-05-02 the SDK's `release_collateral` requires a
 /// `registration_coin_id` arg (the lineage walker needs it to find
 /// the voter's actual on-chain registration coin).
+///
+/// `voter_pubkeys_hex_json` is a JSON array of currently-registered
+/// voter pubkeys INCLUDING this voter — release's deregister
+/// membership proof requires the voter to be present in the supplied
+/// SMT, and the SMT's root must match the on-chain
+/// `registration_merkle_root` (otherwise the SDK errors early with a
+/// clear "re-sync" message).
+///
+/// Returns the Streamable-encoded SpendBundle as a hex string.
 #[wasm_bindgen(js_name = "releaseCollateralBuildSpends")]
-pub fn release_collateral_build_spends_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-    _voter_secret_hex: &str,
-    _registration_coin_id_hex: &str,
-    _destination_puzzle_hash_hex: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "releaseCollateralBuildSpends: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
-    ))
+pub async fn release_collateral_build_spends_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    voter_secret_hex: String,
+    voter_pubkeys_hex_json: String,
+    registration_coin_id_hex: String,
+    destination_puzzle_hash_hex: String,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let secret = parse_secret_hex(&voter_secret_hex, "voter_secret_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let keys = chip_voting_sdk::actors::voter::VoterKeys::new(secret);
+    let smt = build_smt_from_pubkey_json(&voter_pubkeys_hex_json, "voter_pubkeys_hex_json")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let registration_coin_id = parse_hex32(&registration_coin_id_hex)
+        .map_err(|e| JsError::new(&format!("registration_coin_id_hex: {e}")))?;
+    let destination = parse_hex32(&destination_puzzle_hash_hex)
+        .map_err(|e| JsError::new(&format!("destination_puzzle_hash_hex: {e}")))?;
+    let voter = chip_voting_sdk::actors::voter::Voter::new(cfg, keys, wasm_network_to_sdk(network))
+        .with_election_start_height(election_start_height);
+    let chain = JsChainReader::new(backend);
+    let bundle = voter
+        .release_collateral(&chain, &smt, registration_coin_id, destination)
+        .await
+        .map_err(|e| JsError::new(&format!("release_collateral: {e}")))?;
+    let bundle_bytes = encode_streamable(&bundle)?;
+    Ok(hex::encode(&bundle_bytes))
 }
 
 // ============================================================================
