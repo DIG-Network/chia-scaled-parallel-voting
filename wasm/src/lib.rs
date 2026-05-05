@@ -790,6 +790,132 @@ pub fn canonical_vote_message_js(
 }
 
 // ============================================================================
+// SECTION 8b — Voter / network helpers (param structs + key parsing)
+// ============================================================================
+//
+// Wire-format mirrors of [`chip_voting_sdk::actors::voter::CastVoteParams`]
+// and [`UpdateVoteParams`] with all `Bytes32` fields encoded as bare
+// (or `0x`-prefixed) 64-char hex strings. JSON keys are camelCase per
+// the rest of this crate's JS surface.
+
+/// JS-side input mirror of [`chip_voting_sdk::actors::voter::CastVoteParams`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmCastVoteParams {
+    pub ballot_launcher_id_hex: String,
+    pub vote_data_hex: String,
+    pub vote_close_height: u64,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+    pub registration_merkle_root_snapshot_hex: String,
+    pub registration_vote_weight_snapshot: u64,
+    pub voting_coin_amount: u64,
+}
+
+impl WasmCastVoteParams {
+    fn into_sdk(self) -> VotingResult<chip_voting_sdk::actors::voter::CastVoteParams> {
+        Ok(chip_voting_sdk::actors::voter::CastVoteParams {
+            ballot_launcher_id: parse_hex32(&self.ballot_launcher_id_hex)?,
+            vote_data: parse_hex32(&self.vote_data_hex)?,
+            vote_close_height: self.vote_close_height,
+            vote_threshold_num: self.vote_threshold_num,
+            vote_threshold_den: self.vote_threshold_den,
+            registration_merkle_root_snapshot: parse_hex32(
+                &self.registration_merkle_root_snapshot_hex,
+            )?,
+            registration_vote_weight_snapshot: self.registration_vote_weight_snapshot,
+            voting_coin_amount: self.voting_coin_amount,
+        })
+    }
+}
+
+/// JS-side input mirror of [`chip_voting_sdk::actors::voter::UpdateVoteParams`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmUpdateVoteParams {
+    pub voting_coin_id_hex: String,
+    pub old_vote_data_hex: String,
+    pub new_vote_data_hex: String,
+    pub registration_coin_id_hex: String,
+    pub ballot_launcher_id_hex: String,
+    pub vote_close_height: u64,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+    pub registration_merkle_root_snapshot_hex: String,
+    pub registration_vote_weight_snapshot: u64,
+}
+
+impl WasmUpdateVoteParams {
+    fn into_sdk(self) -> VotingResult<chip_voting_sdk::actors::voter::UpdateVoteParams> {
+        Ok(chip_voting_sdk::actors::voter::UpdateVoteParams {
+            voting_coin_id: parse_hex32(&self.voting_coin_id_hex)?,
+            old_vote_data: parse_hex32(&self.old_vote_data_hex)?,
+            new_vote_data: parse_hex32(&self.new_vote_data_hex)?,
+            registration_coin_id: parse_hex32(&self.registration_coin_id_hex)?,
+            ballot_launcher_id: parse_hex32(&self.ballot_launcher_id_hex)?,
+            vote_close_height: self.vote_close_height,
+            vote_threshold_num: self.vote_threshold_num,
+            vote_threshold_den: self.vote_threshold_den,
+            registration_merkle_root_snapshot: parse_hex32(
+                &self.registration_merkle_root_snapshot_hex,
+            )?,
+            registration_vote_weight_snapshot: self.registration_vote_weight_snapshot,
+        })
+    }
+}
+
+/// JSON-friendly result of a cast/update-vote build call. The
+/// SpendBundle is encoded as length-prefixed Streamable bytes (the
+/// canonical chia wire form, identical to what `encodeBundle` /
+/// `assembleSpendBundle` produce). dApps push it as-is via WalletConnect.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmVoteResult {
+    /// Coin id of the (re-)created Voting Coin: for `cast_vote` this
+    /// is the freshly-minted Voting Coin; for `update_vote` it's the
+    /// new Voting Coin singleton id (the prior one is spent).
+    pub voting_coin_id_hex: String,
+    /// Pushable `SpendBundle` as Streamable bytes, hex-encoded.
+    pub spend_bundle_hex: String,
+    /// Voter's `sign_unsafe` BLS signature over the canonical vote
+    /// message. Used by the off-chain aggregator to build the
+    /// per-ballot finalize witness.
+    pub vote_signature_hex: String,
+}
+
+/// Decode a 32-byte BLS secret key from hex (with or without `0x`
+/// prefix). Used by the cast / update wrappers to sign the spend
+/// bundle inside wasm.
+fn parse_secret_hex(s: &str, label: &str) -> VotingResult<SecretKey> {
+    let trimmed = s.trim().trim_start_matches("0x");
+    let bytes = hex::decode(trimmed).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("{label}: hex decode: {e}").into(),
+        ))
+    })?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("{label}: expected 32-byte secret, got {}", bytes.len()).into(),
+        ))
+    })?;
+    SecretKey::from_bytes(&arr).map_err(|e| {
+        VotingError::Other(anyhow_compat::Error(
+            format!("{label}: SecretKey::from_bytes: {e:?}").into(),
+        ))
+    })
+}
+
+/// Convert the JS-side `WasmNetwork` enum into the SDK's
+/// `NetworkType`. The SDK's `NetworkType` is wasm-friendly post
+/// commit 31e42ae4 (no longer `pub use chia_query::NetworkType`).
+fn wasm_network_to_sdk(n: WasmNetwork) -> chip_voting_sdk::NetworkType {
+    match n {
+        WasmNetwork::Mainnet => chip_voting_sdk::NetworkType::Mainnet,
+        WasmNetwork::Testnet11 => chip_voting_sdk::NetworkType::Testnet11,
+    }
+}
+
+// ============================================================================
 // SECTION 9 — Stage-1 chain-walking exports (post-CHIP-rev surface)
 // ============================================================================
 //
@@ -890,18 +1016,46 @@ pub fn cast_vote_build_preview_spend_js(
 }
 
 /// Finalise a cast-vote spend with the voter's BLS signature and
-/// produce a pushable `SpendBundle`. Wraps `Voter::cast_vote`.
-/// Mirrors `phase_vote` in the live integration test.
+/// produce a pushable `SpendBundle`. Wraps
+/// [`chip_voting_sdk::actors::voter::Voter::cast_vote`]. Mirrors
+/// `phase_vote` in the live integration test.
+///
+/// Returns a JSON-serialised [`WasmVoteResult`].
 #[wasm_bindgen(js_name = "castVoteBuildFinalBundle")]
-pub fn cast_vote_build_final_bundle_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-    _voter_secret_hex: &str,
-    _params_json: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "castVoteBuildFinalBundle: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
-    ))
+pub async fn cast_vote_build_final_bundle_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    voter_secret_hex: String,
+    params_json: String,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let secret = parse_secret_hex(&voter_secret_hex, "voter_secret_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let keys = chip_voting_sdk::actors::voter::VoterKeys::new(secret);
+    let wasm_params: WasmCastVoteParams = serde_json::from_str(&params_json)
+        .map_err(|e| JsError::new(&format!("CastVoteParams parse: {e}")))?;
+    let sdk_params = wasm_params
+        .into_sdk()
+        .map_err(|e| JsError::new(&format!("CastVoteParams decode: {e}")))?;
+    let voter = chip_voting_sdk::actors::voter::Voter::new(cfg, keys, wasm_network_to_sdk(network))
+        .with_election_start_height(election_start_height);
+    let chain = JsChainReader::new(backend);
+    let result = voter
+        .cast_vote(&chain, sdk_params)
+        .await
+        .map_err(|e| JsError::new(&format!("cast_vote: {e}")))?;
+    let bundle_bytes = encode_streamable(&result.spend_bundle)?;
+    let out = WasmVoteResult {
+        voting_coin_id_hex: hex::encode(result.voting_coin_id),
+        spend_bundle_hex: hex::encode(&bundle_bytes),
+        vote_signature_hex: hex::encode(result.vote_signature.as_ref()),
+    };
+    serde_json::to_string(&out).map_err(|e| JsError::new(&format!("encode WasmVoteResult: {e}")))
 }
 
 /// Build (preview) the update-vote spend without attaching the voter's
@@ -919,17 +1073,46 @@ pub fn update_vote_build_preview_spend_js(
 }
 
 /// Finalise an update-vote spend with the voter's BLS signature.
-/// Wraps `Voter::update_vote`.
+/// Wraps [`chip_voting_sdk::actors::voter::Voter::update_vote`].
+///
+/// Returns a JSON-serialised [`WasmVoteResult`] whose
+/// `votingCoinIdHex` is the *recreated* Voting Coin id (the prior
+/// one is spent in this transaction).
 #[wasm_bindgen(js_name = "updateVoteBuildFinalBundle")]
-pub fn update_vote_build_final_bundle_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-    _voter_secret_hex: &str,
-    _params_json: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "updateVoteBuildFinalBundle: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
-    ))
+pub async fn update_vote_build_final_bundle_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    voter_secret_hex: String,
+    params_json: String,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let secret = parse_secret_hex(&voter_secret_hex, "voter_secret_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let keys = chip_voting_sdk::actors::voter::VoterKeys::new(secret);
+    let wasm_params: WasmUpdateVoteParams = serde_json::from_str(&params_json)
+        .map_err(|e| JsError::new(&format!("UpdateVoteParams parse: {e}")))?;
+    let sdk_params = wasm_params
+        .into_sdk()
+        .map_err(|e| JsError::new(&format!("UpdateVoteParams decode: {e}")))?;
+    let voter = chip_voting_sdk::actors::voter::Voter::new(cfg, keys, wasm_network_to_sdk(network))
+        .with_election_start_height(election_start_height);
+    let chain = JsChainReader::new(backend);
+    let result = voter
+        .update_vote(&chain, sdk_params)
+        .await
+        .map_err(|e| JsError::new(&format!("update_vote: {e}")))?;
+    let bundle_bytes = encode_streamable(&result.spend_bundle)?;
+    let out = WasmVoteResult {
+        voting_coin_id_hex: hex::encode(result.recreated_voting_coin_id),
+        spend_bundle_hex: hex::encode(&bundle_bytes),
+        vote_signature_hex: hex::encode(result.new_vote_signature.as_ref()),
+    };
+    serde_json::to_string(&out).map_err(|e| JsError::new(&format!("encode WasmVoteResult: {e}")))
 }
 
 /// Build the per-Ballot-Coin finalize bundle (Groth16 proof +
