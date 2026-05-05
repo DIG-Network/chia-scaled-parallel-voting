@@ -20,7 +20,7 @@ import { upsertElection, makeChoices } from "../lib/elections";
 import { writeElectionBootstrap } from "../lib/electionBootstrap";
 import { puzzleHashHexFromWalletAddress } from "../lib/chiaAddress";
 import { findSyntheticPkMatchingCoinPuzzleHashHex } from "../lib/sageSyntheticKey";
-import { formatXch, parseCat, parseXch } from "../lib/units";
+import { parseCat } from "../lib/units";
 import Footer from "../components/Footer";
 import { BroadcastWaitModal } from "../components/BroadcastWaitModal";
 import { pollUntilConfirmed } from "../lib/pollUntil";
@@ -61,7 +61,6 @@ export default dynamic(
         "a406d3a9de984d03c9591c10d917593b434d5263cabe2b42f6b367df16832f81"
       );
       const [collateralAmount, setCollateralAmount] = useState("1.000");
-      const [registrationFee, setRegistrationFee] = useState("0");
       /** ~1 calendar day at Chia target rate (32 blocks / 10 min). */
       const [electionLengthBlocks, setElectionLengthBlocks] = useState("4608");
       /** Weighted quorum N/D (strict tally * D > total_weight * N). Default strict majority (1/2). */
@@ -109,9 +108,7 @@ export default dynamic(
 
           // ---- 3. Validate amounts + choices.
           const collMojos = parseCat(collateralAmount);
-          const feeMojos = parseXch(registrationFee);
           if (collMojos === null || collMojos <= 0n) throw new Error("Bad collateral amount");
-          if (feeMojos === null) throw new Error("Bad registration fee");
 
           const cleanChoiceLabels = choiceLabels
             .map((l) => l.trim())
@@ -150,7 +147,6 @@ export default dynamic(
             verificationKeyHex: ceremony.verificationKeyHex,
             catTailHashHex: catTailHex,
             collateralAmount: Number(collMojos),
-            registrationFee: Number(feeMojos),
             electionLengthBlocks: len,
             electionStartHeight: peak,
             voteThresholdNum: vtn,
@@ -416,22 +412,6 @@ export default dynamic(
                 onChange={(e) => setCollateralAmount(e.target.value)}
                 step="0.001"
                 min="0.001"
-                className="input mono"
-                required
-                disabled={busy}
-              />
-            </Field>
-
-            <Field
-              label="Registration fee (XCH)"
-              hint="Per voter; accumulated to the finalizer. 0 disables."
-            >
-              <input
-                type="number"
-                value={registrationFee}
-                onChange={(e) => setRegistrationFee(e.target.value)}
-                step="0.000000000001"
-                min="0"
                 className="input mono"
                 required
                 disabled={busy}
