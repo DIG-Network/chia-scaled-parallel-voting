@@ -489,8 +489,81 @@ async function phaseDeploy(opts) {
   };
 }
 
+async function phaseVoterReadiness(opts, deploy) {
+  step("Phase 5: voter readiness check (XCH + CAT balance per wallet)");
+
+  if (!deploy?.configJson) {
+    info("No deploy artifacts — skip readiness check");
+    return;
+  }
+  if (!opts.credentials) {
+    info("No --credentials supplied — skip readiness check");
+    return;
+  }
+
+  const cfg = JSON.parse(deploy.configJson);
+  const catTail = "0x" + cfg.cat_tail_hash_hex.replace(/^0x/, "");
+  info(`election cat_tail_hash = ${catTail}`);
+  info(`election collateral    = ${cfg.collateral_amount} CAT mojos / voter`);
+
+  const creds = await parseCredentials(opts.credentials);
+
+  // Funder
+  if (creds.funding.mnemonic) {
+    const f = deriveSyntheticFromMnemonic(creds.funding.mnemonic);
+    const fp2 = "0x" + f.puzzleHashHex;
+    const xch = await coinRecordsByPuzzleHash(fp2, false);
+    const xchTotal = xch.reduce((s, c) => s + c.amount, 0);
+    const catOuter = wasm.catOuterPuzzleHash(catTail, fp2);
+    const catCoins = await coinRecordsByPuzzleHash(catOuter, false);
+    const catTotal = catCoins.reduce((s, c) => s + c.amount, 0);
+    ok(
+      `funder ${creds.funding.name}: xch=${xchTotal} mojos (${xch.length} unspent), ` +
+        `dig=${catTotal} CAT mojos (${catCoins.length} unspent)`
+    );
+  }
+
+  // Validators
+  const readyValidators = [];
+  for (const v of creds.validators) {
+    if (!v.mnemonic) continue;
+    const d = deriveSyntheticFromMnemonic(v.mnemonic);
+    const p2 = "0x" + d.puzzleHashHex;
+    const [xch, catCoins] = await Promise.all([
+      coinRecordsByPuzzleHash(p2, false),
+      (async () => {
+        const catOuter = wasm.catOuterPuzzleHash(catTail, p2);
+        return coinRecordsByPuzzleHash(catOuter, false);
+      })(),
+    ]);
+    const xchTotal = xch.reduce((s, c) => s + c.amount, 0);
+    const catTotal = catCoins.reduce((s, c) => s + c.amount, 0);
+    const canRegister = catTotal >= cfg.collateral_amount && xchTotal > 0;
+    const status = canRegister ? "READY" : "NOT-READY";
+    ok(
+      `validator ${v.name}: xch=${xchTotal} mojos, dig=${catTotal} CAT mojos → ${status}`
+    );
+    if (canRegister) {
+      readyValidators.push({ ...v, derived: d, catCoins });
+    }
+  }
+
+  if (readyValidators.length === 0) {
+    info("");
+    info("No validators currently hold enough DIG CATs to register against this election.");
+    info("To make register/vote/finalize work end-to-end, the funder must:");
+    info(`  1. Mint or transfer DIG CATs (tail ${catTail}) to each validator`);
+    info(`  2. Each validator needs ≥${cfg.collateral_amount} DIG mojos for collateral`);
+    info(`  3. Each validator needs some XCH for the bundle's mempool fees`);
+    info("phase_register_voter is wired but skipped without ready validators.");
+  } else {
+    ok(`${readyValidators.length} validator(s) ready to register`);
+  }
+  return readyValidators;
+}
+
 function phaseWriteSideTodo() {
-  step("Phase 5+: register / vote / finalize / release (TODO)");
+  step("Phase 6+: register / vote / finalize / release (TODO)");
   info(
     "Phase 4 (deploy) builds + dry-runs end-to-end. The remaining write-side"
   );
@@ -523,7 +596,9 @@ async function main() {
     console.log("");
     await phaseWalletCeremony(opts);
     console.log("");
-    await phaseDeploy(opts);
+    const deploy = await phaseDeploy(opts);
+    console.log("");
+    await phaseVoterReadiness(opts, deploy);
     console.log("");
     phaseWriteSideTodo();
     console.log("");
