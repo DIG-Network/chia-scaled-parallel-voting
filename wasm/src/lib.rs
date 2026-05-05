@@ -418,32 +418,48 @@ pub fn encode_bundle(bundle_bytes: &[u8]) -> Result<Box<[u8]>, JsError> {
 }
 
 /// Sign an unsigned coin-spend list (length-prefixed bytes) with the
-/// supplied secret keys.
+/// supplied secret keys, returning the 96-byte aggregated BLS G2
+/// signature.
 ///
-/// FEATURE-GATE STUB: the real impl wraps
-/// `chip_voting_sdk::sign_bundle_signature` (under
-/// `actors::deployer`), which lives behind the SDK's `native`
-/// feature because it pulls in `dig_l1_wallet::transaction::
-/// get_agg_sig_data` (openssl-linked). The non-native shim that
-/// derives `agg_sig_*_additional_data` from
-/// `chia_consensus::consensus_constants` directly is a planned
-/// follow-up in the SDK; until it lands, this returns a typed
-/// `JsError` so dApps can surface a clean "feature not available
-/// in browser build" message.
+/// `secret_keys` is a flat concatenation of 32-byte secrets; pass an
+/// empty slice if the bundle has no AGG_SIG_* conditions and you only
+/// need the BLS identity element back.
+///
+/// Walks every AGG_SIG_* condition emitted by every coin spend's
+/// puzzle, augments per the chia consensus rules, signs each with
+/// the matching secret, and aggregates. Errors if any AGG_SIG
+/// condition has a public key with no matching secret. SECP signing
+/// is not supported in wasm.
 #[wasm_bindgen(js_name = "signCoinSpends")]
 pub fn sign_coin_spends_js(
-    _coin_spends_bytes: &[u8],
-    _secret_keys: &[u8],
-    _network: WasmNetwork,
+    coin_spends_bytes: &[u8],
+    secret_keys: &[u8],
+    network: WasmNetwork,
 ) -> Result<Box<[u8]>, JsError> {
-    Err(JsError::new(
-        "signCoinSpends: not yet wired in the wasm build. \
-         The browser SDK currently builds with \
-         `chip-voting-sdk` default-features = false, which gates \
-         the dig-l1-wallet-backed signing helper. The non-native \
-         shim is planned but not yet implemented; sign in JS via \
-         WalletConnect / Sage instead.",
-    ))
+    let coin_spends = decode_coin_spends(coin_spends_bytes)?;
+    if !secret_keys.len().is_multiple_of(32) {
+        return Err(JsError::new(
+            "signCoinSpends: secret_keys length must be a multiple of 32 (flat \
+             concatenation of 32-byte BLS secret keys)",
+        ));
+    }
+    let mut secrets: Vec<SecretKey> = Vec::with_capacity(secret_keys.len() / 32);
+    for (idx, chunk) in secret_keys.chunks_exact(32).enumerate() {
+        let arr: [u8; 32] = chunk.try_into().expect("chunks_exact(32)");
+        let sk = SecretKey::from_bytes(&arr).map_err(|e| {
+            JsError::new(&format!(
+                "signCoinSpends: secret_keys[{idx}] SecretKey::from_bytes: {e:?}"
+            ))
+        })?;
+        secrets.push(sk);
+    }
+    let sig = chip_voting_sdk::actors::deployer::sign_bundle_signature(
+        &coin_spends,
+        &secrets,
+        wasm_network_to_sdk(network),
+    )
+    .map_err(|e| JsError::new(&format!("sign_bundle_signature: {e}")))?;
+    Ok(sig.to_bytes().to_vec().into_boxed_slice())
 }
 
 /// Locally-validate a SpendBundle's signatures (BLS aggregate verify
