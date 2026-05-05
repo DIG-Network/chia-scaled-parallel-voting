@@ -13,7 +13,7 @@
 const COINSET_BASE_URL =
   process.env.COINSET_BASE_URL?.trim() || "https://api.coinset.org";
 
-async function postJson(path, body) {
+async function postJsonOnce(path, body) {
   const r = await fetch(`${COINSET_BASE_URL}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -24,6 +24,28 @@ async function postJson(path, body) {
     throw new Error(`${path} ${r.status}: ${text}`);
   }
   return r.json();
+}
+
+/**
+ * coinset.org's edge proxy occasionally returns a transport-level
+ * `TypeError: fetch failed` — usually a TLS handshake reset or a
+ * 502 from the upstream node. Retry up to 4 times with exponential
+ * backoff (mirrors the rust live test's chia_query retry policy).
+ */
+async function postJson(path, body) {
+  const MAX_ATTEMPTS = 4;
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await postJsonOnce(path, body);
+    } catch (e) {
+      lastErr = e;
+      if (attempt === MAX_ATTEMPTS) break;
+      const waitMs = 500 * 2 ** (attempt - 1); // 500, 1000, 2000
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+  throw new Error(`${path}: failed after ${MAX_ATTEMPTS} attempts: ${lastErr?.message ?? lastErr}`);
 }
 
 function stripHex(s) {

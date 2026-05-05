@@ -35,6 +35,7 @@ import {
   assertWalletMatchesAddress,
   deriveSyntheticFromMnemonic,
 } from "./walletKeys.mjs";
+import { pushSpendBundleBytes, pollUntilConfirmed } from "./push.mjs";
 
 // ---------------------------------------------------------------------------
 // Argv parsing
@@ -413,11 +414,24 @@ async function phaseDeploy(opts) {
   // ── 9. Push (opt-in) ──────────────────────────────────────────
   if (opts.pushDeploy) {
     step(" → POST /push_tx (live mainnet — costs ~10 mojos)");
-    info("(Push not yet wired in this harness — would convert the streamable");
-    info("SpendBundle bytes to coinset.org's JSON shape and POST /push_tx, then");
-    info("poll coinRecordByName(eveSingletonCoinIdHex) until confirmed_height>0)");
-    info("");
-    info("Skipping push for now. Bundle is verified-locally and ready.");
+    const response = await pushSpendBundleBytes(bundleBytes, { network: "mainnet" });
+    const status = response.status ?? "?";
+    if (status !== "SUCCESS" && status !== 1) {
+      throw new Error(
+        `push_tx returned non-success status: ${status} (error: ${response.error ?? "(none)"})`
+      );
+    }
+    ok(`push_tx accepted: status=${status}`);
+
+    step(" → poll for eve singleton confirmation");
+    const rec = await pollUntilConfirmed(artifacts.eveSingletonCoinIdHex, {
+      label: "eveSingleton",
+      pollIntervalMs: 30_000,
+      timeoutMs: 600_000,
+    });
+    ok(
+      `eve singleton confirmed at height ${rec.confirmedHeight} (parent=${rec.parentCoinInfo.slice(0, 16)}…)`
+    );
   } else {
     info("Dry-run only (default). Re-run with --push to broadcast to mainnet.");
   }
