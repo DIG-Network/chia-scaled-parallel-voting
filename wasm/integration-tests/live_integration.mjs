@@ -31,6 +31,7 @@ import wasm from "chip-voting-wasm";
 import { createChainBackend } from "./chainBackend.mjs";
 import { parseCredentials } from "./credentials.mjs";
 import { peakHeight } from "./coinset.mjs";
+import { assertWalletMatchesAddress } from "./walletKeys.mjs";
 
 // ---------------------------------------------------------------------------
 // Argv parsing
@@ -237,28 +238,73 @@ async function phaseBallotReads(opts) {
 // Phase 3+ — write-side (TODO STAGE B)
 // ---------------------------------------------------------------------------
 
-async function phaseWriteSideTodo(opts) {
-  step("Phase 3+: write-side phases (deploy / register / vote / finalize)");
+async function phaseWalletCeremony(opts) {
+  step("Phase 3: wallet ceremony (BIP39 → chia BLS synthetic → p2 ph)");
+
+  if (!opts.credentials) {
+    info("No --credentials supplied; skipping wallet ceremony");
+    info("(Pass --credentials ../../.test-credentials to verify mnemonic→address derivation)");
+    return;
+  }
+
+  const creds = await parseCredentials(opts.credentials);
+
+  // Funder
+  if (!creds.funding.mnemonic) {
+    info(`Funder ${creds.funding.name} has no mnemonic comment — skipping derivation check`);
+  } else {
+    const { derived } = assertWalletMatchesAddress({
+      mnemonic: creds.funding.mnemonic,
+      address: creds.funding.address,
+      label: `funder/${creds.funding.name}`,
+    });
+    ok(
+      `funder ${creds.funding.name}: derived synthetic_pk=${derived.syntheticPkHex.slice(0, 18)}… ph=0x${derived.puzzleHashHex.slice(0, 16)}…`
+    );
+  }
+
+  // Validators
+  for (const v of creds.validators) {
+    if (!v.mnemonic) {
+      info(`validator ${v.name}: no mnemonic comment — skipping`);
+      continue;
+    }
+    try {
+      const { derived } = assertWalletMatchesAddress({
+        mnemonic: v.mnemonic,
+        address: v.address,
+        label: `validator/${v.name}`,
+      });
+      ok(
+        `validator ${v.name}: derived ph=0x${derived.puzzleHashHex.slice(0, 16)}… (matches address)`
+      );
+      // Cross-check: the credentials file's PUBKEY field should be the
+      // RAW (non-synthetic) BLS pubkey at the unhardened account path,
+      // i.e. what the SDK uses as voter_pubkey. NOT the synthetic key.
+      // If the credentials file stores the raw pubkey, it won't equal
+      // our derived syntheticPkHex — that's expected.
+      if (v.pubkeyHex) {
+        info(
+          `   (.test-credentials VALIDATOR${v.name.match(/\d+/)?.[0] ?? "?"}_PUBKEY = ${v.pubkeyHex.slice(0, 18)}…; this is the raw BLS pk at m/12381'/8444'/2'/0 — voter identity for SPT slots)`
+        );
+      }
+    } catch (e) {
+      throw new Error(`Wallet ceremony failed for validator ${v.name}: ${e.message}`);
+    }
+  }
+}
+
+function phaseWriteSideTodo() {
+  step("Phase 4+: full write-side phases (deploy / register / vote / finalize)");
   info(
-    "STAGE B — pending. Each write phase requires JS-side ceremony the rust test relies on:"
+    "STAGE B — pending. With wallet ceremony (Phase 3) working, the remaining pieces are:"
   );
-  info("  • BIP39 mnemonic → BLS secret derivation (chia path m/12381/8444/...)");
-  info("  • XCH funder pre-spend construction (StandardLayer + sign with funder secret)");
+  info("  • XCH funder pre-spend construction (StandardLayer puzzle + sign)");
   info("  • CAT issuance/transfer pre-spend construction (chia-sdk-driver Cat)");
   info("  • SpendBundle assembly via wasm.assembleSpendBundle");
   info("  • Bundle push via coinset.org /push_tx");
   info("  • Confirmation polling via coinRecordByName");
-  info("Wiring this would mirror live_integration_test.rs phases 1123–2400.");
-  info("");
-  info("Read-side (Phase 2 above) already validates that the wasm exports' chain backend integration");
-  info("works end-to-end. Write-side validation requires the ceremony pieces above to be ported to JS.");
-
-  if (opts.credentials) {
-    const creds = await parseCredentials(opts.credentials);
-    ok(
-      `Parsed credentials: funder=${creds.funding.name} (${creds.funding.address.slice(0, 18)}…), validators=${creds.validators.length}`
-    );
-  }
+  info("Wiring this mirrors live_integration_test.rs phase_deploy → phase_release.");
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +325,9 @@ async function main() {
     console.log("");
     await phaseBallotReads(opts);
     console.log("");
-    await phaseWriteSideTodo(opts);
+    await phaseWalletCeremony(opts);
+    console.log("");
+    phaseWriteSideTodo();
     console.log("");
     ok("ALL CONFIGURED PHASES PASSED");
   } catch (e) {

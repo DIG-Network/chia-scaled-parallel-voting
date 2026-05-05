@@ -12,6 +12,7 @@
     "smoke": "node smoke_test.mjs"
   },
   "dependencies": {
-    "chip-voting-wasm": "file:../pkg-node"
+    "chip-voting-wasm": "file:../pkg-node",
+    "chia-wallet-sdk-wasm": "^0.24.0"
   }
 }
