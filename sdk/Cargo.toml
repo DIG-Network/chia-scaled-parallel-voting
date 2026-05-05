@@ -5,10 +5,57 @@ edition     = "2021"
 description = "Reference Rust driver for the Chia voting CHIP (Election Singleton + CAT-collateralized Registration Coin + Groth16 finalization)."
 license     = "MIT"
 
+# ── FEATURES ────────────────────────────────────────────────────────
+# `native` (default-on) gates everything that pulls in non-portable C
+# / OS-socket dependencies: `chia-query` (mio + native-tls peer pool),
+# `dig-l1-wallet` (openssl + raw TCP), and `tokio`'s socket-bearing
+# features (`rt-multi-thread`, `net`, `io-util`). Wasm callers
+# disable the feature (`default-features = false`) so the
+# wasm32-unknown-unknown build does not pull mio / openssl-sys /
+# tokio-net into the dependency graph.
+#
+# What stays unconditional (wasm-buildable):
+#   * Pure CLVM / BLS / Groth16 prover stack
+#   * `puzzles`, `merkle`, `action_spends`, `state`, `config`,
+#     `ceremony`, `prover`, `error`
+#   * The bare `tokio` `sync` / `macros` / `time` features (these
+#     compile on wasm32 because they have no socket / mio backing).
+#
+# What `native` enables (gated as `#[cfg(feature = "native")]`):
+#   * The whole `actors` module (Aggregator, Voter, ElectionDeployer,
+#     Indexer, BallotIssuer, BallotReader). All four actors take a
+#     `dig_l1_wallet::NetworkType` and the chain-walking ones default
+#     their generic to `chia_query::ChiaQuery`.
+#   * The `ChainReader` impls in `chain.rs` for `chia_query::ChiaQuery`
+#     and `chia_query::coinset::CoinsetClient`. The `ChainReader`
+#     trait itself, the `ChainCoinRecord` struct, and the simulator
+#     impl stay unconditional.
+#   * The top-level `verify_bundle_signatures` helper (uses
+#     `dig_l1_wallet::transaction::get_agg_sig_data`).
+#   * The `pub use chia_query::*` / `pub use dig_l1_wallet::*`
+#     re-exports.
+[features]
+default = ["native"]
+native = [
+    "dep:chia",
+    "dep:chia-query",
+    "dep:dig-l1-wallet",
+    "dep:chia-wallet-sdk",
+    "chia-wallet-sdk/native-tls",
+    "tokio/rt-multi-thread",
+    "tokio/net",
+    "tokio/io-util",
+]
+
 [dependencies]
 # ── Low-level Chia primitives (0.26 line, matching dig-l1-wallet) ───
-chia              = "0.26"
-chia-protocol     = "0.26"
+# `chia` is the umbrella crate; not used directly in SDK source — we
+# pull each sub-crate individually below. With default features it
+# transitively pulls in `chia-ssl` (→ rcgen → ring::SystemRandom)
+# which fails to build for wasm32. Mark it optional + gate it behind
+# `native` so the wasm build skips it entirely.
+chia              = { version = "0.26", optional = true }
+chia-protocol     = { version = "0.26", features = ["serde"] }
 chia-puzzles      = "0.20"   # compiled standard puzzle bytecode + tree hashes (CAT_PUZZLE_HASH, etc.)
 chia-puzzle-types = "0.26"   # CatArgs, SingletonStruct, StandardArgs
 chia-bls          = "0.26"
@@ -20,15 +67,28 @@ clvmr             = "0.14"   # NOTE: clvmr 0.14 (what chia-sdk-driver 0.30 trans
 # ── chia-wallet-sdk umbrella + sub-crates ──────────────────────────
 # Drivers (SpendContext, Launcher, Cat, CatSpend, StandardLayer, Singleton,
 # ActionLayer/ActionLayerSolution, Spends, Spend) + signing + types.
-chia-wallet-sdk = { version = "0.30", default-features = false, features = ["action-layer", "native-tls"] }
+#
+# The umbrella `chia-wallet-sdk` re-exports the same types AND
+# unconditionally pulls in `chia-sdk-client` / `chia-sdk-coinset` /
+# `chia-sdk-test` (peer-talk + simulator), which transitively bring
+# in `chia-ssl` (rcgen → ring::SystemRandom) and `tokio` net features
+# that don't compile for wasm32. The wasm build accesses driver
+# types via the individually-listed sub-crates (`chia-sdk-driver`
+# etc.) directly; the umbrella is only needed when we want to flip
+# its `native-tls` feature on for production builds. Mark it
+# optional + gate it behind `native`.
+chia-wallet-sdk = { version = "0.30", default-features = false, features = ["action-layer"], optional = true }
 chia-sdk-driver = "0.30"     # SpendContext, Layer, Primitive, ActionLayer, etc.
 chia-sdk-signer = "0.30"     # RequiredSignature::from_coin_spends — walks AGG_SIG_* conditions
 chia-sdk-types  = "0.30"     # Conditions enum, MerkleTree, MerkleProof, run_puzzle helper
 chia-sdk-utils  = "0.30"     # Address (bech32m), select_coins (knapsack)
 
-# ── Chain I/O + wallet ───────────────────────────────────────────────
-chia-query    = "0.2"        # decentralised peers + coinset.org HTTP fallback
-dig-l1-wallet = "0.1"        # XCH + CAT wallet (encrypted keystore, BIP39, coin selection)
+# ── Chain I/O + wallet (native-only — gated behind `native`) ────────
+# Both crates pull mio / native-tls / openssl / raw tokio sockets and
+# do not compile for wasm32-unknown-unknown. They are `optional = true`
+# and only enabled when the `native` feature is on (the default).
+chia-query    = { version = "0.2", optional = true }   # decentralised peers + coinset.org HTTP fallback
+dig-l1-wallet = { version = "0.1", optional = true }   # XCH + CAT wallet (encrypted keystore, BIP39, coin selection)
 
 # ── Groth16 + curve (off-chain prover; on-chain verify is in CLVM) ─
 # `std` enables the standard library backed implementations needed for
@@ -59,7 +119,7 @@ tracing      = "0.1"
 async-trait  = "0.1"
 indexmap     = "2"
 hex-literal  = "0.4"
-tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio        = { version = "1", default-features = false, features = ["macros", "sync", "time"] }
 
 [build-dependencies]
 hex = "0.4"

@@ -46,6 +46,14 @@
 //! * [`ceremony`] — run the MPC trusted-setup ceremony
 
 pub mod action_spends;
+// `actors` (Aggregator, Voter, ElectionDeployer, Indexer, BallotIssuer/
+// Reader) takes a `dig_l1_wallet::NetworkType` and defaults its
+// chain-generic to `chia_query::ChiaQuery`; both deps are native-only.
+// Gated behind the SDK's `native` feature (default-on) so the wasm
+// build can omit it. Wasm callers reach through to the sub-modules
+// (`prover`, `merkle`, `action_spends`, `puzzles`, `state`,
+// `ceremony`, `config`) which stay unconditional.
+#[cfg(feature = "native")]
 pub mod actors;
 pub mod ceremony;
 pub mod chain;
@@ -60,9 +68,13 @@ pub mod state;
 
 // ── Public re-exports ─────────────────────────────────────────────────
 
+#[cfg(feature = "native")]
 pub use actors::ballot::{BallotIssuer, BallotReader, CreateBallotParams, CreatedBallot};
+#[cfg(feature = "native")]
 pub use actors::deployer::{DeployParams, DeploymentArtifacts};
+#[cfg(feature = "native")]
 pub use actors::voter::VoterKeys;
+#[cfg(feature = "native")]
 pub use actors::{Aggregator, ElectionDeployer, Indexer, Voter};
 pub use config::{ElectionConfig, MAX_SIGNERS, PUBLIC_INPUT_COUNT, TREE_DEPTH};
 pub use error::{VotingError, VotingResult};
@@ -84,7 +96,11 @@ pub use prover::{Groth16Proof, Scalars};
 
 // The recommended upstream signing helper. Wraps
 // `chia_sdk_signer::RequiredSignature::from_coin_spends` and the
-// network's `agg_sig_me_additional_data`.
+// network's `agg_sig_me_additional_data`. Lives inside `actors::
+// deployer` (which is native-only because the surrounding
+// `WalletProvider` plumbing speaks `dig_l1_wallet`); accordingly
+// gated behind `native`.
+#[cfg(feature = "native")]
 pub use actors::deployer::sign_bundle_signature;
 
 /// FN: dry_run_coin_spends
@@ -284,6 +300,11 @@ pub fn validate_bundle_for_consensus(
 ///      consensus expects.
 ///   2. `chia_bls::aggregate_verify` checks the aggregated signature
 ///      against those pairs.
+///
+/// FEATURE: `native`. Pulls `dig_l1_wallet::transaction::
+/// get_agg_sig_data` (openssl-linked); the wasm build provides its
+/// own equivalent that calls `chia_consensus` constants directly.
+#[cfg(feature = "native")]
 pub fn verify_bundle_signatures(
     bundle: &chia_protocol::SpendBundle,
     network: chia_query::NetworkType,
@@ -325,8 +346,14 @@ pub use chia_bls::{PublicKey, SecretKey, Signature};
 pub use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 
 // Re-export recommended ecosystem types for ergonomic top-level use.
+// `wait_for_current_singleton` lives in the native-only `actors::
+// aggregator`; `wait_for_unspent_coin_at_puzzle_hash` lives in
+// `chain` and is unconditional. The `chia_query` re-exports are
+// native-only (the crate doesn't compile for wasm32).
+#[cfg(feature = "native")]
 pub use actors::aggregator::wait_for_current_singleton;
 pub use chain::wait_for_unspent_coin_at_puzzle_hash;
+#[cfg(feature = "native")]
 pub use chia_query::{ChiaQuery, ChiaQueryConfig, NetworkType};
 // Re-export the coinset.org HTTP client. `chia_query`'s router does
 // peer → peer-retry → coinset, returning the FIRST peer's TxStatus
@@ -341,6 +368,7 @@ pub use chia_puzzle_types::{
     cat::CatArgs, standard::StandardArgs, DeriveSynthetic, LineageProof, Memos, Proof,
 };
 pub use chia_puzzles::SINGLETON_LAUNCHER_HASH;
+#[cfg(feature = "native")]
 pub use chia_query::coinset::CoinsetClient;
 pub use chia_sdk_driver::{
     Cat, CatInfo, CatSpend, Launcher, Puzzle, SingleCatSpend, Spend, SpendContext,
@@ -351,4 +379,5 @@ pub use chia_sdk_types::Conditions;
 pub use clvm_traits;
 pub use clvm_utils;
 pub use clvmr;
+#[cfg(feature = "native")]
 pub use dig_l1_wallet::{CoinSelectionStrategy, L1Wallet, L1WalletConfig};

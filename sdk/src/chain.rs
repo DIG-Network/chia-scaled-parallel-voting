@@ -242,7 +242,12 @@ pub async fn wait_for_unspent_coin_at_puzzle_hash<C: ChainReader>(
 }
 
 // ── chia_query::ChiaQuery adapter ─────────────────────────────────────
+//
+// FEATURE-GATED on `native`. `chia_query` does not build for
+// `wasm32-unknown-unknown` (mio + native-tls peer pool). Wasm
+// callers ship their own `ChainReader` over JS callbacks.
 
+#[cfg(feature = "native")]
 #[async_trait]
 impl ChainReader for chia_query::ChiaQuery {
     async fn coin_records_by_puzzle_hash(
@@ -362,6 +367,7 @@ impl ChainReader for chia_query::ChiaQuery {
 // `Aggregator`, `Voter`, `Oracle`, etc. as a `ChainReader` — no
 // peer pool, no router fan-out, no certificate / TLS setup.
 
+#[cfg(feature = "native")]
 #[async_trait]
 impl ChainReader for chia_query::coinset::CoinsetClient {
     async fn coin_records_by_puzzle_hash(
@@ -564,10 +570,12 @@ pub use simulator_impl::*;
 
 // ── Adapters / parsing helpers ───────────────────────────────────────
 
+#[cfg(feature = "native")]
 fn rpc_err(op: &str, e: chia_query::ChiaQueryError) -> VotingError {
     VotingError::Rpc(format!("{op}: {e}"))
 }
 
+#[cfg(feature = "native")]
 fn adapt_record(r: &chia_query::CoinRecord) -> VotingResult<ChainCoinRecord> {
     let coin = adapt_coin(&r.coin)?;
     Ok(ChainCoinRecord {
@@ -577,12 +585,14 @@ fn adapt_record(r: &chia_query::CoinRecord) -> VotingResult<ChainCoinRecord> {
     })
 }
 
+#[cfg(feature = "native")]
 fn adapt_coin(c: &chia_query::Coin) -> VotingResult<Coin> {
     let parent = parse_hex32(&c.parent_coin_info)?;
     let ph = parse_hex32(&c.puzzle_hash)?;
     Ok(Coin::new(parent, ph, c.amount))
 }
 
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 fn parse_hex32(s: &str) -> VotingResult<Bytes32> {
     let trimmed = s.trim().trim_start_matches("0x");
     let bytes = hex::decode(trimmed).map_err(|e| {
@@ -596,6 +606,7 @@ fn parse_hex32(s: &str) -> VotingResult<Bytes32> {
     Ok(Bytes32::new(arr))
 }
 
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 fn parse_program(hex_str: &str) -> VotingResult<Program> {
     let trimmed = hex_str.trim().trim_start_matches("0x");
     let bytes = hex::decode(trimmed).map_err(|e| {

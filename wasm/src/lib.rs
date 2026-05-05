@@ -56,7 +56,17 @@
 
 use chip_voting_sdk::chain::ChainCoinRecord;
 use chip_voting_sdk::error::{anyhow_compat, VotingError, VotingResult};
-use chip_voting_sdk::{NetworkType, PublicKey, SecretKey, SpendBundle};
+// `NetworkType` (originally `pub use dig_l1_wallet::NetworkType` in
+// the SDK) is gated behind the SDK's `native` feature. The wasm
+// crate disables that feature, so `chip_voting_sdk::NetworkType` is
+// not in scope here. `WasmNetwork` below stands on its own as a
+// pure JS-side enum; native-only entry points that previously took
+// a `NetworkType` are stubbed in Section 9 / Section 4.
+// `SecretKey` was used by the now-stubbed `signCoinSpends`; kept
+// in scope (allow(unused_imports)) so the import survives once
+// the non-native signing shim re-wires the call site.
+#[allow(unused_imports)]
+use chip_voting_sdk::{PublicKey, SecretKey, SpendBundle};
 use js_sys::Promise;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -92,14 +102,16 @@ pub enum WasmNetwork {
     Testnet11,
 }
 
-impl From<WasmNetwork> for NetworkType {
-    fn from(n: WasmNetwork) -> Self {
-        match n {
-            WasmNetwork::Mainnet => NetworkType::Mainnet,
-            WasmNetwork::Testnet11 => NetworkType::Testnet11,
-        }
-    }
-}
+// NOTE: the original `From<WasmNetwork> for NetworkType` impl is
+// deliberately removed. The SDK's `NetworkType` is `pub use
+// dig_l1_wallet::NetworkType`, which lives behind the `native`
+// feature. The wasm crate builds with `default-features = false`,
+// so `NetworkType` is not in scope. `WasmNetwork` is now a
+// stand-alone JS-side enum; the call sites that previously fed it
+// into the SDK's signing helpers (`sign_bundle_signature`,
+// `verify_bundle_signatures`) are stubbed in Section 4 and will
+// be re-wired once non-native shims for those helpers land in the
+// SDK.
 
 // ============================================================================
 // SECTION 3 — JsChainReader (proxies chain reads through JS callbacks)
@@ -316,6 +328,7 @@ fn encode_streamable<T: chia_traits::Streamable>(v: &T) -> Result<Vec<u8>, JsErr
 
 /// Encode a `Vec<CoinSpend>` to length-prefixed streamable bytes.
 /// Layout: `[u32 BE count] ([u32 BE len] [coin_spend streamable])*`.
+#[allow(dead_code)] // Re-attached when buildDeployBundle is un-stubbed.
 fn encode_coin_spends(coin_spends: &[chia_protocol::CoinSpend]) -> Result<Vec<u8>, JsError> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&(coin_spends.len() as u32).to_be_bytes());
@@ -364,44 +377,59 @@ pub fn encode_bundle(bundle_bytes: &[u8]) -> Result<Box<[u8]>, JsError> {
 }
 
 /// Sign an unsigned coin-spend list (length-prefixed bytes) with the
-/// supplied secret keys via the SDK's canonical
-/// `actors::deployer::sign_bundle_signature`. Returns the aggregated
-/// BLS signature (96-byte G2 element) as raw bytes.
+/// supplied secret keys.
+///
+/// FEATURE-GATE STUB: the real impl wraps
+/// `chip_voting_sdk::sign_bundle_signature` (under
+/// `actors::deployer`), which lives behind the SDK's `native`
+/// feature because it pulls in `dig_l1_wallet::transaction::
+/// get_agg_sig_data` (openssl-linked). The non-native shim that
+/// derives `agg_sig_*_additional_data` from
+/// `chia_consensus::consensus_constants` directly is a planned
+/// follow-up in the SDK; until it lands, this returns a typed
+/// `JsError` so dApps can surface a clean "feature not available
+/// in browser build" message.
 #[wasm_bindgen(js_name = "signCoinSpends")]
 pub fn sign_coin_spends_js(
-    coin_spends_bytes: &[u8],
-    secret_keys: &[u8],
-    network: WasmNetwork,
+    _coin_spends_bytes: &[u8],
+    _secret_keys: &[u8],
+    _network: WasmNetwork,
 ) -> Result<Box<[u8]>, JsError> {
-    let coin_spends = decode_coin_spends(coin_spends_bytes)?;
-    if secret_keys.len() % 32 != 0 {
-        return Err(JsError::new("secret_keys length must be a multiple of 32"));
-    }
-    let sks: Vec<SecretKey> = secret_keys
-        .chunks_exact(32)
-        .map(|c| {
-            let arr: [u8; 32] = c.try_into().expect("checked above");
-            SecretKey::from_bytes(&arr)
-                .map_err(|e| JsError::new(&format!("SecretKey::from_bytes: {e:?}")))
-        })
-        .collect::<Result<_, _>>()?;
-    let sig = chip_voting_sdk::sign_bundle_signature(&coin_spends, &sks, network.into())
-        .map_err(|e| JsError::new(&format!("{e:?}")))?;
-    Ok(sig.to_bytes().to_vec().into_boxed_slice())
+    Err(JsError::new(
+        "signCoinSpends: not yet wired in the wasm build. \
+         The browser SDK currently builds with \
+         `chip-voting-sdk` default-features = false, which gates \
+         the dig-l1-wallet-backed signing helper. The non-native \
+         shim is planned but not yet implemented; sign in JS via \
+         WalletConnect / Sage instead.",
+    ))
 }
 
 /// Locally-validate a SpendBundle's signatures (BLS aggregate verify
 /// over the consensus-required `(pubkey, augmented_message)` pairs).
 /// CLVM dry-run is also performed via
 /// `chip_voting_sdk::dry_run_coin_spends`.
+///
+/// FEATURE-GATE STUB: the dry-run half (CLVM run_program) works in
+/// wasm; the BLS-verify half currently goes through
+/// `chip_voting_sdk::verify_bundle_signatures`, which is gated
+/// behind `native` because it threads through `dig_l1_wallet::
+/// transaction::get_agg_sig_data`. Until the SDK exposes a
+/// non-native equivalent, this returns a typed `JsError`.
 #[wasm_bindgen(js_name = "verifyBundleLocally")]
-pub fn verify_bundle_locally_js(bundle_bytes: &[u8], network: WasmNetwork) -> Result<(), JsError> {
+pub fn verify_bundle_locally_js(
+    bundle_bytes: &[u8],
+    _network: WasmNetwork,
+) -> Result<(), JsError> {
     let bundle: SpendBundle = decode_bundle(bundle_bytes)?;
     chip_voting_sdk::dry_run_coin_spends(&bundle.coin_spends)
         .map_err(|e| JsError::new(&format!("dry_run: {e:?}")))?;
-    chip_voting_sdk::verify_bundle_signatures(&bundle, network.into())
-        .map_err(|e| JsError::new(&format!("verify_bundle_signatures: {e:?}")))?;
-    Ok(())
+    Err(JsError::new(
+        "verifyBundleLocally: signature-verification half is not \
+         yet wired in the wasm build (the SDK's \
+         `verify_bundle_signatures` lives behind the `native` \
+         feature). The CLVM dry-run half passed.",
+    ))
 }
 
 // ============================================================================
@@ -494,90 +522,52 @@ pub struct WasmDeployArtifacts {
 
 /// Predict the launcher_id for a given parent coin id + amount,
 /// without actually doing the deploy.
+///
+/// FEATURE-GATE STUB: `actors::deployer::derive_launcher_id` lives
+/// behind the SDK's `native` feature (the whole `actors` module is
+/// gated). The launcher-id derivation is pure puzzle-hash math and
+/// will be re-exposed under a non-`native` feature in a follow-up
+/// SDK change; until then, this returns a typed `JsError`.
 #[wasm_bindgen(js_name = "deriveLauncherId")]
-pub fn derive_launcher_id_js(parent_coin_id_hex: &str, amount: u64) -> Result<String, JsError> {
-    let pid = parse_hex32(parent_coin_id_hex)
-        .map_err(|e| JsError::new(&format!("{e:?}")))?;
-    let id = chip_voting_sdk::actors::deployer::derive_launcher_id(pid, amount);
-    Ok(format!("0x{}", hex::encode(id)))
+pub fn derive_launcher_id_js(
+    _parent_coin_id_hex: &str,
+    _amount: u64,
+) -> Result<String, JsError> {
+    Err(JsError::new(
+        "deriveLauncherId: not yet wired in the wasm build. \
+         The helper lives in `chip_voting_sdk::actors::deployer`, \
+         which is gated behind the SDK's `native` feature. \
+         Promoting it to a wasm-callable surface is a planned \
+         follow-up.",
+    ))
 }
 
 /// Build the (unsigned) deploy spend bundle for a new election.
 /// Mirrors `phase_deploy` in `cli/src/bin/live_integration_test.rs`.
+///
+/// FEATURE-GATE STUB: `ElectionDeployer` / `DeployParams` /
+/// `actors::deployer::derive_launcher_id` /
+/// `actors::aggregator::compute_eve_inner_puzzle_hash` all live
+/// inside the SDK's `actors` module, which is gated behind the
+/// `native` feature (because the actor surface unconditionally
+/// pulls in `dig_l1_wallet::NetworkType` and a default
+/// `chia_query::ChiaQuery` chain generic). Re-exposing the
+/// puzzle-build half of these actors under a non-`native` feature
+/// is the planned follow-up; until then, this returns a typed
+/// `JsError`.
 #[wasm_bindgen(js_name = "buildDeployBundle")]
 pub fn build_deploy_bundle_js(
-    params: JsValue,
-    parent_coin: JsValue,
-    funder_pk_hex: &str,
+    _params: JsValue,
+    _parent_coin: JsValue,
+    _funder_pk_hex: &str,
 ) -> Result<JsValue, JsError> {
-    let params: WasmDeployParams = serde_wasm_bindgen::from_value(params)
-        .map_err(|e| JsError::new(&format!("DeployParams decode: {e}")))?;
-    let parent: JsCoinRecord = serde_wasm_bindgen::from_value(parent_coin)
-        .map_err(|e| JsError::new(&format!("parent_coin decode: {e}")))?;
-    let parent_coin = coin_from_js(&parent).map_err(|e| JsError::new(&format!("{e:?}")))?;
-
-    let vk_bytes = hex::decode(params.verification_key_hex.trim_start_matches("0x"))
-        .map_err(|e| JsError::new(&format!("verification_key_hex decode: {e}")))?;
-    let cat_tail = parse_hex32(&params.cat_tail_hash_hex)
-        .map_err(|e| JsError::new(&format!("{e:?}")))?;
-    let funder_pk_bytes = hex::decode(funder_pk_hex.trim_start_matches("0x"))
-        .map_err(|e| JsError::new(&format!("funder_pk_hex decode: {e}")))?;
-    let funder_pk_arr: [u8; 48] = funder_pk_bytes
-        .try_into()
-        .map_err(|_| JsError::new("funder_pk_hex must be 48 bytes"))?;
-    let funder_pk = PublicKey::from_bytes(&funder_pk_arr)
-        .map_err(|e| JsError::new(&format!("PublicKey::from_bytes: {e:?}")))?;
-
-    // Per CHIP rev 2026-05-02: VK length = 336 + (PUBLIC_INPUT_COUNT + 1) * 48
-    // (s7/s8 `(num, den)` are public inputs, so PUBLIC_INPUT_COUNT == 8).
-    let vk_pi = chip_voting_sdk::PUBLIC_INPUT_COUNT;
-    let vk_len_ok = 336 + (vk_pi + 1) * 48;
-    if vk_bytes.len() != vk_len_ok {
-        return Err(JsError::new(&format!(
-            "verification_key_hex must decode to {} bytes (got {}); rerun ceremony for {} public inputs",
-            vk_len_ok,
-            vk_bytes.len(),
-            vk_pi
-        )));
-    }
-
-    let deploy_params = chip_voting_sdk::DeployParams {
-        verification_key: chip_voting_sdk::ceremony::VerificationKey { raw_bytes: vk_bytes },
-        cat_tail_hash: cat_tail,
-        collateral_amount: params.collateral_amount,
-        election_start_height: params.election_start_height,
-        label: params.label,
-    };
-    let deployer = chip_voting_sdk::ElectionDeployer::new(deploy_params);
-    let (coin_spends, config) = deployer
-        .build_deploy_bundle(parent_coin, funder_pk)
-        .map_err(|e| JsError::new(&format!("buildDeployBundle: {e:?}")))?;
-
-    // Pre-derive eve singleton coin id so the dApp can wait on it.
-    // `compute_eve_inner_puzzle_hash` takes `(config, election_start_height)`
-    // — the genesis state hash depends on the start height baked
-    // into `ElectionState::genesis(empty_root, h)`.
-    let launcher_id =
-        chip_voting_sdk::actors::deployer::derive_launcher_id(parent_coin.coin_id(), 1);
-    let eve_inner_ph = chip_voting_sdk::actors::aggregator::compute_eve_inner_puzzle_hash(
-        &config,
-        params.election_start_height,
-    );
-    let eve_outer_ph =
-        chip_voting_sdk::puzzles::election_singleton_puzzle_hash(launcher_id, eve_inner_ph);
-    let eve_coin = chia_protocol::Coin::new(launcher_id, eve_outer_ph, 1);
-
-    let coin_spends_bytes = encode_coin_spends(&coin_spends)?;
-    let config_json = serde_json::to_string(&config)
-        .map_err(|e| JsError::new(&format!("config to_string: {e}")))?;
-
-    let out = WasmDeployArtifacts {
-        coin_spends_bytes,
-        launcher_id_hex: format!("0x{}", hex::encode(launcher_id)),
-        config_json,
-        eve_singleton_coin_id_hex: format!("0x{}", hex::encode(eve_coin.coin_id())),
-    };
-    serde_wasm_bindgen::to_value(&out).map_err(|e| JsError::new(&e.to_string()))
+    Err(JsError::new(
+        "buildDeployBundle: not yet wired in the wasm build. \
+         `ElectionDeployer` / `DeployParams` and the eve-singleton \
+         coin-id helpers live behind the SDK's `native` feature. \
+         The puzzle-build path is wasm-portable in principle and \
+         is the next planned follow-up.",
+    ))
 }
 
 // ============================================================================
