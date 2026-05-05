@@ -1860,7 +1860,7 @@ async fn phase_vote(
     voter_keys: &VoterKeys,
     vote_data: Bytes32,
     reg_coin_id: Bytes32,
-) -> Result<()> {
+) -> Result<Bytes32> {
     info!("=== PHASE 4.{voter_label}: cast vote ===");
     confirm_or_bail(args, &format!("Broadcast {voter_label}'s vote?"))?;
 
@@ -1910,7 +1910,53 @@ async fn phase_vote(
         ballot_launcher_id = %hex::encode(ballot.ballot_launcher_id),
         "vote cast (Voting Coin minted, Registration Coin recreated)"
     );
-    Ok(())
+
+    // Find the post-cast Registration Coin id — the child of the spent
+    // pre-vote reg coin whose amount equals collateral_amount. The
+    // Voting Coin (amount=1, set via CastVoteParams.voting_coin_amount)
+    // is the OTHER child; filtering by amount distinguishes them.
+    let started = std::time::Instant::now();
+    let max_wait = Duration::from_secs(args.confirmation_timeout_secs.max(120));
+    let poll = Duration::from_secs(args.poll_interval_secs.max(10));
+    loop {
+        match chain
+            .get_coin_records_by_parent_ids(
+                &[format!("0x{}", hex::encode(reg_coin_id))],
+                None,
+                None,
+                true,
+            )
+            .await
+        {
+            Ok(records) => {
+                if let Some(post_cast) =
+                    records.iter().find(|r| r.coin.amount == args.collateral_amount)
+                {
+                    let parent = parse_b32_str(&post_cast.coin.parent_coin_info)?;
+                    let ph = parse_b32_str(&post_cast.coin.puzzle_hash)?;
+                    let coin = chia_protocol::Coin::new(parent, ph, post_cast.coin.amount);
+                    let post_cast_id: Bytes32 = coin.coin_id().into();
+                    info!(
+                        voter_label,
+                        post_cast_reg_coin_id = %hex::encode(post_cast_id),
+                        "located post-cast Registration Coin"
+                    );
+                    return Ok(post_cast_id);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "post-cast reg coin lookup transient error — retry");
+            }
+        }
+        if started.elapsed() >= max_wait {
+            return Err(anyhow::anyhow!(
+                "phase_vote: post-cast Registration Coin not visible after {}s — coinset.org \
+                 secondary index has not propagated voter's cast spend",
+                started.elapsed().as_secs()
+            ));
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 // ── Phase 5: Finalize the Ballot Coin ────────────────────────────────
@@ -2872,8 +2918,13 @@ async fn main() -> Result<()> {
     phase_wait_window(&chain, &ballot, &args).await?;
 
     // ── Phase 4: Cast votes ────────────────────────────────────────
+    // phase_vote returns the post-cast Registration Coin id (child of
+    // the spent reg coin with amount=collateral). phase_release uses
+    // it because the SDK's release_collateral looks up the reg coin by
+    // id and bails if it's already spent — passing the post-register
+    // (=fresh) id would fail.
     let vote_data = Bytes32::new([0x42u8; 32]);
-    phase_vote(
+    let reg1_post_cast = phase_vote(
         &chain,
         network,
         &args,
@@ -2885,7 +2936,7 @@ async fn main() -> Result<()> {
         reg1,
     )
     .await?;
-    phase_vote(
+    let reg2_post_cast = phase_vote(
         &chain,
         network,
         &args,
@@ -2921,7 +2972,7 @@ async fn main() -> Result<()> {
             &deploy,
             "voter1",
             &voter1_keys,
-            reg1,
+            reg1_post_cast,
             validator1_keys.p2_puzzle_hash,
         )
         .await?;
@@ -2932,7 +2983,7 @@ async fn main() -> Result<()> {
             &deploy,
             "voter2",
             &voter2_keys,
-            reg2,
+            reg2_post_cast,
             validator2_keys.p2_puzzle_hash,
         )
         .await?;
