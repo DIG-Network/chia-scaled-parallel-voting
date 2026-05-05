@@ -450,6 +450,28 @@ impl ConstraintSynthesizer<Fr> for VotingCircuit {
 #[derive(Debug, Clone)]
 pub struct ArkProvingKey(pub ProvingKey<Bls12_381>);
 
+impl ArkProvingKey {
+    /// FN: serialize_compressed
+    /// WHAT: serialise the PK to compressed bytes for transport / cache.
+    /// USAGE: ceremony output → CDN → browser → IndexedDB; the wasm
+    ///        finalize path loads it once per session.
+    pub fn serialize_compressed(&self) -> VotingResult<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.0
+            .serialize_compressed(&mut buf)
+            .map_err(|e| VotingError::ProvingError(format!("PK serialize: {e}")))?;
+        Ok(buf)
+    }
+
+    /// FN: deserialize_compressed
+    /// WHAT: parse a compressed-PK byte buffer back into typed form.
+    pub fn deserialize_compressed(bytes: &[u8]) -> VotingResult<Self> {
+        ProvingKey::<Bls12_381>::deserialize_compressed(bytes)
+            .map(ArkProvingKey)
+            .map_err(|e| VotingError::ProvingError(format!("PK deserialize: {e}")))
+    }
+}
+
 /// STRUCT: ArkVerifyingKey
 /// PURPOSE: thin newtype around `ark_groth16::VerifyingKey<Bls12_381>`.
 #[derive(Debug, Clone)]

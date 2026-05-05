@@ -920,6 +920,40 @@ impl WasmLaunchBallotParams {
     }
 }
 
+/// JS-side input for `buildBallotFinalizeBundle`. Mirrors the
+/// non-list / non-PK fields of
+/// [`chip_voting_sdk::actors::aggregator::BuildFinalizeForBallotParams`].
+/// `votes` and `proving_key` are passed as separate wasm args (a JSON
+/// array of [`VoteRecordWire`](chip_voting_sdk::state::VoteRecordWire)
+/// and arkworks-compressed PK bytes, respectively).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmFinalizeParams {
+    pub vote_close_height: u64,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+    pub registration_merkle_root_snapshot_hex: String,
+    pub registration_vote_weight_snapshot: u64,
+}
+
+/// Lift a [`VoteRecordWire`](chip_voting_sdk::state::VoteRecordWire)
+/// (from `collectVotesForBallot`) back into a typed
+/// [`VoteRecord`](chip_voting_sdk::state::VoteRecord) — the inverse
+/// direction the SDK doesn't expose (it has only
+/// `From<&VoteRecord> for VoteRecordWire`).
+fn vote_record_wire_to_sdk(
+    w: &chip_voting_sdk::state::VoteRecordWire,
+) -> VotingResult<chip_voting_sdk::state::VoteRecord> {
+    Ok(chip_voting_sdk::state::VoteRecord {
+        voter_pubkey: parse_pubkey_hex(&w.voter_pubkey_hex, "voter_pubkey_hex")?,
+        vote_data: parse_hex32(&w.vote_data_hex)?,
+        vote_signature_hex: w.vote_signature_hex.clone(),
+        registration_coin_id: parse_hex32(&w.registration_coin_id_hex)?,
+        ballot_launcher_id: parse_hex32(&w.ballot_launcher_id_hex)?,
+        voting_coin_id: parse_hex32(&w.voting_coin_id_hex)?,
+    })
+}
+
 /// JSON-friendly result of a `createBallotBundle` call. Mirrors
 /// [`chip_voting_sdk::actors::ballot::CreatedBallot`] with hex
 /// strings for the on-chain ids and the SpendBundle as Streamable bytes.
@@ -1333,19 +1367,85 @@ pub async fn update_vote_build_final_bundle_js(
 
 /// Build the per-Ballot-Coin finalize bundle (Groth16 proof +
 /// finalize action solution). Wraps
-/// `Aggregator::build_finalize_for_ballot`. Mirrors
-/// `phase_finalize` in the live integration test.
+/// [`chip_voting_sdk::actors::aggregator::Aggregator::build_finalize_for_ballot`].
+/// Mirrors `phase_finalize` in the live integration test.
+///
+/// Inputs:
+///   * `votes_json` — JSON array of
+///     [`VoteRecordWire`](chip_voting_sdk::state::VoteRecordWire)
+///     (typically the output of an earlier `collectVotesForBallot`).
+///   * `proving_key_bytes` — arkworks compressed `ProvingKey<Bls12_381>`
+///     bytes (see `ArkProvingKey::serialize_compressed`). The dApp
+///     fetches this once from a CDN and caches in IndexedDB; it can
+///     be 1–10 MB depending on circuit size.
+///   * `params_json` — [`WasmFinalizeParams`].
+///   * `vote_outcome_hex` — the canonical 32-byte outcome.
+///
+/// The Groth16 prover runs inside wasm via `ark-groth16` (already a
+/// non-feature-gated dep of this crate); a single proof on a
+/// reference circuit takes a few seconds in modern browsers.
+///
+/// Returns the Streamable-encoded SpendBundle as a hex string.
 #[wasm_bindgen(js_name = "buildBallotFinalizeBundle")]
-pub fn build_ballot_finalize_bundle_js(
-    _backend: JsChainBackend,
-    _election_config_json: &str,
-    _ballot_launcher_id_hex: &str,
-    _vote_outcome_hex: &str,
-    _params_json: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "buildBallotFinalizeBundle: post-CHIP-rev wasm wrapper pending SDK feature-gate (see lib.rs note)",
-    ))
+pub async fn build_ballot_finalize_bundle_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    ballot_launcher_id_hex: String,
+    vote_outcome_hex: String,
+    params_json: String,
+    votes_json: String,
+    proving_key_bytes: Vec<u8>,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let ballot_launcher_id = parse_hex32(&ballot_launcher_id_hex)
+        .map_err(|e| JsError::new(&format!("ballot_launcher_id_hex: {e}")))?;
+    let vote_outcome = parse_hex32(&vote_outcome_hex)
+        .map_err(|e| JsError::new(&format!("vote_outcome_hex: {e}")))?;
+    let wasm_params: WasmFinalizeParams = serde_json::from_str(&params_json)
+        .map_err(|e| JsError::new(&format!("WasmFinalizeParams parse: {e}")))?;
+    let registration_merkle_root_snapshot =
+        parse_hex32(&wasm_params.registration_merkle_root_snapshot_hex)
+            .map_err(|e| JsError::new(&format!("registration_merkle_root_snapshot_hex: {e}")))?;
+
+    let votes_wire: Vec<chip_voting_sdk::state::VoteRecordWire> =
+        serde_json::from_str(&votes_json)
+            .map_err(|e| JsError::new(&format!("votes_json parse: {e}")))?;
+    let votes: Vec<chip_voting_sdk::state::VoteRecord> = votes_wire
+        .iter()
+        .map(vote_record_wire_to_sdk)
+        .collect::<VotingResult<Vec<_>>>()
+        .map_err(|e| JsError::new(&format!("VoteRecord decode: {e}")))?;
+
+    let proving_key = chip_voting_sdk::ArkProvingKey::deserialize_compressed(&proving_key_bytes)
+        .map_err(|e| JsError::new(&format!("ArkProvingKey::deserialize_compressed: {e}")))?;
+
+    let chain = JsChainReader::new(backend);
+    let aggregator =
+        chip_voting_sdk::actors::aggregator::Aggregator::new(cfg, chain, wasm_network_to_sdk(network))
+            .with_election_start_height(election_start_height);
+
+    let params = chip_voting_sdk::actors::aggregator::BuildFinalizeForBallotParams {
+        ballot_launcher_id,
+        vote_outcome,
+        votes: &votes,
+        vote_close_height: wasm_params.vote_close_height,
+        vote_threshold_num: wasm_params.vote_threshold_num,
+        vote_threshold_den: wasm_params.vote_threshold_den,
+        registration_merkle_root_snapshot,
+        registration_vote_weight_snapshot: wasm_params.registration_vote_weight_snapshot,
+        proving_key: &proving_key,
+    };
+    let bundle = aggregator
+        .build_finalize_for_ballot(params)
+        .await
+        .map_err(|e| JsError::new(&format!("build_finalize_for_ballot: {e}")))?;
+    let bundle_bytes = encode_streamable(&bundle)?;
+    Ok(hex::encode(&bundle_bytes))
 }
 
 /// Walk the chain to collect every Voting Coin that targets the
