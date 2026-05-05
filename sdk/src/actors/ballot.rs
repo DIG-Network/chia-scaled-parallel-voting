@@ -813,7 +813,7 @@ fn driver_err<E: std::fmt::Debug>(e: E) -> VotingError {
 /// fresh. (Cf. `Indexer`, which caches the last-synced state — the
 /// reader is intentionally lighter weight because Ballot Coin lookups
 /// are inherently per-launcher-id.)
-pub struct BallotReader<C: ChainReader = chia_query::ChiaQuery> {
+pub struct BallotReader<C: ChainReader> {
     pub config: ElectionConfig,
     chain: C,
 }

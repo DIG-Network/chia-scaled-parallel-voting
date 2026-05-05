@@ -47,13 +47,12 @@
 
 pub mod action_spends;
 // `actors` (Aggregator, Voter, ElectionDeployer, Indexer, BallotIssuer/
-// Reader) takes a `dig_l1_wallet::NetworkType` and defaults its
-// chain-generic to `chia_query::ChiaQuery`; both deps are native-only.
-// Gated behind the SDK's `native` feature (default-on) so the wasm
-// build can omit it. Wasm callers reach through to the sub-modules
-// (`prover`, `merkle`, `action_spends`, `puzzles`, `state`,
-// `ceremony`, `config`) which stay unconditional.
-#[cfg(feature = "native")]
+// Reader): the public types and pure helpers are visible to wasm; the
+// methods that sign bundles (via `dig_l1_wallet::transaction::*`) and
+// the trait impls touching `chia_query::*` are gated per-item with
+// `#[cfg(feature = "native")]` inside the module. Wasm callers can
+// construct actor structs and call their non-signing helpers; the
+// signing path lives behind the `native` feature.
 pub mod actors;
 pub mod ceremony;
 pub mod chain;

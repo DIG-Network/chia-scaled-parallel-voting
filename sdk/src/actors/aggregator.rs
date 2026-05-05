@@ -53,7 +53,7 @@ use crate::state::{BallotCoinSnapshot, ElectionState, VoteRecord, VoterSet};
 /// GENERIC: `C` defaults to `chia_query::ChiaQuery` so existing call
 /// sites (`Aggregator::new(config, chain, network)`) continue to type-
 /// check unchanged.
-pub struct Aggregator<C: ChainReader = chia_query::ChiaQuery> {
+pub struct Aggregator<C: ChainReader> {
     pub config: ElectionConfig,
     pub network: NetworkType,
     chain: C,

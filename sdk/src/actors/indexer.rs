@@ -44,7 +44,7 @@ use crate::state::{BallotCoinSnapshot, BallotState, ElectionState, VoteRecord, V
 /// PURPOSE: read-only chain observer.
 /// GENERIC: `C` defaults to `chia_query::ChiaQuery` for source-compat
 ///          with existing callers; tests can supply a `SharedSimulator`.
-pub struct Indexer<C: ChainReader = chia_query::ChiaQuery> {
+pub struct Indexer<C: ChainReader> {
     pub config: ElectionConfig,
     chain: C,
     state: Option<ElectionState>,

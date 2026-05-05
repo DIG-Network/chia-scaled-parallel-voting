@@ -38,6 +38,7 @@ use chia_bls::{PublicKey, SecretKey, Signature};
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_puzzles::SINGLETON_LAUNCHER_HASH;
 use chia_sdk_driver::{Launcher, SpendContext, StandardLayer};
+#[cfg(feature = "native")]
 use dig_l1_wallet::transaction::{assemble_spend_bundle, get_agg_sig_data, sign_coin_spends};
 
 use crate::config::{ElectionConfig, NetworkType};
@@ -183,6 +184,7 @@ impl ElectionDeployer {
     ///               (walks every AGG_SIG_* condition, augments with
     ///               the network's `agg_sig_me_additional_data`,
     ///               produces a single aggregated BLS signature).
+    #[cfg(feature = "native")]
     pub fn deploy_signed(
         &self,
         parent_coin: Coin,
@@ -374,6 +376,7 @@ impl ElectionDeployer {
 ///     produces required (PublicKey, message) pairs
 ///   → matches each pair against `secret_keys`
 ///   → returns aggregated signature
+#[cfg(feature = "native")]
 pub fn sign_bundle_signature(
     coin_spends: &[CoinSpend],
     secret_keys: &[SecretKey],
@@ -385,6 +388,28 @@ pub fn sign_bundle_signature(
             format!("sign_coin_spends failed: {e}").into(),
         ))
     })
+}
+
+/// Wasm-target stub. Actor methods that build signed bundles (`Voter::
+/// cast_vote`, `BallotIssuer::create_ballot`, etc.) call this; in a
+/// wasm build the dependencies needed for native signing
+/// (`dig_l1_wallet::transaction::sign_coin_spends`) aren't available,
+/// so the call-site methods compile but error at runtime if invoked.
+/// Wasm callers should use the SDK's host bridge / wallet flow to sign
+/// externally and assemble the bundle JS-side.
+#[cfg(not(feature = "native"))]
+pub fn sign_bundle_signature(
+    _coin_spends: &[CoinSpend],
+    _secret_keys: &[SecretKey],
+    _network: NetworkType,
+) -> VotingResult<Signature> {
+    Err(VotingError::Other(anyhow_compat::Error(
+        "sign_bundle_signature: not available in wasm builds. Sign the \
+         bundle's coin_spends externally (e.g. via WalletConnect) and \
+         assemble the SpendBundle JS-side."
+            .to_string()
+            .into(),
+    )))
 }
 
 /// FN: uint_atom_hash

@@ -2046,6 +2046,7 @@ fn driver_err<E: std::fmt::Debug>(e: E) -> VotingError {
 ///        results and feed them into `chia_sdk_driver::Cat::parse_children`.
 /// ACCEPTS: both `0x`-prefixed and bare hex strings (chia-query has
 ///          historically been inconsistent about this).
+#[cfg(feature = "native")]
 pub fn convert_coin(c: &chia_query::Coin) -> VotingResult<chia_protocol::Coin> {
     let parent_coin_info = parse_hex32(&c.parent_coin_info)?;
     let puzzle_hash = parse_hex32(&c.puzzle_hash)?;
