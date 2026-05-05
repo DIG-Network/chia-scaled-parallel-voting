@@ -533,6 +533,71 @@ pub fn parse_election_config_js(config_json: &str) -> Result<JsValue, JsError> {
 }
 
 // ============================================================================
+// SECTION 5a — XCH funder spend builder (`buildXchFunderSpend`)
+// ============================================================================
+
+/// Build a Streamable-encoded `CoinSpend` that spends an XCH coin
+/// owned by `funder_synthetic_pk_hex` and emits a single
+/// `CreateCoin(funder_p2_ph, change_amount)` if `change_amount > 0`.
+/// Mirrors the funder pre-spend half of
+/// `cli/src/bin/live_integration_test.rs::phase_create_ballot`.
+///
+/// The output bytes drop straight into `createBallotBundle`'s
+/// `funder_spend_bytes` and `registerBuildSpends`'s
+/// `cat_parent_spend_bytes` (after CAT-wrapping) without further
+/// shaping.
+///
+/// The spend is UNSIGNED — the standard p2 puzzle emits an
+/// `AggSigMe(synthetic_pk, msg)` condition that must be signed at
+/// the bundle level by `signCoinSpends`. Pass the funder's synthetic
+/// secret to `signCoinSpends` after the createBallot bundle is
+/// assembled.
+#[wasm_bindgen(js_name = "buildXchFunderSpend")]
+pub fn build_xch_funder_spend_js(
+    parent_coin_info_hex: &str,
+    funder_synthetic_pk_hex: &str,
+    amount: u64,
+    change_amount: u64,
+) -> Result<Box<[u8]>, JsError> {
+    use chia_protocol::Coin;
+    use chia_puzzle_types::standard::StandardArgs;
+    use chia_puzzle_types::Memos;
+    use chia_sdk_driver::{SpendContext, StandardLayer};
+    use chip_voting_sdk::Conditions;
+
+    let parent = parse_hex32(parent_coin_info_hex)
+        .map_err(|e| JsError::new(&format!("parent_coin_info_hex: {e}")))?;
+    let pk_bytes = hex::decode(funder_synthetic_pk_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("funder_synthetic_pk_hex decode: {e}")))?;
+    let pk_arr: [u8; 48] = pk_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| JsError::new("funder_synthetic_pk_hex must be 48 bytes"))?;
+    let synthetic_pk = PublicKey::from_bytes(&pk_arr)
+        .map_err(|e| JsError::new(&format!("PublicKey::from_bytes: {e:?}")))?;
+    let funder_p2_ph =
+        chia_protocol::Bytes32::new(StandardArgs::curry_tree_hash(synthetic_pk).to_bytes());
+
+    let coin = Coin::new(parent, funder_p2_ph, amount);
+
+    let mut ctx = SpendContext::new();
+    let mut conditions = Conditions::new();
+    if change_amount > 0 {
+        conditions = conditions.create_coin(funder_p2_ph, change_amount, Memos::None);
+    }
+    StandardLayer::new(synthetic_pk)
+        .spend(&mut ctx, coin, conditions)
+        .map_err(|e| JsError::new(&format!("StandardLayer::spend: {e:?}")))?;
+    let spends = ctx.take();
+    let cs = spends
+        .into_iter()
+        .next()
+        .ok_or_else(|| JsError::new("StandardLayer::spend produced no coin spends"))?;
+    let bytes = encode_streamable(&cs)?;
+    Ok(bytes.into_boxed_slice())
+}
+
+// ============================================================================
 // SECTION 5b — Trusted-setup ceremony (`runSingleParticipantCeremony`)
 // ============================================================================
 

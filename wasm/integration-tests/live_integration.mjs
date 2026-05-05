@@ -39,7 +39,13 @@ import { pushSpendBundleBytes, pollUntilConfirmed } from "./push.mjs";
 import {
   readDeployArtifacts,
   writeDeployArtifacts,
+  readBallotArtifacts,
+  writeBallotArtifacts,
 } from "./artifacts.mjs";
+import {
+  encodeCoinSpendStreamable,
+  encodeCoinSpendListLengthPrefixed,
+} from "./encoding.mjs";
 
 // ---------------------------------------------------------------------------
 // Argv parsing
@@ -54,6 +60,7 @@ function parseArgs(argv) {
     runDeploy: false,
     pushDeploy: false,
     forceRedeploy: false,
+    runCreateBallot: false,
     // Default CAT TAIL: DIG token (per app/app/create/page.tsx default).
     // Voters will need a balance of this CAT to register. Override
     // with --cat-tail <hex> for a different election currency.
@@ -78,6 +85,8 @@ function parseArgs(argv) {
       out.catTailHashHex = argv[++i];
     } else if (a === "--force-redeploy") {
       out.forceRedeploy = true;
+    } else if (a === "--run-create-ballot") {
+      out.runCreateBallot = true;
     }
   }
   return out;
@@ -562,8 +571,166 @@ async function phaseVoterReadiness(opts, deploy) {
   return readyValidators;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 6 — phase_create_ballot (operator creates a fresh Ballot Coin lineage)
+// ---------------------------------------------------------------------------
+
+async function phaseCreateBallot(opts, deploy) {
+  step("Phase 6: create + launch a Ballot Coin");
+
+  if (!opts.runCreateBallot) {
+    info("Skipping create_ballot (default). Pass --run-create-ballot to attempt.");
+    return null;
+  }
+  if (!deploy?.configJson) {
+    throw new Error("create_ballot needs deploy artifacts (run phase_deploy first)");
+  }
+  if (!opts.credentials) {
+    throw new Error("create_ballot needs --credentials");
+  }
+
+  const creds = await parseCredentials(opts.credentials);
+  if (!creds.funding.mnemonic) {
+    throw new Error("funder mnemonic missing");
+  }
+  const funder = deriveSyntheticFromMnemonic(creds.funding.mnemonic);
+
+  // ── 1. Find an XCH funder coin (≥ 2 mojos for the launcher) ────
+  const fp2Hex = "0x" + funder.puzzleHashHex;
+  const xchCoins = await coinRecordsByPuzzleHash(fp2Hex, false);
+  // Need a coin > 2 so change > 0 and the StandardLayer spend has a
+  // condition to wrap (delegatedSpend([]) panics inside chia-wallet-
+  // sdk-wasm). Picking the smallest >= 100 keeps the bundle tiny but
+  // still has change.
+  const candidates = xchCoins
+    .filter((c) => c.spentHeight === 0 && c.amount >= 100)
+    .sort((a, b) => a.amount - b.amount); // smallest viable first
+  if (candidates.length === 0) {
+    throw new Error("no funder XCH coin (≥ 100 mojos) for createBallot funding");
+  }
+  const funderCoin = candidates[0];
+  ok(`funder XCH coin: amount=${funderCoin.amount} mojos`);
+
+  // ── 2. Build the funder StandardLayer spend via wasm helper ─────
+  const change = funderCoin.amount - 2;
+  const funderSpendBytes = wasm.buildXchFunderSpend(
+    "0x" + funderCoin.parentCoinInfo,
+    funder.syntheticPkHex,
+    BigInt(funderCoin.amount),
+    BigInt(change)
+  );
+  ok(`funder spend assembled: ${funderSpendBytes.length} streamable bytes`);
+
+  // ── 3. Pick ballot params ──────────────────────────────────────
+  // ballot_seed: random 32 bytes for uniqueness across runs.
+  const ballotSeed = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(ballotSeed);
+  const ballotSeedHex = "0x" + bytesToHex(ballotSeed);
+  // outcome_domain_hash: arbitrary 32-byte hash binding the choices.
+  // Using a known marker so this is identifiable on chain.
+  const outcomeDomainHashHex = "0x" + "01".repeat(32);
+  // vote_close_height: peak + ~50 blocks (~25 minutes mainnet).
+  const peak = await peakHeight();
+  const voteCloseHeight = peak + 50;
+  info(`ballot_seed         = ${ballotSeedHex.slice(0, 18)}…`);
+  info(`outcome_domain_hash = ${outcomeDomainHashHex.slice(0, 18)}…`);
+  info(`vote_close_height   = ${voteCloseHeight} (peak ${peak} + 50)`);
+
+  const params = {
+    ballotSeedHex,
+    voteCloseHeight,
+    outcomeDomainHashHex,
+  };
+
+  // ── 4. Call wasm.createBallotBundle ───────────────────────────
+  step(" → wasm.createBallotBundle");
+  const backend = createChainBackend({ verbose: opts.verbose });
+  const resultJson = await wasm.createBallotBundle(
+    backend,
+    deploy.configJson,
+    funderSpendBytes,
+    JSON.stringify(params),
+    wasm.WasmNetwork.Mainnet,
+    BigInt(deploy.electionStartHeight)
+  );
+  const created = JSON.parse(resultJson);
+  ok(`ballot_launcher_id = ${created.ballotLauncherIdHex}`);
+  ok(`ballot_coin_id     = ${created.ballotCoinIdHex}`);
+
+  // ── 5. Re-sign the bundle with the funder's synthetic SK ──────
+  // The createBallotBundle produces a bundle with identity sig (no
+  // AGG_SIG inside the singleton spend), but the funder's
+  // StandardLayer spend emits AGG_SIG_ME(synthPk, msg). Re-sign so
+  // chia consensus accepts.
+  step(" → re-sign bundle with funder synthetic SK");
+  const { SpendBundle } = await import("chia-wallet-sdk-wasm");
+  const bundleHex = created.spendBundleHex;
+  const bundleBytes = hexToBytesU8(bundleHex);
+  const bundle = SpendBundle.fromBytes(bundleBytes);
+  const allCoinSpends = bundle.coinSpends;
+  const coinSpendsBytesLP = encodeCoinSpendListLengthPrefixed(allCoinSpends);
+  const sigBytes = wasm.signCoinSpends(
+    coinSpendsBytesLP,
+    funder.syntheticSecretBytes,
+    wasm.WasmNetwork.Mainnet
+  );
+  ok(`re-signed: ${sigBytes.length}-byte aggregate`);
+  const finalBundleBytes = wasm.assembleSpendBundle(coinSpendsBytesLP, sigBytes);
+  step(" → verifyBundleLocally");
+  wasm.verifyBundleLocally(finalBundleBytes, wasm.WasmNetwork.Mainnet);
+  ok("create_ballot bundle validates locally");
+
+  // ── 6. Push (opt-in) ──────────────────────────────────────────
+  if (opts.pushDeploy) {
+    step(" → push createBallot bundle");
+    const response = await pushSpendBundleBytes(finalBundleBytes, { network: "mainnet" });
+    if (response.status !== "SUCCESS" && response.status !== 1) {
+      throw new Error(`push_tx returned: ${response.status} (${response.error ?? "(none)"})`);
+    }
+    ok(`push_tx accepted: ${response.status}`);
+
+    step(" → poll for ballot launcher confirmation");
+    const rec = await pollUntilConfirmed(created.ballotLauncherIdHex, {
+      label: "ballotLauncher",
+      pollIntervalMs: 30_000,
+      timeoutMs: 600_000,
+    });
+    ok(`ballot launcher confirmed at height ${rec.confirmedHeight}`);
+
+    // Persist
+    const ballots = await readBallotArtifacts();
+    ballots.push({
+      ballotLauncherIdHex: created.ballotLauncherIdHex,
+      ballotCoinIdHex: created.ballotCoinIdHex,
+      voteCloseHeight,
+      outcomeDomainHashHex,
+      ballotSeedHex,
+      mainnetConfirmedHeight: rec.confirmedHeight,
+    });
+    await writeBallotArtifacts(ballots);
+    ok("ballot artifact saved to .artifacts/ballots.json");
+  } else {
+    info("Dry-run only. Pass --push to broadcast.");
+  }
+
+  return created;
+}
+
+// Inline hex helpers (avoid pulling chia-wallet-sdk-wasm just for fromHex).
+function hexToBytesU8(hex) {
+  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+function bytesToHex(bytes) {
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function phaseWriteSideTodo() {
-  step("Phase 6+: register / vote / finalize / release (TODO)");
+  step("Phase 7+: launch_ballot / register / vote / finalize / release (TODO)");
   info(
     "Phase 4 (deploy) builds + dry-runs end-to-end. The remaining write-side"
   );
@@ -599,6 +766,8 @@ async function main() {
     const deploy = await phaseDeploy(opts);
     console.log("");
     await phaseVoterReadiness(opts, deploy);
+    console.log("");
+    await phaseCreateBallot(opts, deploy);
     console.log("");
     phaseWriteSideTodo();
     console.log("");
