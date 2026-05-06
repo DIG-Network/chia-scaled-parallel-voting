@@ -137,6 +137,146 @@ function finalizeCollectHarvestPct(collect: FinalizeCollectPayload): number {
 // CRITICAL WASM IMPORT PATTERN: components that touch wasm MUST
 // load via `dynamic(async () => { ... }, { ssr: false })`. Top-
 // level `import "chip-voting-wasm"` crashes the prerender pass.
+/**
+ * Per-ballot listing under one election. Reads the ballot bootstrap
+ * (populated by handleCreateAndLaunchBallot or share-bundle import),
+ * renders one row per ballot with its status badge and a Select
+ * button. Selection drives handleVote / handleChangeVote /
+ * handleFinalize.
+ *
+ * Status pack:
+ *   active    — vote_close_height > current peak. Open for voting.
+ *   expired   — close passed, no finalize record yet.
+ *   finalized — finalizedAtHeight set in bootstrap.
+ */
+function BallotsList(props: {
+  electionLauncherIdHex: string;
+  selectedBallotId: string | null;
+  setSelectedBallotId: (id: string | null) => void;
+  currentPeak: number;
+  myVoteDataHex: string | null;
+  refreshKey: number;
+}) {
+  const [ballots, setBallots] = useState<
+    import("../lib/ballotBootstrap").BallotBootstrap[]
+  >([]);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
+      if (cancelled) return;
+      const all = listBallotBootstraps(props.electionLauncherIdHex);
+      // Sort: open first (newest), then closed-not-finalized, then finalized.
+      const status = (b: typeof all[number]): number => {
+        const finalized = !!b.finalizedAtHeight;
+        const closed = b.voteCloseHeight <= props.currentPeak;
+        if (finalized) return 2;
+        if (closed) return 1;
+        return 0;
+      };
+      all.sort((a, b) => {
+        const sa = status(a);
+        const sb = status(b);
+        if (sa !== sb) return sa - sb;
+        return (b.launchedAtHeight ?? 0) - (a.launchedAtHeight ?? 0);
+      });
+      setBallots(all);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [props.electionLauncherIdHex, props.refreshKey, props.currentPeak]);
+
+  if (ballots.length === 0) {
+    return (
+      <div className="rounded-xl border border-dashed border-[var(--color-border)] bg-[var(--color-bg)]/50 p-5">
+        <h3 className="font-semibold mb-1">Ballots</h3>
+        <p className="text-sm text-[var(--color-muted)]">
+          No ballots in this session yet. The deployer can mint one above; voters
+          can also import a share bundle that includes ballot bootstrap.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-[var(--color-border)] p-5">
+      <h3 className="font-semibold mb-3">Ballots ({ballots.length})</h3>
+      <ul className="space-y-2">
+        {ballots.map((b) => {
+          const finalized = !!b.finalizedAtHeight;
+          const closed = b.voteCloseHeight <= props.currentPeak;
+          const blocksLeft = b.voteCloseHeight - props.currentPeak;
+          const status = finalized ? "finalized" : closed ? "expired" : "active";
+          const selected =
+            props.selectedBallotId &&
+            normalizeHex32(props.selectedBallotId) ===
+              normalizeHex32(b.ballotLauncherIdHex);
+          return (
+            <li key={b.ballotLauncherIdHex}>
+              <button
+                type="button"
+                onClick={() =>
+                  props.setSelectedBallotId(
+                    selected ? null : b.ballotLauncherIdHex
+                  )
+                }
+                className={`w-full text-left rounded-lg border p-3 transition ${
+                  selected
+                    ? "border-[var(--color-accent)] bg-[var(--color-accent)]/[0.08]"
+                    : "border-[var(--color-border)] hover:border-[var(--color-accent)]/50"
+                }`}
+              >
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-1">
+                  <span
+                    className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-bold ${
+                      status === "active"
+                        ? "bg-green-500/15 text-green-700 dark:text-green-400"
+                        : status === "expired"
+                          ? "bg-amber-500/15 text-amber-700 dark:text-amber-400"
+                          : "bg-[var(--color-accent)]/15 text-[var(--color-accent)]"
+                    }`}
+                  >
+                    {status}
+                  </span>
+                  <span className="font-mono text-xs">
+                    {truncHex(normalizeHex32(b.ballotLauncherIdHex), 10, 6)}
+                  </span>
+                  {selected ? (
+                    <span className="text-[11px] text-[var(--color-accent)]">
+                      ✓ selected
+                    </span>
+                  ) : null}
+                </div>
+                <div className="text-xs text-[var(--color-muted)] flex flex-wrap gap-x-4 gap-y-0.5">
+                  <span>close height: {b.voteCloseHeight.toLocaleString()}</span>
+                  {!closed && props.currentPeak > 0 ? (
+                    <span>~{blocksLeft.toLocaleString()} blocks left</span>
+                  ) : null}
+                  {finalized ? (
+                    <span>
+                      finalized @ {(b.finalizedAtHeight ?? 0).toLocaleString()}
+                    </span>
+                  ) : null}
+                  {b.registrationVoteWeightSnapshot > 0 ? (
+                    <span>
+                      vote weight snapshot: {b.registrationVoteWeightSnapshot}
+                    </span>
+                  ) : null}
+                </div>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      <p className="text-xs text-[var(--color-muted)] mt-3">
+        Pick a ballot to drive the Step 2 / Step 3 actions below. Active
+        ballots accept votes; expired ones can be finalized by the deployer.
+      </p>
+    </div>
+  );
+}
+
 const ElectionPageInner = dynamic(
   async function DynamicElem() {
     const wasm = await getWasm();
@@ -241,6 +381,24 @@ const ElectionPageInner = dynamic(
       const [finalizePayoutPh, setFinalizePayoutPh] = useState<string | null>(
         null
       );
+
+      /**
+       * The ballot the voter / operator currently selected from the
+       * Ballots list. CHIP rev 2026-05-02 model: an election has many
+       * ballots; cast_vote / change_vote / finalize each act on ONE
+       * specific ballot. When unset, handlers fall back to the
+       * "newest open" / "newest closed" pickers so the existing
+       * single-ballot flow keeps working for elections with one
+       * active ballot.
+       */
+      const [selectedBallotId, setSelectedBallotId] = useState<string | null>(
+        null
+      );
+      /**
+       * Force re-render of ballots list when the bootstrap changes
+       * (e.g., handleCreateAndLaunchBallot writes a new entry).
+       */
+      const [ballotsListEpoch, setBallotsListEpoch] = useState(0);
 
       /**
        * CAT amount (decimal string, 3 fractional digits) to lock when registering.
@@ -1107,6 +1265,8 @@ const ElectionPageInner = dynamic(
             addedAt: new Date().toISOString(),
           };
           writeBallotBootstrap(bb);
+          setBallotsListEpoch((n) => n + 1);
+          setSelectedBallotId(created.ballotLauncherIdHex);
 
           setTxStatus(
             `Ballot launched. close height ${voteCloseHeight} (~${50 * 52}s window). ` +
@@ -1415,18 +1575,27 @@ const ElectionPageInner = dynamic(
             }
           }
 
-          // ── 2. Pick the open ballot to cast against ────────────
-          // Reads from per-ballot bootstrap (populated by
-          // handleCreateAndLaunchBallot or share-bundle import). The
-          // CHIP-rev-2026-05-02 vote flow is per-ballot, not
-          // per-election: every cast_vote spends one specific Ballot
-          // Coin singleton's oracle action and is curried to a
-          // specific (vote_close_height, threshold, registration
-          // snapshot).
+          // ── 2. Pick the ballot to cast against ──────────────────
+          // The user picks via the Ballots list (selectedBallotId).
+          // If unset, fall back to the newest open ballot — keeps the
+          // single-ballot path working for simple elections.
           setBusy("Locating an open ballot…");
           const peak = await peakHeight();
           if (!peak) throw new Error("Could not read chain peak");
-          const ballot = pickOpenBallotForVoting(launcherIdHex, peak);
+          let ballot: BallotBootstrap | null = null;
+          if (selectedBallotId) {
+            const { readBallotBootstrap } = await import("../lib/ballotBootstrap");
+            ballot = readBallotBootstrap(launcherIdHex, selectedBallotId);
+            if (ballot && ballot.voteCloseHeight <= peak) {
+              throw new Error(
+                "Selected ballot is closed (vote_close_height passed). " +
+                  "Pick an active ballot from the Ballots list."
+              );
+            }
+          }
+          if (!ballot) {
+            ballot = pickOpenBallotForVoting(launcherIdHex, peak);
+          }
           if (!ballot) {
             throw new Error(
               "No open ballot in this session. Ask the deployer to mint one (Mint a new ballot card), " +
@@ -1608,7 +1777,14 @@ const ElectionPageInner = dynamic(
           setBusy("Locating an open ballot…");
           const peak = await peakHeight();
           if (!peak) throw new Error("Could not read chain peak");
-          const ballot = pickOpenBallotForVoting(launcherIdHex, peak);
+          let ballot: BallotBootstrap | null = null;
+          if (selectedBallotId) {
+            const { readBallotBootstrap } = await import("../lib/ballotBootstrap");
+            ballot = readBallotBootstrap(launcherIdHex, selectedBallotId);
+          }
+          if (!ballot) {
+            ballot = pickOpenBallotForVoting(launcherIdHex, peak);
+          }
           if (!ballot) {
             throw new Error(
               "No open ballot in this session. update_vote is per-ballot — make sure you're voting on a ballot whose snapshot is in your bootstrap."
@@ -2027,11 +2203,27 @@ const ElectionPageInner = dynamic(
           // ballot's launcher.
           const peakNow = await peakHeight();
           if (!peakNow) throw new Error("Could not read chain peak");
-          const closedBallots = (await import("../lib/ballotBootstrap"))
-            .listBallotBootstraps(launcherIdHex)
-            .filter((b) => b.voteCloseHeight <= peakNow && !!b.eveBallotCoinIdHex)
-            .sort((a, b) => (b.launchedAtHeight ?? 0) - (a.launchedAtHeight ?? 0));
-          const finalizeBallot = closedBallots[0];
+          const { listBallotBootstraps, readBallotBootstrap } = await import(
+            "../lib/ballotBootstrap"
+          );
+          let finalizeBallot: BallotBootstrap | null = null;
+          if (selectedBallotId) {
+            const sel = readBallotBootstrap(launcherIdHex, selectedBallotId);
+            if (sel && sel.voteCloseHeight <= peakNow && !!sel.eveBallotCoinIdHex) {
+              finalizeBallot = sel;
+            } else if (sel) {
+              throw new Error(
+                "Selected ballot is not yet closed — finalize is gated by " +
+                  "AssertHeightAbsolute(VOTE_CLOSE_HEIGHT) on the eve Ballot Coin."
+              );
+            }
+          }
+          if (!finalizeBallot) {
+            const closedBallots = listBallotBootstraps(launcherIdHex)
+              .filter((b) => b.voteCloseHeight <= peakNow && !!b.eveBallotCoinIdHex)
+              .sort((a, b) => (b.launchedAtHeight ?? 0) - (a.launchedAtHeight ?? 0));
+            finalizeBallot = closedBallots[0];
+          }
           if (!finalizeBallot) {
             throw new Error(
               "No closed ballot in this session. The vote close height must have passed for the ballot you want to finalize."
@@ -3085,6 +3277,20 @@ const ElectionPageInner = dynamic(
                     </button>
                   </div>
                 ) : null}
+
+                {/* Ballots list — every ballot under this election
+                    plus its status. Selecting a row drives
+                    handleVote / handleChangeVote / handleFinalize. */}
+                <BallotsList
+                  electionLauncherIdHex={launcherIdHex}
+                  selectedBallotId={selectedBallotId}
+                  setSelectedBallotId={setSelectedBallotId}
+                  currentPeak={
+                    electionLc.status === "ready" ? electionLc.peak : 0
+                  }
+                  myVoteDataHex={resolvedMyVoteDataHex}
+                  refreshKey={ballotsListEpoch}
+                />
 
                 {/* Step 2 — ballot (meaningful UI only once registered + pubkey) */}
                 <div
