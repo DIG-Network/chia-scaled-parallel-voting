@@ -381,23 +381,63 @@ const ElectionPageInner = dynamic(
       }, [address]);
 
       // ── Sync snapshot from chain ──────────────────────────────────
+      // CHIP rev 2026-05-02: the whole-election `syncSnapshot` walked
+      // the chain to populate finalized + vote outcome + voter set in
+      // one call. The new model splits that across the Election
+      // Singleton (registration state only) and per-ballot bootstrap
+      // (ballot finalize state). We synthesize the legacy
+      // SyncSnapshotShape so the existing JSX consumers don't need
+      // rewriting:
+      //   * registrationCount / registrationMerkleRootHex / smtRootHex
+      //     come from `wasm.readElectionSingletonState`.
+      //   * votersHex falls back to `session.registeredPubkeysHex`
+      //     (UI-tracked locally; accurate for voters this session
+      //     observed register).
+      //   * finalized / voteOutcomeHex aggregate the bootstrap's per-
+      //     ballot finalize records — true iff at least one ballot
+      //     has been finalized.
+      //   * accumulatedFees is no longer surfaced in the new model
+      //     (no on-chain fee accumulator); reported as 0.
       const syncSnapshot = useCallback(async () => {
         if (!session) return;
         setSnapshotLoading(true);
         setSnapshotError(null);
         try {
           const backend = createChainBackend();
-          const snap = (await (wasm as any).syncSnapshot(
+          const cfg = JSON.parse(session.configJson);
+          const electionStartHeight = Number(cfg.election_start_height ?? 0);
+          const stateJson = await wasm.readElectionSingletonState(
             backend as any,
-            session.configJson
-          )) as SyncSnapshotShape;
+            session.configJson,
+            BigInt(electionStartHeight)
+          );
+          const state = JSON.parse(stateJson) as {
+            coinIdHex: string;
+            registrationMerkleRootHex: string;
+            registrationCount: number;
+            registrationVoteWeight: number;
+            electionStartHeight: number;
+          };
+          const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
+          const ballots = listBallotBootstraps(launcherIdHex);
+          const finalizedBallot = ballots.find((b) => !!b.finalizedAtHeight);
+          const snap: SyncSnapshotShape = {
+            registrationCount: state.registrationCount,
+            registrationMerkleRootHex: state.registrationMerkleRootHex,
+            finalized: !!finalizedBallot,
+            voteOutcomeHex: finalizedBallot?.voteOutcomeHex ?? "0x" + "0".repeat(64),
+            accumulatedFees: 0,
+            electionStartHeight: state.electionStartHeight,
+            votersHex: session.registeredPubkeysHex ?? [],
+            smtRootHex: state.registrationMerkleRootHex,
+          };
           setSnapshot(snap);
         } catch (e: any) {
           setSnapshotError(e?.message ?? String(e));
         } finally {
           setSnapshotLoading(false);
         }
-      }, [session]);
+      }, [session, launcherIdHex]);
 
       useEffect(() => {
         if (chainStatus === "deployed") {
@@ -426,8 +466,31 @@ const ElectionPageInner = dynamic(
             }
 
             const backend = createChainBackend();
-            const votes = await (wasm as any).collectVotes(backend as any, configJson);
-            const ballotsCast = Array.isArray(votes) ? votes.length : 0;
+            // CHIP rev 2026-05-02: votes are per-ballot. Aggregate
+            // ballot count across every ballot bootstrap we know
+            // about; for each, query its on-chain Voting Coin
+            // lineage via collectVotesForBallot.
+            const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
+            const allBallots = listBallotBootstraps(launcherIdHex);
+            const voterPubkeysJson = JSON.stringify(
+              session?.registeredPubkeysHex ?? []
+            );
+            let ballotsCast = 0;
+            for (const b of allBallots) {
+              try {
+                const rowsJson = (await wasm.collectVotesForBallot(
+                  backend as any,
+                  configJson,
+                  b.ballotLauncherIdHex,
+                  voterPubkeysJson
+                )) as string;
+                const rows = JSON.parse(rowsJson);
+                if (Array.isArray(rows)) ballotsCast += rows.length;
+              } catch {
+                /* swallow per-ballot errors — a single missing ballot
+                   shouldn't blank the lifecycle status. */
+              }
+            }
 
             if (snapshotRef.current?.finalized === true) {
               const peakSnap = await peakHeight();
@@ -445,10 +508,12 @@ const ElectionPageInner = dynamic(
               return;
             }
 
-            const tip = (await (wasm as any).findCurrentSingleton(
-              backend as any,
-              configJson
-            )) as { coinIdHex: string; finalized: boolean };
+            // The Election Singleton itself doesn't carry a "finalized"
+            // bit — that's a per-ballot state in the new model. We
+            // treat the snapshot as finalized iff at least one tracked
+            // ballot has a finalize confirmation in its bootstrap.
+            const tipFinalized = allBallots.some((b) => !!b.finalizedAtHeight);
+            const tip = { coinIdHex: "", finalized: tipFinalized };
 
             if (cancelled) return;
 
@@ -541,11 +606,34 @@ const ElectionPageInner = dynamic(
       const pullFreshSnapshot = useCallback(async (): Promise<SyncSnapshotShape | null> => {
         if (!session) return null;
         const backend = createChainBackend();
-        return (await (wasm as any).syncSnapshot(
+        const cfg = JSON.parse(session.configJson);
+        const electionStartHeight = Number(cfg.election_start_height ?? 0);
+        const stateJson = await wasm.readElectionSingletonState(
           backend as any,
-          session.configJson
-        )) as SyncSnapshotShape;
-      }, [session]);
+          session.configJson,
+          BigInt(electionStartHeight)
+        );
+        const state = JSON.parse(stateJson) as {
+          coinIdHex: string;
+          registrationMerkleRootHex: string;
+          registrationCount: number;
+          registrationVoteWeight: number;
+          electionStartHeight: number;
+        };
+        const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
+        const ballots = listBallotBootstraps(launcherIdHex);
+        const finalizedBallot = ballots.find((b) => !!b.finalizedAtHeight);
+        return {
+          registrationCount: state.registrationCount,
+          registrationMerkleRootHex: state.registrationMerkleRootHex,
+          finalized: !!finalizedBallot,
+          voteOutcomeHex: finalizedBallot?.voteOutcomeHex ?? "0x" + "0".repeat(64),
+          accumulatedFees: 0,
+          electionStartHeight: state.electionStartHeight,
+          votersHex: session.registeredPubkeysHex ?? [],
+          smtRootHex: state.registrationMerkleRootHex,
+        };
+      }, [session, launcherIdHex]);
 
       const snapshotBrief = useCallback((s: SyncSnapshotShape | null | undefined) => {
         if (!s) return "";
@@ -619,26 +707,38 @@ const ElectionPageInner = dynamic(
         void (async () => {
           try {
             const backend = createChainBackend();
-            const rows = (await (wasm as any).collectVotes(
-              backend as any,
-              session!.configJson
-            )) as unknown[];
+            const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
+            // Aggregate this voter's most-recent vote across all
+            // tracked ballots (newest ballot wins if multiple).
+            const allBallots = [...listBallotBootstraps(launcherIdHex)].sort(
+              (a, b) => (b.launchedAtHeight ?? 0) - (a.launchedAtHeight ?? 0)
+            );
             const pkWant = normalizeHex32(effectiveVoterPk);
             let found: string | null = null;
-            for (const r of rows ?? []) {
-              const row = r as Record<string, string | undefined>;
-              const rk = normalizeHex32(
-                row.voter_pubkey_hex ?? row.voterPubkeyHex ?? ""
-              );
-              if (rk !== pkWant) continue;
-              const vd = row.vote_data_hex ?? row.voteDataHex ?? "";
-              if (vd) {
-                const t = vd.trim();
-                found = t.startsWith("0x")
-                  ? t.toLowerCase()
-                  : `0x${normalizeHex32(t)}`;
+            for (const b of allBallots) {
+              const rowsJson = (await wasm.collectVotesForBallot(
+                backend as any,
+                session!.configJson,
+                b.ballotLauncherIdHex,
+                JSON.stringify([effectiveVoterPk])
+              )) as string;
+              const rows = JSON.parse(rowsJson) as unknown[];
+              for (const r of rows ?? []) {
+                const row = r as Record<string, string | undefined>;
+                const rk = normalizeHex32(
+                  row.voter_pubkey_hex ?? row.voterPubkeyHex ?? ""
+                );
+                if (rk !== pkWant) continue;
+                const vd = row.vote_data_hex ?? row.voteDataHex ?? "";
+                if (vd) {
+                  const t = vd.trim();
+                  found = t.startsWith("0x")
+                    ? t.toLowerCase()
+                    : `0x${normalizeHex32(t)}`;
+                }
+                break;
               }
-              break;
+              if (found) break;
             }
             if (!cancelled) {
               setIndexedMyVoteDataHex(found);
@@ -678,17 +778,36 @@ const ElectionPageInner = dynamic(
         void (async () => {
           try {
             const backend = createChainBackend();
-            const raw = (await (wasm as any).collectVotes(
-              backend as any,
-              session!.configJson
-            )) as unknown[];
-            if (cancelled) return;
+            const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
+            // Tally aggregates votes across every tracked ballot
+            // for this election. Aligns with the per-ballot model:
+            // each Voting Coin lineage hangs off a specific ballot,
+            // so we walk each ballot separately and union the rows.
+            const allBallots = listBallotBootstraps(launcherIdHex);
+            const voterPubkeysJson = JSON.stringify(
+              session!.registeredPubkeysHex ?? []
+            );
             const rows: { voteDataHex: string }[] = [];
-            for (const r of raw ?? []) {
-              const row = r as Record<string, string | undefined>;
-              const vd = row.voteDataHex ?? row.vote_data_hex ?? "";
-              if (vd) rows.push({ voteDataHex: vd });
+            for (const b of allBallots) {
+              try {
+                const rawJson = (await wasm.collectVotesForBallot(
+                  backend as any,
+                  session!.configJson,
+                  b.ballotLauncherIdHex,
+                  voterPubkeysJson
+                )) as string;
+                if (cancelled) return;
+                const raw = JSON.parse(rawJson) as unknown[];
+                for (const r of raw ?? []) {
+                  const row = r as Record<string, string | undefined>;
+                  const vd = row.voteDataHex ?? row.vote_data_hex ?? "";
+                  if (vd) rows.push({ voteDataHex: vd });
+                }
+              } catch {
+                /* swallow per-ballot errors */
+              }
             }
+            if (cancelled) return;
             setOnChainVoteTally(
               computeOnChainVoteTallyFromWire(rows, session.choices)
             );
@@ -2042,10 +2161,25 @@ const ElectionPageInner = dynamic(
 
           setFinalizeModal(null);
 
+          // Persist finalize state to the ballot bootstrap so
+          // syncSnapshot's `finalized` aggregator picks it up. Done
+          // optimistically right after push: pullFreshSnapshot
+          // already polls until visible, but the snapshot tracker
+          // only sees finalize via this bootstrap field.
+          const peakAfter = await peakHeight();
+          const updatedBootstrap: BallotBootstrap = {
+            ...finalizeBallot,
+            finalizedAtHeight: peakAfter ?? finalizeBallot.voteCloseHeight,
+            voteOutcomeHex: outcomeHex.startsWith("0x")
+              ? outcomeHex
+              : "0x" + outcomeHex,
+          };
+          writeBallotBootstrap(updatedBootstrap);
+
           const finOk = await waitBroadcastConfirm({
             title: "Confirming finalization",
             intro:
-              "Waiting until the election singleton shows `finalized` on-chain.",
+              "Waiting until the election snapshot reflects ballot finalize.",
             predicate: async () => {
               const s = await pullFreshSnapshot();
               return !!(s?.finalized && !finalizedBefore);

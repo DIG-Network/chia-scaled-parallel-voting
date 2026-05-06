@@ -51,6 +51,10 @@ export interface BallotBootstrap {
   addedAt: string;
   /** UI label (defaults to ballotLauncherId slice). */
   label?: string;
+  /** Block height the finalize bundle confirmed at (post-finalize). */
+  finalizedAtHeight?: number;
+  /** Canonical 32-byte vote outcome (`sha256("vote:" + label)`). */
+  voteOutcomeHex?: string;
 }
 
 function normKey(electionLauncherIdHex: string, ballotLauncherIdHex: string): string {
