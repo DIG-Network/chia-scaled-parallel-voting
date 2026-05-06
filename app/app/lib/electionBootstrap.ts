@@ -15,6 +15,17 @@ export type ElectionBootstrap = {
   eveCoinIdHex?: string;
   provingKeyBase64?: string;
   registeredPubkeysHex?: string[];
+  /**
+   * Block height the deployer used as `election_start_height` at
+   * `wasm.buildDeployBundle` time. Required by every chain-walking
+   * wasm export (`readElectionSingletonState`, `cast_vote`,
+   * `register`, `release`) — the launcher walker uses this to
+   * predict the eve singleton puzzle hash, and a wrong value means
+   * find_current_singleton returns NotDeployed. The SDK's
+   * ElectionConfig does NOT include this field; we persist it on
+   * the bootstrap so it survives refresh + share-bundle round-trips.
+   */
+  electionStartHeight?: number;
 };
 
 export function normalizeLauncherForKey(launcherIdHex: string): string {

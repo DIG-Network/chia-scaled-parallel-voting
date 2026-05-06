@@ -333,6 +333,14 @@ export default dynamic(
             eveCoinIdHex: row.eveCoinIdHex,
             provingKeyBase64: row.provingKeyBase64,
             choices: row.choices,
+            // Persist the deploy peak so /election's chain-walking
+            // wasm calls (`readElectionSingletonState`,
+            // `cast_vote`, `register`, `release`,
+            // `createBallotBundle`, `launchBallotBundle`) can predict
+            // the right eve singleton ph. The SDK's ElectionConfig
+            // doesn't carry this — it's an external constant the
+            // launcher walker MUST receive.
+            electionStartHeight: peak,
           });
 
           setStatus("Deployed! Redirecting…");

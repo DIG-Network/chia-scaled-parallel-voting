@@ -558,7 +558,11 @@ const ElectionPageInner = dynamic(
         try {
           const backend = createChainBackend();
           const cfg = JSON.parse(session.configJson);
-          const electionStartHeight = Number(cfg.election_start_height ?? 0);
+          const electionStartHeight = Number(
+            session?.electionStartHeight ??
+              cfg.election_start_height ??
+              0
+          );
           const stateJson = await wasm.readElectionSingletonState(
             backend as any,
             session.configJson,
@@ -695,10 +699,13 @@ const ElectionPageInner = dynamic(
             const anchorFromConfig = Number(parsed.election_start_height ?? 0);
             const snapR = snapshotRef.current;
             const anchor =
-              snapR?.electionStartHeight != null &&
-              snapR.electionStartHeight > 0
-                ? snapR.electionStartHeight
-                : anchorFromConfig;
+              session?.electionStartHeight != null &&
+              session.electionStartHeight > 0
+                ? session.electionStartHeight
+                : snapR?.electionStartHeight != null &&
+                    snapR.electionStartHeight > 0
+                  ? snapR.electionStartHeight
+                  : anchorFromConfig;
 
             if (cancelled) return;
             if (peak === null) {
@@ -759,7 +766,11 @@ const ElectionPageInner = dynamic(
         if (!session) return null;
         const backend = createChainBackend();
         const cfg = JSON.parse(session.configJson);
-        const electionStartHeight = Number(cfg.election_start_height ?? 0);
+        const electionStartHeight = Number(
+            session?.electionStartHeight ??
+              cfg.election_start_height ??
+              0
+          );
         const stateJson = await wasm.readElectionSingletonState(
           backend as any,
           session.configJson,
@@ -1053,7 +1064,11 @@ const ElectionPageInner = dynamic(
           return;
         }
         const cfg = JSON.parse(session.configJson);
-        const electionStartHeight = Number(cfg.election_start_height ?? 0);
+        const electionStartHeight = Number(
+            session?.electionStartHeight ??
+              cfg.election_start_height ??
+              0
+          );
         if (!electionStartHeight) {
           setError("Election start height missing from session config — re-import.");
           return;
@@ -1402,7 +1417,11 @@ const ElectionPageInner = dynamic(
               title: "Build registration transaction",
               detail: "Assembling unsigned register bundle (singleton + CAT)…",
             });
-            const electionStartHeight = Number(cfg.election_start_height ?? 0);
+            const electionStartHeight = Number(
+            session?.electionStartHeight ??
+              cfg.election_start_height ??
+              0
+          );
             // SMT input must reflect on-chain registered voters, NOT
             // including the voter being registered (non-membership
             // proof). Filter out signingPk if the session bootstrap
@@ -1613,7 +1632,11 @@ const ElectionPageInner = dynamic(
             votingCoinAmount: 1,
           };
           const cfg = JSON.parse(session.configJson);
-          const electionStartHeight = Number(cfg.election_start_height ?? 0);
+          const electionStartHeight = Number(
+            session?.electionStartHeight ??
+              cfg.election_start_height ??
+              0
+          );
 
           const backend = createChainBackend();
 
@@ -1838,7 +1861,11 @@ const ElectionPageInner = dynamic(
               ballot.registrationVoteWeightSnapshot,
           };
           const cfg = JSON.parse(session.configJson);
-          const electionStartHeight = Number(cfg.election_start_height ?? 0);
+          const electionStartHeight = Number(
+            session?.electionStartHeight ??
+              cfg.election_start_height ??
+              0
+          );
 
           // ── 4. Sage signs new_vote_message via the AggSigUnsafe shim.
           setBusy("Building change-vote preview spend…");
@@ -1961,7 +1988,11 @@ const ElectionPageInner = dynamic(
         try {
           const baseline = snapshotBrief(snapshot);
           const cfg = JSON.parse(session.configJson);
-          const electionStartHeight = Number(cfg.election_start_height ?? 0);
+          const electionStartHeight = Number(
+            session?.electionStartHeight ??
+              cfg.election_start_height ??
+              0
+          );
           const catTail = "0x" + String(cfg.cat_tail_hash_hex ?? "").replace(/^0x/, "");
 
           // ── 1. Find the voter's CURRENT registration coin via
@@ -2293,7 +2324,11 @@ const ElectionPageInner = dynamic(
           });
           const pkBytes = base64ToBytes(session.provingKeyBase64);
           const cfg = JSON.parse(session.configJson);
-          const electionStartHeight = Number(cfg.election_start_height ?? 0);
+          const electionStartHeight = Number(
+            session?.electionStartHeight ??
+              cfg.election_start_height ??
+              0
+          );
           // Per-ballot finalize. Snapshot fields MUST mirror what
           // `BallotIssuer::launch_ballot` curried into the eve Ballot
           // Coin (captured by handleCreateAndLaunchBallot via
