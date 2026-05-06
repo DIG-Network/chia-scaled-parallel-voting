@@ -579,7 +579,6 @@ const ElectionPageInner = dynamic(
             registrationMerkleRootHex: state.registrationMerkleRootHex,
             finalized: !!finalizedBallot,
             voteOutcomeHex: finalizedBallot?.voteOutcomeHex ?? "0x" + "0".repeat(64),
-            accumulatedFees: 0,
             electionStartHeight: state.electionStartHeight,
             votersHex: session.registeredPubkeysHex ?? [],
             smtRootHex: state.registrationMerkleRootHex,
@@ -781,7 +780,6 @@ const ElectionPageInner = dynamic(
           registrationMerkleRootHex: state.registrationMerkleRootHex,
           finalized: !!finalizedBallot,
           voteOutcomeHex: finalizedBallot?.voteOutcomeHex ?? "0x" + "0".repeat(64),
-          accumulatedFees: 0,
           electionStartHeight: state.electionStartHeight,
           votersHex: session.registeredPubkeysHex ?? [],
           smtRootHex: state.registrationMerkleRootHex,
@@ -796,7 +794,6 @@ const ElectionPageInner = dynamic(
           normalizeHex32(s.voteOutcomeHex),
           normalizeHex32(s.registrationMerkleRootHex),
           normalizeHex32(s.smtRootHex),
-          String(s.accumulatedFees ?? 0),
           String(s.electionStartHeight ?? 0),
           ...(s.votersHex ?? []).map((v) => normalizeHex32(v)).sort(),
         ].join("|");
@@ -2503,14 +2500,6 @@ const ElectionPageInner = dynamic(
                     )}
                   </div>
                 </div>
-                <div>
-                  <div className="text-xs text-[var(--color-muted)]">
-                    Reg. fee
-                  </div>
-                  <div className="mono">
-                    {formatXch(cfg.registration_fee)} XCH
-                  </div>
-                </div>
               </div>
               <p className="text-xs text-[var(--color-muted)] mt-4">
                 Times out after 5 min. If that happens the bundle was
@@ -2602,10 +2591,9 @@ const ElectionPageInner = dynamic(
         snapshot === null
           ? null
           : BigInt(snapshot.registrationCount) * minCollateralMojos;
-      const totalRegFees =
-        snapshot === null
-          ? null
-          : BigInt(snapshot.registrationCount) * BigInt(cfg.registration_fee);
+      // CHIP rev 2026-05-02 dropped per-voter registration_fee from
+      // the on-chain ElectionConfig — the totalRegFees stat is gone
+      // from the UI.
 
       const finalizedOnChain = snapshot?.finalized === true;
 
@@ -2896,10 +2884,6 @@ const ElectionPageInner = dynamic(
                 value={`${formatCat(cfg.collateral_amount)} (${collateralAssetShort})`}
               />
               <Stat
-                label="Registration fee"
-                value={`${formatXch(cfg.registration_fee)} XCH`}
-              />
-              <Stat
                 label="Window"
                 value={`${cfg.election_length_blocks} blocks`}
               />
@@ -2964,12 +2948,6 @@ const ElectionPageInner = dynamic(
                 }
               />
               <Stat
-                label="Total reg. fees collected"
-                value={
-                  totalRegFees === null ? "—" : `${formatXch(totalRegFees)} XCH`
-                }
-              />
-              <Stat
                 label="Status"
                 value={
                   snapshot === null
@@ -3016,14 +2994,6 @@ const ElectionPageInner = dynamic(
                         .toLowerCase()
                         .replace(/^0x/, "")
                   )
-                }
-              />
-              <Stat
-                label="Accumulated fees"
-                value={
-                  snapshot === null
-                    ? "—"
-                    : `${formatXch(snapshot.accumulatedFees)} XCH`
                 }
               />
             </div>
@@ -3182,13 +3152,6 @@ const ElectionPageInner = dynamic(
                         </span>{" "}
                         {collateralAssetShort} — you may stake more; finalize
                         weights ballots by locked CAT at registration.
-                      </p>
-                      <p className="text-sm text-[var(--color-muted)] mb-3">
-                        Registration fee{" "}
-                        <span className="font-medium text-[var(--color-foreground)]">
-                          {formatXch(cfg.registration_fee)} XCH
-                        </span>{" "}
-                        (per voter).
                       </p>
                       <label className="block text-xs font-medium text-[var(--color-muted)] mb-1.5">
                         CAT to lock (minimum {formatCat(cfg.collateral_amount)})
@@ -3649,25 +3612,9 @@ const ElectionPageInner = dynamic(
                     <div className="space-y-4">
                       <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)]/80 p-3 text-sm">
                         <div className="font-medium text-[var(--color-foreground)] mb-2">
-                          Finalizer reward (on-chain, first successful finalize)
+                          Finalize destination
                         </div>
                         <ul className="space-y-1.5 text-[var(--color-muted)] text-xs leading-relaxed">
-                          <li>
-                            Accrued registration fees on the singleton:&nbsp;
-                            <span className="mono font-medium text-[var(--color-foreground)]">
-                              {snapshot === null
-                                ? "—"
-                                : `${formatXch(snapshot.accumulatedFees)} XCH`}
-                            </span>
-                            {snapshot !== null &&
-                              snapshot.accumulatedFees <= 0 && (
-                                <span>
-                                  {" "}
-                                  — this deployment may use a zero registration
-                                  fee.
-                                </span>
-                              )}
-                          </li>
                           <li>
                             Pays out to the standard puzzle hash of your{" "}
                             <span className="font-medium">
@@ -4212,7 +4159,6 @@ interface SyncSnapshotShape {
   registrationMerkleRootHex: string;
   finalized: boolean;
   voteOutcomeHex: string;
-  accumulatedFees: number;
   electionStartHeight: number;
   votersHex: string[];
   smtRootHex: string;
