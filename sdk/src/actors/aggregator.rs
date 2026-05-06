@@ -1588,10 +1588,19 @@ pub async fn find_current_singleton<C: ChainReader>(
     }
 
     // ── Slow path: walk lineage from launcher ───────────────────
+    // The Chia SingletonLauncher contract guarantees exactly one
+    // valid child per launcher (the eve singleton). We accept it
+    // regardless of whether its puzzle_hash matches the
+    // `eve_ph` we predicted from `election_start_height` — the
+    // prediction can drift if the caller doesn't know the deployer's
+    // exact submission peak (e.g. a re-import without the original
+    // bootstrap, or a session whose electionStartHeight was never
+    // persisted). The launcher_id alone is sufficient to discover
+    // the singleton; whatever the launcher minted IS the eve.
     let eve_children = chain.coin_records_by_parent_ids(&[launcher_id]).await?;
     let eve_record = eve_children
         .into_iter()
-        .find(|r| r.coin.puzzle_hash == eve_ph)
+        .find(|r| r.coin.amount % 2 == 1)
         .ok_or(VotingError::NotDeployed)?;
 
     let mut smt = SparseMerkleTree::new();
