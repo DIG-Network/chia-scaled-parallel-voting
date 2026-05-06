@@ -21,17 +21,38 @@ function trimTrail(s: string): string {
   return out;
 }
 
-/** Format an XCH amount (mojos) with the chia-canonical 12 decimals. */
-export function formatXch(mojos: bigint | number): string {
-  const m = typeof mojos === "bigint" ? mojos : BigInt(mojos);
+/** Format an XCH amount (mojos) with the chia-canonical 12 decimals.
+ * Tolerates undefined / null / strings. CHIP rev 2026-05-02 dropped
+ * some on-chain fee fields (`registration_fee`, `accumulatedFees`)
+ * that legacy JSX still references — the formatter returns "0"
+ * instead of crashing the page when those are absent. */
+export function formatXch(
+  mojos: bigint | number | string | null | undefined
+): string {
+  if (mojos === null || mojos === undefined) return "0";
+  let m: bigint;
+  try {
+    m = typeof mojos === "bigint" ? mojos : BigInt(mojos);
+  } catch {
+    return "0";
+  }
   const whole = m / XCH_MOJOS;
   const frac = (m % XCH_MOJOS).toString().padStart(12, "0");
   return trimTrail(`${whole.toString()}.${frac}`);
 }
 
-/** Format a CAT amount (mojos) with the standard 3-decimal precision. */
-export function formatCat(mojos: bigint | number): string {
-  const m = typeof mojos === "bigint" ? mojos : BigInt(mojos);
+/** Format a CAT amount (mojos) with the standard 3-decimal precision.
+ *  Same defensive null-handling as `formatXch`. */
+export function formatCat(
+  mojos: bigint | number | string | null | undefined
+): string {
+  if (mojos === null || mojos === undefined) return "0";
+  let m: bigint;
+  try {
+    m = typeof mojos === "bigint" ? mojos : BigInt(mojos);
+  } catch {
+    return "0";
+  }
   const whole = m / CAT_MOJOS;
   const frac = (m % CAT_MOJOS).toString().padStart(3, "0");
   return trimTrail(`${whole.toString()}.${frac}`);
