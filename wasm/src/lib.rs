@@ -1576,38 +1576,195 @@ pub async fn launch_ballot_bundle_js(
         .map_err(|e| JsError::new(&format!("encode WasmLaunchedBallot: {e}")))
 }
 
-/// Hardware-wallet preview variant of `castVoteBuildFinalBundle`.
+/// Build a one-condition shim spend that lets a chip0002 wallet produce
+/// the unaugmented `sign_unsafe(vote_message)` BLS signature without the
+/// dApp ever holding the voter's secret. The returned spend has a single
+/// `(50 voter_pk vote_message)` condition (= `AGG_SIG_UNSAFE`); when the
+/// dApp passes it to `chip0002_signCoinSpends` in PARTIAL mode, the
+/// wallet's returned aggregate IS that single sig — byte-for-byte equal
+/// to what `Voter::keys.sign_unsafe(vote_message)` would compute.
 ///
-/// SDK-BLOCKED: this entry point is reserved for the hardware-wallet
-/// flow where the voter's BLS secret never enters the browser. A
-/// usable implementation needs the SDK to expose `Voter::cast_vote`
-/// split into two halves:
-///   1. `cast_vote_build_with_initial_sig(chain, params, voter_pk,
-///      initial_signature) -> { coin_spends, augmented_aggsig_messages }`
-///      — builds the on-chain solution embedding the caller-provided
-///      `sign_unsafe(vote_message)` signature, returns the unsigned
-///      coin_spends + the augmented `(pk, msg)` pairs the wallet must
-///      sign for the bundle aggregate.
-///   2. `assembleSpendBundle(coin_spends, agg_signature)` (already
-///      exported) — attaches the wallet-supplied aggregate.
+/// FLOW (browser dApp):
+///   1. `castVoteBuildPreviewSpend(...)` → `{ coinSpends, voteMessageHex }`.
+///   2. `walletConnect.signCoinSpends(coinSpends, partial=true)` →
+///      96-byte aggregate hex = `sign_unsafe(vote_message)`.
+///   3. `castVoteBuildUnsignedCoinSpends(..., voteSignatureHex=…)` →
+///      the real cast_vote coin_spends with the sig embedded.
+///   4. `walletConnect.signCoinSpends(coinSpends, partial=true)` →
+///      bundle aggregate (covers AGG_SIG_ME conditions across all coins).
+///   5. `assembleSpendBundleFromWalletCoinSpends(coinSpends, agg)` →
+///      pushable bundle bytes.
 ///
-/// Until the SDK ships that split, browsers must use
-/// `castVoteBuildFinalBundle` with a browser-held secret. Hardware-
-/// wallet integrations should drive `chip-voting-cli phase_vote`
-/// out-of-band.
+/// Returns a JSON string the dApp parses into
+/// `{ coinSpends: WalletCoinSpend[]; voteMessageHex: string }`.
 #[wasm_bindgen(js_name = "castVoteBuildPreviewSpend")]
 pub fn cast_vote_build_preview_spend_js(
     _backend: JsChainBackend,
-    _election_config_json: &str,
-    _voter_pk_hex: &str,
-    _params_json: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "castVoteBuildPreviewSpend: not implemented — needs SDK to expose a no-secret \
-         build_with_initial_sig variant of Voter::cast_vote (browser preview for \
-         hardware-wallet voters). Use castVoteBuildFinalBundle with a browser-held \
-         secret today, or drive chip-voting-cli phase_vote out-of-band.",
-    ))
+    election_config_json: &str,
+    voter_pk_hex: &str,
+    params_json: &str,
+) -> Result<String, JsError> {
+    use clvm_traits::ToClvm;
+    use clvm_utils::tree_hash;
+    use clvmr::Allocator;
+
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let election_id = cfg
+        .election_launcher_id()
+        .map_err(|e| JsError::new(&format!("election_launcher_id: {e}")))?;
+    let voter_pk = parse_pubkey_hex(voter_pk_hex, "voter_pk_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let wasm_params: WasmCastVoteParams = serde_json::from_str(params_json)
+        .map_err(|e| JsError::new(&format!("CastVoteParams parse: {e}")))?;
+    let sdk_params = wasm_params
+        .into_sdk()
+        .map_err(|e| JsError::new(&format!("CastVoteParams decode: {e}")))?;
+
+    let vote_message = chip_voting_sdk::puzzles::vote_message(
+        sdk_params.vote_data,
+        sdk_params.ballot_launcher_id,
+        election_id,
+    );
+
+    // Build (q . ((50 voter_pk vote_message))) — a puzzle that returns
+    // a single AGG_SIG_UNSAFE condition. Coin amount=1 keeps wallets
+    // that validate amount>0 happy; parent_coin_info=0 because the
+    // shim never goes on-chain.
+    let mut allocator = Allocator::new();
+    let pk_bytes = chia_protocol::Bytes::new(voter_pk.to_bytes().to_vec());
+    let msg_bytes = chia_protocol::Bytes::new(vote_message.to_vec());
+    let condition: (u8, (chia_protocol::Bytes, (chia_protocol::Bytes, ()))) =
+        (50, (pk_bytes, (msg_bytes, ())));
+    let conditions_value = vec![condition];
+    let conditions_node = conditions_value
+        .to_clvm(&mut allocator)
+        .map_err(|e| JsError::new(&format!("conditions to_clvm: {e}")))?;
+    let one_node = allocator
+        .new_atom(&[1])
+        .map_err(|e| JsError::new(&format!("alloc quote atom: {e:?}")))?;
+    let puzzle_node = allocator
+        .new_pair(one_node, conditions_node)
+        .map_err(|e| JsError::new(&format!("alloc puzzle pair: {e:?}")))?;
+    let solution_node = chip_voting_sdk::clvmr::NodePtr::NIL;
+
+    let puzzle_bytes = chip_voting_sdk::clvmr::serde::node_to_bytes(&allocator, puzzle_node)
+        .map_err(|e| JsError::new(&format!("serialize puzzle: {e:?}")))?;
+    let solution_bytes = chip_voting_sdk::clvmr::serde::node_to_bytes(&allocator, solution_node)
+        .map_err(|e| JsError::new(&format!("serialize solution: {e:?}")))?;
+    let puzzle_th = tree_hash(&allocator, puzzle_node);
+    let coin_ph = chia_protocol::Bytes32::new(puzzle_th.to_bytes());
+
+    let shim_coin_spend = chia_protocol::CoinSpend {
+        coin: chia_protocol::Coin::new(
+            chia_protocol::Bytes32::new([0u8; 32]),
+            coin_ph,
+            1,
+        ),
+        puzzle_reveal: chia_protocol::Program::from(puzzle_bytes),
+        solution: chia_protocol::Program::from(solution_bytes),
+    };
+
+    let wallet_spend = coin_spend_to_wallet(&shim_coin_spend);
+    let out = serde_json::json!({
+        "coinSpends": [wallet_spend],
+        "voteMessageHex": format!("0x{}", hex::encode(vote_message)),
+    });
+    serde_json::to_string(&out).map_err(|e| JsError::new(&format!("encode preview: {e}")))
+}
+
+/// Sage-friendly counterpart to [`castVoteBuildFinalBundle`]: takes a
+/// pre-computed `voter_vote_signature_hex` (the dApp obtains it via
+/// [`castVoteBuildPreviewSpend`] + chip0002_signCoinSpends partial)
+/// and returns the UNSIGNED cast_vote coin_spends in wallet RPC shape,
+/// ready for a second chip0002_signCoinSpends pass to produce the
+/// bundle aggregate.
+///
+/// Returns a JSON string the dApp parses into
+/// `{ coinSpends: WalletCoinSpend[]; votingCoinIdHex: string;
+///    voteSignatureHex: string; voteMessageHex: string }`.
+#[wasm_bindgen(js_name = "castVoteBuildUnsignedCoinSpends")]
+pub async fn cast_vote_build_unsigned_coin_spends_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    voter_pk_hex: String,
+    params_json: String,
+    voter_vote_signature_hex: String,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let voter_pk = parse_pubkey_hex(&voter_pk_hex, "voter_pk_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let wasm_params: WasmCastVoteParams = serde_json::from_str(&params_json)
+        .map_err(|e| JsError::new(&format!("CastVoteParams parse: {e}")))?;
+    let sdk_params = wasm_params
+        .into_sdk()
+        .map_err(|e| JsError::new(&format!("CastVoteParams decode: {e}")))?;
+    let sig_bytes = hex::decode(voter_vote_signature_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("voter_vote_signature_hex decode: {e}")))?;
+    if sig_bytes.len() != 96 {
+        return Err(JsError::new(
+            "voter_vote_signature_hex must decode to 96 bytes (BLS G2)",
+        ));
+    }
+    let initial_signature = chia_protocol::Bytes::new(sig_bytes);
+
+    // VoterKeys::new requires a SecretKey; for the no-secret browser
+    // path we synthesise a placeholder keypair and override the pubkey
+    // we actually want via the SDK's external-sig builder. The
+    // placeholder secret never signs anything in this code path —
+    // only `cast_vote_build_coin_spends` runs, and it consumes
+    // `initial_signature` directly, never touching `self.keys.secret`.
+    let voter = build_voter_for_external_signing(cfg, voter_pk, network, election_start_height)?;
+    let chain = JsChainReader::new(backend);
+    let result = voter
+        .cast_vote_build_coin_spends(&chain, &sdk_params, initial_signature)
+        .await
+        .map_err(|e| JsError::new(&format!("cast_vote_build_coin_spends: {e}")))?;
+
+    let wallet_spends: Vec<WalletCoinSpend> = result
+        .coin_spends
+        .iter()
+        .map(coin_spend_to_wallet)
+        .collect();
+    let out = serde_json::json!({
+        "coinSpends": wallet_spends,
+        "votingCoinIdHex": format!("0x{}", hex::encode(result.voting_coin_id)),
+        "voteSignatureHex": format!("0x{}", hex::encode(result.vote_signature.as_ref())),
+        "voteMessageHex": format!("0x{}", hex::encode(result.vote_message)),
+    });
+    serde_json::to_string(&out).map_err(|e| JsError::new(&format!("encode result: {e}")))
+}
+
+/// Construct a `Voter` whose `keys.pubkey` matches the supplied
+/// hardware-wallet pubkey, but whose `keys.secret` is a deterministic
+/// placeholder that NEVER signs anything (the external-signing path
+/// hands its caller's signature directly into the SDK, bypassing
+/// `keys.sign_unsafe` and the bundle aggregator). Used by the
+/// browser-held-pubkey wasm exports.
+fn build_voter_for_external_signing(
+    cfg: chip_voting_sdk::ElectionConfig,
+    voter_pk: chia_bls::PublicKey,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<chip_voting_sdk::actors::voter::Voter, JsError> {
+    // Placeholder secret bytes — any 32-byte value parseable by
+    // SecretKey::from_bytes works because we never sign with it.
+    let placeholder_secret_bytes = [1u8; 32];
+    let placeholder_secret = SecretKey::from_bytes(&placeholder_secret_bytes)
+        .map_err(|e| JsError::new(&format!("placeholder secret: {e:?}")))?;
+    let mut keys = chip_voting_sdk::actors::voter::VoterKeys::new(placeholder_secret);
+    // Overwrite the auto-derived pubkey with the wallet's actual one.
+    keys.pubkey = voter_pk;
+    let voter = chip_voting_sdk::actors::voter::Voter::new(cfg, keys, wasm_network_to_sdk(network))
+        .with_election_start_height(election_start_height);
+    Ok(voter)
 }
 
 /// Finalise a cast-vote spend with the voter's BLS signature and
@@ -1778,9 +1935,18 @@ pub async fn build_ballot_finalize_bundle_js(
         .map_err(|e| JsError::new(&format!("ArkProvingKey::deserialize_compressed: {e}")))?;
 
     let chain = JsChainReader::new(backend);
-    let aggregator =
+    let mut aggregator =
         chip_voting_sdk::actors::aggregator::Aggregator::new(cfg, chain, wasm_network_to_sdk(network))
             .with_election_start_height(election_start_height);
+    // Aggregator::build_finalize_for_ballot reads synced state
+    // (`voter_set`, `merkle_tree`, `state`); without `sync()` those
+    // accessors return `NotDeployed`. The dApp / harness can't easily
+    // call `.sync()` itself because the Aggregator is created here and
+    // `Aggregator::sync` requires `&mut self` — so call it inline.
+    aggregator
+        .sync()
+        .await
+        .map_err(|e| JsError::new(&format!("Aggregator::sync: {e}")))?;
 
     let params = chip_voting_sdk::actors::aggregator::BuildFinalizeForBallotParams {
         ballot_launcher_id,
@@ -1904,6 +2070,46 @@ pub async fn get_ballot_js(
     .map_err(|e| JsError::new(&format!("get_ballot: {e}")))?;
     serde_json::to_string(&snapshot)
         .map_err(|e| JsError::new(&format!("encode snapshot: {e}")))
+}
+
+/// Read the current Election Singleton's state from chain by walking
+/// the launcher lineage. Returns JSON with `coinIdHex`,
+/// `registrationMerkleRootHex`, `registrationCount`,
+/// `registrationVoteWeight`, `electionStartHeight`.
+///
+/// dApp callers should snapshot this state right before
+/// `launchBallotBundle` and persist the registration root + vote
+/// weight alongside the ballot's other curry data — every later phase
+/// (`castVoteBuildFinalBundle`, `updateVoteBuildFinalBundle`,
+/// `buildBallotFinalizeBundle`, `announceBallotFinalization`) MUST
+/// pass the matching snapshot or the eve Ballot Coin's curried puzzle
+/// hash won't agree with what the chain mints.
+#[wasm_bindgen(js_name = "readElectionSingletonState")]
+pub async fn read_election_singleton_state_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let chain = JsChainReader::new(backend);
+    let cs = chip_voting_sdk::actors::aggregator::find_current_singleton(
+        &chain,
+        &cfg,
+        election_start_height,
+    )
+    .await
+    .map_err(|e| JsError::new(&format!("find_current_singleton: {e:?}")))?;
+    let out = serde_json::json!({
+        "coinIdHex": format!("0x{}", hex::encode(cs.coin.coin_id())),
+        "registrationMerkleRootHex": format!("0x{}", hex::encode(cs.state.registration_merkle_root)),
+        "registrationCount": cs.state.registration_count,
+        "registrationVoteWeight": cs.state.registration_vote_weight,
+        "electionStartHeight": cs.state.election_start_height,
+    });
+    Ok(out.to_string())
 }
 
 /// JS-side input mirror of
@@ -2053,6 +2259,136 @@ pub fn assemble_spend_bundle_js(
         ));
     }
     let arr: [u8; 96] = aggregated_signature_bytes.try_into().expect("checked above");
+    let sig = chia_bls::Signature::from_bytes(&arr)
+        .map_err(|e| JsError::new(&format!("Signature::from_bytes: {e:?}")))?;
+    let bundle = SpendBundle::new(coin_spends, sig);
+    let bytes = encode_streamable(&bundle)?;
+    Ok(bytes.into_boxed_slice())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Sage-bundle conversion helpers
+// ─────────────────────────────────────────────────────────────────────
+//
+// The dApp's WalletConnect surface (`chip0002_signCoinSpends`,
+// `chip0002_sendTransaction`) expects bundles in the wallet RPC JSON
+// shape (`{ coin: { parent_coin_info, puzzle_hash, amount },
+// puzzle_reveal, solution }` per coin spend; `aggregated_signature`
+// at the top level). Wasm callers usually hold a `chia_protocol`
+// Streamable byte form. These three helpers do the (de)serialization
+// without pulling `chia_query` (which has native-only deps and won't
+// compile to wasm).
+//
+// SHAPE: matches `chia_query::SpendBundle` field-for-field — so the
+// dApp can `JSON.parse(...)` the result and hand it straight to Sage
+// or to coinset.org's `/push_tx`.
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WalletCoin {
+    parent_coin_info: String,
+    puzzle_hash: String,
+    amount: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WalletCoinSpend {
+    coin: WalletCoin,
+    puzzle_reveal: String,
+    solution: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WalletSpendBundle {
+    coin_spends: Vec<WalletCoinSpend>,
+    aggregated_signature: String,
+}
+
+fn coin_spend_to_wallet(cs: &chia_protocol::CoinSpend) -> WalletCoinSpend {
+    WalletCoinSpend {
+        coin: WalletCoin {
+            parent_coin_info: format!("0x{}", hex::encode(cs.coin.parent_coin_info)),
+            puzzle_hash: format!("0x{}", hex::encode(cs.coin.puzzle_hash)),
+            amount: cs.coin.amount,
+        },
+        puzzle_reveal: format!("0x{}", hex::encode(cs.puzzle_reveal.as_ref())),
+        solution: format!("0x{}", hex::encode(cs.solution.as_ref())),
+    }
+}
+
+fn wallet_to_coin_spend(w: &WalletCoinSpend) -> Result<chia_protocol::CoinSpend, JsError> {
+    let parent = parse_hex32(&w.coin.parent_coin_info)
+        .map_err(|e| JsError::new(&format!("coin.parent_coin_info: {e}")))?;
+    let ph = parse_hex32(&w.coin.puzzle_hash)
+        .map_err(|e| JsError::new(&format!("coin.puzzle_hash: {e}")))?;
+    let coin = chia_protocol::Coin::new(parent, ph, w.coin.amount);
+    let puzzle_reveal_bytes = hex::decode(w.puzzle_reveal.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("puzzle_reveal hex decode: {e}")))?;
+    let solution_bytes = hex::decode(w.solution.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("solution hex decode: {e}")))?;
+    Ok(chia_protocol::CoinSpend {
+        coin,
+        puzzle_reveal: chia_protocol::Program::from(puzzle_reveal_bytes),
+        solution: chia_protocol::Program::from(solution_bytes),
+    })
+}
+
+/// Decode a Streamable `SpendBundle` byte string into the wallet RPC
+/// JSON shape — the format Sage's `chip0002_sendTransaction` and
+/// coinset.org's `/push_tx` accept. Returns a JSON string the JS side
+/// can `JSON.parse(...)` directly into a `SpendBundleJson`.
+#[wasm_bindgen(js_name = "bundleBytesToWalletJson")]
+pub fn bundle_bytes_to_wallet_json_js(bundle_bytes: &[u8]) -> Result<String, JsError> {
+    let bundle: SpendBundle = decode_streamable(bundle_bytes)?;
+    let out = WalletSpendBundle {
+        coin_spends: bundle.coin_spends.iter().map(coin_spend_to_wallet).collect(),
+        aggregated_signature: format!(
+            "0x{}",
+            hex::encode(bundle.aggregated_signature.to_bytes())
+        ),
+    };
+    serde_json::to_string(&out)
+        .map_err(|e| JsError::new(&format!("encode WalletSpendBundle: {e}")))
+}
+
+/// Decode a Streamable `SpendBundle` byte string and emit ONLY its
+/// coin_spends, in the wallet RPC JSON shape — for handing to Sage's
+/// `chip0002_signCoinSpends`. Drops the `aggregated_signature` (Sage
+/// produces a fresh one).
+#[wasm_bindgen(js_name = "extractWalletCoinSpendsFromBundle")]
+pub fn extract_wallet_coin_spends_from_bundle_js(
+    bundle_bytes: &[u8],
+) -> Result<String, JsError> {
+    let bundle: SpendBundle = decode_streamable(bundle_bytes)?;
+    let coin_spends: Vec<WalletCoinSpend> =
+        bundle.coin_spends.iter().map(coin_spend_to_wallet).collect();
+    serde_json::to_string(&coin_spends)
+        .map_err(|e| JsError::new(&format!("encode WalletCoinSpend list: {e}")))
+}
+
+/// Re-assemble a Streamable `SpendBundle` from wallet-format
+/// coin_spends (Sage's `chip0002_signCoinSpends` input shape) plus
+/// the aggregated signature Sage returns. Inverse of
+/// `bundleBytesToWalletJson` paired with `extractWalletCoinSpendsFromBundle`.
+#[wasm_bindgen(js_name = "assembleSpendBundleFromWalletCoinSpends")]
+pub fn assemble_spend_bundle_from_wallet_coin_spends_js(
+    coin_spends_json: &str,
+    aggregated_signature_hex: &str,
+) -> Result<Box<[u8]>, JsError> {
+    let wallet_spends: Vec<WalletCoinSpend> =
+        serde_json::from_str(coin_spends_json)
+            .map_err(|e| JsError::new(&format!("coin_spends_json parse: {e}")))?;
+    let coin_spends: Vec<chia_protocol::CoinSpend> = wallet_spends
+        .iter()
+        .map(wallet_to_coin_spend)
+        .collect::<Result<Vec<_>, _>>()?;
+    let sig_bytes = hex::decode(aggregated_signature_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("aggregated_signature hex decode: {e}")))?;
+    if sig_bytes.len() != 96 {
+        return Err(JsError::new(
+            "aggregated_signature must be 96 bytes (BLS G2)",
+        ));
+    }
+    let arr: [u8; 96] = sig_bytes.as_slice().try_into().expect("checked above");
     let sig = chia_bls::Signature::from_bytes(&arr)
         .map_err(|e| JsError::new(&format!("Signature::from_bytes: {e:?}")))?;
     let bundle = SpendBundle::new(coin_spends, sig);

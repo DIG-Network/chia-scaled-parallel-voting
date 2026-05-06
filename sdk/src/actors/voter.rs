@@ -239,6 +239,29 @@ pub struct UpdateVoteResult {
 ///     `sign_unsafe`. Written into the Voting Coin's memos; the
 ///     off-chain aggregator BLS-aggregates these per-ballot to
 ///     produce the finalize witness.
+/// STRUCT: CastVoteCoinSpends
+/// PURPOSE: return shape of [`Voter::cast_vote_build_coin_spends`] —
+///          the unsigned coin_spends a Sage-backed dApp gets to sign
+///          externally via chip0002. Mirrors the fields a hardware-
+///          wallet flow needs to:
+///   1. Push the bundle (after the wallet provides the aggregate sig).
+///   2. Echo `vote_signature` to the off-chain aggregator.
+///   3. Cross-check the canonical `vote_message` against what the
+///      dApp computed before requesting the wallet signature.
+pub struct CastVoteCoinSpends {
+    pub coin_spends: Vec<CoinSpend>,
+    pub voting_coin_id: Bytes32,
+    /// The voter's `sign_unsafe` BLS signature over `vote_message`,
+    /// echoed back unchanged from the caller's input. Embedded into
+    /// the mint_voting_coin solution and surfaced to off-chain
+    /// aggregators.
+    pub vote_signature: chia_protocol::Bytes,
+    /// `sha256(vote_data || ballot_launcher_id || election_launcher_id)`
+    /// — the bytes the caller signed with `sign_unsafe` to produce
+    /// `vote_signature`. Returned for the dApp to cross-check.
+    pub vote_message: Bytes32,
+}
+
 pub struct CastVoteResult {
     pub voting_coin_id: Bytes32,
     pub spend_bundle: SpendBundle,
@@ -567,15 +590,40 @@ impl Voter {
     /// non-membership witness is the canonical empty-SPT siblings.
     /// Multi-vote support (rebuilding the BallotMembership witness
     /// from prior cast_vote / update_vote spends) is future work.
-    pub async fn cast_vote<C: ChainReader>(
+    /// Sage / hardware-wallet-friendly variant of [`Voter::cast_vote`].
+    ///
+    /// SHAPE: takes a pre-computed `initial_signature` (the voter's
+    /// `sign_unsafe(vote_message)` BLS sig) instead of holding the
+    /// secret. Returns the unsigned coin_spends; the caller (typically
+    /// a browser dApp via WalletConnect / chip0002) then signs the
+    /// bundle's aggregated signature externally.
+    ///
+    /// This is the lower half of the split documented at
+    /// `wasm/src/lib.rs::cast_vote_build_preview_spend_js`. The upper
+    /// half — obtaining `initial_signature` — is the dApp's job: build
+    /// a one-condition shim spend with `AggSigUnsafe(voter_pk,
+    /// vote_message)` and have the wallet sign it in partial mode;
+    /// the returned aggregate IS that single sig, byte-for-byte equal
+    /// to what `keys.sign_unsafe(vm.as_ref())` would produce.
+    pub async fn cast_vote_build_coin_spends<C: ChainReader>(
         &self,
         chain: &C,
-        params: CastVoteParams,
-    ) -> VotingResult<CastVoteResult> {
+        params: &CastVoteParams,
+        initial_signature: chia_protocol::Bytes,
+    ) -> VotingResult<CastVoteCoinSpends> {
         use chia_protocol::{Bytes, Coin};
         use chia_puzzle_types::singleton::SingletonArgs;
         use clvm_traits::{clvm_curried_args, ToClvm};
         use clvm_utils::{tree_hash, CurriedProgram, TreeHash};
+
+        if initial_signature.len() != 96 {
+            return Err(voting_other(format!(
+                "Voter::cast_vote_build_coin_spends: initial_signature must be 96 bytes \
+                 (BLS G2), got {}",
+                initial_signature.len(),
+            )));
+        }
+        let initial_signature_bytes: Bytes = initial_signature;
 
         let cat_tail_hash = self
             .config
@@ -801,18 +849,19 @@ impl Voter {
         .to_clvm(&mut *ctx)
         .map_err(driver_err)?;
 
-        // Voter signs the canonical vote_message UNAUGMENTED so the
-        // off-chain aggregator can verify against the published
-        // pubkey directly. The on-chain action ALSO emits an
-        // AggSigMe over the same preimage; the bundle signer below
-        // collects that one (augmented) automatically.
+        // The voter signs the canonical vote_message UNAUGMENTED so
+        // the off-chain aggregator can verify against the published
+        // pubkey directly. The on-chain action ALSO emits an AggSigMe
+        // over the same preimage; the bundle signer below collects
+        // that one (augmented) automatically. In this builder the
+        // unaugmented sig is passed in as `initial_signature` (vs the
+        // Voter::cast_vote wrapper, which computes it from
+        // self.keys.sign_unsafe).
         let vm = puzzles::vote_message(
             params.vote_data,
             params.ballot_launcher_id,
             election_id,
         );
-        let initial_signature = self.keys.sign_unsafe(vm.as_ref());
-        let initial_signature_bytes = Bytes::new(initial_signature.to_bytes().to_vec());
 
         // BallotMembership witness for the empty SPT (genesis state):
         //   (ballot_launcher_id . (s0 . (s1 . ... (s31 . ()))))
@@ -914,7 +963,10 @@ impl Voter {
         );
         let voting_coin_id = voting_coin.coin_id();
 
-        // ── 8. Sign + bundle ──────────────────────────────────────
+        // ── 8. Dry-run + return unsigned coin_spends ─────────────
+        // The bundle aggregate signature is the caller's job — for the
+        // secret-key path that's `Voter::cast_vote`'s wrapper below;
+        // for the Sage path it's a second `chip0002_signCoinSpends`.
         let coin_spends = vec![ballot_singleton_spend, cat_mint_spend];
         if let Err(e) = crate::dry_run_coin_spends(&coin_spends) {
             if let Ok(dir) = std::env::var("CHIP_VOTING_DUMP_DIR") {
@@ -939,6 +991,47 @@ impl Voter {
             }
             return Err(voting_other(format!("Voter::cast_vote dry-run: {e:?}")));
         }
+
+        Ok(CastVoteCoinSpends {
+            coin_spends,
+            voting_coin_id,
+            vote_signature: initial_signature_bytes,
+            vote_message: vm,
+        })
+    }
+
+    /// Build a `cast_vote` spend bundle using `self.keys.secret` for
+    /// signing — the secret-key path for native CLI / integration test
+    /// callers. Browser dApps that don't hold the secret should use
+    /// [`Voter::cast_vote_build_coin_spends`] + an external
+    /// chip0002 signer.
+    pub async fn cast_vote<C: ChainReader>(
+        &self,
+        chain: &C,
+        params: CastVoteParams,
+    ) -> VotingResult<CastVoteResult> {
+        let election_id = self
+            .config
+            .election_launcher_id()
+            .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
+        let vm = puzzles::vote_message(
+            params.vote_data,
+            params.ballot_launcher_id,
+            election_id,
+        );
+        let initial_signature = self.keys.sign_unsafe(vm.as_ref());
+        let initial_signature_bytes =
+            chia_protocol::Bytes::new(initial_signature.to_bytes().to_vec());
+
+        let CastVoteCoinSpends {
+            coin_spends,
+            voting_coin_id,
+            vote_signature,
+            ..
+        } = self
+            .cast_vote_build_coin_spends(chain, &params, initial_signature_bytes)
+            .await?;
+
         let signature = sign_bundle_signature(
             &coin_spends,
             std::slice::from_ref(&self.keys.secret),
@@ -948,7 +1041,7 @@ impl Voter {
         Ok(CastVoteResult {
             voting_coin_id,
             spend_bundle: SpendBundle::new(coin_spends, signature),
-            vote_signature: initial_signature_bytes,
+            vote_signature,
         })
     }
 
