@@ -50,10 +50,6 @@ import {
   catCollateralDedupeKey,
   type CollateralScanProgress,
 } from "../lib/catCollateralDiscovery";
-import {
-  discoverMempoolFeeXch,
-  discoverRegistrationFeeXch,
-} from "../lib/registrationFeeDiscovery";
 import { findSyntheticPkForWalletAddress } from "../lib/sageSyntheticKey";
 import { puzzleHashHexFromWalletAddress } from "../lib/chiaAddress";
 import { createChainBackend } from "../lib/chainBackend";
@@ -62,7 +58,6 @@ import Footer from "../components/Footer";
 import { BroadcastWaitModal } from "../components/BroadcastWaitModal";
 import { ElectionFinalizeQuietBanner } from "../components/ElectionFinalizeQuietBanner";
 import { pollUntilConfirmed } from "../lib/pollUntil";
-import { reconstructCatLineage } from "../lib/reconstructCatLineage";
 import { getWasm } from "../lib/sdk";
 
 /** WASM `CollectVotesStage` (camelCase) from collectVotesWithProgress. */
@@ -2197,20 +2192,10 @@ const ElectionPageInner = dynamic(
         }
       };
 
-      // ── ORACLE FLOW ─────────────────────────────────────────────
-      const handleOracle = async () => {
-        // CHIP rev 2026-05-02: the standalone `buildOracleBundle`
-        // export was removed. The Ballot Coin oracle action is now
-        // co-spent automatically by every cast_vote / update_vote /
-        // finalize spend (it's the open-state check), so a separate
-        // oracle button is no longer meaningful. Kept as a no-op so
-        // existing JSX bindings still compile; will be removed in a
-        // follow-up cleanup.
-        setError(
-          "Standalone oracle action is deprecated. The oracle is now co-spent " +
-            "implicitly by every cast_vote / update_vote / finalize spend."
-        );
-      };
+      // (handleOracle removed — CHIP rev 2026-05-02 dropped the
+      //  standalone `buildOracleBundle`. The Ballot Coin oracle
+      //  action is co-spent implicitly by every cast_vote /
+      //  update_vote / finalize.)
 
       // ── RENDER ──────────────────────────────────────────────────
 
@@ -3585,33 +3570,8 @@ const ElectionPageInner = dynamic(
                   )}
                 </div>
 
-                {/* Step 5 — oracle */}
-                <div className="rounded-xl border border-[var(--color-border)] p-5">
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-3">
-                    <span
-                      className="inline-flex h-7 min-w-7 shrink-0 items-center justify-center rounded-full px-2 text-[11px] font-bold bg-[var(--color-accent)]/20 text-[var(--color-accent)]"
-                      aria-hidden
-                    >
-                      5
-                    </span>
-                    <span className="font-semibold">Oracle announcement</span>
-                  </div>
-                  <p className="text-sm text-[var(--color-muted)] mb-4">
-                    Optionally re-publish or update the{" "}
-                    {snapshot?.finalized
-                      ? "finalized"
-                      : "pending (not yet finalized)"}{" "}
-                    outcome announcement for indexers tracking this bulletin.
-                  </p>
-                  <button
-                    type="button"
-                  onClick={handleOracle}
-                    disabled={!!busy || !!finalizeModal}
-                    className="btn-secondary w-full sm:w-auto min-w-[220px]"
-                  >
-                    Submit oracle announcement
-                  </button>
-                </div>
+                {/* Step 5 (oracle) removed — CHIP rev 2026-05-02
+                    dropped the standalone Oracle action. */}
               </div>
             )}
           </section>
