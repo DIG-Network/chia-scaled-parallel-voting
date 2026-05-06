@@ -387,12 +387,17 @@ impl Voter {
     /// `RequiredSignature::from_coin_spends` to walk every AGG_SIG_*
     /// condition (the voter's `AggSigMe(VOTER_PUBKEY,
     /// registration_message)`).
-    pub async fn register<C: ChainReader>(
+    /// Sage-friendly variant of [`Voter::register`]. Returns the
+    /// unsigned coin_spends; caller signs the bundle aggregate
+    /// externally (no `sign_unsafe` step — register has no off-chain
+    /// aggregator sig like cast_vote / update_vote, just AGG_SIG_ME
+    /// conditions Sage's chip0002_signCoinSpends covers in one pass).
+    pub async fn register_build_coin_spends<C: ChainReader>(
         &self,
         smt: &crate::merkle::SparseMerkleTree,
         cat_parent_spend: CoinSpend,
         chain: &C,
-    ) -> VotingResult<SpendBundle> {
+    ) -> VotingResult<Vec<CoinSpend>> {
         use clvm_traits::{clvm_curried_args, ToClvm};
         use clvm_utils::CurriedProgram;
 
@@ -557,6 +562,23 @@ impl Voter {
             }
             return Err(voting_other(format!("Voter::register dry-run: {e:?}")));
         }
+
+        Ok(coin_spends)
+    }
+
+    /// Build a `register` SpendBundle using `self.keys.secret` for
+    /// signing — secret-key path for native CLI / integration test.
+    /// Browser dApps that don't hold the secret should use
+    /// [`Voter::register_build_coin_spends`].
+    pub async fn register<C: ChainReader>(
+        &self,
+        smt: &crate::merkle::SparseMerkleTree,
+        cat_parent_spend: CoinSpend,
+        chain: &C,
+    ) -> VotingResult<SpendBundle> {
+        let coin_spends = self
+            .register_build_coin_spends(smt, cat_parent_spend, chain)
+            .await?;
         let signature = sign_bundle_signature(
             &coin_spends,
             std::slice::from_ref(&self.keys.secret),

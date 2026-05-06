@@ -649,8 +649,44 @@ pub async fn build_cat_registration_spend_js(
     cat_tail_hash_hex: String,
     collateral_amount: u64,
 ) -> Result<Vec<u8>, JsError> {
-    use chia_puzzle_types::standard::StandardArgs;
     use chia_puzzle_types::DeriveSynthetic;
+
+    let voter_secret = parse_secret_hex(&voter_secret_hex, "voter_secret_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let voter_pk = voter_secret.public_key();
+    let synthetic_pk = voter_secret.derive_synthetic().public_key();
+    let voter_pk_hex = format!("0x{}", hex::encode(voter_pk.to_bytes()));
+    let synthetic_pk_hex = format!("0x{}", hex::encode(synthetic_pk.to_bytes()));
+    build_cat_registration_spend_for_wallet_js(
+        backend,
+        voter_pk_hex,
+        synthetic_pk_hex,
+        cat_input_coin_id_hex,
+        election_launcher_id_hex,
+        cat_tail_hash_hex,
+        collateral_amount,
+    )
+    .await
+}
+
+/// Sage-friendly variant of [`buildCatRegistrationSpend`]. Takes the
+/// voter's account-path pubkey and the validator's synthetic pubkey
+/// externally (the dApp resolves both via Sage's
+/// `chip0002_getPublicKeys` paging) so the secret never enters the
+/// browser. Inner spend's StandardLayer is curried with the supplied
+/// synthetic_pk; chip0002_signCoinSpends fills in the AGG_SIG_ME later
+/// when the full register bundle is signed.
+#[wasm_bindgen(js_name = "buildCatRegistrationSpendForWallet")]
+pub async fn build_cat_registration_spend_for_wallet_js(
+    backend: JsChainBackend,
+    voter_pk_hex: String,
+    validator_synthetic_pk_hex: String,
+    cat_input_coin_id_hex: String,
+    election_launcher_id_hex: String,
+    cat_tail_hash_hex: String,
+    collateral_amount: u64,
+) -> Result<Vec<u8>, JsError> {
+    use chia_puzzle_types::standard::StandardArgs;
     use chia_puzzle_types::Memos;
     use chia_sdk_driver::{Cat as DriverCat, CatSpend, Puzzle, SpendContext, SpendWithConditions, StandardLayer};
     use chip_voting_sdk::clvm_traits::ToClvm;
@@ -658,13 +694,11 @@ pub async fn build_cat_registration_spend_js(
     use chip_voting_sdk::Conditions;
     use sha2::{Digest, Sha256};
 
-    let voter_secret = parse_secret_hex(&voter_secret_hex, "voter_secret_hex")
+    let voter_pk = parse_pubkey_hex(&voter_pk_hex, "voter_pk_hex")
         .map_err(|e| JsError::new(&format!("{e}")))?;
-    let voter_pk = voter_secret.public_key();
-    // The voter_secret IS the account-path key (caller already derived
-    // m/12381'/8444'/2'/0); synthesise from there.
-    let synthetic_secret = voter_secret.derive_synthetic();
-    let synthetic_pk = synthetic_secret.public_key();
+    let synthetic_pk =
+        parse_pubkey_hex(&validator_synthetic_pk_hex, "validator_synthetic_pk_hex")
+            .map_err(|e| JsError::new(&format!("{e}")))?;
     let p2_puzzle_hash =
         chia_protocol::Bytes32::new(StandardArgs::curry_tree_hash(synthetic_pk).to_bytes());
 
@@ -1472,6 +1506,45 @@ pub async fn register_build_spends_js(
         .map_err(|e| JsError::new(&format!("register: {e}")))?;
     let bundle_bytes = encode_streamable(&bundle)?;
     Ok(hex::encode(&bundle_bytes))
+}
+
+/// Sage-friendly variant of [`registerBuildSpends`]. Takes the
+/// voter's PUBLIC key (Sage holds the secret) and returns the unsigned
+/// register coin_spends in wallet RPC shape. The dApp signs externally
+/// with chip0002_signCoinSpends partial. Mirrors the
+/// release_collateral / cast_vote unsigned-builder pattern.
+///
+/// Returns JSON `{ coinSpends: WalletCoinSpend[] }`.
+#[wasm_bindgen(js_name = "registerBuildUnsignedCoinSpends")]
+pub async fn register_build_unsigned_coin_spends_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    voter_pk_hex: String,
+    voter_pubkeys_hex_json: String,
+    cat_parent_spend_bytes: Vec<u8>,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let voter_pk = parse_pubkey_hex(&voter_pk_hex, "voter_pk_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let smt = build_smt_from_pubkey_json(&voter_pubkeys_hex_json, "voter_pubkeys_hex_json")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let cat_parent_spend: chia_protocol::CoinSpend = decode_streamable(&cat_parent_spend_bytes)?;
+
+    let voter = build_voter_for_external_signing(cfg, voter_pk, network, election_start_height)?;
+    let chain = JsChainReader::new(backend);
+    let coin_spends = voter
+        .register_build_coin_spends(&smt, cat_parent_spend, &chain)
+        .await
+        .map_err(|e| JsError::new(&format!("register_build_coin_spends: {e}")))?;
+    let wallet_spends: Vec<WalletCoinSpend> =
+        coin_spends.iter().map(coin_spend_to_wallet).collect();
+    let out = serde_json::json!({ "coinSpends": wallet_spends });
+    serde_json::to_string(&out).map_err(|e| JsError::new(&format!("encode result: {e}")))
 }
 
 /// Mint a fresh Ballot Coin launcher (per CHIP rev §211-253). Wraps

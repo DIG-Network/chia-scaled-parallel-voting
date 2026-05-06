@@ -1085,178 +1085,73 @@ const ElectionPageInner = dynamic(
             const signingPk = discovery.voterPk;
             const catCoin = discovery.catCoin;
 
+            // ── Compute CAT input coin id (sha256(parent || ph || amount_be8)).
+            //    The Sage-friendly buildCatRegistrationSpendForWallet
+            //    walks the chain via voter_hint to find the lineage
+            //    proof, so we no longer need reconstructCatLineage
+            //    locally — just hand it the coin id.
             setRegistrationModal({
               title: "Build registration transaction",
-              detail: "Loading CAT parent coin from chain…",
+              detail: "Building CAT collateral coin spend…",
             });
-          const lineage = await reconstructCatLineage(
-            catCoin,
-              normalizeHex32(String(cfg.cat_tail_hash_hex ?? ""))
+            const { Coin } = await import("chia-wallet-sdk-wasm");
+            const catCoinIdBytes = new Coin(
+              hexToBytes(catCoin.parentCoinInfo),
+              hexToBytes(catCoin.puzzleHash),
+              BigInt(catCoin.amount)
+            ).coinId();
+            const catCoinIdHex =
+              "0x" +
+              Array.from(catCoinIdBytes)
+                .map((b) => b.toString(16).padStart(2, "0"))
+                .join("");
+            const catTailHex =
+              "0x" + String(cfg.cat_tail_hash_hex ?? "").replace(/^0x/, "");
+            const electionLauncherHex =
+              "0x" + String(cfg.election_launcher_id_hex ?? "").replace(/^0x/, "");
+            const backend = createChainBackend();
+            const catParentSpendBytes = await wasm.buildCatRegistrationSpendForWallet(
+              backend as any,
+              signingPk,        // voter_pk (account-path / self-registering)
+              signingPk,        // validator_synthetic_pk — self-registration
+              catCoinIdHex,
+              electionLauncherHex,
+              catTailHex,
+              collateralAmount
             );
 
+            // CHIP rev 2026-05-02: no separate registration_fee /
+            // mempool_fee inputs in the bundle. If a fee output is
+            // desired, attach a free-standing XCH funder spend and
+            // include it in the bundle's coin_spends list before
+            // signing — out of scope for the standard register flow.
+
+            // ── Build unsigned register coin_spends ─────────────
             setRegistrationModal({
               title: "Build registration transaction",
-              detail: "Assembling CAT collateral coin spend…",
+              detail: "Assembling unsigned register bundle (singleton + CAT)…",
             });
-          const catRecordJs = {
-            parentCoinInfo: catCoin.parentCoinInfo,
-            puzzleHash: catCoin.puzzleHash,
-            amount: catCoin.amount,
-            spentHeight: catCoin.spentHeight,
-            confirmedHeight: catCoin.confirmedHeight,
-          };
-          const catParentSpendBytes = wasm.buildCatCollateralSpend(
+            const electionStartHeight = Number(cfg.election_start_height ?? 0);
+            // SMT input must reflect on-chain registered voters, NOT
+            // including the voter being registered (non-membership
+            // proof). Filter out signingPk if the session bootstrap
+            // already lists it (e.g. on retry).
+            const otherPubkeys = (session.registeredPubkeysHex ?? []).filter(
+              (p) => normalizeHex32(p) !== normalizeHex32(signingPk)
+            );
+            const unsignedJson = await wasm.registerBuildUnsignedCoinSpends(
+              backend as any,
               session.configJson,
               signingPk,
-              signingPk,
-            catRecordJs as any,
-            lineage as any,
-            collateralAmount
-          );
-
-            const regFeeMojos = BigInt(String(cfg.registration_fee ?? "0"));
-            let registrationFeeCoinSpendBytes: Uint8Array | undefined;
-            let registrationFeePayerPk: string | undefined;
-            const excludeXchForMempool: CoinRecord[] = [];
-            if (regFeeMojos > 0n) {
-              if (regFeeMojos % 2n !== 0n) {
-                throw new Error(
-                  "Election registration_fee must be an even mojo amount (singleton amount 1+fees must stay odd)."
-                );
-              }
-              if (regFeeMojos > BigInt(Number.MAX_SAFE_INTEGER)) {
-                throw new Error("registration_fee exceeds safe integer range");
-              }
-              setRegistrationModal({
-                title: "Build registration transaction",
-                detail: `Finding XCH for registration fee (${formatXch(
-                  regFeeMojos
-                )} XCH) across Sage synthetic keys…`,
-              });
-              const feePick = await discoverRegistrationFeeXch({
-                regFeeMojos,
-                prioritizePkHexes: [signingPk, voterPk],
-                onProgress: (p) => {
-                  if (p.phase === "priority_keys") {
-                    setRegistrationModal({
-                      title: "Build registration transaction",
-                      detail:
-                        `Finding XCH for registration fee (${formatXch(
-                          regFeeMojos
-                        )} XCH).\nTrying collateral and receive-address keys first — pass ${p.keysChecked}.`,
-                    });
-                  } else {
-                    setRegistrationModal({
-                      title: "Build registration transaction",
-                      detail:
-                        `Finding XCH for registration fee (${formatXch(
-                          regFeeMojos
-                        )} XCH).\n` +
-                        `Paging chip0002_getPublicKeys — scanned ${p.keysChecked} synthetic keys ` +
-                        `(offset ${p.sageOffset}). Stops when a standard XCH coin ≥ fee is found.`,
-                    });
-                  }
-                },
-              });
-              excludeXchForMempool.push(feePick.xchCoin);
-              registrationFeePayerPk = feePick.feePayerPk;
-
-              registrationFeeCoinSpendBytes = wasm.buildRegistrationFeeXchSpend(
-                feePick.feePayerPk,
-                {
-                  parentCoinInfo: feePick.xchCoin.parentCoinInfo,
-                  puzzleHash: feePick.xchCoin.puzzleHash,
-                  amount: feePick.xchCoin.amount,
-                  spentHeight: feePick.xchCoin.spentHeight,
-                  confirmedHeight: feePick.xchCoin.confirmedHeight,
-                } as CoinRecord,
-                regFeeMojos
-              );
-            }
-
-            const mempoolFeeMojos = (() => {
-              const raw =
-                process.env.NEXT_PUBLIC_REGISTRATION_MEMPOOL_FEE_MOJOS?.trim() ||
-                "10000000";
-              try {
-                const n = BigInt(raw);
-                return n < 0n ? 0n : n;
-              } catch {
-                return 10_000_000n;
-              }
-            })();
-
-            let mempoolFeeCoinSpendBytes: Uint8Array | undefined;
-            if (mempoolFeeMojos > 0n) {
-              if (mempoolFeeMojos > BigInt(Number.MAX_SAFE_INTEGER)) {
-                throw new Error(
-                  "NEXT_PUBLIC_REGISTRATION_MEMPOOL_FEE_MOJOS exceeds safe integer range"
-                );
-              }
-              setRegistrationModal({
-                title: "Build registration transaction",
-                detail: `Finding XCH for mempool fee (${formatXch(
-                  mempoolFeeMojos
-                )} XCH) across Sage synthetic keys…`,
-              });
-              const mpPick = await discoverMempoolFeeXch({
-                feeMojos: mempoolFeeMojos,
-                excludeCoins: excludeXchForMempool,
-                prioritizePkHexes: [
-                  signingPk,
-                  voterPk,
-                  registrationFeePayerPk,
-                ],
-                onProgress: (p) => {
-                  if (p.phase === "priority_keys") {
-                    setRegistrationModal({
-                      title: "Build registration transaction",
-                      detail:
-                        `Finding XCH for mempool fee (${formatXch(
-                          mempoolFeeMojos
-                        )} XCH).\nTrying collateral and receive-address keys first — pass ${p.keysChecked}.`,
-                    });
-                  } else {
-                    setRegistrationModal({
-                      title: "Build registration transaction",
-                      detail:
-                        `Finding XCH for mempool fee (${formatXch(
-                          mempoolFeeMojos
-                        )} XCH).\n` +
-                        `Paging chip0002_getPublicKeys — scanned ${p.keysChecked} synthetic keys ` +
-                        `(offset ${p.sageOffset}). Stops when a standard XCH coin ≥ fee is found (different from registration fee coin if any).`,
-                    });
-                  }
-                },
-              });
-              mempoolFeeCoinSpendBytes = wasm.buildMempoolFeeXchSpend(
-                mpPick.feePayerPk,
-                {
-                  parentCoinInfo: mpPick.xchCoin.parentCoinInfo,
-                  puzzleHash: mpPick.xchCoin.puzzleHash,
-                  amount: mpPick.xchCoin.amount,
-                  spentHeight: mpPick.xchCoin.spentHeight,
-                  confirmedHeight: mpPick.xchCoin.confirmedHeight,
-                } as CoinRecord,
-                mempoolFeeMojos
-              );
-            }
-
-            setRegistrationModal({
-              title: "Build registration transaction",
-              detail:
-                "Assembling unsigned register bundle (singleton + CAT + protocol fee coin if any + mempool fee if any)…",
-            });
-          const backend = createChainBackend();
-            const wcSpends = (await wasm.registerBuildSpends(
-            backend as any,
-              session.configJson,
-              signingPk,
-            catParentSpendBytes,
-              collateralAmount,
-              registrationFeeCoinSpendBytes,
-              mempoolFeeCoinSpendBytes
-            )) as SpendBundleJson["coin_spends"];
+              JSON.stringify(otherPubkeys),
+              catParentSpendBytes,
+              wasm.WasmNetwork.Mainnet,
+              BigInt(electionStartHeight)
+            );
+            const unsigned = JSON.parse(unsignedJson) as {
+              coinSpends: SpendBundleJson["coin_spends"];
+            };
+            const wcSpends = unsigned.coinSpends;
 
             setRegistrationModal({
               title: "Sign in Sage",
@@ -1266,8 +1161,8 @@ const ElectionPageInner = dynamic(
             });
             const sigHex = await walletConnect.signCoinSpends(
               wcSpends,
-              false,
-              false
+              true,   // partial — Sage returns aggregate of all wallet-key AggSigMe
+              false   // no auto-submit
             );
             if (!sigHex) {
               throw new Error("Wallet rejected the signature request");
@@ -1281,15 +1176,16 @@ const ElectionPageInner = dynamic(
                   : `Retry ${attempt + 1}/${REGISTER_PUSH_MAX_ATTEMPTS} — submitting…`,
             });
             const regBundleBytes = wasm.assembleSpendBundleFromWalletCoinSpends(
-              wcSpends,
+              JSON.stringify(wcSpends),
               sigHex
             );
             wasm.verifyBundleLocally(regBundleBytes, wasm.WasmNetwork.Mainnet);
 
             try {
-              await pushTx(
-                wasm.bundleToWalletJson(regBundleBytes) as SpendBundleJson
-              );
+              const bundleJson = JSON.parse(
+                wasm.bundleBytesToWalletJson(regBundleBytes)
+              ) as SpendBundleJson;
+              await pushTx(bundleJson);
             } catch (pushErr: unknown) {
               const lastTry = attempt >= REGISTER_PUSH_MAX_ATTEMPTS - 1;
               if (!isConsensusRetriablePushError(pushErr) || lastTry) {
