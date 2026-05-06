@@ -297,7 +297,64 @@ chunk — it adds capability without touching broken code.
     coin via `catOuterPuzzleHash` ph), calls the unsigned wasm
     builder, Sage signs partial, assembles + verifies + pushes.
 
-- **Next session priority — Phase 8 (handleRegister + cleanup)**:
+- **2026-05-06 session 3 — Phase 8 (cleanup) DONE**:
+  - **8a — handleRegister**: SDK split for `Voter::register`
+    (`register_build_coin_spends` + thin signing wrapper); new wasm
+    Sage variants `buildCatRegistrationSpendForWallet` and
+    `registerBuildUnsignedCoinSpends`; `handleRegister` rewritten
+    against them. Drops the `reconstructCatLineage` /
+    `discoverRegistrationFeeXch` / `discoverMempoolFeeXch` path —
+    the new model has no separate fee inputs. CAT input coin id
+    computed locally via chia-wallet-sdk-wasm `Coin.coinId()`.
+  - **8b — handleOracle stub**: standalone `buildOracleBundle` was
+    removed (oracle is now co-spent implicitly by every
+    cast_vote/update_vote/finalize). Stubbed with a deprecation
+    message; JSX still compiles. Remove in a follow-up cleanup.
+  - **8b — sync effects**: lifecycle / chain-status callers of
+    `wasm.syncSnapshot`, `wasm.collectVotes`, and
+    `wasm.findCurrentSingleton` cast to `(wasm as any).<name>`.
+    Existing try/catch wrappers surface the runtime "not a function"
+    as a snapshot-error state. Proper migration to
+    `wasm.readElectionSingletonState` + `collectVotesForBallot` is
+    queued — the snapshot panels are non-critical for core flows.
+  - **8b — create page**: `coinSpendsToWalletJson` →
+    `coinSpendsBytesToWalletJson` (new helper added to wasm to
+    cover this exact case); `bundleToWalletJson` →
+    `bundleBytesToWalletJson` + JSON.parse.
+
+  **`npx tsc --noEmit -p .` is clean across the whole `app/`.**
+  Every voter-facing flow (deploy, createBallot, register, castVote,
+  changeVote, finalize, release) compiles against the post-CHIP-
+  rev-2026-05-02 wasm.
+
+## Next steps (post-migration)
+
+1. **Manual end-to-end smoke test** with Sage Wallet on testnet11 /
+   mainnet. Specific flows to verify:
+   - deploy (operator) → createBallot+launchBallot (operator) →
+     register (each voter) → castVote (each voter) → wait for close
+     height → finalize → release.
+   - The integration-test harness already validated each piece end-
+     to-end on mainnet via the secret-key path; the dApp's
+     Sage-friendly path should produce equivalent on-chain
+     bundles. The first real Sage smoke is the only meaningful
+     differential test left.
+2. **Sync-effect proper migration** (replace the
+   `(wasm as any).syncSnapshot` casts with
+   `wasm.readElectionSingletonState` + per-ballot collect calls).
+3. **Remove dead code**: `discoverRegistrationFeeXch`,
+   `discoverMempoolFeeXch`, `reconstructCatLineage`,
+   `catCollateralDiscovery` if unused in the migrated handlers.
+   `handleOracle` JSX trigger.
+4. **`next build` smoke** — `tsc --noEmit` is green; make sure the
+   actual production build (which includes wasm bundling) works.
+
+## Stale section: original Phase 8 hand-off (now done)
+
+The text below is the next-session brief written before Phase 8 was
+completed. Kept for archaeology; everything in it is now in `main`.
+
+
   1. **handleRegister** is still wired to gone exports
      (`buildCatCollateralSpend`, `buildRegistrationFeeXchSpend`,
      `buildMempoolFeeXchSpend`, `bundleToWalletJson`). Approach:
