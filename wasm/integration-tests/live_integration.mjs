@@ -30,7 +30,12 @@
 import wasm from "chip-voting-wasm";
 import { createChainBackend } from "./chainBackend.mjs";
 import { parseCredentials } from "./credentials.mjs";
-import { coinRecordsByPuzzleHash, coinRecordByName, peakHeight } from "./coinset.mjs";
+import {
+  coinRecordsByPuzzleHash,
+  coinRecordByName,
+  coinRecordsByHint,
+  peakHeight,
+} from "./coinset.mjs";
 import {
   assertWalletMatchesAddress,
   deriveSyntheticFromMnemonic,
@@ -62,6 +67,10 @@ function parseArgs(argv) {
     forceRedeploy: false,
     runCreateBallot: false,
     runRegister: false,
+    runCastVote: false,
+    voteChoice: "Yes",
+    runFinalize: false,
+    runRelease: false,
     // Default CAT TAIL: DIG token (per app/app/create/page.tsx default).
     // Voters will need a balance of this CAT to register. Override
     // with --cat-tail <hex> for a different election currency.
@@ -90,6 +99,14 @@ function parseArgs(argv) {
       out.runCreateBallot = true;
     } else if (a === "--run-register") {
       out.runRegister = true;
+    } else if (a === "--run-cast-vote") {
+      out.runCastVote = true;
+    } else if (a === "--vote-choice") {
+      out.voteChoice = argv[++i];
+    } else if (a === "--run-finalize") {
+      out.runFinalize = true;
+    } else if (a === "--run-release") {
+      out.runRelease = true;
     }
   }
   return out;
@@ -779,6 +796,27 @@ async function phaseLaunchBallot(opts, deploy, createdBallot) {
     voteThresholdDen: 2,
   };
 
+  // Capture the Election Singleton's state RIGHT BEFORE launch so the
+  // ballot's curried snapshot can be persisted alongside ballot metadata
+  // — every subsequent phase (cast_vote / update_vote / finalize /
+  // announce) MUST pass these exact values or the eve Ballot Coin's
+  // curry diverges from chain. The SDK reads its own copy inside
+  // launchBallot; ours observe the same chain tip so they agree by
+  // construction (modulo a concurrent register landing mid-phase).
+  const snapshotBackend = createChainBackend({ verbose: opts.verbose });
+  step(" → wasm.readElectionSingletonState (snapshot pre-launch)");
+  const stateJson = await wasm.readElectionSingletonState(
+    snapshotBackend,
+    deploy.configJson,
+    BigInt(deploy.electionStartHeight)
+  );
+  const preLaunchState = JSON.parse(stateJson);
+  ok(
+    `pre-launch snapshot: count=${preLaunchState.registrationCount} ` +
+      `vote_weight=${preLaunchState.registrationVoteWeight} ` +
+      `root=${String(preLaunchState.registrationMerkleRootHex).slice(0, 18)}…`
+  );
+
   const backend = createChainBackend({ verbose: opts.verbose });
   step(" → wasm.launchBallotBundle");
   const resultJson = await wasm.launchBallotBundle(
@@ -824,8 +862,13 @@ async function phaseLaunchBallot(opts, deploy, createdBallot) {
     target.eveBallotCoinIdHex = launched.eveBallotCoinIdHex;
     target.eveBallotPuzzleHashHex = launched.eveBallotPuzzleHashHex;
     target.launchedAtHeight = rec.confirmedHeight;
+    target.voteThresholdNum = params.voteThresholdNum;
+    target.voteThresholdDen = params.voteThresholdDen;
+    target.registrationMerkleRootSnapshotHex = preLaunchState.registrationMerkleRootHex;
+    target.registrationVoteWeightSnapshot = preLaunchState.registrationVoteWeight;
+    target.registrationCountSnapshot = preLaunchState.registrationCount;
     await writeBallotArtifacts(ballots);
-    ok("ballot artifact updated with launch info");
+    ok("ballot artifact updated with launch info + snapshot");
   }
   return launched;
 }
@@ -929,15 +972,33 @@ async function phaseRegisterVoter(opts, deploy) {
       BigInt(deploy.electionStartHeight)
     );
     const bundleBytes = hexToBytesU8(bundleHex);
-    ok(`  register bundle: ${bundleBytes.length} bytes`);
+    ok(`  register bundle: ${bundleBytes.length} bytes (SDK-signed: voter account_sk only)`);
+
+    // SDK's Voter::register signs with the voter's account secret only;
+    // the CAT spend's StandardLayer emits AGG_SIG_ME(synthetic_pk, …)
+    // which needs synthetic_sk. Re-sign with both keys so the bundle's
+    // aggregate covers every AGG_SIG condition. (Mirrors the rust
+    // live_integration_test.rs::phase_register_voter re-sign step.)
+    step("   → re-sign with [account_sk, synthetic_sk]");
+    const coinSpendsBytesLP = wasm.extractCoinSpendsFromBundle(bundleBytes);
+    const bothSecrets = new Uint8Array(64);
+    bothSecrets.set(entry.accountSecretBytes, 0);
+    bothSecrets.set(entry.derived.syntheticSecretBytes, 32);
+    const sigBytes = wasm.signCoinSpends(
+      coinSpendsBytesLP,
+      bothSecrets,
+      wasm.WasmNetwork.Mainnet
+    );
+    const finalBundleBytes = wasm.assembleSpendBundle(coinSpendsBytesLP, sigBytes);
+    ok(`  re-signed: ${sigBytes.length}-byte aggregate, final bundle ${finalBundleBytes.length} bytes`);
 
     step("   → verifyBundleLocally");
-    wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
+    wasm.verifyBundleLocally(finalBundleBytes, wasm.WasmNetwork.Mainnet);
     ok("  bundle validates locally");
 
     if (opts.pushDeploy) {
       step("   → push register bundle");
-      const response = await pushSpendBundleBytes(bundleBytes, { network: "mainnet" });
+      const response = await pushSpendBundleBytes(finalBundleBytes, { network: "mainnet" });
       // ALREADY_INCLUDING_TRANSACTION means the bundle is already in
       // mempool (e.g. from a prior attempt that lost the response) —
       // treat as success and proceed to poll for the reg coin.
@@ -991,8 +1052,553 @@ async function computeCoinId(coinRecord) {
   return bytesToHex(coin.coinId());
 }
 
+// ---------------------------------------------------------------------------
+// Phase 9 — phase_cast_vote (each registered validator casts a vote on the
+// most recently-launched open ballot)
+// ---------------------------------------------------------------------------
+
+async function phaseCastVote(opts, deploy) {
+  step("Phase 9: cast_vote against the most-recently-launched open ballot");
+
+  if (!opts.runCastVote) {
+    info("Skipping cast_vote (default). Pass --run-cast-vote to attempt.");
+    return null;
+  }
+  if (!deploy?.configJson) throw new Error("cast_vote needs deploy artifacts");
+  if (!opts.credentials) throw new Error("cast_vote needs --credentials");
+
+  // Pick a launched ballot whose vote_close_height is still in the future
+  // AND whose snapshot is non-empty (i.e. was launched after at least one
+  // register). Old empty-snapshot ballots from earlier runs are ignored.
+  const ballots = await readBallotArtifacts();
+  const peak = await peakHeight();
+  info(`current peak = ${peak}`);
+  const candidate = ballots
+    .filter(
+      (b) =>
+        b.eveBallotCoinIdHex &&
+        b.voteCloseHeight > peak &&
+        b.registrationMerkleRootSnapshotHex &&
+        b.registrationVoteWeightSnapshot > 0
+    )
+    .sort((a, b) => b.launchedAtHeight - a.launchedAtHeight)[0];
+  if (!candidate) {
+    throw new Error(
+      "phase_cast_vote: no open ballot with non-empty registration snapshot. " +
+        "Run --run-create-ballot --run-register --run-cast-vote in one pass " +
+        "so the new ballot is launched after the validators are registered."
+    );
+  }
+  ok(
+    `selected ballot ${candidate.ballotLauncherIdHex.slice(0, 18)}… ` +
+      `(close_height=${candidate.voteCloseHeight}, vote_weight_snapshot=${candidate.registrationVoteWeightSnapshot})`
+  );
+
+  // vote_data per app/lib/elections.ts convention: sha256("vote:" + label).
+  const choice = opts.voteChoice ?? "Yes";
+  const voteDataBytes = await sha256Bytes(new TextEncoder().encode(`vote:${choice}`));
+  const voteDataHex = "0x" + bytesToHex(voteDataBytes);
+  info(`vote choice = "${choice}" → vote_data=${voteDataHex.slice(0, 18)}…`);
+
+  const creds = await parseCredentials(opts.credentials);
+  const cast = [];
+  for (const v of creds.validators) {
+    if (!v.mnemonic) continue;
+
+    // Re-derive the validator's account-path BLS secret (the voter's
+    // identity key — same one phase_register_voter used).
+    const { Mnemonic, SecretKey } = await import("chia-wallet-sdk-wasm");
+    const mn = new Mnemonic(v.mnemonic);
+    const seed = mn.toSeed("");
+    const master = SecretKey.fromSeed(seed);
+    const account = master.deriveUnhardenedPath(new Uint32Array([12381, 8444, 2, 0]));
+    const accountSecretBytes = account.toBytes();
+    const accountPkHex = "0x" + bytesToHex(account.publicKey().toBytes());
+
+    // Sanity: confirm this voter is in the SMT snapshot. The SDK's
+    // cast_vote walks the chain to find the registration coin via hint;
+    // if it's not there we skip rather than burn mojos on a doomed bundle.
+    const regPh = wasm.freshRegistrationCoinPuzzleHash(deploy.configJson, accountPkHex);
+    const regCoins = await coinRecordsByPuzzleHash(regPh, false);
+    const unspentReg = regCoins.find((c) => c.spentHeight === 0);
+    if (!unspentReg) {
+      info(`  ${v.name}: no unspent registration coin at predicted ph — skipping`);
+      continue;
+    }
+    info(
+      `--- Casting ${v.name} (pk=${accountPkHex.slice(0, 18)}…, reg_coin amount=${unspentReg.amount}) ---`
+    );
+
+    const params = {
+      ballotLauncherIdHex: "0x" + candidate.ballotLauncherIdHex.replace(/^0x/, ""),
+      voteDataHex,
+      voteCloseHeight: candidate.voteCloseHeight,
+      voteThresholdNum: candidate.voteThresholdNum ?? 1,
+      voteThresholdDen: candidate.voteThresholdDen ?? 2,
+      registrationMerkleRootSnapshotHex: candidate.registrationMerkleRootSnapshotHex,
+      registrationVoteWeightSnapshot: candidate.registrationVoteWeightSnapshot,
+      votingCoinAmount: 1,
+    };
+
+    step("   → wasm.castVoteBuildFinalBundle");
+    const backend = createChainBackend({ verbose: opts.verbose });
+    const resultJson = await wasm.castVoteBuildFinalBundle(
+      backend,
+      deploy.configJson,
+      "0x" + bytesToHex(accountSecretBytes),
+      JSON.stringify(params),
+      wasm.WasmNetwork.Mainnet,
+      BigInt(deploy.electionStartHeight)
+    );
+    const result = JSON.parse(resultJson);
+    ok(`  voting_coin_id  = ${result.votingCoinIdHex}`);
+    ok(`  vote_signature  = ${result.voteSignatureHex.slice(0, 18)}…`);
+    const bundleBytes = hexToBytesU8(result.spendBundleHex);
+    ok(`  bundle: ${bundleBytes.length} bytes`);
+
+    step("   → verifyBundleLocally");
+    wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
+    ok("  bundle validates locally");
+
+    if (opts.pushDeploy) {
+      step("   → push cast_vote bundle");
+      const response = await pushSpendBundleBytes(bundleBytes, { network: "mainnet" });
+      const isAlreadyIncluded =
+        typeof response.error === "string" &&
+        response.error.includes("ALREADY_INCLUDING_TRANSACTION");
+      if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded) {
+        throw new Error(`push_tx returned: ${response.status} (${response.error ?? "(none)"})`);
+      }
+      ok(`  push_tx accepted: ${isAlreadyIncluded ? "ALREADY_IN_MEMPOOL" : response.status}`);
+
+      step("   → poll for voting coin confirmation");
+      const rec = await pollUntilConfirmed(result.votingCoinIdHex, {
+        label: `votingCoin/${v.name}`,
+        pollIntervalMs: 30_000,
+        timeoutMs: 600_000,
+      });
+      ok(`  voting coin confirmed at height ${rec.confirmedHeight}`);
+      cast.push({
+        validator: v.name,
+        accountPkHex,
+        votingCoinIdHex: result.votingCoinIdHex,
+        voteSignatureHex: result.voteSignatureHex,
+        voteDataHex,
+        confirmedHeight: rec.confirmedHeight,
+      });
+    } else {
+      info("  Dry-run only — pass --push to broadcast");
+    }
+  }
+
+  ok(`Phase 9 complete: ${cast.length} vote(s) cast on ballot ${candidate.ballotLauncherIdHex.slice(0, 18)}…`);
+  return { ballot: candidate, cast };
+}
+
+async function sha256Bytes(buf) {
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", buf);
+  return new Uint8Array(digest);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 — phase_finalize (close-window wait + Groth16-authenticated
+// finalize spend that mints the next-generation Ballot Coin with
+// `finalized=true`)
+// ---------------------------------------------------------------------------
+
+async function phaseWaitForCloseHeight(closeHeight) {
+  step(`Phase 10a: wait for peak >= vote_close_height (${closeHeight})`);
+  // Ballot Coin's `finalize` action gates on AssertHeightAbsolute(close).
+  // We poll until peak crosses the line; mainnet block time ≈ 52s.
+  const POLL_MS = 30_000;
+  const TIMEOUT_MS = 60 * 60_000; // 60 min cap
+  const started = Date.now();
+  while (Date.now() - started < TIMEOUT_MS) {
+    const peak = await peakHeight();
+    if (peak >= closeHeight) {
+      ok(`peak ${peak} >= close ${closeHeight} — window open`);
+      return peak;
+    }
+    info(`  peak=${peak}, close=${closeHeight}, ${closeHeight - peak} blocks to go (sleeping ${POLL_MS / 1000}s)`);
+    await new Promise((r) => setTimeout(r, POLL_MS));
+  }
+  throw new Error(`phaseWaitForCloseHeight: timed out after ${TIMEOUT_MS / 1000}s`);
+}
+
+async function phaseFinalize(opts, deploy) {
+  step("Phase 10: finalize the cast-against ballot");
+
+  if (!opts.runFinalize) {
+    info("Skipping finalize (default). Pass --run-finalize to attempt.");
+    return null;
+  }
+  if (!deploy?.configJson) throw new Error("finalize needs deploy artifacts");
+  if (!opts.credentials) throw new Error("finalize needs --credentials");
+  if (!deploy.provingKeyBytesB64) {
+    throw new Error("finalize: deploy.json missing provingKeyBytesB64 — redeploy required");
+  }
+
+  // Pick the ballot we cast against — same selection rule as phaseCastVote
+  // (most-recently-launched, snapshot non-empty, voting-coin lineage).
+  const ballots = await readBallotArtifacts();
+  const candidate = ballots
+    .filter(
+      (b) =>
+        b.eveBallotCoinIdHex &&
+        b.registrationMerkleRootSnapshotHex &&
+        b.registrationVoteWeightSnapshot > 0
+    )
+    .sort((a, b) => b.launchedAtHeight - a.launchedAtHeight)[0];
+  if (!candidate) {
+    throw new Error("phase_finalize: no ballot eligible for finalize");
+  }
+  info(`finalizing ballot ${candidate.ballotLauncherIdHex.slice(0, 18)}…`);
+
+  // Block until the close height passes.
+  await phaseWaitForCloseHeight(candidate.voteCloseHeight);
+
+  // Voter pubkey list for collectVotesForBallot — derived from .test-credentials.
+  const creds = await parseCredentials(opts.credentials);
+  const voterPubkeys = [];
+  for (const v of creds.validators) {
+    if (!v.mnemonic) continue;
+    const { Mnemonic, SecretKey } = await import("chia-wallet-sdk-wasm");
+    const mn = new Mnemonic(v.mnemonic);
+    const seed = mn.toSeed("");
+    const master = SecretKey.fromSeed(seed);
+    const account = master.deriveUnhardenedPath(new Uint32Array([12381, 8444, 2, 0]));
+    voterPubkeys.push("0x" + bytesToHex(account.publicKey().toBytes()));
+  }
+  ok(`voter pubkey list (${voterPubkeys.length}): ${voterPubkeys.map((p) => p.slice(0, 14)).join(", ")}…`);
+
+  // Walk the chain to harvest every Voting Coin under this ballot.
+  step(" → wasm.collectVotesForBallot");
+  const collectBackend = createChainBackend({ verbose: opts.verbose });
+  const votesJson = await wasm.collectVotesForBallot(
+    collectBackend,
+    deploy.configJson,
+    "0x" + candidate.ballotLauncherIdHex.replace(/^0x/, ""),
+    JSON.stringify(voterPubkeys)
+  );
+  const votes = JSON.parse(votesJson);
+  ok(`collected ${votes.length} vote(s) on chain`);
+  if (votes.length === 0) {
+    throw new Error("phase_finalize: collectVotesForBallot returned no votes — finalize would underflow");
+  }
+  for (const v of votes) {
+    // VoteRecordWire keys are snake_case (no #[serde(rename_all)]).
+    info(
+      `   voter=${String(v.voter_pubkey_hex).slice(0, 14)}… vote=${String(v.vote_data_hex).slice(0, 14)}…`
+    );
+  }
+
+  // Determine vote_outcome — the message most signers signed. For our
+  // yes/no test where every voter chose "Yes", this is sha256("vote:Yes").
+  const choice = opts.voteChoice ?? "Yes";
+  const outcomeBytes = await sha256Bytes(new TextEncoder().encode(`vote:${choice}`));
+  const voteOutcomeHex = "0x" + bytesToHex(outcomeBytes);
+  info(`vote_outcome (${choice}) = ${voteOutcomeHex.slice(0, 18)}…`);
+
+  // Decode the cached arkworks proving key.
+  const provingKeyBytes = Uint8Array.from(Buffer.from(deploy.provingKeyBytesB64, "base64"));
+  ok(`proving key: ${provingKeyBytes.length} bytes`);
+
+  const params = {
+    voteCloseHeight: candidate.voteCloseHeight,
+    voteThresholdNum: candidate.voteThresholdNum ?? 1,
+    voteThresholdDen: candidate.voteThresholdDen ?? 2,
+    registrationMerkleRootSnapshotHex: candidate.registrationMerkleRootSnapshotHex,
+    registrationVoteWeightSnapshot: candidate.registrationVoteWeightSnapshot,
+  };
+
+  step(" → wasm.buildBallotFinalizeBundle (runs Groth16 prover — may take seconds)");
+  const finalizeBackend = createChainBackend({ verbose: opts.verbose });
+  const bundleHex = await wasm.buildBallotFinalizeBundle(
+    finalizeBackend,
+    deploy.configJson,
+    "0x" + candidate.ballotLauncherIdHex.replace(/^0x/, ""),
+    voteOutcomeHex,
+    JSON.stringify(params),
+    votesJson,
+    provingKeyBytes,
+    wasm.WasmNetwork.Mainnet,
+    BigInt(deploy.electionStartHeight)
+  );
+  const bundleBytes = hexToBytesU8(bundleHex);
+  ok(`finalize bundle: ${bundleBytes.length} bytes`);
+
+  step(" → verifyBundleLocally");
+  wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
+  ok("bundle validates locally");
+
+  if (opts.pushDeploy) {
+    step(" → push finalize bundle (no AGG_SIG; Groth16-authenticated)");
+    const response = await pushSpendBundleBytes(bundleBytes, { network: "mainnet" });
+    const isAlreadyIncluded =
+      typeof response.error === "string" &&
+      response.error.includes("ALREADY_INCLUDING_TRANSACTION");
+    if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded) {
+      throw new Error(`push_tx returned: ${response.status} (${response.error ?? "(none)"})`);
+    }
+    ok(`push_tx accepted: ${isAlreadyIncluded ? "ALREADY_IN_MEMPOOL" : response.status}`);
+
+    // Confirm by polling for the LATEST ballot coin (post-cast_vote)
+    // to become spent — that's what the finalize bundle consumes. The
+    // eve ballot coin was already spent earlier by the first cast_vote
+    // (the oracle action consumes-and-recreates the singleton on every
+    // cast), so polling the eve gives a false positive.
+    step(" → locate latest ballot coin in lineage");
+    const ballotPh = "0x" + candidate.eveBallotPuzzleHashHex.replace(/^0x/, "");
+    const recordsAtPh = await coinRecordsByPuzzleHash(ballotPh, true);
+    const unspentLatest = recordsAtPh.find((c) => c.spentHeight === 0);
+    if (!unspentLatest) {
+      throw new Error(
+        `phase_finalize: no unspent ballot coin at ${ballotPh.slice(0, 18)}… ` +
+          `before push — pre-existing finalize?`
+      );
+    }
+    const latestCoinId = await computeCoinId(unspentLatest);
+    info(`  latest ballot coin: id=${latestCoinId.slice(0, 18)}… amount=${unspentLatest.amount}`);
+
+    step(" → poll for latest ballot coin to be spent (signal of finalize)");
+    const startedPoll = Date.now();
+    let spentRecord = null;
+    while (Date.now() - startedPoll < 600_000) {
+      const rec = await coinRecordByName("0x" + latestCoinId);
+      if (rec && rec.spentHeight && rec.spentHeight !== 0) {
+        spentRecord = rec;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 30_000));
+    }
+    if (!spentRecord) {
+      throw new Error(`latest ballot coin ${latestCoinId.slice(0, 18)}… not spent within 600s — finalize may have failed`);
+    }
+    ok(`latest ballot coin spent at height ${spentRecord.spentHeight} — finalize confirmed`);
+
+    // Persist the finalize confirmation on the ballot artifact.
+    const target = ballots.find(
+      (b) => b.ballotLauncherIdHex === candidate.ballotLauncherIdHex
+    );
+    if (target) {
+      target.finalizedAtHeight = spentRecord.spentHeight;
+      target.voteOutcomeHex = voteOutcomeHex;
+      await writeBallotArtifacts(ballots);
+      ok("ballot artifact updated with finalize info");
+    }
+  } else {
+    info("Dry-run only — pass --push to broadcast");
+  }
+
+  return { ballot: candidate, votes };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11 — phase_release (each registered validator deregisters and gets
+// their CAT collateral back at their own CAT-wrapped p2 puzzle hash)
+// ---------------------------------------------------------------------------
+
+async function phaseRelease(opts, deploy) {
+  step("Phase 11: release collateral for each registered validator");
+
+  if (!opts.runRelease) {
+    info("Skipping release (default). Pass --run-release to attempt.");
+    return null;
+  }
+  if (!deploy?.configJson) throw new Error("release needs deploy artifacts");
+  if (!opts.credentials) throw new Error("release needs --credentials");
+
+  const cfg = JSON.parse(deploy.configJson);
+  const catTail = "0x" + cfg.cat_tail_hash_hex.replace(/^0x/, "");
+  const creds = await parseCredentials(opts.credentials);
+
+  // Build the FULL voter pubkey list for the SMT — release_collateral
+  // asserts smt.root() matches the on-chain registration_merkle_root,
+  // and the deregister action's membership proof requires the voter
+  // being released to be IN the SMT (not non-membership like register).
+  const voterEntries = [];
+  for (const v of creds.validators) {
+    if (!v.mnemonic) continue;
+    const { Mnemonic, SecretKey } = await import("chia-wallet-sdk-wasm");
+    const mn = new Mnemonic(v.mnemonic);
+    const seed = mn.toSeed("");
+    const master = SecretKey.fromSeed(seed);
+    const account = master.deriveUnhardenedPath(new Uint32Array([12381, 8444, 2, 0]));
+    voterEntries.push({
+      v,
+      derived: deriveSyntheticFromMnemonic(v.mnemonic),
+      accountSecretBytes: account.toBytes(),
+      accountPkHex: "0x" + bytesToHex(account.publicKey().toBytes()),
+    });
+  }
+  // The SMT passed to releaseCollateralBuildSpends must match the
+  // on-chain registration_merkle_root EXACTLY. That root drops a voter
+  // when their release lands, so we must (a) initialise from the
+  // CURRENT chain state (some voters may already be released from a
+  // prior run) and (b) update the set after each successful release.
+  // To detect "currently registered", we need an unspent coin at the
+  // hint that is a REGISTRATION coin — not the released CAT collateral
+  // (which lands at catOuter(tail, dest_p2_ph) and is also hinted with
+  // voter_hint so the validator can find it). Compute each voter's
+  // released-collateral CAT outer ph and exclude it from the filter.
+  const electionLauncherIdHex = "0x" + cfg.election_launcher_id_hex.replace(/^0x/, "");
+  const stillRegistered = new Set();
+  for (const e of voterEntries) {
+    const hint = wasm.voterHint(electionLauncherIdHex, catTail, e.accountPkHex);
+    const releasedCatPh = String(
+      wasm.catOuterPuzzleHash(catTail, "0x" + e.derived.puzzleHashHex)
+    )
+      .replace(/^0x/, "")
+      .toLowerCase();
+    const recs = await coinRecordsByHint(hint, true);
+    const unspentRegLike = recs.some(
+      (r) =>
+        r.spentHeight === 0 &&
+        String(r.puzzleHash).replace(/^0x/, "").toLowerCase() !== releasedCatPh
+    );
+    if (unspentRegLike) {
+      stillRegistered.add(e.accountPkHex);
+    }
+  }
+  if (stillRegistered.size === 0) {
+    ok("No currently-registered validators (all already released?). Nothing to do.");
+    return [];
+  }
+  ok(
+    `Initial on-chain SMT voter list (${stillRegistered.size}): ` +
+      `${[...stillRegistered].map((p) => p.slice(0, 14)).join(", ")}…`
+  );
+
+  const released = [];
+  for (const entry of voterEntries) {
+    info(`\n--- Releasing ${entry.v.name} (${entry.accountPkHex.slice(0, 18)}…) ---`);
+    if (!stillRegistered.has(entry.accountPkHex)) {
+      info("  already released (not in current on-chain SMT) — skipping");
+      continue;
+    }
+    const allVoterPubkeysHex = [...stillRegistered];
+    info(`  current SMT input (${allVoterPubkeysHex.length}): ${allVoterPubkeysHex.map((p) => p.slice(0, 14)).join(", ")}…`);
+
+    // Find the CURRENT (unspent) registration coin for this voter.
+    // After cast_vote, the recreated reg coin lands at a DIFFERENT
+    // puzzle hash (state moved: e.g. last_voted_ballot is curried in),
+    // so `freshRegistrationCoinPuzzleHash` no longer predicts it.
+    // The voter_hint memo is state-independent — the SDK uses it for
+    // exactly this lookup. Fetch by hint, filter unspent.
+    const voterHintHex = wasm.voterHint(electionLauncherIdHex, catTail, entry.accountPkHex);
+    info(`  voter_hint = ${String(voterHintHex).slice(0, 18)}…`);
+    const releasedCatPh = String(
+      wasm.catOuterPuzzleHash(catTail, "0x" + entry.derived.puzzleHashHex)
+    )
+      .replace(/^0x/, "")
+      .toLowerCase();
+    const hintRecords = await coinRecordsByHint(voterHintHex, true);
+    const unspentReg = hintRecords.find(
+      (c) =>
+        c.spentHeight === 0 &&
+        String(c.puzzleHash).replace(/^0x/, "").toLowerCase() !== releasedCatPh
+    );
+    if (!unspentReg) {
+      info(
+        `  no unspent registration coin via hint ${String(voterHintHex).slice(0, 18)}… ` +
+          `(${hintRecords.length} hint-indexed records total) — skipping`
+      );
+      continue;
+    }
+    const regCoinIdHex = await computeCoinId(unspentReg);
+    ok(`  current reg coin: id=${regCoinIdHex.slice(0, 18)}… amount=${unspentReg.amount} ph=${unspentReg.puzzleHash.slice(0, 18)}…`);
+
+    // Destination = validator's standard p2 ph (the INNER ph; the CAT
+    // outer wraps it on-chain, so the released collateral lands in the
+    // validator's CAT-wrapped p2 wallet — recoverable by the same key
+    // they used to register).
+    const destinationPhHex = "0x" + entry.derived.puzzleHashHex;
+    info(`  destination p2 ph = ${destinationPhHex.slice(0, 18)}… (CAT-wrapped on chain)`);
+    const destCatOuter = wasm.catOuterPuzzleHash(catTail, destinationPhHex);
+    info(`  expected CAT outer ph = ${String(destCatOuter).slice(0, 18)}…`);
+
+    step("   → wasm.releaseCollateralBuildSpends");
+    const backend = createChainBackend({ verbose: opts.verbose });
+    const bundleHex = await wasm.releaseCollateralBuildSpends(
+      backend,
+      deploy.configJson,
+      "0x" + bytesToHex(entry.accountSecretBytes),
+      JSON.stringify(allVoterPubkeysHex),
+      "0x" + regCoinIdHex,
+      destinationPhHex,
+      wasm.WasmNetwork.Mainnet,
+      BigInt(deploy.electionStartHeight)
+    );
+    const bundleBytes = hexToBytesU8(bundleHex);
+    ok(`  release bundle: ${bundleBytes.length} bytes (SDK-signed: voter account_sk only)`);
+
+    // Same as register: SDK signs with the voter's account secret only,
+    // but the CAT spend's StandardLayer also requires synthetic_sk's
+    // signature. Re-sign with both keys.
+    step("   → re-sign with [account_sk, synthetic_sk]");
+    const coinSpendsBytesLP = wasm.extractCoinSpendsFromBundle(bundleBytes);
+    const bothSecrets = new Uint8Array(64);
+    bothSecrets.set(entry.accountSecretBytes, 0);
+    bothSecrets.set(entry.derived.syntheticSecretBytes, 32);
+    const sigBytes = wasm.signCoinSpends(
+      coinSpendsBytesLP,
+      bothSecrets,
+      wasm.WasmNetwork.Mainnet
+    );
+    const finalBundleBytes = wasm.assembleSpendBundle(coinSpendsBytesLP, sigBytes);
+    ok(`  re-signed: ${sigBytes.length}-byte aggregate, final bundle ${finalBundleBytes.length} bytes`);
+
+    step("   → verifyBundleLocally");
+    wasm.verifyBundleLocally(finalBundleBytes, wasm.WasmNetwork.Mainnet);
+    ok("  bundle validates locally");
+
+    if (opts.pushDeploy) {
+      step("   → push release bundle");
+      const response = await pushSpendBundleBytes(finalBundleBytes, { network: "mainnet" });
+      const isAlreadyIncluded =
+        typeof response.error === "string" &&
+        response.error.includes("ALREADY_INCLUDING_TRANSACTION");
+      if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded) {
+        throw new Error(`push_tx returned: ${response.status} (${response.error ?? "(none)"})`);
+      }
+      ok(`  push_tx accepted: ${isAlreadyIncluded ? "ALREADY_IN_MEMPOOL" : response.status}`);
+
+      // Poll for the reg coin to be spent — strongest signal that the
+      // release deregister action ran on chain.
+      step("   → poll for registration coin to be spent (signal of release)");
+      const startedPoll = Date.now();
+      let spent = null;
+      while (Date.now() - startedPoll < 600_000) {
+        const rec = await coinRecordByName("0x" + regCoinIdHex);
+        if (rec && rec.spentHeight && rec.spentHeight !== 0) {
+          spent = rec;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 30_000));
+      }
+      if (!spent) {
+        throw new Error(`reg coin ${regCoinIdHex.slice(0, 18)}… not spent within 600s — release failed`);
+      }
+      ok(`  reg coin spent at height ${spent.spentHeight} — release confirmed`);
+      stillRegistered.delete(entry.accountPkHex);
+      released.push({
+        validator: entry.v.name,
+        regCoinIdHex,
+        destinationPhHex,
+        destCatOuter: String(destCatOuter),
+        spentAtHeight: spent.spentHeight,
+      });
+    } else {
+      info("  Dry-run only — pass --push to broadcast");
+    }
+  }
+
+  ok(`Phase 11 complete: ${released.length} validator(s) released`);
+  return released;
+}
+
 function phaseWriteSideTodo() {
-  step("Phase 9+: vote / finalize / release (TODO)");
+  step("=== All phases (deploy → register → ballot → vote → finalize → release) wired ===");
   info(
     "Phase 4 (deploy) builds + dry-runs end-to-end. The remaining write-side"
   );
@@ -1034,6 +1640,12 @@ async function main() {
     await phaseLaunchBallot(opts, deploy, createdBallot);
     console.log("");
     await phaseRegisterVoter(opts, deploy);
+    console.log("");
+    await phaseCastVote(opts, deploy);
+    console.log("");
+    await phaseFinalize(opts, deploy);
+    console.log("");
+    await phaseRelease(opts, deploy);
     console.log("");
     phaseWriteSideTodo();
     console.log("");
