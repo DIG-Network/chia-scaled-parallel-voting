@@ -56,7 +56,6 @@ import { createChainBackend } from "../lib/chainBackend";
 import { walletConnect } from "../lib/walletConnectInstance";
 import Footer from "../components/Footer";
 import { BroadcastWaitModal } from "../components/BroadcastWaitModal";
-import { ElectionFinalizeQuietBanner } from "../components/ElectionFinalizeQuietBanner";
 import { pollUntilConfirmed } from "../lib/pollUntil";
 import { getWasm } from "../lib/sdk";
 
@@ -310,7 +309,11 @@ const ElectionPageInner = dynamic(
       const [snapshotLoading, setSnapshotLoading] = useState(false);
       const [snapshotError, setSnapshotError] = useState<string | null>(null);
 
-      /** Height-lock + tally for expired / finished messaging (poll; same basis as finalize banner). */
+      /** Lifecycle ticker — Election Singleton is permanent (CHIP rev
+       *  2026-05-02 doesn't have a per-election expiry; only ballots
+       *  have vote_close_height). This tracks peak + ballotsCast +
+       *  whether ANY tracked ballot has been finalized. Per-ballot
+       *  expiry display lives in BallotsList. */
       const POLL_ELECTION_LC_MS = 32_000;
       type ElectionLifecycle =
         | { status: "idle" }
@@ -319,10 +322,8 @@ const ElectionPageInner = dynamic(
         | {
             status: "ready";
             finalized: boolean;
-            quietElapsed: boolean;
             ballotsCast: number;
             peak: number;
-            finalizeMinHeight: number;
           };
 
       const [electionLc, setElectionLc] = useState<ElectionLifecycle>({
@@ -648,66 +649,15 @@ const ElectionPageInner = dynamic(
               }
             }
 
-            if (snapshotRef.current?.finalized === true) {
-              const peakSnap = await peakHeight();
-              if (!cancelled) {
-                const ph = peakSnap ?? 0;
-                setElectionLc({
-                  status: "ready",
-                  finalized: true,
-                  quietElapsed: true,
-                  ballotsCast,
-                  peak: ph,
-                  finalizeMinHeight: ph,
-                });
-              }
-              return;
-            }
-
             // The Election Singleton itself doesn't carry a "finalized"
             // bit — that's a per-ballot state in the new model. We
             // treat the snapshot as finalized iff at least one tracked
             // ballot has a finalize confirmation in its bootstrap.
             const tipFinalized = allBallots.some((b) => !!b.finalizedAtHeight);
-            const tip = { coinIdHex: "", finalized: tipFinalized };
 
             if (cancelled) return;
-
-            const snapFresh = snapshotRef.current;
-            if (tip.finalized || (snapFresh && snapFresh.finalized)) {
-              const peakDone = await peakHeight();
-              if (!cancelled) {
-                const ph = peakDone ?? 0;
-                setElectionLc({
-                  status: "ready",
-                  finalized: true,
-                  quietElapsed: true,
-                  ballotsCast,
-                  peak: ph,
-                  finalizeMinHeight: ph,
-                });
-              }
-              return;
-            }
 
             const peak = await peakHeight();
-            const parsed = JSON.parse(configJson) as {
-              election_length_blocks?: number | string;
-              election_start_height?: number | string;
-            };
-            const len = Number(parsed.election_length_blocks ?? 0);
-            const anchorFromConfig = Number(parsed.election_start_height ?? 0);
-            const snapR = snapshotRef.current;
-            const anchor =
-              session?.electionStartHeight != null &&
-              session.electionStartHeight > 0
-                ? session.electionStartHeight
-                : snapR?.electionStartHeight != null &&
-                    snapR.electionStartHeight > 0
-                  ? snapR.electionStartHeight
-                  : anchorFromConfig;
-
-            if (cancelled) return;
             if (peak === null) {
               if (!cancelled) {
                 setElectionLc({
@@ -717,28 +667,14 @@ const ElectionPageInner = dynamic(
               }
               return;
             }
-            if (anchor <= 0 || !Number.isFinite(anchor)) {
-              if (!cancelled) {
-                setElectionLc({
-                  status: "error",
-                  message:
-                    "Election config is missing election_start_height — paste an updated ElectionConfig from the coordinator.",
-                });
-              }
-              return;
-            }
-
-            const finalizeMinHeight = anchor + len;
-            const quietElapsed = finalizeMinHeight <= peak;
 
             if (!cancelled) {
               setElectionLc({
                 status: "ready",
-                finalized: false,
-                quietElapsed,
+                finalized:
+                  tipFinalized || snapshotRef.current?.finalized === true,
                 ballotsCast,
                 peak,
-                finalizeMinHeight,
               });
             }
           } catch (e: unknown) {
@@ -992,13 +928,13 @@ const ElectionPageInner = dynamic(
       const resolvedMyVoteDataHex =
         indexedMyVoteDataHex ?? optimisticVoteDataHex;
 
-      const votesClosed = useMemo(
-        () =>
-          electionLc.status === "ready" &&
-          !electionLc.finalized &&
-          electionLc.quietElapsed,
-        [electionLc]
-      );
+      // CHIP rev 2026-05-02: "votes closed" is per-ballot now. The
+      // election-level votesClosed flag was used to gate the legacy
+      // single-ballot finalize section; that section now operates
+      // on the SELECTED ballot (BallotsList sets selectedBallotId),
+      // so the gate becomes false at the election level — the
+      // selected-ballot's status drives the actual button enabling.
+      const votesClosed = false as const;
 
       const waitBroadcastConfirm = useCallback(
         async (opts: {
@@ -2632,19 +2568,14 @@ const ElectionPageInner = dynamic(
 
       const finalizedOnChain = snapshot?.finalized === true;
 
-      const showElectionExpiredNoBallots =
-        snapshot !== null &&
-        electionLc.status === "ready" &&
-        !electionLc.finalized &&
-        electionLc.quietElapsed &&
-        electionLc.ballotsCast === 0;
-
-      const showElectionFinishedVotingPeriod =
-        snapshot !== null &&
-        electionLc.status === "ready" &&
-        !electionLc.finalized &&
-        electionLc.quietElapsed &&
-        electionLc.ballotsCast > 0;
+      // CHIP rev 2026-05-02: Election Singleton has no per-election
+      // expiry / finalize window. The "expired no ballots" and
+      // "finished voting period" banners no longer apply at the
+      // election level — per-ballot expiry display lives in
+      // BallotsList. Kept as `false` constants so the legacy JSX
+      // gates compile-out cleanly.
+      const showElectionExpiredNoBallots = false as const;
+      const showElectionFinishedVotingPeriod = false as const;
 
       return (
         <>
@@ -2879,36 +2810,11 @@ const ElectionPageInner = dynamic(
             </section>
           )}
 
-          <ElectionFinalizeQuietBanner
-            finalized={snapshot?.finalized === true}
-            lifecycleErrorMessage={
-              electionLc.status === "error" ? electionLc.message : undefined
-            }
-            lifecycleStatus={
-              electionLc.status === "idle" ? "loading" : electionLc.status
-            }
-            quietCountdown={
-              electionLc.status === "ready" && !electionLc.finalized
-                ? {
-                    blocksRemaining: Math.max(
-                      0,
-                      electionLc.finalizeMinHeight - electionLc.peak
-                    ),
-                    finalizeMinHeight: electionLc.finalizeMinHeight,
-                    peak: electionLc.peak,
-                  }
-                : null
-            }
-            show={
-              snapshot !== null &&
-              chainStatus === "deployed" &&
-              !(
-                electionLc.status === "ready" &&
-                !electionLc.finalized &&
-                electionLc.quietElapsed
-              )
-            }
-          />
+          {/* CHIP rev 2026-05-02: <ElectionFinalizeQuietBanner>
+              removed — per-election quiet/finalize countdown was
+              based on `election_start_height + election_length_blocks`
+              and no longer applies. Per-ballot countdowns live in
+              BallotsList. */}
 
           {/* ────────── Election parameters ────────── */}
           <section className="card-elev">
@@ -2988,15 +2894,8 @@ const ElectionPageInner = dynamic(
                   snapshot === null
                     ? "—"
                     : snapshot.finalized
-                    ? "Finalized"
-                      : electionLc.status === "ready"
-                        ? electionLc.quietElapsed &&
-                          electionLc.ballotsCast === 0
-                          ? "Expired"
-                          : electionLc.quietElapsed
-                            ? "Voting ended"
-                            : "Open"
-                    : "Open"
+                      ? "At least one ballot finalized"
+                      : "Active"
                 }
               />
               <Stat
@@ -3620,28 +3519,11 @@ const ElectionPageInner = dynamic(
                   ) : !votesClosed ? (
                     <div className="space-y-2 text-sm text-[var(--color-muted)]">
                       <p>
-                        Finalize unlocks once the singleton&apos;s voting-period
-                        height lock is satisfied (election length in blocks since
-                        the current tip coin was indexed).
+                        Pick an expired ballot from the Ballots list above to
+                        finalize. Each ballot&apos;s vote_close_height gates its
+                        own finalize action; the Election Singleton itself never
+                        expires.
                       </p>
-                      {electionLc.status === "ready" && !electionLc.finalized && (
-                        <p className="text-xs mono">
-                          ≈{" "}
-                          <span className="font-medium">
-                            {Math.max(
-                              0,
-                              electionLc.finalizeMinHeight - electionLc.peak
-                            )}
-                          </span>{" "}
-                          blocks remaining at peak{" "}
-                          <span className="font-medium">{electionLc.peak}</span>{" "}
-                          (finalize at height ≥{" "}
-                          <span className="font-medium">
-                            {electionLc.finalizeMinHeight}
-                          </span>
-                          ).
-                        </p>
-                      )}
                     </div>
                   ) : (
                     <div className="space-y-4">
