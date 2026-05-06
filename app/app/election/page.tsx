@@ -589,6 +589,23 @@ const ElectionPageInner = dynamic(
             smtRootHex: state.registrationMerkleRootHex,
           };
           setSnapshot(snap);
+          // Self-heal: when the sync recovers a non-zero
+          // electionStartHeight from chain (post-launch /
+          // post-register, where apply_singleton_spend evolved the
+          // genesis state), persist it back to the bootstrap so
+          // future voting / register / release flows have the right
+          // value without needing the deployer's submission peak.
+          if (
+            state.electionStartHeight > 0 &&
+            (session.electionStartHeight ?? 0) !== state.electionStartHeight
+          ) {
+            const merged: ElectionBootstrap = {
+              ...session,
+              electionStartHeight: state.electionStartHeight,
+            };
+            writeElectionBootstrap(merged);
+            setSession(merged);
+          }
         } catch (e: any) {
           setSnapshotError(e?.message ?? String(e));
         } finally {
