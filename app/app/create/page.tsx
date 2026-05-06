@@ -61,11 +61,10 @@ export default dynamic(
         "a406d3a9de984d03c9591c10d917593b434d5263cabe2b42f6b367df16832f81"
       );
       const [collateralAmount, setCollateralAmount] = useState("1.000");
-      /** ~1 calendar day at Chia target rate (32 blocks / 10 min). */
-      const [electionLengthBlocks, setElectionLengthBlocks] = useState("4608");
-      /** Weighted quorum N/D (strict tally * D > total_weight * N). Default strict majority (1/2). */
-      const [voteThresholdNum, setVoteThresholdNum] = useState("1");
-      const [voteThresholdDen, setVoteThresholdDen] = useState("2");
+      // CHIP rev 2026-05-02: election_length_blocks and
+      // vote_threshold_num/den are PER-BALLOT now, not per-election.
+      // The deployer picks vote_close_height + threshold each time
+      // they mint a ballot from /election → "Mint a new ballot".
       const [status, setStatus] = useState<string>("Ready");
       const [busy, setBusy] = useState(false);
       const [deployAwait, setDeployAwait] = useState<null | {
@@ -131,26 +130,11 @@ export default dynamic(
             );
           }
 
-          const len = Number(electionLengthBlocks);
-          const vtn = Number.parseInt(voteThresholdNum.trim(), 10);
-          const vtd = Number.parseInt(voteThresholdDen.trim(), 10);
-          if (!Number.isFinite(len) || len < 1) {
-            throw new Error("Election length must be at least one block.");
-          }
-          if (!Number.isFinite(vtn) || !Number.isFinite(vtd) || vtn < 1 || vtd < 1) {
-            throw new Error(
-              "Vote quorum numerator and denominator must be integers ≥ 1."
-            );
-          }
-
           const params = {
             verificationKeyHex: ceremony.verificationKeyHex,
             catTailHashHex: catTailHex,
             collateralAmount: Number(collMojos),
-            electionLengthBlocks: len,
             electionStartHeight: peak,
-            voteThresholdNum: vtn,
-            voteThresholdDen: vtd,
             label: label.trim() || null,
           };
 
@@ -438,54 +422,9 @@ export default dynamic(
               />
             </Field>
 
-            <Field
-              label="Election length (blocks)"
-              hint="Time-lock between deploy and earliest finalize. Default ~1 day (4608 blocks at 32 blocks/10 min)."
-            >
-              <input
-                type="number"
-                value={electionLengthBlocks}
-                onChange={(e) => setElectionLengthBlocks(e.target.value)}
-                step="1"
-                min="1"
-                className="input mono"
-                required
-                disabled={busy}
-              />
-            </Field>
-
-            <Field
-              label="Finalize quorum (weighted N / D)"
-              hint={
-                'On-chain strict rule tally × D > total_registration_weight × N. Majority-by-stake is typically 1/2.'
-              }
-            >
-              <div className="flex gap-3 items-center">
-                <input
-                  type="number"
-                  value={voteThresholdNum}
-                  onChange={(e) => setVoteThresholdNum(e.target.value)}
-                  step="1"
-                  min="1"
-                  className="input mono flex-1"
-                  title="Numerator N"
-                  required
-                  disabled={busy}
-                />
-                <span className="text-[var(--color-muted)]">/</span>
-                <input
-                  type="number"
-                  value={voteThresholdDen}
-                  onChange={(e) => setVoteThresholdDen(e.target.value)}
-                  step="1"
-                  min="1"
-                  className="input mono flex-1"
-                  title="Denominator D"
-                  required
-                  disabled={busy}
-                />
-              </div>
-            </Field>
+            {/* Election length / finalize quorum are PER-BALLOT in
+                CHIP rev 2026-05-02 — set when minting a ballot from
+                /election → "Mint a new ballot", not at deploy. */}
 
             <Field
               label="Voter choices"
