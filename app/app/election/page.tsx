@@ -14,6 +14,7 @@ import { useSearchParams } from "next/navigation";
 import { useAppSelector } from "../redux/hooks";
 import {
   coinRecordByName,
+  coinRecordsByPuzzleHash,
   CoinRecord,
   isConsensusRetriablePushError,
   peakHeight,
@@ -32,6 +33,10 @@ import {
   mergeBootstrapPubkeyRegistered,
   type ElectionBootstrap,
 } from "../lib/electionBootstrap";
+import {
+  writeBallotBootstrap,
+  type BallotBootstrap,
+} from "../lib/ballotBootstrap";
 import {
   formatCat,
   formatXch,
@@ -751,6 +756,253 @@ const ElectionPageInner = dynamic(
         },
         [syncSnapshot, pullFreshSnapshot]
       );
+
+      // ── CREATE + LAUNCH BALLOT FLOW (operator only) ──────────────
+      //
+      // Mints a Ballot Coin lineage under this election. Two on-chain
+      // submissions:
+      //   1. createBallotBundle — Sage signs the funder XCH coin
+      //      (provides 2 mojos for the launcher coin), spends the
+      //      Election Singleton's createBallot action.
+      //   2. launchBallotBundle — second-spend of the launcher to
+      //      mint the eve Ballot Coin (no AggSig — bundle's identity
+      //      sig is sufficient).
+      //
+      // After both confirm, we capture the Election Singleton state
+      // RIGHT BEFORE the launch and persist a per-ballot bootstrap so
+      // every voter / finalizer / releaser sees the SAME snapshot the
+      // ballot was minted with. Mirrors `phaseCreateBallot` +
+      // `phaseLaunchBallot` from the integration test harness.
+      const handleCreateAndLaunchBallot = async () => {
+        if (!session?.provingKeyBase64) {
+          setError("Only the deployer (holder of the Groth16 proving key) can mint a ballot.");
+          return;
+        }
+        if (!address) {
+          setError("Connect Sage Wallet first.");
+          return;
+        }
+        const cfg = JSON.parse(session.configJson);
+        const electionStartHeight = Number(cfg.election_start_height ?? 0);
+        if (!electionStartHeight) {
+          setError("Election start height missing from session config — re-import.");
+          return;
+        }
+
+        setError(null);
+        setTxStatus(null);
+        setBusy("Creating ballot…");
+
+        try {
+          await walletConnect.waitForInit();
+
+          // ── 1. Find an XCH coin in the operator's wallet to fund the launcher.
+          //     Need amount > 2 so change > 0 (the StandardLayer
+          //     spend panics on `delegatedSpend([])`).
+          setBusy("Finding XCH funder coin…");
+          const userPh = await puzzleHashHexFromWalletAddress(address);
+          if (!userPh) throw new Error("Could not decode Sage wallet address");
+          const xchPh = "0x" + userPh;
+          const xchCoins = await coinRecordsByPuzzleHash(xchPh, false);
+          const candidates = xchCoins
+            .filter((c) => c.spentHeight === 0 && c.amount >= 100)
+            .sort((a, b) => a.amount - b.amount);
+          if (candidates.length === 0) {
+            throw new Error(
+              "No spendable XCH coin (≥100 mojos) at your connected receive address. " +
+                "Top up the wallet or switch addresses."
+            );
+          }
+          const funderCoin = candidates[0];
+
+          // Resolve synthetic pubkey for the funder coin's puzzle hash.
+          const synthPk = await findSyntheticPkForWalletAddress(address);
+          if (!synthPk) {
+            throw new Error(
+              "Could not resolve synthetic pubkey for receive address from Sage. " +
+                "Wallet may have rejected chip0002_getPublicKeys."
+            );
+          }
+
+          // ── 2. Build the funder StandardLayer spend (unsigned —
+          //      Sage signs it later as part of the bundle's AggSigMe
+          //      sweep).
+          const change = BigInt(funderCoin.amount) - 2n;
+          const funderSpendBytes = wasm.buildXchFunderSpend(
+            "0x" + funderCoin.parentCoinInfo,
+            synthPk,
+            BigInt(funderCoin.amount),
+            change
+          );
+
+          // ── 3. Pick ballot params.
+          const ballotSeed = new Uint8Array(32);
+          globalThis.crypto.getRandomValues(ballotSeed);
+          const ballotSeedHex =
+            "0x" + Array.from(ballotSeed).map((b) => b.toString(16).padStart(2, "0")).join("");
+          const peak = await peakHeight();
+          if (!peak) throw new Error("Could not read chain peak");
+          // ~25 minutes mainnet (52s/block), ~50 blocks. Configurable
+          // via UI in a follow-up.
+          const voteCloseHeight = peak + 50;
+          // Deterministic placeholder outcome domain. Production
+          // deployments would tree-hash a structured proposal here.
+          const outcomeDomainHashHex = "0x" + "01".repeat(32);
+          const voteThresholdNum = 1;
+          const voteThresholdDen = 2;
+
+          const createParams = {
+            ballotSeedHex,
+            voteCloseHeight,
+            outcomeDomainHashHex,
+          };
+
+          // ── 4. createBallotBundle (singleton create_ballot action).
+          setBusy("Building createBallot bundle…");
+          const backend = createChainBackend();
+          const createdJson = await wasm.createBallotBundle(
+            backend as any,
+            session.configJson,
+            funderSpendBytes,
+            JSON.stringify(createParams),
+            wasm.WasmNetwork.Mainnet,
+            BigInt(electionStartHeight)
+          );
+          const created = JSON.parse(createdJson) as {
+            ballotLauncherIdHex: string;
+            ballotCoinIdHex: string;
+            spendBundleHex: string;
+          };
+
+          // ── 5. Sage signs the bundle's coin_spends (covers the
+          //      funder's StandardLayer AggSigMe).
+          setBusy("Awaiting Sage signature for createBallot…");
+          const createBundleBytes = hexToBytes(created.spendBundleHex);
+          const wcSpendsJson = wasm.extractWalletCoinSpendsFromBundle(createBundleBytes);
+          const wcSpends = JSON.parse(wcSpendsJson);
+          const sigHex = await walletConnect.signCoinSpends(wcSpends, false, false);
+          if (!sigHex) throw new Error("Wallet rejected the createBallot signature request");
+
+          setBusy("Verifying createBallot bundle locally…");
+          const finalCreateBundleBytes = wasm.assembleSpendBundleFromWalletCoinSpends(
+            JSON.stringify(wcSpends),
+            sigHex
+          );
+          wasm.verifyBundleLocally(finalCreateBundleBytes, wasm.WasmNetwork.Mainnet);
+
+          setBusy("Submitting createBallot bundle…");
+          const createBundleJson = JSON.parse(
+            wasm.bundleBytesToWalletJson(finalCreateBundleBytes)
+          ) as SpendBundleJson;
+          await pushTx(createBundleJson);
+
+          setBusy("Polling for ballot launcher confirmation…");
+          const launcherIdToWatch = created.ballotLauncherIdHex;
+          const launcherOk = await pollUntilConfirmed({
+            predicate: async () => {
+              const rec = await coinRecordByName(launcherIdToWatch);
+              return !!rec && (rec.confirmedHeight ?? 0) > 0;
+            },
+            pollMs: 30_000,
+            timeoutMs: 600_000,
+          });
+          if (!launcherOk) {
+            throw new Error("ballot launcher coin not confirmed within 10 min");
+          }
+
+          // ── 6. Capture pre-launch Election Singleton state — the
+          //      registration snapshot the eve Ballot Coin will be
+          //      curried with. Every later actor must mirror these.
+          setBusy("Capturing election state snapshot…");
+          const stateJson = await wasm.readElectionSingletonState(
+            backend as any,
+            session.configJson,
+            BigInt(electionStartHeight)
+          );
+          const preLaunchState = JSON.parse(stateJson) as {
+            registrationMerkleRootHex: string;
+            registrationVoteWeight: number;
+            registrationCount: number;
+          };
+
+          // ── 7. launchBallotBundle (launcher second-spend → eve).
+          setBusy("Building launchBallot bundle…");
+          const launchParams = {
+            voteCloseHeight,
+            outcomeDomainHashHex,
+            voteThresholdNum,
+            voteThresholdDen,
+          };
+          const launchedJson = await wasm.launchBallotBundle(
+            backend as any,
+            session.configJson,
+            "0x" + created.ballotLauncherIdHex.replace(/^0x/, ""),
+            JSON.stringify(launchParams),
+            wasm.WasmNetwork.Mainnet,
+            BigInt(electionStartHeight)
+          );
+          const launched = JSON.parse(launchedJson) as {
+            ballotLauncherIdHex: string;
+            eveBallotCoinIdHex: string;
+            eveBallotPuzzleHashHex: string;
+            spendBundleHex: string;
+          };
+
+          setBusy("Verifying launchBallot bundle locally…");
+          const launchBundleBytes = hexToBytes(launched.spendBundleHex);
+          wasm.verifyBundleLocally(launchBundleBytes, wasm.WasmNetwork.Mainnet);
+
+          setBusy("Submitting launchBallot bundle…");
+          const launchBundleJson = JSON.parse(
+            wasm.bundleBytesToWalletJson(launchBundleBytes)
+          ) as SpendBundleJson;
+          await pushTx(launchBundleJson);
+
+          setBusy("Polling for eve ballot coin confirmation…");
+          const eveIdToWatch = launched.eveBallotCoinIdHex;
+          const eveOk = await pollUntilConfirmed({
+            predicate: async () => {
+              const rec = await coinRecordByName(eveIdToWatch);
+              return !!rec && (rec.confirmedHeight ?? 0) > 0;
+            },
+            pollMs: 30_000,
+            timeoutMs: 600_000,
+          });
+          if (!eveOk) {
+            throw new Error("eve ballot coin not confirmed within 10 min");
+          }
+          const eveRec = await coinRecordByName(eveIdToWatch);
+
+          // ── 8. Persist per-ballot bootstrap so castVote / finalize
+          //      / release can read the snapshot without a chain walk.
+          const bb: BallotBootstrap = {
+            electionLauncherIdHex: launcherIdHex,
+            ballotLauncherIdHex: created.ballotLauncherIdHex,
+            eveBallotCoinIdHex: launched.eveBallotCoinIdHex,
+            eveBallotPuzzleHashHex: launched.eveBallotPuzzleHashHex,
+            launchedAtHeight: eveRec?.confirmedHeight,
+            voteCloseHeight,
+            outcomeDomainHashHex,
+            ballotSeedHex,
+            voteThresholdNum,
+            voteThresholdDen,
+            registrationMerkleRootSnapshotHex: preLaunchState.registrationMerkleRootHex,
+            registrationVoteWeightSnapshot: preLaunchState.registrationVoteWeight,
+            registrationCountSnapshot: preLaunchState.registrationCount,
+            addedAt: new Date().toISOString(),
+          };
+          writeBallotBootstrap(bb);
+
+          setTxStatus(
+            `Ballot launched. close height ${voteCloseHeight} (~${50 * 52}s window). ` +
+              `Voters can register / cast against ballot ${created.ballotLauncherIdHex.slice(0, 10)}…`
+          );
+        } catch (e: any) {
+          setError(e?.message ?? String(e));
+        } finally {
+          setBusy(null);
+        }
+      };
 
       // ── REGISTER FLOW (post-CHIP-bls-unify) ──────────────────────
       // CAT collateral: try receive-address synthetic key, then page
@@ -2545,6 +2797,46 @@ const ElectionPageInner = dynamic(
                     </>
                   )}
                 </div>
+
+                {/* Operator-only — mint a new ballot under this election.
+                    Visible only when this session holds the Groth16
+                    proving key (= the deployer / share-bundle holder).
+                    Persists per-ballot snapshot to ballotBootstrap so
+                    voter / finalize / release flows can read it
+                    without re-walking the chain. */}
+                {session?.provingKeyBase64 ? (
+                  <div className="rounded-xl border border-[var(--color-accent)]/35 bg-[var(--color-accent)]/[0.04] p-5">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-3">
+                      <span
+                        className="inline-flex h-7 min-w-7 shrink-0 items-center justify-center rounded-full px-2 text-[11px] font-bold bg-[var(--color-accent)]/20 text-[var(--color-accent)]"
+                        aria-hidden
+                      >
+                        OP
+                      </span>
+                      <h3 className="font-semibold">Mint a new ballot</h3>
+                    </div>
+                    <p className="text-sm text-[var(--color-muted)] mb-3">
+                      Operator action: create a Ballot Coin lineage under
+                      this election. Funds the launcher with 2 mojos from
+                      your Sage XCH wallet, captures the current
+                      registration snapshot, and persists the ballot’s
+                      curry pack so voters can cast against it.
+                      Vote-close height defaults to peak + 50 (~25 min on
+                      mainnet).
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleCreateAndLaunchBallot}
+                      disabled={!!busy || !address}
+                      className="btn-primary w-full sm:w-auto min-w-[220px]"
+                    >
+                      {busy?.startsWith("Creating ballot") ||
+                      busy?.includes("ballot")
+                        ? busy
+                        : "Create new ballot"}
+                    </button>
+                  </div>
+                ) : null}
 
                 {/* Step 2 — ballot (meaningful UI only once registered + pubkey) */}
                 <div
