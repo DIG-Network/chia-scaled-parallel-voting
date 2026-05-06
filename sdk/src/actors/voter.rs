@@ -210,6 +210,24 @@ pub struct UpdateVoteParams {
     pub registration_vote_weight_snapshot: u64,
 }
 
+/// STRUCT: UpdateVoteCoinSpends
+/// PURPOSE: return shape of [`Voter::update_vote_build_coin_spends`] —
+///          unsigned coin_spends + auxiliary data a Sage-backed dApp
+///          consumes to finalize the spend externally. Mirrors
+///          [`CastVoteCoinSpends`] for the update flow.
+pub struct UpdateVoteCoinSpends {
+    pub coin_spends: Vec<CoinSpend>,
+    pub recreated_voting_coin_id: Bytes32,
+    /// The voter's `sign_unsafe` BLS signature over `new_vote_message`,
+    /// echoed back from the caller's input. Embedded into the
+    /// update_vote action solution.
+    pub new_vote_signature: chia_protocol::Bytes,
+    /// `sha256(new_vote_data || ballot_launcher_id || election_launcher_id)`
+    /// — the bytes the caller signed with `sign_unsafe`. Returned for
+    /// the dApp to cross-check its preview shim.
+    pub new_vote_message: Bytes32,
+}
+
 /// STRUCT: UpdateVoteResult
 /// PURPOSE: outputs from `Voter::update_vote`.
 #[derive(Clone, Debug)]
@@ -1074,17 +1092,32 @@ impl Voter {
     ///
     /// **NO singleton co-spend on the Election Singleton.** Vote
     /// edits live entirely on the Ballot Coin / Voting Coin lane.
-    pub async fn update_vote<C: ChainReader>(
+    /// Sage-friendly variant of [`Voter::update_vote`]. Takes a
+    /// pre-computed `new_signature` (the voter's
+    /// `sign_unsafe(new_vote_message)` BLS sig). Returns unsigned
+    /// coin_spends; caller signs the bundle aggregate externally.
+    /// Mirrors [`Voter::cast_vote_build_coin_spends`].
+    pub async fn update_vote_build_coin_spends<C: ChainReader>(
         &self,
         chain: &C,
-        params: UpdateVoteParams,
-    ) -> VotingResult<UpdateVoteResult> {
+        params: &UpdateVoteParams,
+        new_signature: chia_protocol::Bytes,
+    ) -> VotingResult<UpdateVoteCoinSpends> {
         use chia_protocol::Bytes;
         use chia_puzzle_types::singleton::SingletonArgs;
         // (chia_puzzle_types::Proof types only used inside
         // find_current_ballot_singleton — not needed here.)
         use clvm_traits::{clvm_curried_args, ToClvm};
         use clvm_utils::{tree_hash, CurriedProgram, TreeHash};
+
+        if new_signature.len() != 96 {
+            return Err(voting_other(format!(
+                "Voter::update_vote_build_coin_spends: new_signature must be 96 bytes \
+                 (BLS G2), got {}",
+                new_signature.len(),
+            )));
+        }
+        let new_signature_bytes: Bytes = new_signature;
 
         let cat_tail_hash = self
             .config
@@ -1303,13 +1336,15 @@ impl Voter {
         let update_vote_program_node =
             load_action_puzzle(&mut ctx, puzzles::VOTING_COIN_UPDATE_VOTE_HEX)?;
 
+        // The voter signs new_vote_message UNAUGMENTED so the
+        // off-chain aggregator can verify against the published
+        // pubkey directly. In this builder the signature is passed in
+        // (the secret-key wrapper below computes it from self.keys).
         let new_vm = puzzles::vote_message(
             params.new_vote_data,
             params.ballot_launcher_id,
             election_id,
         );
-        let new_signature = self.keys.sign_unsafe(new_vm.as_ref());
-        let new_signature_bytes = Bytes::new(new_signature.to_bytes().to_vec());
 
         let update_vote_solution_value = (
             params.ballot_launcher_id,
@@ -1407,6 +1442,46 @@ impl Voter {
                 "Voter::update_vote dry-run: {e:?}"
             )));
         }
+
+        Ok(UpdateVoteCoinSpends {
+            coin_spends,
+            recreated_voting_coin_id,
+            new_vote_signature: new_signature_bytes,
+            new_vote_message: new_vm,
+        })
+    }
+
+    /// Build an `update_vote` spend bundle using `self.keys.secret`
+    /// for signing — the secret-key path for native CLI / integration
+    /// test callers. Browser dApps that don't hold the secret should
+    /// use [`Voter::update_vote_build_coin_spends`].
+    pub async fn update_vote<C: ChainReader>(
+        &self,
+        chain: &C,
+        params: UpdateVoteParams,
+    ) -> VotingResult<UpdateVoteResult> {
+        let election_id = self
+            .config
+            .election_launcher_id()
+            .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
+        let new_vm = puzzles::vote_message(
+            params.new_vote_data,
+            params.ballot_launcher_id,
+            election_id,
+        );
+        let new_signature = self.keys.sign_unsafe(new_vm.as_ref());
+        let new_signature_bytes =
+            chia_protocol::Bytes::new(new_signature.to_bytes().to_vec());
+
+        let UpdateVoteCoinSpends {
+            coin_spends,
+            recreated_voting_coin_id,
+            new_vote_signature,
+            ..
+        } = self
+            .update_vote_build_coin_spends(chain, &params, new_signature_bytes)
+            .await?;
+
         let signature = sign_bundle_signature(
             &coin_spends,
             std::slice::from_ref(&self.keys.secret),
@@ -1415,7 +1490,7 @@ impl Voter {
         Ok(UpdateVoteResult {
             recreated_voting_coin_id,
             spend_bundle: SpendBundle::new(coin_spends, signature),
-            new_vote_signature: new_signature_bytes,
+            new_vote_signature,
         })
     }
 

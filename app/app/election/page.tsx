@@ -1566,6 +1566,7 @@ const ElectionPageInner = dynamic(
         setTxStatus(null);
         setBusy("Replacing ballot…");
         try {
+          // ── 1. Resolve new vote_data from UI input ─────────────
           let voteHex: string;
           if (session.choices && session.choices.length > 0) {
             if (changeBallotPickIdx === null) {
@@ -1593,52 +1594,141 @@ const ElectionPageInner = dynamic(
             );
           }
 
-          const backend = createChainBackend();
-          setBusy("Building change-vote preview spends…");
-          const previewSpends = await wasm.changeVoteBuildPreviewSpend(
-            backend as any,
-            session.configJson,
-            effectiveVoterPk,
-            voteHex
-          );
-
-          setBusy("Awaiting wallet signature…");
-          const sigHex = await walletConnect.signCoinSpends(
-            previewSpends,
-            false,
-            false
-          );
-          if (!sigHex) {
-            throw new Error("Wallet rejected the signature request");
-          }
-          const sigBytes = hexToBytes(sigHex);
-          if (sigBytes.length !== 96) {
+          // ── 2. Pick the open ballot the existing vote is on ─────
+          setBusy("Locating an open ballot…");
+          const peak = await peakHeight();
+          if (!peak) throw new Error("Could not read chain peak");
+          const ballot = pickOpenBallotForVoting(launcherIdHex, peak);
+          if (!ballot) {
             throw new Error(
-              `Wallet returned a ${sigBytes.length}-byte signature; expected 96 bytes for the aggregated BLS signature.`
+              "No open ballot in this session. update_vote is per-ballot — make sure you're voting on a ballot whose snapshot is in your bootstrap."
             );
           }
 
-          setBusy("Building final change-vote bundle…");
-          const bundleBytes = await wasm.changeVoteBuildFinalBundle(
+          // ── 3. Find the voter's CURRENT Voting Coin via collectVotesForBallot.
+          //      The row tells us voting_coin_id + registration_coin_id —
+          //      both required by UpdateVoteParams. ──────────────────
+          const backend = createChainBackend();
+          const rowsJson = (await wasm.collectVotesForBallot(
+            backend as any,
+            session.configJson,
+            ballot.ballotLauncherIdHex,
+            JSON.stringify([effectiveVoterPk])
+          )) as string;
+          const rows = JSON.parse(rowsJson) as Array<
+            Record<string, string | undefined>
+          >;
+          const pkNorm = normalizeHex32(effectiveVoterPk);
+          const myRow = rows.find(
+            (r) =>
+              normalizeHex32(
+                r.voter_pubkey_hex ?? r.voterPubkeyHex ?? ""
+              ) === pkNorm
+          );
+          if (!myRow) {
+            throw new Error(
+              "Could not locate your existing Voting Coin on chain — has the prior cast_vote confirmed?"
+            );
+          }
+          const votingCoinIdHex =
+            myRow.voting_coin_id_hex ?? myRow.votingCoinIdHex ?? "";
+          const registrationCoinIdHex =
+            myRow.registration_coin_id_hex ?? myRow.registrationCoinIdHex ?? "";
+          const oldVoteDataHex =
+            myRow.vote_data_hex ?? myRow.voteDataHex ?? resolvedMyVoteDataHex;
+          if (!votingCoinIdHex || !registrationCoinIdHex) {
+            throw new Error("collectVotesForBallot row missing voting / registration coin ids.");
+          }
+
+          const params = {
+            votingCoinIdHex,
+            oldVoteDataHex,
+            newVoteDataHex: voteHex,
+            registrationCoinIdHex,
+            ballotLauncherIdHex: ballot.ballotLauncherIdHex,
+            voteCloseHeight: ballot.voteCloseHeight,
+            voteThresholdNum: ballot.voteThresholdNum,
+            voteThresholdDen: ballot.voteThresholdDen,
+            registrationMerkleRootSnapshotHex:
+              ballot.registrationMerkleRootSnapshotHex,
+            registrationVoteWeightSnapshot:
+              ballot.registrationVoteWeightSnapshot,
+          };
+          const cfg = JSON.parse(session.configJson);
+          const electionStartHeight = Number(cfg.election_start_height ?? 0);
+
+          // ── 4. Sage signs new_vote_message via the AggSigUnsafe shim.
+          setBusy("Building change-vote preview spend…");
+          const previewJson = await wasm.updateVoteBuildPreviewSpend(
             backend as any,
             session.configJson,
             effectiveVoterPk,
-            voteHex,
-            sigBytes
+            JSON.stringify(params)
           );
+          const preview = JSON.parse(previewJson) as {
+            coinSpends: SpendBundleJson["coin_spends"];
+            voteMessageHex: string;
+          };
 
-          setBusy("Verifying bundle locally…");
+          setBusy("Awaiting Sage signature on new vote message…");
+          const newVoteSigHex = await walletConnect.signCoinSpends(
+            preview.coinSpends,
+            true,
+            false
+          );
+          if (!newVoteSigHex) {
+            throw new Error("Wallet rejected the new-vote-message signature request");
+          }
+
+          // ── 5. Build the unsigned update_vote coin_spends. ──────
+          setBusy("Building update_vote bundle…");
+          const unsignedJson = await wasm.updateVoteBuildUnsignedCoinSpends(
+            backend as any,
+            session.configJson,
+            effectiveVoterPk,
+            JSON.stringify(params),
+            newVoteSigHex,
+            wasm.WasmNetwork.Mainnet,
+            BigInt(electionStartHeight)
+          );
+          const unsigned = JSON.parse(unsignedJson) as {
+            coinSpends: SpendBundleJson["coin_spends"];
+            recreatedVotingCoinIdHex: string;
+            newVoteSignatureHex: string;
+            newVoteMessageHex: string;
+          };
+
+          // ── 6. Sage signs the bundle aggregate.
+          setBusy("Awaiting Sage signature on bundle…");
+          const aggSigHex = await walletConnect.signCoinSpends(
+            unsigned.coinSpends,
+            true,
+            false
+          );
+          if (!aggSigHex) {
+            throw new Error("Wallet rejected the bundle signature request");
+          }
+
+          // ── 7. Assemble + verify + push ────────────────────────
+          setBusy("Assembling and verifying bundle…");
+          const bundleBytes = wasm.assembleSpendBundleFromWalletCoinSpends(
+            JSON.stringify(unsigned.coinSpends),
+            aggSigHex
+          );
           wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
 
           setBusy("Submitting change-vote bundle…");
-          await pushTx(wasm.bundleToWalletJson(bundleBytes) as SpendBundleJson);
+          const bundleJson = JSON.parse(
+            wasm.bundleBytesToWalletJson(bundleBytes)
+          ) as SpendBundleJson;
+          await pushTx(bundleJson);
 
+          // ── 8. Optimistic state + on-chain confirm ─────────────
           const vdCanon = voteHex.trim().startsWith("0x")
             ? voteHex.trim().toLowerCase()
             : `0x${normalizeHex32(voteHex)}`;
           setOptimisticVoteDataHex(vdCanon);
 
-          const pkNorm = normalizeHex32(effectiveVoterPk);
           const vdNorm = normalizeHex32(voteHex);
           const ok = await waitBroadcastConfirm({
             title: "Confirming replaced ballot",
@@ -1646,12 +1736,16 @@ const ElectionPageInner = dynamic(
               "Waiting until coinset-backed reads show your updated vote_data.",
             predicate: async () => {
               const b = createChainBackend();
-              const rows = (await wasm.collectVotes(
+              const rowsJson2 = (await wasm.collectVotesForBallot(
                 b as any,
-                session.configJson
-              )) as unknown[];
-              for (const r of rows ?? []) {
-                const row = r as Record<string, string | undefined>;
+                session.configJson,
+                ballot.ballotLauncherIdHex,
+                JSON.stringify([effectiveVoterPk])
+              )) as string;
+              const rows2 = JSON.parse(rowsJson2) as Array<
+                Record<string, string | undefined>
+              >;
+              for (const row of rows2 ?? []) {
                 const rk = normalizeHex32(
                   row.voter_pubkey_hex ?? row.voterPubkeyHex ?? ""
                 );

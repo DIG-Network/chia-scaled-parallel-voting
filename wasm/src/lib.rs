@@ -1604,9 +1604,9 @@ pub fn cast_vote_build_preview_spend_js(
     voter_pk_hex: &str,
     params_json: &str,
 ) -> Result<String, JsError> {
-    use clvm_traits::ToClvm;
+    use chip_voting_sdk::clvm_traits::ToClvm;
+    use chip_voting_sdk::clvmr::Allocator;
     use clvm_utils::tree_hash;
-    use clvmr::Allocator;
 
     let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(election_config_json)
         .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
@@ -1810,26 +1810,143 @@ pub async fn cast_vote_build_final_bundle_js(
     serde_json::to_string(&out).map_err(|e| JsError::new(&format!("encode WasmVoteResult: {e}")))
 }
 
-/// Hardware-wallet preview variant of `updateVoteBuildFinalBundle`.
+/// Sage-friendly preview variant of [`updateVoteBuildFinalBundle`].
+/// Builds a one-condition shim spend with `AGG_SIG_UNSAFE(voter_pk,
+/// new_vote_message)` so a chip0002 wallet's partial signCoinSpends
+/// returns `sign_unsafe(new_vote_message)` byte-for-byte. Mirrors
+/// [`castVoteBuildPreviewSpend`] but for the update flow.
 ///
-/// SDK-BLOCKED: same shape as `castVoteBuildPreviewSpend` —
-/// `Voter::update_vote` needs an analogous
-/// `update_vote_build_with_initial_sig` split before this can be
-/// wired. See the `castVoteBuildPreviewSpend` doc-comment for the
-/// full contract.
+/// Returns JSON `{ coinSpends: WalletCoinSpend[]; voteMessageHex: string }`.
 #[wasm_bindgen(js_name = "updateVoteBuildPreviewSpend")]
 pub fn update_vote_build_preview_spend_js(
     _backend: JsChainBackend,
-    _election_config_json: &str,
-    _voter_pk_hex: &str,
-    _params_json: &str,
-) -> Result<JsValue, JsError> {
-    Err(JsError::new(
-        "updateVoteBuildPreviewSpend: not implemented — needs SDK to expose a no-secret \
-         build_with_initial_sig variant of Voter::update_vote (browser preview for \
-         hardware-wallet voters). Use updateVoteBuildFinalBundle with a browser-held \
-         secret today, or drive chip-voting-cli phase_update_vote out-of-band.",
-    ))
+    election_config_json: &str,
+    voter_pk_hex: &str,
+    params_json: &str,
+) -> Result<String, JsError> {
+    use chip_voting_sdk::clvm_traits::ToClvm;
+    use chip_voting_sdk::clvmr::Allocator;
+    use clvm_utils::tree_hash;
+
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let election_id = cfg
+        .election_launcher_id()
+        .map_err(|e| JsError::new(&format!("election_launcher_id: {e}")))?;
+    let voter_pk = parse_pubkey_hex(voter_pk_hex, "voter_pk_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let wasm_params: WasmUpdateVoteParams = serde_json::from_str(params_json)
+        .map_err(|e| JsError::new(&format!("UpdateVoteParams parse: {e}")))?;
+    let sdk_params = wasm_params
+        .into_sdk()
+        .map_err(|e| JsError::new(&format!("UpdateVoteParams decode: {e}")))?;
+
+    let new_vote_message = chip_voting_sdk::puzzles::vote_message(
+        sdk_params.new_vote_data,
+        sdk_params.ballot_launcher_id,
+        election_id,
+    );
+
+    // Same shim shape as cast_vote preview: (q . ((50 voter_pk msg))).
+    let mut allocator = Allocator::new();
+    let pk_bytes = chia_protocol::Bytes::new(voter_pk.to_bytes().to_vec());
+    let msg_bytes = chia_protocol::Bytes::new(new_vote_message.to_vec());
+    let condition: (u8, (chia_protocol::Bytes, (chia_protocol::Bytes, ()))) =
+        (50, (pk_bytes, (msg_bytes, ())));
+    let conditions_value = vec![condition];
+    let conditions_node = conditions_value
+        .to_clvm(&mut allocator)
+        .map_err(|e| JsError::new(&format!("conditions to_clvm: {e}")))?;
+    let one_node = allocator
+        .new_atom(&[1])
+        .map_err(|e| JsError::new(&format!("alloc quote atom: {e:?}")))?;
+    let puzzle_node = allocator
+        .new_pair(one_node, conditions_node)
+        .map_err(|e| JsError::new(&format!("alloc puzzle pair: {e:?}")))?;
+    let solution_node = chip_voting_sdk::clvmr::NodePtr::NIL;
+    let puzzle_bytes = chip_voting_sdk::clvmr::serde::node_to_bytes(&allocator, puzzle_node)
+        .map_err(|e| JsError::new(&format!("serialize puzzle: {e:?}")))?;
+    let solution_bytes = chip_voting_sdk::clvmr::serde::node_to_bytes(&allocator, solution_node)
+        .map_err(|e| JsError::new(&format!("serialize solution: {e:?}")))?;
+    let puzzle_th = tree_hash(&allocator, puzzle_node);
+    let coin_ph = chia_protocol::Bytes32::new(puzzle_th.to_bytes());
+
+    let shim_coin_spend = chia_protocol::CoinSpend {
+        coin: chia_protocol::Coin::new(
+            chia_protocol::Bytes32::new([0u8; 32]),
+            coin_ph,
+            1,
+        ),
+        puzzle_reveal: chia_protocol::Program::from(puzzle_bytes),
+        solution: chia_protocol::Program::from(solution_bytes),
+    };
+    let wallet_spend = coin_spend_to_wallet(&shim_coin_spend);
+    let out = serde_json::json!({
+        "coinSpends": [wallet_spend],
+        "voteMessageHex": format!("0x{}", hex::encode(new_vote_message)),
+    });
+    serde_json::to_string(&out).map_err(|e| JsError::new(&format!("encode preview: {e}")))
+}
+
+/// Sage-friendly counterpart to [`updateVoteBuildFinalBundle`]. Takes
+/// the wallet-supplied `new_vote_signature_hex` (from
+/// [`updateVoteBuildPreviewSpend`] + chip0002_signCoinSpends partial)
+/// and returns the unsigned update_vote coin_spends in wallet RPC
+/// shape. Mirrors [`castVoteBuildUnsignedCoinSpends`].
+///
+/// Returns JSON `{ coinSpends: WalletCoinSpend[]; recreatedVotingCoinIdHex: string;
+///                 newVoteSignatureHex: string; newVoteMessageHex: string }`.
+#[wasm_bindgen(js_name = "updateVoteBuildUnsignedCoinSpends")]
+pub async fn update_vote_build_unsigned_coin_spends_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    voter_pk_hex: String,
+    params_json: String,
+    new_vote_signature_hex: String,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let voter_pk = parse_pubkey_hex(&voter_pk_hex, "voter_pk_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let wasm_params: WasmUpdateVoteParams = serde_json::from_str(&params_json)
+        .map_err(|e| JsError::new(&format!("UpdateVoteParams parse: {e}")))?;
+    let sdk_params = wasm_params
+        .into_sdk()
+        .map_err(|e| JsError::new(&format!("UpdateVoteParams decode: {e}")))?;
+    let sig_bytes = hex::decode(new_vote_signature_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("new_vote_signature_hex decode: {e}")))?;
+    if sig_bytes.len() != 96 {
+        return Err(JsError::new(
+            "new_vote_signature_hex must decode to 96 bytes (BLS G2)",
+        ));
+    }
+    let new_signature = chia_protocol::Bytes::new(sig_bytes);
+
+    let voter = build_voter_for_external_signing(cfg, voter_pk, network, election_start_height)?;
+    let chain = JsChainReader::new(backend);
+    let result = voter
+        .update_vote_build_coin_spends(&chain, &sdk_params, new_signature)
+        .await
+        .map_err(|e| JsError::new(&format!("update_vote_build_coin_spends: {e}")))?;
+
+    let wallet_spends: Vec<WalletCoinSpend> = result
+        .coin_spends
+        .iter()
+        .map(coin_spend_to_wallet)
+        .collect();
+    let out = serde_json::json!({
+        "coinSpends": wallet_spends,
+        "recreatedVotingCoinIdHex": format!("0x{}", hex::encode(result.recreated_voting_coin_id)),
+        "newVoteSignatureHex": format!("0x{}", hex::encode(result.new_vote_signature.as_ref())),
+        "newVoteMessageHex": format!("0x{}", hex::encode(result.new_vote_message)),
+    });
+    serde_json::to_string(&out).map_err(|e| JsError::new(&format!("encode result: {e}")))
 }
 
 /// Finalise an update-vote spend with the voter's BLS signature.
