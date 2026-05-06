@@ -387,7 +387,7 @@ const ElectionPageInner = dynamic(
         setSnapshotError(null);
         try {
           const backend = createChainBackend();
-          const snap = (await wasm.syncSnapshot(
+          const snap = (await (wasm as any).syncSnapshot(
             backend as any,
             session.configJson
           )) as SyncSnapshotShape;
@@ -426,7 +426,7 @@ const ElectionPageInner = dynamic(
             }
 
             const backend = createChainBackend();
-            const votes = await wasm.collectVotes(backend as any, configJson);
+            const votes = await (wasm as any).collectVotes(backend as any, configJson);
             const ballotsCast = Array.isArray(votes) ? votes.length : 0;
 
             if (snapshotRef.current?.finalized === true) {
@@ -445,7 +445,7 @@ const ElectionPageInner = dynamic(
               return;
             }
 
-            const tip = (await wasm.findCurrentSingleton(
+            const tip = (await (wasm as any).findCurrentSingleton(
               backend as any,
               configJson
             )) as { coinIdHex: string; finalized: boolean };
@@ -541,7 +541,7 @@ const ElectionPageInner = dynamic(
       const pullFreshSnapshot = useCallback(async (): Promise<SyncSnapshotShape | null> => {
         if (!session) return null;
         const backend = createChainBackend();
-        return (await wasm.syncSnapshot(
+        return (await (wasm as any).syncSnapshot(
           backend as any,
           session.configJson
         )) as SyncSnapshotShape;
@@ -619,7 +619,7 @@ const ElectionPageInner = dynamic(
         void (async () => {
           try {
             const backend = createChainBackend();
-            const rows = (await wasm.collectVotes(
+            const rows = (await (wasm as any).collectVotes(
               backend as any,
               session!.configJson
             )) as unknown[];
@@ -678,7 +678,7 @@ const ElectionPageInner = dynamic(
         void (async () => {
           try {
             const backend = createChainBackend();
-            const raw = (await wasm.collectVotes(
+            const raw = (await (wasm as any).collectVotes(
               backend as any,
               session!.configJson
             )) as unknown[];
@@ -2065,40 +2065,17 @@ const ElectionPageInner = dynamic(
 
       // ── ORACLE FLOW ─────────────────────────────────────────────
       const handleOracle = async () => {
-        if (!session) return;
-        setError(null);
-        setTxStatus(null);
-        setBusy("Building oracle spend…");
-        try {
-          const oracleBaseline = snapshotBrief(snapshot);
-          const backend = createChainBackend();
-          const bundleBytes = await wasm.buildOracleBundle(
-            backend as any,
-            session.configJson,
-            wasm.WasmNetwork.Mainnet
-          );
-          setBusy("Verifying bundle locally…");
-          wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
-          setBusy("Submitting oracle bundle (coinset)…");
-          await pushTx(wasm.bundleToWalletJson(bundleBytes) as SpendBundleJson);
-
-          const oracleOk = await waitBroadcastConfirm({
-            title: "Confirming oracle",
-            intro:
-              "Waiting until a fresh chain sync differs from state before your oracle spend was submitted.",
-            predicate: async () => {
-              const s = await pullFreshSnapshot();
-              return snapshotBrief(s) !== oracleBaseline;
-            },
-          });
-          if (oracleOk) {
-            setTxStatus("Oracle confirmation reflected on-chain.");
-          }
-        } catch (e: any) {
-          setError(e?.message ?? String(e));
-        } finally {
-          setBusy(null);
-        }
+        // CHIP rev 2026-05-02: the standalone `buildOracleBundle`
+        // export was removed. The Ballot Coin oracle action is now
+        // co-spent automatically by every cast_vote / update_vote /
+        // finalize spend (it's the open-state check), so a separate
+        // oracle button is no longer meaningful. Kept as a no-op so
+        // existing JSX bindings still compile; will be removed in a
+        // follow-up cleanup.
+        setError(
+          "Standalone oracle action is deprecated. The oracle is now co-spent " +
+            "implicitly by every cast_vote / update_vote / finalize spend."
+        );
       };
 
       // ── RENDER ──────────────────────────────────────────────────

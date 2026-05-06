@@ -213,8 +213,8 @@ export default dynamic(
             };
 
             setStatus("Awaiting wallet signature…");
-            const wcSpends = wasm.coinSpendsToWalletJson(
-              candidate.coinSpendsBytes
+            const wcSpends = JSON.parse(
+              wasm.coinSpendsBytesToWalletJson(candidate.coinSpendsBytes)
             ) as WalletConnectCoinSpend[];
             const signed = await walletConnect.signCoinSpends(
               wcSpends,
@@ -239,8 +239,9 @@ export default dynamic(
             setStatus("Verifying bundle locally…");
             wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
 
-            const walletBundle =
-              wasm.bundleToWalletJson(bundleBytes) as SpendBundleJson;
+            const walletBundle = JSON.parse(
+              wasm.bundleBytesToWalletJson(bundleBytes)
+            ) as SpendBundleJson;
             setStatus(
               parentAttempt === 0
                 ? "Submitting bundle to mempool (coinset)…"

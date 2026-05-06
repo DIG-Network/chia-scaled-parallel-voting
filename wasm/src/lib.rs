@@ -2600,6 +2600,22 @@ pub fn extract_wallet_coin_spends_from_bundle_js(
         .map_err(|e| JsError::new(&format!("encode WalletCoinSpend list: {e}")))
 }
 
+/// Decode a length-prefixed Streamable coin_spends list (the
+/// pre-bundle shape returned by `buildDeployBundle`,
+/// `extractCoinSpendsFromBundle`, etc.) and emit it in wallet RPC
+/// JSON. Equivalent to assembling a placeholder-sig bundle and then
+/// `extractWalletCoinSpendsFromBundle`, but skips the sig step.
+#[wasm_bindgen(js_name = "coinSpendsBytesToWalletJson")]
+pub fn coin_spends_bytes_to_wallet_json_js(
+    coin_spends_bytes: &[u8],
+) -> Result<String, JsError> {
+    let coin_spends = decode_coin_spends(coin_spends_bytes)?;
+    let wallet_spends: Vec<WalletCoinSpend> =
+        coin_spends.iter().map(coin_spend_to_wallet).collect();
+    serde_json::to_string(&wallet_spends)
+        .map_err(|e| JsError::new(&format!("encode WalletCoinSpend list: {e}")))
+}
+
 /// Re-assemble a Streamable `SpendBundle` from wallet-format
 /// coin_spends (Sage's `chip0002_signCoinSpends` input shape) plus
 /// the aggregated signature Sage returns. Inverse of
