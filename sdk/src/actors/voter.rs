@@ -1523,13 +1523,19 @@ impl Voter {
     /// singleton's current SPT root so the deregister proof can be
     /// computed; callers should sync via `Aggregator::sync_with_chain`
     /// or maintain their own SMT before calling.
-    pub async fn release_collateral<C: ChainReader>(
+    /// Sage-friendly variant of [`Voter::release_collateral`].
+    /// Returns the unsigned coin_spends; the caller (typically a
+    /// browser dApp via chip0002_signCoinSpends) signs the bundle's
+    /// AGG_SIG_ME conditions externally. release_collateral has no
+    /// `sign_unsafe` step (no off-chain aggregator sig like
+    /// cast_vote / update_vote) — Sage signs everything in one pass.
+    pub async fn release_collateral_build_coin_spends<C: ChainReader>(
         &self,
         chain: &C,
         smt: &crate::merkle::SparseMerkleTree,
         registration_coin_id: Bytes32,
         destination: Bytes32,
-    ) -> VotingResult<SpendBundle> {
+    ) -> VotingResult<Vec<CoinSpend>> {
         use clvm_traits::{clvm_curried_args, ToClvm};
         use clvm_utils::CurriedProgram;
 
@@ -1799,6 +1805,24 @@ impl Voter {
                 "Voter::release_collateral dry-run: {e:?}"
             )));
         }
+
+        Ok(coin_spends)
+    }
+
+    /// Build a release-collateral SpendBundle using `self.keys.secret`
+    /// for signing — the secret-key path for native CLI / integration
+    /// test callers. Browser dApps that don't hold the secret should
+    /// use [`Voter::release_collateral_build_coin_spends`].
+    pub async fn release_collateral<C: ChainReader>(
+        &self,
+        chain: &C,
+        smt: &crate::merkle::SparseMerkleTree,
+        registration_coin_id: Bytes32,
+        destination: Bytes32,
+    ) -> VotingResult<SpendBundle> {
+        let coin_spends = self
+            .release_collateral_build_coin_spends(chain, smt, registration_coin_id, destination)
+            .await?;
         let signature = sign_bundle_signature(
             &coin_spends,
             std::slice::from_ref(&self.keys.secret),

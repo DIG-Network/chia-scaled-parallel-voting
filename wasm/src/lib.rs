@@ -2357,6 +2357,51 @@ pub async fn release_collateral_build_spends_js(
     Ok(hex::encode(&bundle_bytes))
 }
 
+/// Sage-friendly variant of [`releaseCollateralBuildSpends`]. Takes
+/// the voter's PUBLIC key (Sage holds the secret) plus the same SMT /
+/// reg-coin-id / destination args, returns the unsigned coin_spends
+/// in wallet RPC shape. The dApp calls chip0002_signCoinSpends in
+/// partial mode to produce the bundle aggregate, then
+/// [`assembleSpendBundleFromWalletCoinSpends`].
+///
+/// Returns JSON `{ coinSpends: WalletCoinSpend[] }`.
+#[wasm_bindgen(js_name = "releaseCollateralBuildUnsignedCoinSpends")]
+pub async fn release_collateral_build_unsigned_coin_spends_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    voter_pk_hex: String,
+    voter_pubkeys_hex_json: String,
+    registration_coin_id_hex: String,
+    destination_puzzle_hash_hex: String,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let voter_pk = parse_pubkey_hex(&voter_pk_hex, "voter_pk_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let smt = build_smt_from_pubkey_json(&voter_pubkeys_hex_json, "voter_pubkeys_hex_json")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let registration_coin_id = parse_hex32(&registration_coin_id_hex)
+        .map_err(|e| JsError::new(&format!("registration_coin_id_hex: {e}")))?;
+    let destination = parse_hex32(&destination_puzzle_hash_hex)
+        .map_err(|e| JsError::new(&format!("destination_puzzle_hash_hex: {e}")))?;
+
+    let voter = build_voter_for_external_signing(cfg, voter_pk, network, election_start_height)?;
+    let chain = JsChainReader::new(backend);
+    let coin_spends = voter
+        .release_collateral_build_coin_spends(&chain, &smt, registration_coin_id, destination)
+        .await
+        .map_err(|e| JsError::new(&format!("release_collateral_build_coin_spends: {e}")))?;
+
+    let wallet_spends: Vec<WalletCoinSpend> =
+        coin_spends.iter().map(coin_spend_to_wallet).collect();
+    let out = serde_json::json!({ "coinSpends": wallet_spends });
+    serde_json::to_string(&out).map_err(|e| JsError::new(&format!("encode result: {e}")))
+}
+
 // ============================================================================
 // SECTION 10 — Bundle assembly helper
 // ============================================================================

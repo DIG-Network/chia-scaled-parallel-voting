@@ -1777,33 +1777,99 @@ const ElectionPageInner = dynamic(
         setBusy("Releasing collateral…");
         try {
           const baseline = snapshotBrief(snapshot);
+          const cfg = JSON.parse(session.configJson);
+          const electionStartHeight = Number(cfg.election_start_height ?? 0);
+          const catTail = "0x" + String(cfg.cat_tail_hash_hex ?? "").replace(/^0x/, "");
+
+          // ── 1. Find the voter's CURRENT registration coin via
+          //      voter_hint. After cast_vote the reg coin gets
+          //      recreated at a state-shifted ph that the static
+          //      `freshRegistrationCoinPuzzleHash` no longer
+          //      predicts. Filter out the released-CAT coin (also
+          //      hinted with voter_hint).
+          const voterHintHex = wasm.voterHint(
+            "0x" + String(cfg.election_launcher_id_hex ?? "").replace(/^0x/, ""),
+            catTail,
+            effectiveVoterPk
+          );
           const dest = wasm.standardPuzzleHash(effectiveVoterPk);
+          const releasedCatPh = String(
+            wasm.catOuterPuzzleHash(catTail, dest)
+          )
+            .replace(/^0x/, "")
+            .toLowerCase();
           const backend = createChainBackend();
-          setBusy("Building release spends…");
-          const wcSpends = (await wasm.releaseCollateralBuildSpends(
+          setBusy("Locating registration coin via voter_hint…");
+          const { coinRecordsByHint } = await import("../lib/coinset");
+          const hintRecords = await coinRecordsByHint(voterHintHex, true);
+          const unspentReg = hintRecords.find(
+            (c) =>
+              c.spentHeight === 0 &&
+              String(c.puzzleHash).replace(/^0x/, "").toLowerCase() !== releasedCatPh
+          );
+          if (!unspentReg) {
+            throw new Error(
+              "No unspent Registration Coin at your voter_hint — already released, or never registered."
+            );
+          }
+          // Compute coin id (sha256(parent || ph || amount be8)).
+          const { Coin } = await import("chia-wallet-sdk-wasm");
+          const coin = new Coin(
+            hexToBytes(unspentReg.parentCoinInfo),
+            hexToBytes(unspentReg.puzzleHash),
+            BigInt(unspentReg.amount)
+          );
+          const regCoinIdBytes = coin.coinId();
+          const regCoinIdHex =
+            "0x" +
+            Array.from(regCoinIdBytes)
+              .map((b) => b.toString(16).padStart(2, "0"))
+              .join("");
+
+          // ── 2. Voter pubkey list — must match on-chain SMT. The
+          //      session bootstrap tracks every voter we know about.
+          //      Empty list = SMT root mismatch downstream; the SDK
+          //      surfaces a clear "re-sync" error.
+          const voterPubkeys = session.registeredPubkeysHex ?? [];
+
+          // ── 3. Build unsigned coin_spends (Sage signs externally).
+          setBusy("Building release coin_spends…");
+          const unsignedJson = await wasm.releaseCollateralBuildUnsignedCoinSpends(
             backend as any,
             session.configJson,
             effectiveVoterPk,
-            dest
-          )) as SpendBundleJson["coin_spends"];
+            JSON.stringify(voterPubkeys),
+            regCoinIdHex,
+            dest,
+            wasm.WasmNetwork.Mainnet,
+            BigInt(electionStartHeight)
+          );
+          const unsigned = JSON.parse(unsignedJson) as {
+            coinSpends: SpendBundleJson["coin_spends"];
+          };
 
-          setBusy("Awaiting wallet signature…");
+          setBusy("Awaiting Sage signature on bundle…");
           const sigHex = await walletConnect.signCoinSpends(
-            wcSpends,
-            false,
+            unsigned.coinSpends,
+            true,
             false
           );
           if (!sigHex) {
             throw new Error("Wallet rejected the signature request");
           }
 
-          setBusy("Submitting collateral release bundle (coinset)…");
-          const relBundleBytes =
-            wasm.assembleSpendBundleFromWalletCoinSpends(wcSpends, sigHex);
-          wasm.verifyBundleLocally(relBundleBytes, wasm.WasmNetwork.Mainnet);
-          await pushTx(
-            wasm.bundleToWalletJson(relBundleBytes) as SpendBundleJson
+          setBusy("Assembling and verifying bundle…");
+          const relBundleBytes = wasm.assembleSpendBundleFromWalletCoinSpends(
+            JSON.stringify(unsigned.coinSpends),
+            sigHex
           );
+          wasm.verifyBundleLocally(relBundleBytes, wasm.WasmNetwork.Mainnet);
+
+          setBusy("Submitting collateral release bundle (coinset)…");
+          const bundleJson = JSON.parse(
+            wasm.bundleBytesToWalletJson(relBundleBytes)
+          ) as SpendBundleJson;
+          await pushTx(bundleJson);
 
           const released = await waitBroadcastConfirm({
             title: "Confirming collateral release",
@@ -1944,33 +2010,44 @@ const ElectionPageInner = dynamic(
             };
           };
 
-          const collectVotesWithProgressFn = (
-            wasm as { collectVotesWithProgress?: (...a: unknown[]) => Promise<unknown> }
-          ).collectVotesWithProgress;
-
-          let wireVotes: VoteWireLite[];
-          if (typeof collectVotesWithProgressFn === "function") {
-            wireVotes = (await collectVotesWithProgressFn.call(
-              wasm,
-            backend as any,
-              session.configJson,
-              (progressRaw: unknown) => {
-                const pl = readCollectProgress(progressRaw);
-                if (!pl) return;
-                setFinalizeModal({
-                  title: "Finalize election",
-                  phase: "collect",
-                  detail: `${finalizeCollectStageLabel(pl.stage)} — decoded ballots collected: ${pl.ballotsCollected}.`,
-                  collect: pl,
-                });
-              }
-            )) as VoteWireLite[];
-          } else {
-            wireVotes = (await wasm.collectVotes(
-              backend as any,
-              session.configJson
-            )) as VoteWireLite[];
+          // CHIP rev 2026-05-02: votes are per-ballot. Pick the
+          // newest closed ballot whose snapshot we hold; the
+          // collectVotesForBallot walk traverses the Voting Coin
+          // lineage hint-indexed by voter_hint, scoped to this one
+          // ballot's launcher.
+          const peakNow = await peakHeight();
+          if (!peakNow) throw new Error("Could not read chain peak");
+          const closedBallots = (await import("../lib/ballotBootstrap"))
+            .listBallotBootstraps(launcherIdHex)
+            .filter((b) => b.voteCloseHeight <= peakNow && !!b.eveBallotCoinIdHex)
+            .sort((a, b) => (b.launchedAtHeight ?? 0) - (a.launchedAtHeight ?? 0));
+          const finalizeBallot = closedBallots[0];
+          if (!finalizeBallot) {
+            throw new Error(
+              "No closed ballot in this session. The vote close height must have passed for the ballot you want to finalize."
+            );
           }
+
+          // Voter pubkey list — the union of every voter we know about
+          // from the session bootstrap. Empty list = no votes; the
+          // SDK errors below if zero ballots collected.
+          const voterPubkeys = session.registeredPubkeysHex ?? [];
+
+          setFinalizeModal({
+            title: "Finalize election",
+            phase: "collect",
+            detail:
+              `Walking Voting Coin lineage for ballot ${finalizeBallot.ballotLauncherIdHex.slice(0, 10)}… ` +
+              `(${voterPubkeys.length} known voter pubkey(s)).`,
+            collect: null,
+          });
+          const wireVotesJson = (await wasm.collectVotesForBallot(
+            backend as any,
+            session.configJson,
+            finalizeBallot.ballotLauncherIdHex,
+            JSON.stringify(voterPubkeys)
+          )) as string;
+          const wireVotes = JSON.parse(wireVotesJson) as VoteWireLite[];
 
           setFinalizeModal({
             title: "Finalize election",
@@ -2016,15 +2093,33 @@ const ElectionPageInner = dynamic(
               "The proving step typically runs tens of seconds to a few minutes depending on quorum size — leave this tab open.",
           });
           const pkBytes = base64ToBytes(session.provingKeyBase64);
-          const bundleBytes = await wasm.buildFinalizeBundleFromCollectedVotes(
+          const cfg = JSON.parse(session.configJson);
+          const electionStartHeight = Number(cfg.election_start_height ?? 0);
+          // Per-ballot finalize. Snapshot fields MUST mirror what
+          // `BallotIssuer::launch_ballot` curried into the eve Ballot
+          // Coin (captured by handleCreateAndLaunchBallot via
+          // wasm.readElectionSingletonState).
+          const finalizeParams = {
+            voteCloseHeight: finalizeBallot.voteCloseHeight,
+            voteThresholdNum: finalizeBallot.voteThresholdNum,
+            voteThresholdDen: finalizeBallot.voteThresholdDen,
+            registrationMerkleRootSnapshotHex:
+              finalizeBallot.registrationMerkleRootSnapshotHex,
+            registrationVoteWeightSnapshot:
+              finalizeBallot.registrationVoteWeightSnapshot,
+          };
+          const bundleHex = await wasm.buildBallotFinalizeBundle(
             backend as any,
             session.configJson,
-            pkBytes,
+            finalizeBallot.ballotLauncherIdHex,
             outcomeHex,
-            dest,
-            wireVotes as any,
-            wasm.WasmNetwork.Mainnet
+            JSON.stringify(finalizeParams),
+            wireVotesJson,
+            pkBytes,
+            wasm.WasmNetwork.Mainnet,
+            BigInt(electionStartHeight)
           );
+          const bundleBytes = hexToBytes(bundleHex);
 
           setFinalizeModal({
             title: "Finalize election",
@@ -2033,7 +2128,9 @@ const ElectionPageInner = dynamic(
           });
           wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
 
-          const bundleJson = wasm.bundleToWalletJson(bundleBytes) as SpendBundleJson;
+          const bundleJson = JSON.parse(
+            wasm.bundleBytesToWalletJson(bundleBytes)
+          ) as SpendBundleJson;
           const finalizedBefore = (await pullFreshSnapshot())?.finalized === true;
 
           // CHIP‑0002: prefer full-node mempool submit over `chip0002_sendTransaction`.
