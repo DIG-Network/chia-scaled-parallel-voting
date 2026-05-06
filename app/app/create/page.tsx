@@ -201,16 +201,27 @@ export default dynamic(
             }
 
             setStatus("Building deploy spend bundle…");
-            const candidate = (await wasm.buildDeployBundle(
-              params,
-              parent,
-              synPk
-            )) as {
+            // serde_wasm_bindgen + #[serde(with = "serde_bytes")] emits
+            // a JS Map (not a plain object) for the artifacts struct.
+            // Convert via Object.fromEntries when that happens —
+            // mirrors the dance in
+            // wasm/integration-tests/live_integration.mjs::phaseDeploy.
+            const artifactsRaw = await wasm.buildDeployBundle(params, parent, synPk);
+            const candidate = (
+              artifactsRaw instanceof Map
+                ? Object.fromEntries(artifactsRaw)
+                : artifactsRaw
+            ) as {
               coinSpendsBytes: Uint8Array;
               launcherIdHex: string;
               configJson: string;
               eveSingletonCoinIdHex: string;
             };
+            if (!candidate?.coinSpendsBytes) {
+              throw new Error(
+                "buildDeployBundle returned no coin_spends_bytes — wasm/JS shape mismatch"
+              );
+            }
 
             setStatus("Awaiting wallet signature…");
             const wcSpends = JSON.parse(
