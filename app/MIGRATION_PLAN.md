@@ -265,3 +265,70 @@ chunk — it adds capability without touching broken code.
     `sign_unsafe`, just an unsigned-builder variant) + UI
     handleRelease migration.
   - Phase 8: cleanup of dead helpers + `next build` smoke + e2e.
+
+- **2026-05-06 session 2**:
+  - Phase 1 done: Sage-bundle conversion helpers for the dApp:
+    `bundleBytesToWalletJson`, `extractWalletCoinSpendsFromBundle`,
+    `assembleSpendBundleFromWalletCoinSpends`. Plus operator-only
+    `handleCreateAndLaunchBallot` UI on /election + new
+    `app/lib/ballotBootstrap.ts` for per-ballot persistence.
+  - Phase 4 done: `handleVote` migrated to `castVoteBuildPreviewSpend`
+    + `castVoteBuildUnsignedCoinSpends` chain, reads ballot
+    bootstrap, uses `collectVotesForBallot` for the confirm poll.
+  - Phase 5 done: SDK split for `update_vote`
+    (`Voter::update_vote_build_coin_spends` + thin wrapper); wasm
+    `updateVoteBuildPreviewSpend` (was a stub) + new
+    `updateVoteBuildUnsignedCoinSpends`; `handleChangeVote` migrated
+    (uses `collectVotesForBallot` to find existing
+    voting/registration coin ids before calling preview).
+  - Phase 6 done: `handleFinalize` migrated. `wasm.collectVotes` →
+    `wasm.collectVotesForBallot` (per-ballot, takes voter pubkey list
+    from `session.registeredPubkeysHex`); `buildFinalizeBundleFromCollectedVotes`
+    → `buildBallotFinalizeBundle` (per-ballot, takes the bootstrap
+    snapshot pack); `bundleToWalletJson` →
+    `bundleBytesToWalletJson`. Picks the newest closed ballot from
+    `listBallotBootstraps` (`vote_close_height <= peak`).
+  - Phase 7 done: SDK split for `release_collateral`
+    (`Voter::release_collateral_build_coin_spends` returns unsigned
+    coin_spends; existing `release_collateral` is a wrapper that
+    signs). Wasm `releaseCollateralBuildUnsignedCoinSpends` Sage-
+    friendly variant. `handleRelease` migrated: looks up the current
+    registration coin via `voterHint` (filters out the released-CAT
+    coin via `catOuterPuzzleHash` ph), calls the unsigned wasm
+    builder, Sage signs partial, assembles + verifies + pushes.
+
+- **Next session priority — Phase 8 (handleRegister + cleanup)**:
+  1. **handleRegister** is still wired to gone exports
+     (`buildCatCollateralSpend`, `buildRegistrationFeeXchSpend`,
+     `buildMempoolFeeXchSpend`, `bundleToWalletJson`). Approach:
+     a. SDK split for `Voter::register` mirroring the release pattern
+        (just an unsigned-builder variant; register has no
+        `sign_unsafe`). Add
+        `Voter::register_build_coin_spends(&smt, cat_parent_spend,
+        chain) -> Vec<CoinSpend>`.
+     b. Wasm Sage variant of `buildCatRegistrationSpend` that takes
+        BOTH `voter_pk_hex` and `validator_synthetic_pk_hex`
+        externally (existing version derives both from a secret) and
+        returns the unsigned CAT coin_spend bytes.
+     c. Wasm `registerBuildUnsignedCoinSpends` taking the same
+        `voter_pk_hex + voter_pubkeys + cat_parent_spend +
+        network + election_start_height` shape, returning
+        wallet-format coin_spends.
+     d. UI `handleRegister` rewrite — drop
+        `discoverRegistrationFeeXch` / `discoverMempoolFeeXch` (the
+        new model has no separate fee inputs in the bundle; if a
+        fee output is desired the dApp can attach it as a separate
+        XCH funder spend, but the SDK doesn't require it).
+  2. **handleOracle** — uses `buildOracleBundle` (removed). The
+     ballot oracle action is now part of cast_vote / update_vote, not
+     a standalone bundle. Either remove handleOracle entirely or
+     migrate to a per-ballot oracle helper if such a thing exists.
+  3. **Lifecycle / sync effects** at lines ~390, 429, 448, 544, 622,
+     681 use `syncSnapshot`, `collectVotes`, `findCurrentSingleton`.
+     Map to `wasm.readElectionSingletonState` (already exported) +
+     `collectVotesForBallot` (per-ballot, needs ballot picker) +
+     equivalent of `findCurrentSingleton` (also `readElectionSingletonState`).
+  4. **app/create/page.tsx** — uses `coinSpendsToWalletJson` and
+     `bundleToWalletJson`. Two single-line swaps.
+  5. After all type errors clear, run `next build` end-to-end and
+     smoke-test on testnet11 if available.
