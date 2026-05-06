@@ -1537,7 +1537,17 @@ pub async fn find_current_singleton<C: ChainReader>(
     // otherwise the walker returns a stale tip and the next spend gets
     // MINTING_COIN/DOUBLE_SPEND on the chain.
     let eve_records = chain.coin_records_by_puzzle_hash(eve_ph).await?;
-    let eve_candidate = match eve_records.iter().find(|r| r.is_unspent()) {
+    // Post-eve singletons keep the same outer puzzle_hash whenever the
+    // curried inner state hasn't changed (createBallot/launchBallot
+    // pass through registration_merkle_root + count). So the secondary
+    // index can return BOTH the (spent) eve AND a (unspent) post-eve
+    // generation. Only the eve has parent_coin_info == launcher_id;
+    // anything else is a generation-2+ coin that needs Proof::Lineage,
+    // which the slow path constructs correctly.
+    let eve_candidate = match eve_records
+        .iter()
+        .find(|r| r.is_unspent() && r.coin.parent_coin_info == launcher_id)
+    {
         Some(c) => match chain.coin_record_by_id(c.coin.coin_id()).await? {
             Some(authoritative) if authoritative.is_unspent() => Some(c),
             // Primary disagrees — the index returned a stale "unspent"
