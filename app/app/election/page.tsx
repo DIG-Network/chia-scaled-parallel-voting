@@ -35,6 +35,7 @@ import {
 } from "../lib/electionBootstrap";
 import {
   writeBallotBootstrap,
+  pickOpenBallotForVoting,
   type BallotBootstrap,
 } from "../lib/ballotBootstrap";
 import {
@@ -1383,6 +1384,7 @@ const ElectionPageInner = dynamic(
         setTxStatus(null);
         setBusy("Voting…");
         try {
+          // ── 1. Resolve vote_data from UI input ────────────────
           let voteHex: string;
           if (session.choices && session.choices.length > 0) {
             if (pickedChoiceIdx === null) {
@@ -1391,69 +1393,128 @@ const ElectionPageInner = dynamic(
             voteHex = session.choices[pickedChoiceIdx].voteDataHex;
           } else {
             voteHex = freeformVote.trim();
-          if (!voteHex.startsWith("0x")) voteHex = "0x" + voteHex;
-          if (voteHex.length !== 66) {
+            if (!voteHex.startsWith("0x")) voteHex = "0x" + voteHex;
+            if (voteHex.length !== 66) {
               const enc = new TextEncoder().encode(freeformVote);
-            const hash = await crypto.subtle.digest("SHA-256", enc);
-            voteHex =
-              "0x" +
-              Array.from(new Uint8Array(hash))
-                .map((b) => b.toString(16).padStart(2, "0"))
-                .join("");
+              const hash = await crypto.subtle.digest("SHA-256", enc);
+              voteHex =
+                "0x" +
+                Array.from(new Uint8Array(hash))
+                  .map((b) => b.toString(16).padStart(2, "0"))
+                  .join("");
             }
           }
-          const backend = createChainBackend();
 
-          // 1. Build placeholder spend.
-          setBusy("Building preview vote spend…");
-          const previewSpends = (await wasm.voteBuildPreviewSpend(
-            backend as any,
-            session.configJson,
-            effectiveVoterPk,
-            voteHex
-          )) as SpendBundleJson["coin_spends"];
-
-          // 2. Sage signs (partial mode — single AGG_SIG_UNSAFE).
-          // The returned 96-byte sig IS the canonical signature
-          // because the spend has exactly one AGG_SIG.
-          setBusy("Awaiting wallet signature…");
-          const sigHex = await walletConnect.signCoinSpends(
-            previewSpends,
-            true,  // partial — one AGG_SIG_UNSAFE only
-            false  // no auto-submit
-          );
-          if (!sigHex) {
-            throw new Error("Wallet rejected the signature request");
-          }
-          const sigBytes = hexToBytes(sigHex);
-          if (sigBytes.length !== 96) {
+          // ── 2. Pick the open ballot to cast against ────────────
+          // Reads from per-ballot bootstrap (populated by
+          // handleCreateAndLaunchBallot or share-bundle import). The
+          // CHIP-rev-2026-05-02 vote flow is per-ballot, not
+          // per-election: every cast_vote spends one specific Ballot
+          // Coin singleton's oracle action and is curried to a
+          // specific (vote_close_height, threshold, registration
+          // snapshot).
+          setBusy("Locating an open ballot…");
+          const peak = await peakHeight();
+          if (!peak) throw new Error("Could not read chain peak");
+          const ballot = pickOpenBallotForVoting(launcherIdHex, peak);
+          if (!ballot) {
             throw new Error(
-              `Wallet returned a ${sigBytes.length}-byte signature; ` +
-                `expected 96 bytes. ` +
-                `Make sure Sage's chip0002_signCoinSpends is in ` +
-                `partial-aggregate mode (the AGG_SIG_UNSAFE on the ` +
-                `vote action is the spend's only signature requirement).`
+              "No open ballot in this session. Ask the deployer to mint one (Mint a new ballot card), " +
+                "or import a share bundle that includes ballot bootstrap."
             );
           }
 
-          // 3. Rebuild final spend with real sig in memo.
-          setBusy("Building final vote bundle…");
-          const bundleBytes = await wasm.voteBuildFinalBundle(
+          const params = {
+            ballotLauncherIdHex: ballot.ballotLauncherIdHex,
+            voteDataHex: voteHex,
+            voteCloseHeight: ballot.voteCloseHeight,
+            voteThresholdNum: ballot.voteThresholdNum,
+            voteThresholdDen: ballot.voteThresholdDen,
+            registrationMerkleRootSnapshotHex:
+              ballot.registrationMerkleRootSnapshotHex,
+            registrationVoteWeightSnapshot:
+              ballot.registrationVoteWeightSnapshot,
+            votingCoinAmount: 1,
+          };
+          const cfg = JSON.parse(session.configJson);
+          const electionStartHeight = Number(cfg.election_start_height ?? 0);
+
+          const backend = createChainBackend();
+
+          // ── 3. Sage signs the vote_message via a one-condition
+          //      AggSigUnsafe shim spend. The wallet's partial-mode
+          //      aggregate is byte-for-byte equal to
+          //      sign_unsafe(vote_message). ─────────────────────────
+          setBusy("Building preview vote spend…");
+          const previewJson = await wasm.castVoteBuildPreviewSpend(
             backend as any,
             session.configJson,
             effectiveVoterPk,
-            voteHex,
-            sigBytes
+            JSON.stringify(params)
           );
+          const preview = JSON.parse(previewJson) as {
+            coinSpends: SpendBundleJson["coin_spends"];
+            voteMessageHex: string;
+          };
 
-          setBusy("Verifying bundle locally…");
+          setBusy("Awaiting Sage signature on vote message…");
+          const voteSigHex = await walletConnect.signCoinSpends(
+            preview.coinSpends,
+            true,  // partial — single AGG_SIG_UNSAFE
+            false  // no auto-submit
+          );
+          if (!voteSigHex) {
+            throw new Error("Wallet rejected the vote-message signature request");
+          }
+
+          // ── 4. Build the real cast_vote coin_spends with the
+          //      voter's signature embedded in the mint_voting_coin
+          //      memo. Returns the unsigned bundle in wallet shape;
+          //      Sage will sign it (its AGG_SIG_ME conditions) in the
+          //      next step. ────────────────────────────────────────
+          setBusy("Building cast_vote bundle…");
+          const unsignedJson = await wasm.castVoteBuildUnsignedCoinSpends(
+            backend as any,
+            session.configJson,
+            effectiveVoterPk,
+            JSON.stringify(params),
+            voteSigHex,
+            wasm.WasmNetwork.Mainnet,
+            BigInt(electionStartHeight)
+          );
+          const unsigned = JSON.parse(unsignedJson) as {
+            coinSpends: SpendBundleJson["coin_spends"];
+            votingCoinIdHex: string;
+            voteSignatureHex: string;
+            voteMessageHex: string;
+          };
+
+          // ── 5. Sage signs the full bundle's AGG_SIG_ME conditions.
+          setBusy("Awaiting Sage signature on bundle…");
+          const aggSigHex = await walletConnect.signCoinSpends(
+            unsigned.coinSpends,
+            true,  // partial — wallet returns aggregate without auto-submit
+            false
+          );
+          if (!aggSigHex) {
+            throw new Error("Wallet rejected the bundle signature request");
+          }
+
+          // ── 6. Assemble + verify + push ────────────────────────
+          setBusy("Assembling and verifying bundle…");
+          const bundleBytes = wasm.assembleSpendBundleFromWalletCoinSpends(
+            JSON.stringify(unsigned.coinSpends),
+            aggSigHex
+          );
           wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
 
           setBusy("Submitting bundle to mempool (coinset)…");
-          await pushTx(
-            wasm.bundleToWalletJson(bundleBytes) as SpendBundleJson
-          );
+          const bundleJson = JSON.parse(
+            wasm.bundleBytesToWalletJson(bundleBytes)
+          ) as SpendBundleJson;
+          await pushTx(bundleJson);
 
+          // ── 7. Optimistic state + on-chain confirm ─────────────
           const vdCanon = voteHex.trim().startsWith("0x")
             ? voteHex.trim().toLowerCase()
             : `0x${normalizeHex32(voteHex)}`;
@@ -1467,12 +1528,16 @@ const ElectionPageInner = dynamic(
               "Waiting until coinset-backed reads detect your ballot (same source as tally).",
             predicate: async () => {
               const b = createChainBackend();
-              const rows = (await wasm.collectVotes(
+              const rowsJson = (await wasm.collectVotesForBallot(
                 b as any,
-                session.configJson
-              )) as unknown[];
-              for (const r of rows ?? []) {
-                const row = r as Record<string, string | undefined>;
+                session.configJson,
+                ballot.ballotLauncherIdHex,
+                JSON.stringify([effectiveVoterPk])
+              )) as string;
+              const rows = JSON.parse(rowsJson) as Array<
+                Record<string, string | undefined>
+              >;
+              for (const row of rows ?? []) {
                 const rk = normalizeHex32(
                   row.voter_pubkey_hex ?? row.voterPubkeyHex ?? ""
                 );
