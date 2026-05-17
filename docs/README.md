@@ -1,12 +1,14 @@
 # CHIP companion documents
 
-These Markdown files live next to the main draft **[CHIP_DRAFT.md](./CHIP_DRAFT.md)**—the CHIP body stays a higher-level overview; companion files add **protocol flow** and **puzzle-level** detail.
+The **[chia-parallel-voting](https://github.com/DIG-Network/chia-parallel-voting)** repo (`main`) holds the CHIP draft, companions, puzzles, and SDK. Browse the **`docs/`** tree on GitHub: [`github.com/DIG-Network/chia-parallel-voting/tree/main/docs`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/docs).
 
 | Document | Contents |
 |----------|----------|
-| [CHIP_DRAFT.md](./CHIP_DRAFT.md) | Main CHIP draft (abstract through specification summary) |
-| [chip-protocol-flow.md](./chip-protocol-flow.md) | End-to-end phases: ceremony → deploy → register → ballots → vote → finalize → deregister / release |
-| [chip-ceremony.md](./chip-ceremony.md) | Ceremony Singleton, marker coins, voucher, `CANONICAL_MSG`, inner action tables |
-| [chip-election-coins.md](./chip-election-coins.md) | `ElectionState`, Election / Ballot / Registration / Voting inner actions and state |
-| [chip-witnesses-encoding.md](./chip-witnesses-encoding.md) | SPT definitions, vote modes, `vote_message`, eight public inputs, constants, announcements |
-| [chip-groth16-clvm.md](./chip-groth16-clvm.md) | Groth16 + CLVM (CHIP-0011), finalize split with BLS, tolerance/threshold figures in `assets/` |
+| [**CHIP_DRAFT.md**](https://github.com/DIG-Network/chia-parallel-voting/blob/main/docs/CHIP_DRAFT.md) (local: [./CHIP_DRAFT.md](./CHIP_DRAFT.md)) | Main CHIP draft — abstract through specification summary; companion table links to the files below |
+| [**chip-protocol-flow.md**](https://github.com/DIG-Network/chia-parallel-voting/blob/main/docs/chip-protocol-flow.md) | Phases 0–5 with *Implementation* paragraphs pointing at [`puzzles/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles), [`sdk/src/actors/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/sdk/src/actors), [`cli/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/cli) |
+| [**chip-ceremony.md**](https://github.com/DIG-Network/chia-parallel-voting/blob/main/docs/chip-ceremony.md) | Ceremony singleton — inner-action table includes **Source** column; marker [`marker.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ceremony_coin/marker.rue), voucher [`ceremony_voucher.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ceremony_singleton/ceremony_voucher.rue) |
+| [**chip-election-coins.md**](https://github.com/DIG-Network/chia-parallel-voting/blob/main/docs/chip-election-coins.md) | Election / ballot / registration / voting — each section ends with *Rue* / *actor* links to [`puzzles/election/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/election), [`ballot_coin/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/ballot_coin), etc. |
+| [**chip-witnesses-encoding.md**](https://github.com/DIG-Network/chia-parallel-voting/blob/main/docs/chip-witnesses-encoding.md) | SPTs, vote modes, `vote_message`, eight public inputs — cites [`merkle_utils.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/merkle_utils.rue), [`circuit.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/prover/circuit.rs), [`finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/finalize.rue), [`ballot_coin/shared.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/shared.rue) |
+| [**chip-groth16-clvm.md**](https://github.com/DIG-Network/chia-parallel-voting/blob/main/docs/chip-groth16-clvm.md) | Groth16 + CLVM — numbered steps reference [`finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/finalize.rue); figures in [`assets/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/assets) |
+
+**Also:** [`sdk/tests/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/sdk/tests) (integration / E2E), workspace [`Cargo.toml`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/Cargo.toml), top-level [`README.md`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/README.md).

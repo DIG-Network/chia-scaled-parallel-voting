@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 edition     = "2021"
 license     = "MIT"
-repository  = "https://github.com/dig-network/CHIP"
+repository  = "https://github.com/DIG-Network/chia-parallel-voting"
 
 [workspace.dependencies]
 # Core Chia primitives — same line as dig-l1-wallet 0.1.

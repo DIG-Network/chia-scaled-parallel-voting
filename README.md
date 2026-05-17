@@ -2,7 +2,7 @@
 
 Reference implementation and **CHIP draft** for large-scale, permissionless voting on [Chia](https://www.chia.net/): an **Election Singleton** orchestrates registration and ballot issuance; **Registration**, **Ballot**, and **Voting** coins separate enrollment from parallel votes; each ballot finalizes with **Groth16** and an aggregate **BLS** check on-chain ([CHIP-0011](https://github.com/Chia-Network/chips/blob/main/CHIPs/chip-0011.md)). Inner actions follow the [CHIP-0050](https://github.com/Yakuhito/chips/blob/b23ed49e00164cbc62b9b6ae4d48071930c5b1d2/CHIPs/chip-0050.md) action layer. A **ceremony** lineage produces the circuit verification key used at election deploy.
 
-**Maintainer:** [DIG Network](https://github.com/DIG-Network)
+**Maintainer:** [DIG Network](https://github.com/DIG-Network) · **Repository:** [github.com/DIG-Network/chia-parallel-voting](https://github.com/DIG-Network/chia-parallel-voting)
 
 ## Quick deploy (web app)
 
@@ -29,6 +29,10 @@ npm run dev
 
 More detail, architecture, and page routes: [`app/README.md`](app/README.md).
 
+### SAGE Wallet (browser limits)
+
+The dApp integrates **[SAGE Wallet](https://sagewallet.net/)** via **WalletConnect**. SAGE does **not** yet expose the **`SIGN_UNSAFE`** WalletConnect API that unsafe/CHIP-0002-style spend signing relies on, so you can only get **partway** through on-chain flows in the browser before the UI is blocked. The **CLI live integration tests** (e.g. `chip-voting-live-test`) already run the **full** election lifecycle end-to-end against a real network. Once SAGE adds the **`SIGN_UNSAFE`** endpoint, the browser app can be **completed** without changing this repository’s voting protocol.
+
 ## Features
 
 - **Parallel voting lane** — `mint_voting_coin` / `update_vote` do not spend the election singleton.
@@ -36,17 +40,19 @@ More detail, architecture, and page routes: [`app/README.md`](app/README.md).
 - **CAT-collateralized registration** — membership in a registration sparse Merkle tree; per-registration ballot trees enforce one voting lineage per ballot.
 - **Trusted-setup ceremony** — contribute / finalize flow with voucher binding for `vk_hash` and deployment limits.
 - **Rust SDK and CLI** — construct spends and bundles; callers push transactions (e.g. via `chia-query`).
-- **WASM** — browser-side helpers for dApps; **Next.js app** under `app/` for exploratory UI.
+- **WASM** — browser-side helpers for dApps; **Next.js app** under `app/` with **SAGE Wallet** (WalletConnect); see **SAGE Wallet (browser limits)** above.
 
 ## Documentation
 
+CHIP text and normative companions with **links to source on `main`**: **[`docs/` on GitHub](https://github.com/DIG-Network/chia-parallel-voting/tree/main/docs)**.
+
 | Resource | Description |
 |----------|-------------|
-| [docs/CHIP_DRAFT.md](docs/CHIP_DRAFT.md) | Main CHIP draft (abstract, motivation, specification summary) |
-| [docs/README.md](docs/README.md) | Index of companion specs (protocol flow, ceremony, coins, witnesses, Groth16+CLVM) |
+| [docs/CHIP_DRAFT.md](docs/CHIP_DRAFT.md) | Main CHIP draft ([blob](https://github.com/DIG-Network/chia-parallel-voting/blob/main/docs/CHIP_DRAFT.md)) |
+| [docs/README.md](docs/README.md) | Companion index + source map ([blob](https://github.com/DIG-Network/chia-parallel-voting/blob/main/docs/README.md)) |
 | [sdk/README.md](sdk/README.md) | SDK architecture, crates, actors, and API overview |
 
-Companion docs under `docs/` spell out inner actions, Merkle rules, public inputs, announcements, and end-to-end phases. Figures live in [`assets/`](assets/).
+Companion docs spell out inner actions, Merkle rules, public inputs, announcements, and end-to-end phases. Figures live in [`assets/`](assets/) · [GitHub tree](https://github.com/DIG-Network/chia-parallel-voting/tree/main/assets).
 
 ## Repository layout
 

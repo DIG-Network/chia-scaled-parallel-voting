@@ -1,8 +1,10 @@
 # Witnesses, Merkle trees, vote modes, and encodings (companion to CHIP draft)
 
-Normative detail for trees, vote messages, Groth16 public inputs, and announcements. Overview: [CHIP_DRAFT.md](./CHIP_DRAFT.md) § Specification. **Conceptual:** how Groth16 is verified in CLVM and why the split with BLS works — [chip-groth16-clvm.md](./chip-groth16-clvm.md).
+Normative detail for trees, vote messages, Groth16 public inputs, and announcements. Overview: [CHIP_DRAFT.md](./CHIP_DRAFT.md) § Specification. **Conceptual (Groth16 + CLVM):** [chip-groth16-clvm.md](./chip-groth16-clvm.md). *Reference implementation:* [DIG-Network/chia-parallel-voting](https://github.com/DIG-Network/chia-parallel-voting) (`main`).
 
 ## Sparse Merkle trees
+
+Puzzle-side hashing and proof conventions lean on [`puzzles/merkle_utils.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/merkle_utils.rue) and election/registration shared headers ([`election/shared.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/election/shared.rue), [`registration_coin/shared.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/registration_coin/shared.rue)). Off-chain witness construction is implemented in [`sdk/src/merkle.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/merkle.rs).
 
 ### Registration tree (reference `TREE_DEPTH = 32`)
 
@@ -15,12 +17,12 @@ Normative detail for trees, vote messages, Groth16 public inputs, and announceme
 
 - **Leaf:** `sha256(ballot_launcher_id)`.
 - **Slot (reference):** `sha256(ballot_launcher_id) mod 2^32`.
-- **Depth:** **32** in reference. Any change requires matching circuit and puzzle definitions.
+- **Depth:** **32** in reference. Any change requires matching the Groth16 circuit ([`sdk/src/prover/circuit.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/prover/circuit.rs)) and puzzle definitions under [`puzzles/registration_coin/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/registration_coin), [`puzzles/election/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/election).
 
 ## Vote modes
 
 - **Unrestricted:** `vote_options_root` is 32 zero bytes; any `vote_data` subject to other checks.
-- **Restricted:** `vote_options_root` is root of sorted Merkle tree of allowed outcomes; mint and update **MUST** include inclusion proofs.
+- **Restricted:** `vote_options_root` is root of sorted Merkle tree of allowed outcomes; [`mint_voting_coin.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/registration_coin/mint_voting_coin.rue) and [`update_vote.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/voting_coin/update_vote.rue) **MUST** include inclusion proofs when restricted.
 
 If `vote_mode_lock` on the Election Singleton is not all `0xFF`, every ballot **MUST** use that locked root.
 
@@ -28,9 +30,11 @@ If `vote_mode_lock` on the Election Singleton is not all `0xFF`, every ballot **
 
 `vote_message = sha256(vote_outcome || ballot_launcher_id || election_launcher_id)`
 
-All implementations (puzzles, aggregator, circuit) **MUST** use this exact preimage order.
+All implementations (puzzles, aggregator, circuit) **MUST** use this exact preimage order. The voting puzzle defines the same ordering in [`voting_coin/shared.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/voting_coin/shared.rue); the ballot finalize verifier recomputes it in [`ballot_coin/finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/finalize.rue).
 
 ## Groth16 public inputs (ordered)
+
+The eight scalars committed as public inputs to the circuit ([`sdk/src/prover/circuit.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/prover/circuit.rs), **ordering MUST match** the header comments in [`finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/finalize.rue)):
 
 1. `registration_merkle_root` (witness-time)
 2. `registration_vote_weight`
@@ -43,12 +47,12 @@ All implementations (puzzles, aggregator, circuit) **MUST** use this exact preim
 
 Threshold **num** / **den** as public inputs allow one VK (fixed `MAX_SIGNERS`) to support multiple rational quorum fractions.
 
-**VK size (reference):** **768** bytes (`336 + 9 × 48`).
+**VK size (reference):** **768** bytes (`336 + 9 × 48`). Proof serialization: [`sdk/src/prover/proof.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/prover/proof.rs).
 
 ## Off-chain vs on-chain
 
-- **Off-chain:** Enumerate registrations and Voting Coins; verify lineage; weighted quorum; BLS aggregation; Groth16 witness and proof.
-- **On-chain:** Ballot `finalize` verifies Groth16 and `bls_verify`. Any actor may submit a valid finalize bundle; incentives are out of scope for this CHIP.
+- **Off-chain:** Enumerate registrations and Voting Coins; verify lineage; weighted quorum; BLS aggregation; Groth16 witness and proof (aggregator: [`sdk/src/actors/aggregator.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/actors/aggregator.rs)).
+- **On-chain:** Ballot `finalize` in [`finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/finalize.rue) verifies Groth16 and `bls_verify`. Any actor may submit a valid finalize bundle; incentives are out of scope for this CHIP.
 
 ## Pinned constants (reference interop)
 
@@ -57,11 +61,11 @@ Threshold **num** / **den** as public inputs allow one VK (fixed `MAX_SIGNERS`) 
 - `PUBLIC_INPUT_COUNT = 8`
 - `EMPTY_LEAF_HASH` as above
 
-Bytecode source of truth: `puzzles/compiled/`, `sdk/src/puzzles.rs`.
-
-Companion index: [README.md](./README.md).
+These align with the circuit and [`sdk/src/puzzles.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/puzzles.rs). **Bytecode** is emitted under [`puzzles/compiled/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/compiled) after [`build.sh`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/build.sh) / [`build.ps1`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/build.ps1).
 
 ## Announcement preimages
+
+String layouts and helpers appear in [`puzzles/ballot_coin/shared.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/shared.rue) and the oracle spend [`oracle.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/oracle.rue).
 
 | Source | Preimage |
 |--------|----------|
@@ -69,3 +73,5 @@ Companion index: [README.md](./README.md).
 | Ballot oracle (closed) | open preimage || `vote_outcome || agg_signers` |
 | Ballot finalized | `"ballot_finalized" || ballot_launcher_id || vote_outcome || agg_signers` |
 | Deregister | `"deregister" || voter_pubkey` |
+
+Companion index: [README.md](./README.md).

@@ -1,6 +1,6 @@
 # Groth16, CLVM, and ballot finalization (companion to CHIP draft)
 
-This document explains **how Groth16 is combined with Chia’s CLVM** for Ballot Coin `finalize`, **why the construction is sound**, and how the figures under `assets/` illustrate the *intuition* behind thresholds and proof anchoring. Normative bytecode ordering and public-input tables: [chip-witnesses-encoding.md](./chip-witnesses-encoding.md), `puzzles/ballot_coin/finalize.rue`, `sdk/src/prover/circuit.rs`. Protocol overview: [CHIP_DRAFT.md](./CHIP_DRAFT.md).
+This document explains **how Groth16 is combined with Chia’s CLVM** for Ballot Coin `finalize`, **why the construction is sound**, and how figures under [`assets/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/assets) illustrate the *intuition* behind thresholds. *Reference repo:* [DIG-Network/chia-parallel-voting](https://github.com/DIG-Network/chia-parallel-voting) (`main`). Protocol overview: [CHIP_DRAFT.md](./CHIP_DRAFT.md). Normative ordering of public inputs and Merkle rules: [chip-witnesses-encoding.md](./chip-witnesses-encoding.md).
 
 ---
 
@@ -8,7 +8,7 @@ This document explains **how Groth16 is combined with Chia’s CLVM** for Ballot
 
 Chia’s CLVM is not a general “ZK verifier.” What it **does** provide (per [CHIP-0011](https://github.com/Chia-Network/chips/blob/main/CHIPs/chip-0011.md)) are **BLS12-381 curve operations** exposed as opcodes—enough to evaluate the **Groth16 verification equation** as a fixed product-of-pairings identity, and to run **`bls_verify`** for aggregate signatures.
 
-In this CHIP, the Ballot Coin **`finalize`** puzzle:
+In this CHIP, the Ballot Coin **`finalize`** puzzle ([`puzzles/ballot_coin/finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/finalize.rue)):
 
 1. Rebuilds the **Groth16 instance** from the proof \((A,B,C)\), the **verification key** \((\alpha,\beta,\gamma,\delta)\) and **input commitment** points **IC[0..8]** curried at deploy.
 2. Derives eight **scalar inputs** \(s_1,\ldots,s_8\) from **on-chain-visible** data (registration snapshot, weights, `vote_message`, threshold pack, ballot id, num/den) and compares them to scalars supplied in the spend, so the proof cannot be replayed against a different ballot or election snapshot.
@@ -24,19 +24,21 @@ So: **Groth16 proves (off-chain) that an R1CS instance for the voting circuit ho
 
 | Layer | Responsibility |
 |--------|----------------|
-| **R1CS + Groth16 (prover)** | Produces a proof that the circuit’s constraints are satisfied for the **committed** public inputs—e.g. that a **quorum / majority** relation over registered weight and the claimed signer set is consistent with the circuit definition (see comments in `sdk/src/prover/circuit.rs` for the exact relation encoded there). |
-| **Ballot `finalize` (CLVM)** | Verifies the Groth16 proof with **CHIP-0011** pairings; **re-derives** \(s_1..s_8\) from curried and solution fields so tampering with roots, thresholds, or ballot id breaks verification; verifies **BLS aggregation** over **`vote_message`**. |
-| **Registration / Voting puzzles** | Enroll voters in the registration SPT, pin per-ballot **oracle** (open height and vote options), and keep voting state off the Election singleton’s hot path. |
+| **R1CS + Groth16 (prover)** | Produces a proof that the circuit’s constraints are satisfied for the **committed** public inputs—e.g. that a **quorum / majority** relation over registered weight and the claimed signer set is consistent with the circuit definition (see comments in [`sdk/src/prover/circuit.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/prover/circuit.rs)). **Proof bytes ↔ arkworks:** [`sdk/src/prover/proof.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/prover/proof.rs). |
+| **Ballot `finalize` (CLVM)** | Verifies the Groth16 proof with **CHIP-0011** pairings in [`finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/finalize.rue); **re-derives** \(s_1..s_8\) from curried and solution fields; verifies **BLS aggregation** over **`vote_message`**. |
+| **Registration / Voting puzzles** | Enroll voters in the registration SPT ([`register.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/election/register.rue)), pin per-ballot **oracle** ([`oracle.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/oracle.rue); mint/update: [`mint_voting_coin.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/registration_coin/mint_voting_coin.rue), [`update_vote.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/voting_coin/update_vote.rue)), and keep voting state off the Election singleton’s hot path. |
 
 **Why both Groth16 and `bls_verify`?** BLS aggregation gives a compact signature over **`vote_message`** tied to **`agg_signers`**. It does not, by itself, prove statements about **global** registration roots, **weights**, or **threshold arithmetic** inside a single cheap opcode. The circuit is the place where those predicates are expressed as R1CS constraints; Groth16 compresses that check to **three curve points and a handful of pairings** on-chain. The **oracle** spend on the Ballot Coin is still needed where the proof does not encode every pin (e.g. **`VOTE_CLOSE_HEIGHT`** and **`VOTE_OPTIONS_ROOT`** for mint/update).
+
+**Finalize bundle assembly (off-chain):** [`sdk/src/actors/aggregator.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/actors/aggregator.rs). Example tests: [`sdk/tests/finalize_per_ballot_e2e.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/tests/finalize_per_ballot_e2e.rs), [`finalize_one_third_threshold_e2e.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/tests/finalize_one_third_threshold_e2e.rs).
 
 ---
 
 ## Why the on-chain scalar bindings matter
 
-Groth16’s **verification key** is tied to a **fixed circuit shape** and a **ceremony-produced** structured reference string. The **instance** for a specific finalize is the vector of **public inputs**. In `finalize.rue`, the prover supplies **Scalars** \(s_1,\ldots,s_8\); the puzzle **recomputes** the expected scalars from:
+Groth16’s **verification key** is tied to a **fixed circuit shape** and a **ceremony-produced** structured reference string. The **instance** for a specific finalize is the vector of **public inputs**. In [`finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/finalize.rue), the prover supplies **Scalars** \(s_1,\ldots,s_8\); the puzzle **recomputes** the expected scalars from:
 
-- `REGISTRATION_MERKLE_ROOT_SNAPSHOT`, `REGISTRATION_VOTE_WEIGHT_SNAPSHOT` (snapshotted at `createBallot`),
+- `REGISTRATION_MERKLE_ROOT_SNAPSHOT`, `REGISTRATION_VOTE_WEIGHT_SNAPSHOT` (snapshotted at `createBallot` — [`create_ballot.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/election/create_ballot.rue)),
 - `agg_signers`, `vote_message`, `threshold_pack(VOTE_THRESHOLD_NUM, VOTE_THRESHOLD_DEN)`, `BALLOT_LAUNCHER_ID`,
 - and the raw field encodings for num/den,
 
@@ -46,13 +48,13 @@ and **asserts equality** with the proof’s public scalars (hashes mod \(r\) whe
 
 ## Trusted setup and `vk_hash`
 
-Groth16 requires a **circuit-specific** trusted setup. This CHIP assumes a **multi-party ceremony** (see [chip-ceremony.md](./chip-ceremony.md)) yields a **verification key** whose **SHA-256** is **`vk_hash`** on the Election Singleton. Implementations **must** treat **`vk_hash`** and voucher binding as part of the trust model: a malicious VK would break soundness regardless of CLVM correctness.
+Groth16 requires a **circuit-specific** trusted setup. This CHIP assumes a **multi-party ceremony** (see [chip-ceremony.md](./chip-ceremony.md); puzzles [`puzzles/ceremony_singleton/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/ceremony_singleton)) yields a **verification key** whose **SHA-256** is **`vk_hash`** on the Election Singleton. Implementations **must** treat **`vk_hash`** and voucher binding as part of the trust model: a malicious VK would break soundness regardless of CLVM correctness.
 
 ---
 
 ## Figures (pedagogical intuition)
 
-The PNGs in [`../assets/`](../assets/) are **not** literal diagrams of CLVM opcodes or of the Groth16 CRS. They illustrate **why a threshold can pin an outcome** before one talks about pairings: with **too few** contributions, many “curves” are still consistent with the observed data; with **enough** contributions, the aggregate constraint set can **lock** the relevant commitment. **τ** in the figures (“where the proof value is read”) is a visual stand-in for **evaluating a committed polynomial / SRS at a secret point**—the same *flavor* of idea that makes polynomial-based SNARKs possible—without replacing the formal definition of Groth16.
+The PNGs [`figure_1.png`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/assets/figure_1.png) and [`figure_2.png`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/assets/figure_2.png) in [`assets/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/assets) are **not** literal diagrams of CLVM opcodes or of the Groth16 CRS. They illustrate **why a threshold can pin an outcome** before one talks about pairings: with **too few** contributions, many “curves” are still consistent with the observed data; with **enough** contributions, the aggregate constraint set can **lock** the relevant commitment. **τ** in the figures (“where the proof value is read”) is a visual stand-in for **evaluating a committed polynomial / SRS at a secret point**—the same *flavor* of idea that makes polynomial-based SNARKs possible—without replacing the formal definition of Groth16.
 
 ### Figure 1 — below threshold (ambiguous)
 
@@ -83,13 +85,5 @@ The PNGs in [`../assets/`](../assets/) are **not** literal diagrams of CLVM opco
 *Interpretation:* Once the threshold relation enforced in the circuit holds, the **public inputs** Pin down the instance; Groth16 then proves that instance in zero knowledge (witness privacy is secondary here; **soundness** of the vote outcome + quorum claim is primary).
 
 ---
-
-## Reference code
-
-| Piece | Location |
-|--------|-----------|
-| On-chain finalize | `puzzles/ballot_coin/finalize.rue` (`bls_pairing_identity`, scalar checks, announcements) |
-| Circuit + prove / verify helpers | `sdk/src/prover/circuit.rs`, `sdk/src/prover/proof.rs` |
-| CHIP-0011 | [CHIP-0011](https://github.com/Chia-Network/chips/blob/main/CHIPs/chip-0011.md) — BLS / pairings used by the verifier |
 
 Companion index: [README.md](./README.md).

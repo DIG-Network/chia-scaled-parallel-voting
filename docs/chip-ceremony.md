@@ -1,10 +1,10 @@
 # Ceremony layer (companion to CHIP draft)
 
-Normative detail for the **Ceremony Singleton** and auxiliary coins. Overview: [CHIP_DRAFT.md](./CHIP_DRAFT.md) § Specification. **Flow:** [chip-protocol-flow.md](./chip-protocol-flow.md) Phase 0.
+Normative detail for the **Ceremony Singleton** and auxiliary coins. Overview: [CHIP_DRAFT.md](./CHIP_DRAFT.md) § Specification ([GitHub](https://github.com/DIG-Network/chia-parallel-voting/blob/main/docs/CHIP_DRAFT.md)). **Flow:** [chip-protocol-flow.md](./chip-protocol-flow.md) Phase 0. *Open-source reference:* [DIG-Network/chia-parallel-voting](https://github.com/DIG-Network/chia-parallel-voting) (`main`).
 
 ## State (`CeremonyState`)
 
-Five fields (see `puzzles/ceremony_singleton/shared.rue` and `sdk::CeremonyState`):
+Five fields (see [`puzzles/ceremony_singleton/shared.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ceremony_singleton/shared.rue) and the `CeremonyState` struct in [`sdk/src/state.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/state.rs)):
 
 | Field | Meaning |
 |--------|---------|
@@ -16,18 +16,20 @@ Five fields (see `puzzles/ceremony_singleton/shared.rue` and `sdk::CeremonyState
 
 ## Deploy curries (minimum)
 
-Include at least: `START_BLOCK_HEIGHT`, `CEREMONY_LENGTH_BLOCKS`, `MIN_PARTICIPANTS`, `MAX_VOTERS`, `vk_seed`, `CEREMONY_COIN_MOD_HASH`, `CEREMONY_VOUCHER_MOD_HASH`. Exact layouts: `puzzles/ceremony_singleton/`.
+Include at least: `START_BLOCK_HEIGHT`, `CEREMONY_LENGTH_BLOCKS`, `MIN_PARTICIPANTS`, `MAX_VOTERS`, `vk_seed`, `CEREMONY_COIN_MOD_HASH`, `CEREMONY_VOUCHER_MOD_HASH`. Exact layouts live under [`puzzles/ceremony_singleton/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/ceremony_singleton); the two inner spend paths are [`contribute.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ceremony_singleton/contribute.rue) and [`finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ceremony_singleton/finalize.rue).
 
 ## Inner actions
 
-| Action | Requirements |
-|--------|----------------|
-| **`contribute`** | Rejected if `finalized` is set. Allowed only while `START_BLOCK_HEIGHT ≤ height < START_BLOCK_HEIGHT + CEREMONY_LENGTH_BLOCKS`. `prev_contribution_hash` **MUST** equal current `last_contribution_hash` (first contributor uses `vk_seed`). `AggSigUnsafe` **MUST** bind the domain-separated ceremony contribution message (string **MUST** match reference implementation). Creates a **Ceremony Marker Coin** with **even** output amount so the singleton outer has exactly one odd `CreateCoin` (recreation). Increments `contribution_count` and updates `last_contribution_hash`. Large parameters: committed by hash on-chain; payloads recovered off-chain from spends and memos. |
-| **`finalize`** | Only after `height ≥ START_BLOCK_HEIGHT + CEREMONY_LENGTH_BLOCKS`. Requires `finalized` unset and `contribution_count ≥ MIN_PARTICIPANTS`. Sets `finalized`, `vk_hash`, `marker_root` from solution. Mints **Ceremony Voucher** and summary marker(s) with VK-related memos. **Not** authenticated by a designated key: first valid spend wins. Verifiers **SHOULD** independently derive or verify `vk_hash` and `marker_root` from marker chain before relying on an election. |
+| Action | Requirements | Source (`main`) |
+|--------|----------------|-----------------|
+| **`contribute`** | Rejected if `finalized` is set. Allowed only while `START_BLOCK_HEIGHT ≤ height < START_BLOCK_HEIGHT + CEREMONY_LENGTH_BLOCKS`. `prev_contribution_hash` **MUST** equal current `last_contribution_hash` (first contributor uses `vk_seed`). `AggSigUnsafe` **MUST** bind the domain-separated ceremony contribution message (string **MUST** match reference implementation). Creates a **Ceremony Marker Coin** with **even** output amount so the singleton outer has exactly one odd `CreateCoin` (recreation). Increments `contribution_count` and updates `last_contribution_hash`. Large parameters: committed by hash on-chain; payloads recovered off-chain from spends and memos. | [`contribute.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ceremony_singleton/contribute.rue) |
+| **`finalize`** | Only after `height ≥ START_BLOCK_HEIGHT + CEREMONY_LENGTH_BLOCKS`. Requires `finalized` unset and `contribution_count ≥ MIN_PARTICIPANTS`. Sets `finalized`, `vk_hash`, `marker_root` from solution. Mints **Ceremony Voucher** and summary marker(s) with VK-related memos. **Not** authenticated by a designated key: first valid spend wins. Verifiers **SHOULD** independently derive or verify `vk_hash` and `marker_root` from marker chain before relying on an election. | [`finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ceremony_singleton/finalize.rue) |
+
+**Off-chain / test orchestration:** [`sdk/src/actors/ceremony.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/actors/ceremony.rs), [`sdk/src/ceremony/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/sdk/src/ceremony). Example tests: [`sdk/tests/ceremony_contribute_e2e.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/tests/ceremony_contribute_e2e.rs), [`sdk/tests/ceremony_deploy_e2e.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/tests/ceremony_deploy_e2e.rs), broader suite under [`sdk/tests/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/sdk/tests).
 
 ## Ceremony Marker Coin
 
-- **Source:** `puzzles/ceremony_coin/marker.rue`.
+- **Source:** [`puzzles/ceremony_coin/marker.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ceremony_coin/marker.rue).
 - **Curried:** `CEREMONY_LAUNCHER_ID`, `PARTICIPANT_PUBKEY`, `CONTRIBUTION_HASH`, `PREV_CONTRIBUTION_HASH`.
 - **Created by** Ceremony `contribute` only. Even amount (reference: 2 mojos) for singleton morph rules.
 - **Spend:** may return no conditions; coin remains an on-chain commitment until removed.
@@ -35,8 +37,8 @@ Include at least: `START_BLOCK_HEIGHT`, `CEREMONY_LENGTH_BLOCKS`, `MIN_PARTICIPA
 
 ## Ceremony Voucher Coin
 
-- **Source:** `puzzles/ceremony_singleton/ceremony_voucher.rue`.
-- **Minted only** from ceremony `finalize`.
+- **Source:** [`puzzles/ceremony_singleton/ceremony_voucher.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ceremony_singleton/ceremony_voucher.rue).
+- **Minted only** from ceremony [`finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ceremony_singleton/finalize.rue).
 - Anyone-can-spend with self-recreation at same puzzle hash and amount so **many** election deploys can reuse one ceremony.
 - **`CANONICAL_MSG`:**
 
@@ -45,10 +47,5 @@ Include at least: `START_BLOCK_HEIGHT`, `CEREMONY_LENGTH_BLOCKS`, `MIN_PARTICIPA
 Election deploy **SHOULD** co-spend the voucher and assert this announcement.
 
 **Contributions MUST NOT** be voucher-gated; the contribution window is **permissionless** at the puzzle level. Allow-lists are deployment policy only.
-
-## Reference code paths
-
-- Puzzles: `puzzles/ceremony_singleton/`, `puzzles/ceremony_coin/marker.rue`
-- SDK: `sdk/src/actors/ceremony.rs`, `sdk/src/ceremony/`, `sdk/src/state.rs` (`CeremonyState`)
 
 Companion index: [README.md](./README.md).
