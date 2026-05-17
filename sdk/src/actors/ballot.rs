@@ -70,6 +70,15 @@ pub struct CreateBallotParams {
     pub ballot_seed: Bytes32,
     pub vote_close_height: u64,
     pub outcome_domain_hash: Bytes32,
+    /// M7e: 32-byte vote-mode commitment for the new Ballot Coin.
+    /// `Bytes32::default()` (= 0x00…00) means Mode1Free (no
+    /// restriction on vote_data); any other value is a sorted-options
+    /// merkle root the Ballot Coin's oracle will commit to and
+    /// `update_vote` will require a matching merkle proof for. The
+    /// election's `State.vote_mode_lock` gates which values are
+    /// accepted (sentinel `VOTE_MODE_LOCK_NONE = 0xFF…FF` allows
+    /// any; otherwise the value must match the lock byte-for-byte).
+    pub vote_options_root: Bytes32,
 }
 
 /// STRUCT: LaunchBallotParams
@@ -101,6 +110,13 @@ pub struct LaunchBallotParams {
     pub outcome_domain_hash: Bytes32,
     pub vote_threshold_num: u64,
     pub vote_threshold_den: u64,
+    /// M7e: 32-byte vote-mode commitment curried into the eve Ballot
+    /// Coin's oracle action. MUST equal the value passed in the
+    /// matching `CreateBallotParams.vote_options_root` so the predicted
+    /// ballot puzzle hash matches what `create_ballot` minted.
+    /// `Bytes32::default()` (= 0x00…00) for Mode1Free; otherwise a
+    /// sorted-options merkle root for Mode2Restricted.
+    pub vote_options_root: Bytes32,
 }
 
 /// STRUCT: LaunchedBallot
@@ -290,32 +306,46 @@ impl BallotIssuer {
         )?;
 
         // ── 3. Build the curried create_ballot action puzzle ────
-        // CURRY ORDER (per `puzzles/election/create_ballot.rue`):
-        //   (SINGLETON_LAUNCHER_PUZZLE_HASH, ELECTION_LAUNCHER_ID)
+        // CURRY ORDER (per `puzzles/election/create_ballot.rue`,
+        // M6-revised): (SINGLETON_LAUNCHER_PUZZLE_HASH,
+        // ELECTION_LAUNCHER_ID, NO_VOTE_MODE_LOCK)
+        // NO_VOTE_MODE_LOCK is the 32-byte 0xFF…FF sentinel the
+        // puzzle compares against State.vote_mode_lock to decide
+        // whether the lock gate runs. Same constant in every
+        // deployment — currying it ensures puzzle-side bytewise
+        // comparison without needing a magic literal in the .rue.
         let singleton_launcher_ph = Bytes32::from(SINGLETON_LAUNCHER_HASH);
+        let no_vote_mode_lock = crate::vote_mode::VOTE_MODE_LOCK_NONE;
         let create_ballot_program_node =
             load_action_puzzle(&mut ctx, puzzles::ELECTION_CREATE_BALLOT_HEX)?;
         let create_ballot_curried = CurriedProgram {
             program: create_ballot_program_node,
-            args: clvm_curried_args!(singleton_launcher_ph, election_id),
+            args: clvm_curried_args!(singleton_launcher_ph, election_id, no_vote_mode_lock),
         }
         .to_clvm(&mut *ctx)
         .map_err(driver_err)?;
 
         // ── 4. Build the create_ballot action solution ──────────
-        // SOLUTION SHAPE per `create_ballot.rue` (after the curried
-        // `Truth: ElectionStateTruth` arg the action layer prepends
-        // automatically):
+        // SOLUTION SHAPE per `create_ballot.rue` (M6-revised — after
+        // the curried `Truth: ElectionStateTruth` arg the action layer
+        // prepends automatically):
         //   `(singleton_coin_id, ballot_seed, vote_close_height,
-        //    ...outcome_domain_hash)`
-        // Rue's trailing `...outcome_domain_hash: Bytes32` produces a
-        // flat-tail cons chain — the cdr of the last cons IS the
+        //    outcome_domain_hash, ...ballot_vote_options_root)`
+        // Rue's trailing `...ballot_vote_options_root: Bytes32` produces
+        // a flat-tail cons chain — the cdr of the last cons IS the
         // 32-byte hash directly (no NIL terminator).
+        // M7e: thread the caller-supplied per-ballot vote_options_root
+        // through. Sentinel 0x00…00 = Mode1Free; otherwise a sorted-
+        // options merkle root the Ballot Coin's oracle will commit to.
+        let ballot_vote_options_root: Bytes32 = params.vote_options_root;
         let create_ballot_solution_value = (
             singleton_coin_id,
             (
                 params.ballot_seed,
-                (params.vote_close_height, params.outcome_domain_hash),
+                (
+                    params.vote_close_height,
+                    (params.outcome_domain_hash, ballot_vote_options_root),
+                ),
             ),
         );
         let create_ballot_solution = create_ballot_solution_value
@@ -593,12 +623,19 @@ impl BallotIssuer {
         let finalize_full_hash =
             Bytes32::new(clvm_utils::tree_hash(&ctx, finalize_curried).to_bytes());
 
-        // oracle curry order (per `puzzles/ballot_coin/oracle.rue`):
-        //   (BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT)
+        // oracle curry order (per `puzzles/ballot_coin/oracle.rue`,
+        // M4-revised): (BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT,
+        // VOTE_OPTIONS_ROOT). M7e: thread the caller-supplied per-ballot
+        // value (via LaunchBallotParams).
+        let vote_options_root_curry: Bytes32 = params.vote_options_root;
         let oracle_program_node = load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_ORACLE_HEX)?;
         let oracle_curried = CurriedProgram {
             program: oracle_program_node,
-            args: clvm_curried_args!(launcher_coin_id, params.vote_close_height),
+            args: clvm_curried_args!(
+                launcher_coin_id,
+                params.vote_close_height,
+                vote_options_root_curry
+            ),
         }
         .to_clvm(&mut *ctx)
         .map_err(driver_err)?;
@@ -667,10 +704,30 @@ impl BallotIssuer {
         // nil-terminated CLVM list shape (the launcher's `mod`
         // expects exactly that).
         use chia_puzzle_types::singleton::LauncherSolution;
+        // Commit the per-ballot curry params on-chain via the launcher
+        // second-spend's `key_value_list` (Option A: chain-readable
+        // curry). Any reader can fetch the launcher's
+        // puzzle_and_solution + parse the memo to recover the curry —
+        // no off-chain metadata required. Mirrors the order curried
+        // into the `finalize` action puzzle.
+        let curry_memo = crate::state::BallotLauncherMemo {
+            schema_tag: chia_protocol::Bytes::new(
+                crate::state::BALLOT_LAUNCHER_MEMO_TAG.to_vec(),
+            ),
+            vote_close_height: params.vote_close_height,
+            outcome_domain_hash: params.outcome_domain_hash,
+            vote_threshold_num: params.vote_threshold_num,
+            vote_threshold_den: params.vote_threshold_den,
+            registration_merkle_root_snapshot,
+            registration_vote_weight_snapshot,
+            // M8: per-ballot vote-mode commitment so cross-browser
+            // dApps can recover the ballot's mode from chain alone.
+            vote_options_root: params.vote_options_root,
+        };
         let launcher_solution = LauncherSolution {
             singleton_puzzle_hash: eve_ballot_puzzle_hash,
             amount: EVE_BALLOT_AMOUNT,
-            key_value_list: (),
+            key_value_list: curry_memo,
         };
         let launcher_solution_node = launcher_solution
             .to_clvm(&mut *ctx)
@@ -783,11 +840,25 @@ fn state_node_for(
     ctx: &mut SpendContext,
     state: &crate::state::ElectionState,
 ) -> VotingResult<clvmr::NodePtr> {
+    // M2: 8-field cons tree
+    // (root . (count . (weight . (start . (cer . (max . (vk . lock))))))).
     let value = (
         state.registration_merkle_root,
         (
             state.registration_count,
-            (state.registration_vote_weight, state.election_start_height),
+            (
+                state.registration_vote_weight,
+                (
+                    state.election_start_height,
+                    (
+                        state.ceremony_launcher_id,
+                        (
+                            state.max_voters,
+                            (state.vk_hash, state.vote_mode_lock),
+                        ),
+                    ),
+                ),
+            ),
         ),
     );
     value.to_clvm(&mut **ctx).map_err(driver_err)
@@ -901,14 +972,17 @@ pub async fn list_ballots_via_chain<C: ChainReader>(
         let mut next_singleton: Option<crate::chain::ChainCoinRecord> = None;
         for child in children.into_iter() {
             if child.coin.puzzle_hash == launcher_ph && child.coin.amount == 2 {
-                snapshots.push(BallotCoinSnapshot {
-                    ballot_launcher_id: child.coin.coin_id(),
-                    election_launcher_id: election_id,
-                    vote_close_height: 0,
-                    outcome_domain_hash: Bytes32::default(),
-                    state: crate::state::BallotState::fresh(),
-                    coin_id: child.coin.coin_id(),
-                });
+                let ballot_launcher_id = child.coin.coin_id();
+                let memo = read_ballot_launcher_memo(chain, ballot_launcher_id).await?;
+                let (state, latest_coin_id) =
+                    walk_ballot_state_via_chain(chain, ballot_launcher_id).await?;
+                snapshots.push(build_ballot_snapshot(
+                    ballot_launcher_id,
+                    election_id,
+                    memo,
+                    state,
+                    latest_coin_id,
+                ));
             } else if child.coin.amount % 2 == 1 {
                 next_singleton = Some(child);
             }
@@ -954,14 +1028,261 @@ pub async fn get_ballot_via_chain<C: ChainReader>(
         return Ok(None);
     }
 
-    Ok(Some(BallotCoinSnapshot {
+    let memo = read_ballot_launcher_memo(chain, ballot_launcher_id).await?;
+    let (state, latest_coin_id) =
+        walk_ballot_state_via_chain(chain, ballot_launcher_id).await?;
+    Ok(Some(build_ballot_snapshot(
+        ballot_launcher_id,
+        election_id,
+        memo,
+        state,
+        latest_coin_id,
+    )))
+}
+
+/// FN: build_ballot_snapshot
+/// WHAT: assemble a `BallotCoinSnapshot` from a known ballot launcher
+///       id + the optional curry memo recovered from the launcher's
+///       second-spend + the chain-derived latest state and singleton
+///       coin id.
+/// WHY:  shared by `list_ballots_via_chain` + `get_ballot_via_chain`
+///       so the two construction sites stay in lockstep on the
+///       memo-merge + state-walk logic.
+fn build_ballot_snapshot(
+    ballot_launcher_id: Bytes32,
+    election_id: Bytes32,
+    memo: Option<crate::state::BallotLauncherMemo>,
+    state: crate::state::BallotState,
+    latest_coin_id: Bytes32,
+) -> BallotCoinSnapshot {
+    let (
+        vote_close_height,
+        outcome_domain_hash,
+        vote_threshold_num,
+        vote_threshold_den,
+        registration_merkle_root_snapshot,
+        registration_vote_weight_snapshot,
+        vote_options_root,
+    ) = match memo {
+        Some(m) => (
+            m.vote_close_height,
+            m.outcome_domain_hash,
+            Some(m.vote_threshold_num),
+            Some(m.vote_threshold_den),
+            Some(m.registration_merkle_root_snapshot),
+            Some(m.registration_vote_weight_snapshot),
+            Some(m.vote_options_root),
+        ),
+        None => (0u64, Bytes32::default(), None, None, None, None, None),
+    };
+    BallotCoinSnapshot {
         ballot_launcher_id,
         election_launcher_id: election_id,
-        vote_close_height: 0,
-        outcome_domain_hash: Bytes32::default(),
-        state: crate::state::BallotState::fresh(),
-        coin_id: ballot_launcher_id,
-    }))
+        vote_close_height,
+        outcome_domain_hash,
+        state,
+        coin_id: latest_coin_id,
+        vote_threshold_num,
+        vote_threshold_den,
+        registration_merkle_root_snapshot,
+        registration_vote_weight_snapshot,
+        vote_options_root,
+    }
+}
+
+/// FN: walk_ballot_state_via_chain
+/// WHAT: walk a ballot's singleton lineage from launcher → latest, and
+///       derive the current `BallotState` (finalized / vote_outcome /
+///       agg_signers) directly from chain. Returns `(state,
+///       latest_coin_id)`.
+/// HOW:  the eve Ballot Coin is minted with `BallotState::fresh()`
+///       curried into its action_layer, so its puzzle_hash IS the
+///       fresh-state ph by construction. Because the only state-
+///       mutating action in the protocol is `finalize`, ANY divergence
+///       between the latest singleton's puzzle_hash and the eve's
+///       puzzle_hash means finalize ran somewhere in the lineage. The
+///       finalize spend itself is the parent of the post-finalize
+///       coin (the first coin in the lineage with a non-fresh ph);
+///       parsing its inner_solution via `extract_finalize_outcome`
+///       recovers `vote_outcome` directly from the action's solution.
+async fn walk_ballot_state_via_chain<C: ChainReader>(
+    chain: &C,
+    ballot_launcher_id: Bytes32,
+) -> VotingResult<(crate::state::BallotState, Bytes32)> {
+    let launcher_children = chain
+        .coin_records_by_parent_ids(&[ballot_launcher_id])
+        .await?;
+    let eve = match launcher_children
+        .into_iter()
+        .find(|r| r.coin.amount % 2 == 1)
+    {
+        Some(eve) => eve,
+        None => {
+            // Launcher unspent / no eve yet → ballot not fully launched.
+            return Ok((crate::state::BallotState::fresh(), ballot_launcher_id));
+        }
+    };
+    let fresh_ph = eve.coin.puzzle_hash;
+    // Track the parent of the post-finalize coin (= the finalize spend).
+    // Walk forward; record `prev` so when we find a coin with a
+    // non-fresh ph, we know its parent is the finalize spent coin.
+    let mut prev: Option<crate::chain::ChainCoinRecord> = None;
+    let mut current = eve;
+    let mut finalize_spent_coin_id: Option<Bytes32> = None;
+    loop {
+        if current.coin.puzzle_hash != fresh_ph && finalize_spent_coin_id.is_none() {
+            // First coin with non-fresh ph = post-finalize coin. Its
+            // parent (the previous coin in our walk) was spent by
+            // finalize.
+            if let Some(p) = &prev {
+                finalize_spent_coin_id = Some(p.coin.coin_id());
+            }
+        }
+        if current.is_unspent() {
+            break;
+        }
+        let coin_id = current.coin.coin_id();
+        let children = chain.coin_records_by_parent_ids(&[coin_id]).await?;
+        match children.into_iter().find(|r| r.coin.amount % 2 == 1) {
+            Some(next) => {
+                prev = Some(current);
+                current = next;
+            }
+            None => break,
+        }
+    }
+    let latest_coin_id = current.coin.coin_id();
+    if current.coin.puzzle_hash == fresh_ph {
+        // No state mutation ever happened → still fresh.
+        return Ok((crate::state::BallotState::fresh(), latest_coin_id));
+    }
+    // Finalized. Try to extract vote_outcome + agg_signers from the
+    // finalize spend's puzzle_and_solution. Falls back to defaults
+    // when the chain backend can't supply the spend (rare — the spend
+    // exists by definition since the post-finalize coin was created).
+    let mut vote_outcome = Bytes32::default();
+    let mut agg_signers = Bytes32::default();
+    if let Some(finalize_id) = finalize_spent_coin_id {
+        if let Some((_puzzle, solution)) = chain.puzzle_and_solution(finalize_id).await? {
+            if let Some((vo, sg)) = extract_finalize_outcome(&solution) {
+                vote_outcome = vo;
+                agg_signers = sg;
+            }
+        }
+    }
+    let state = crate::state::BallotState {
+        finalized: true,
+        vote_outcome,
+        agg_signers,
+    };
+    Ok((state, latest_coin_id))
+}
+
+/// FN: extract_finalize_outcome
+/// WHAT: parse the singleton-wrapped action_layer solution from a
+///       finalize spend's `puzzle_and_solution` and extract
+///       `(vote_outcome, agg_signers)` from the finalize action's
+///       solution. Returns `None` if the solution shape doesn't match
+///       (e.g., a non-finalize action invocation, or a malformed spend).
+/// SOURCE OF SHAPE:
+///   * Singleton wrapper: `(lineage_proof, amount, inner_solution)` —
+///     `chia_puzzle_types::singleton::SingletonSolution`.
+///   * inner_solution = action_layer solution, hand-built by
+///     `build_action_layer_solution` as the cons chain
+///     `(puzzles . (sap . (solutions . finalizer_solution)))`.
+///   * solutions[0] = the invoked action's solution. For finalize:
+///     `(proof . (vote_outcome . (agg_signers . (agg_sig . scalars))))`
+///     per `aggregator.rs::build_finalize_with_proof_for_ballot_inner`
+///     and `puzzles/ballot_coin/finalize.rue`.
+fn extract_finalize_outcome(solution: &chia_protocol::Program) -> Option<(Bytes32, Bytes32)> {
+    use chia_puzzle_types::singleton::SingletonSolution;
+    use clvm_traits::FromClvm;
+    use clvmr::{Allocator, NodePtr};
+
+    let mut alloc = Allocator::new();
+    let solution_node: NodePtr = solution.to_clvm(&mut alloc).ok()?;
+
+    // Outer wrapper: SingletonSolution { lineage_proof, amount, inner_solution }.
+    let parsed: SingletonSolution<NodePtr> =
+        SingletonSolution::from_clvm(&alloc, solution_node).ok()?;
+    let inner = parsed.inner_solution;
+
+    // inner = (puzzles . (sap . (solutions . finalizer_solution)))
+    let (_puzzles, rest1) = pair(&alloc, inner)?;
+    let (_sap, rest2) = pair(&alloc, rest1)?;
+    let (solutions, _fs) = pair(&alloc, rest2)?;
+    // solutions is a CLVM list; first element = finalize action's solution.
+    let (finalize_solution, _rest) = pair(&alloc, solutions)?;
+    // finalize_solution = (proof . (vote_outcome . (agg_signers . _)))
+    let (_proof, after_proof) = pair(&alloc, finalize_solution)?;
+    let (vote_outcome_node, after_vo) = pair(&alloc, after_proof)?;
+    let (agg_signers_node, _after_as) = pair(&alloc, after_vo)?;
+
+    let vote_outcome = atom_to_bytes32(&alloc, vote_outcome_node)?;
+    // `agg_signers` in the finalize SOLUTION is a variable-length Bytes
+    // (the participation bitfield); the on-chain BallotState stores it
+    // as a Bytes32 (sha256 / pad / however the action processes it).
+    // For now we expose the atom as Bytes32 when its length is 32, and
+    // fall back to default otherwise — matches what the dApp consumes
+    // (display-only field, never verified locally).
+    let agg_signers = atom_to_bytes32(&alloc, agg_signers_node).unwrap_or_default();
+    Some((vote_outcome, agg_signers))
+}
+
+fn pair(alloc: &clvmr::Allocator, node: clvmr::NodePtr) -> Option<(clvmr::NodePtr, clvmr::NodePtr)> {
+    match alloc.sexp(node) {
+        clvmr::SExp::Pair(a, b) => Some((a, b)),
+        clvmr::SExp::Atom => None,
+    }
+}
+
+fn atom_to_bytes32(alloc: &clvmr::Allocator, node: clvmr::NodePtr) -> Option<Bytes32> {
+    let bytes = alloc.atom(node);
+    let slice = bytes.as_ref();
+    if slice.len() != 32 {
+        return None;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(slice);
+    Some(Bytes32::new(arr))
+}
+
+/// FN: read_ballot_launcher_memo
+/// WHAT: fetch the launcher coin's spent puzzle_and_solution and
+///       parse the third element of the launcher solution as a
+///       `BallotLauncherMemo`. Returns `Ok(None)` when the launcher
+///       is unspent (not yet broadcast / not yet confirmed) OR when
+///       the key_value_list doesn't decode as a CHIP memo (legacy
+///       ballots, third-party launchers).
+/// WHY:  Option A — chain-discoverable curry. Cross-browser
+///       observers + share-bundle importers can recover the curry
+///       params without external metadata.
+pub(crate) async fn read_ballot_launcher_memo<C: ChainReader>(
+    chain: &C,
+    ballot_launcher_id: Bytes32,
+) -> VotingResult<Option<crate::state::BallotLauncherMemo>> {
+    use chia_puzzle_types::singleton::LauncherSolution;
+    use clvm_traits::{FromClvm, ToClvm};
+
+    let (_puzzle, solution) = match chain.puzzle_and_solution(ballot_launcher_id).await? {
+        Some(ps) => ps,
+        None => return Ok(None),
+    };
+    let mut alloc = clvmr::Allocator::new();
+    let solution_node = match solution.to_clvm(&mut alloc) {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    let parsed: LauncherSolution<crate::state::BallotLauncherMemo> =
+        match LauncherSolution::from_clvm(&alloc, solution_node) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+    let memo = parsed.key_value_list;
+    if memo.schema_tag.as_ref() != crate::state::BALLOT_LAUNCHER_MEMO_TAG {
+        return Ok(None);
+    }
+    Ok(Some(memo))
 }
 
 /// STRUCT: AnnounceFinalizationParams
@@ -1084,13 +1405,21 @@ pub async fn build_announce_finalization_bundle<C: ChainReader>(
     })?;
     let finalize_full_hash = Bytes32::new(tree_hash(&ctx, finalize_curried).to_bytes());
 
+    // M4-revised: oracle now currys (BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT,
+    // VOTE_OPTIONS_ROOT). Defaulting to Mode1Free sentinel until M7e
+    // threads `params.vote_options_root` through.
+    let vote_options_root_curry: Bytes32 = Bytes32::default();
     let oracle_program_node = crate::action_spends::load_action_puzzle(
         &mut ctx,
         crate::puzzles::BALLOT_COIN_ORACLE_HEX,
     )?;
     let oracle_curried = CurriedProgram {
         program: oracle_program_node,
-        args: clvm_curried_args!(params.ballot_launcher_id, params.vote_close_height),
+        args: clvm_curried_args!(
+            params.ballot_launcher_id,
+            params.vote_close_height,
+            vote_options_root_curry
+        ),
     }
     .to_clvm(&mut *ctx)
     .map_err(|e| {

@@ -206,6 +206,11 @@ pub fn dummy_deploy_params() -> DeployParams {
         },
         cat_tail_hash: Bytes32::new([0x77; 32]),
         collateral_amount: 1_000,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        ceremony_launcher_id: Bytes32::default(),
+        vk_hash: Bytes32::default(),
+        vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         // CHIP rev 2026-05-02: registration_fee and election_length_blocks
         // were dropped from DeployParams (per-ballot timing replaces the
         // global election length; XCH fee was removed entirely).
@@ -225,7 +230,7 @@ pub fn real_deploy_params_with_pk() -> (
     use ark_std::rand::SeedableRng;
     use chip_voting_sdk::prover::circuit::generate_test_setup;
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
-    let (pk, vk) = generate_test_setup(&mut rng).expect("generate_test_setup");
+    let (pk, vk) = generate_test_setup(32, &mut rng).expect("generate_test_setup");
     let vk_bytes = vk.chia_chunked_bytes().expect("vk chunked bytes");
     let params = DeployParams {
         verification_key: VerificationKey {
@@ -233,6 +238,11 @@ pub fn real_deploy_params_with_pk() -> (
         },
         cat_tail_hash: Bytes32::new([0x77; 32]),
         collateral_amount: 1_000,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        ceremony_launcher_id: Bytes32::default(),
+        vk_hash: Bytes32::default(),
+        vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         // CHIP rev 2026-05-02: registration_fee + election_length_blocks dropped.
         election_start_height: 0,
         label: Some("integration-test-real-vk".into()),
@@ -247,7 +257,7 @@ pub fn deploy_into_sim() -> (ElectionConfig, Simulator) {
     let funder = sim.bls(1);
     let deployer = ElectionDeployer::new(dummy_deploy_params());
     let (coin_spends, config) = deployer
-        .build_deploy_bundle(funder.coin, funder.pk)
+        .build_deploy_bundle(funder.coin, funder.pk, true)
         .expect("build_deploy_bundle");
     sim.spend_coins(coin_spends, &[funder.sk])
         .expect("simulator accepts deploy bundle");
@@ -267,7 +277,7 @@ pub fn deploy_with_real_pk_into_sim() -> (
     let funder = sim.bls(1);
     let deployer = ElectionDeployer::new(params);
     let (coin_spends, config) = deployer
-        .build_deploy_bundle(funder.coin, funder.pk)
+        .build_deploy_bundle(funder.coin, funder.pk, true)
         .expect("build_deploy_bundle");
     sim.spend_coins(coin_spends, &[funder.sk])
         .expect("simulator accepts deploy bundle");

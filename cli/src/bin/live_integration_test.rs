@@ -60,6 +60,12 @@
 
 use anyhow::{bail, Context as _, Result};
 use bip39::{Language, Mnemonic};
+use chip_voting_sdk::actors::ceremony::{
+    CeremonyContributor, CeremonyDeployer, CeremonyFinalizer,
+    CeremonyParams as OnChainCeremonyParams, CeremonyReader, ContributeParams,
+    DEFAULT_CEREMONY_MAX_VOTERS, FinalizeArtifacts, FinalizeParams,
+};
+use chip_voting_sdk::state::CeremonyState;
 use chip_voting_sdk::ceremony::{
     CeremonyCoordinator, CeremonyParticipant, MpcBackend, SimulatedBackend,
 };
@@ -69,10 +75,10 @@ use chip_voting_sdk::prover::circuit::{ArkProvingKey, ArkVerifyingKey};
 use chip_voting_sdk::{
     actors::deployer::sign_bundle_signature, dry_run_coin_spends, master_to_wallet_unhardened,
     puzzles, verify_bundle_signatures, wait_for_current_singleton, Aggregator, Bytes32, Cat,
-    CatArgs, CatSpend, Coin, CoinSpend, CoinsetClient, Conditions, DeployParams, DeriveSynthetic,
-    ElectionConfig, ElectionDeployer, Memos, NetworkType, PublicKey, Puzzle, SecretKey,
-    SpendBundle, SpendContext, SpendWithConditions, StandardArgs, StandardLayer, VerificationKey,
-    Voter, VoterKeys,
+    CatArgs, CatSpend, Coin, CoinSpend, CoinsetClient, Conditions, DeployParams,
+    DeploymentArtifacts, DeriveSynthetic, ElectionConfig, ElectionDeployer, Memos, NetworkType,
+    PublicKey, Puzzle, SecretKey, SpendBundle, SpendContext, SpendWithConditions, StandardArgs,
+    StandardLayer, VerificationKey, Voter, VoterKeys,
 };
 use clap::Parser;
 use std::collections::HashMap;
@@ -157,6 +163,34 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     launcher_amount: u64,
 
+    /// M14: vote-mode commitment for the per-ballot oracle curry +
+    /// create_ballot solution. 32-byte hex (0x-prefix optional).
+    /// Default `0x00…00` = Mode1Free (any vote_data accepted). Pass a
+    /// sorted-options merkle root to mint a Mode2Restricted ballot.
+    /// MUST match the election's `vote_mode_lock` when the deploy was
+    /// mode-locked (otherwise the create_ballot puzzle's M6 gate
+    /// raises). Operators can run the cli with this flag to manually
+    /// exercise the three M14 combinations:
+    ///   (a) deploy with no lock + this flag absent → Mode1Free ballot
+    ///   (b) deploy with no lock + this flag set    → Mode2Restricted ballot
+    ///   (c) deploy locked-Restricted + flag matches lock → success;
+    ///       flag mismatched → create_ballot dry-run rejects.
+    #[arg(long, default_value = "0000000000000000000000000000000000000000000000000000000000000000")]
+    ballot_vote_options_root: String,
+
+    /// M5r-merkle-h: comma-separated label list defining the locked
+    /// option set for Mode2Restricted ballots. Each label is hashed
+    /// via `sha256("vote:" + label)` (matches the dApp + cli's
+    /// internal vote_data convention). When set, phase_vote computes
+    /// the merkle inclusion proof for the picked vote_data and
+    /// threads it into CastVoteParams so the on-chain
+    /// mint_voting_coin's M5r-merkle-e gate accepts the cast.
+    /// If --ballot-vote-options-root is ALSO set, the cli asserts the
+    /// derived merkle root equals the flag value (catches operator
+    /// label/root mismatches before broadcast).
+    #[arg(long)]
+    ballot_options_csv: Option<String>,
+
     /// Per-broadcast confirmation poll interval (seconds).
     #[arg(long, default_value_t = 8)]
     poll_interval_secs: u64,
@@ -186,6 +220,23 @@ struct Args {
     /// Trace-level logging (debug → trace).
     #[arg(long)]
     trace: bool,
+
+    /// Run the on-chain ceremony deploy phase (Phase 0.5). Currently
+    /// scaffolded only — see `phase_ceremony_deploy`. Pairs with the
+    /// `--run-ceremony-deploy` flag in
+    /// `wasm/integration-tests/live_integration.mjs`.
+    #[arg(long)]
+    run_ceremony_deploy: bool,
+
+    /// Run the on-chain ceremony contribute phase (Phase 0.6).
+    /// Requires `--run-ceremony-deploy`.
+    #[arg(long)]
+    run_ceremony_contribute: bool,
+
+    /// Run the on-chain ceremony VK derivation phase (Phase 0.7).
+    /// Requires `--run-ceremony-deploy` + `--run-ceremony-contribute`.
+    #[arg(long)]
+    run_ceremony_derive_vk: bool,
     // NOTE: legacy chia_query peer-pool args (`--trusted-fullnode`,
     // `--peer-connect-timeout-secs`, `--max-peers`) were removed when
     // the live test switched to using `CoinsetClient` exclusively for
@@ -1000,12 +1051,12 @@ fn run_local_ceremony() -> Result<CeremonyArtifacts> {
     use ark_serialize::CanonicalDeserialize;
 
     info!("running single-participant SimulatedBackend ceremony");
-    let mut coord = CeremonyCoordinator::new(Box::new(SimulatedBackend));
+    let mut coord = CeremonyCoordinator::new(Box::new(SimulatedBackend::default()));
     coord
         .start("chip-voting-v1".into())
         .map_err(|e| anyhow::anyhow!("ceremony start: {e:?}"))?;
     let alice = CeremonyParticipant::new(
-        Box::new(SimulatedBackend),
+        Box::new(SimulatedBackend::default()),
         "live-test-alice".into(),
         Some("live integration test ceremony".into()),
     );
@@ -1022,7 +1073,7 @@ fn run_local_ceremony() -> Result<CeremonyArtifacts> {
         .accept_contribution(contribution.transcript)
         .map_err(|e| anyhow::anyhow!("accept_contribution: {e:?}"))?;
 
-    let backend = SimulatedBackend;
+    let backend = SimulatedBackend::default();
     let final_transcript = coord
         .current_transcript()
         .map_err(|e| anyhow::anyhow!("current_transcript: {e:?}"))?;
@@ -1120,6 +1171,480 @@ struct DeployArtifacts {
     election_start_height: u64,
 }
 
+/// On-chain ceremony bootstrap returned by `phase_ceremony_deploy` and
+/// threaded through `phase_contribute` / `phase_ceremony_finalize` /
+/// `phase_deploy`. Carries everything later phases need to walk the
+/// singleton, build contribute / finalize bundles, and recover the
+/// voucher coin's parent + amount for the V7 linked deploy.
+#[allow(dead_code)] // some fields used only by V11d (linked deploy)
+#[derive(Debug, Clone)]
+struct CeremonyDeployArtifacts {
+    launcher_id: Bytes32,
+    /// Coin id of the funder XCH coin that produced the launcher. Needed
+    /// for the eve singleton's lineage proof in `phase_contribute`
+    /// (`Proof::Eve { parent_parent_coin_info: this, parent_amount: 1 }`).
+    launcher_parent_coin_id: Bytes32,
+    deploy_height: u32,
+    params: OnChainCeremonyParams,
+}
+
+/// PHASE 0.5 — phase_ceremony_deploy
+/// On-chain Groth16 ceremony deploy. When `--run-ceremony-deploy` is
+/// set, allocates an XCH funder, builds + signs a CeremonyDeployer
+/// bundle, pushes it, and waits for the launcher coin (and the eve
+/// singleton's child puzzle hash) to confirm. Returns the launcher
+/// id + curried params so subsequent contribute / finalize phases
+/// can drive the same singleton.
+///
+/// MIRRORS: `phaseCeremonyDeploy` in
+/// `wasm/integration-tests/live_integration.mjs`.
+async fn phase_ceremony_deploy(
+    chain: &CoinsetClient,
+    funding_keys: &WalletKeys,
+    network: NetworkType,
+    args: &Args,
+) -> Result<Option<CeremonyDeployArtifacts>> {
+    if !args.run_ceremony_deploy {
+        info!("=== PHASE 0.5: ceremony deploy (skipped — pass --run-ceremony-deploy) ===");
+        return Ok(None);
+    }
+    info!("=== PHASE 0.5: ceremony deploy ===");
+    confirm_or_bail(args, "Broadcast the ceremony deploy bundle?")?;
+
+    // 1 mojo for the launcher itself + ample slack for change.
+    let parent_coin = find_xch_coin(chain, funding_keys.p2_puzzle_hash, 100)
+        .await
+        .context("phase_ceremony_deploy: no XCH funding coin")?;
+    let funding_input_id: Bytes32 = parent_coin.coin_id().into();
+    let launcher_parent_coin_id = parent_coin.coin_id();
+
+    let start_block_height = u64::from(
+        current_peak_height(chain)
+            .await
+            .context("phase_ceremony_deploy: read current peak height")?,
+    );
+
+    // V11 spec: max_voters=200 — small enough to converge inside a single
+    // live-test run, large enough to exercise the depth-aware tree paths
+    // (depth = ceil(log2(200)) = 8). One contribution + min_participants=1
+    // is the smallest non-trivial transcript that still satisfies finalize.
+    // 30 blocks ≈ 26 minutes on mainnet at 52s/block — short enough that
+    // a single live test run can wait it out and still exercise the
+    // window-close → finalize → voucher discovery path. The contribute
+    // phase must land within this window; finalize requires it to have
+    // closed (peak >= start + length).
+    let params = OnChainCeremonyParams {
+        start_block_height,
+        ceremony_length_blocks: 30,
+        min_participants: 1,
+        max_voters: 200,
+        vk_seed: Bytes32::default(),
+        label: Some(format!(
+            "live-test-ceremony-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S")
+        )),
+    };
+    let _ = DEFAULT_CEREMONY_MAX_VOTERS; // doc-marker that 200 is intentionally below default
+    let deployer = CeremonyDeployer::new(params.clone());
+
+    let (bundle, launcher_id) = deployer
+        .deploy_signed(
+            parent_coin,
+            funding_keys.synthetic_pk,
+            std::slice::from_ref(&funding_keys.synthetic_sk),
+            network,
+        )
+        .map_err(|e| anyhow::anyhow!("ceremony deploy_signed: {e:?}"))?;
+
+    info!(
+        launcher_id = %hex::encode(launcher_id),
+        coin_spends = bundle.coin_spends.len(),
+        "ceremony deploy bundle assembled — broadcasting"
+    );
+    push_tx(chain, &bundle, "ceremony deploy").await?;
+
+    wait_for_spend(
+        chain,
+        funding_input_id,
+        args,
+        "ceremony deploy funding XCH coin",
+    )
+    .await?;
+    let _ = wait_for_confirmation(chain, launcher_id, args, "ceremony launcher coin").await?;
+
+    let deploy_height = current_peak_height(chain).await?;
+    info!(
+        launcher_id = %hex::encode(launcher_id),
+        deploy_height,
+        max_voters = params.max_voters,
+        "ceremony deploy phase complete"
+    );
+
+    Ok(Some(CeremonyDeployArtifacts {
+        launcher_id,
+        launcher_parent_coin_id,
+        deploy_height,
+        params,
+    }))
+}
+
+/// Per-contribution record returned by `phase_contribute` and
+/// consumed by `phase_ceremony_finalize` (V11c-ii) to compose the
+/// `marker_root` over the sorted contribution coin ids.
+#[allow(dead_code)] // marker_coin_id used by V11c-ii
+#[derive(Debug, Clone)]
+struct ContributionRecord {
+    marker_coin_id: Bytes32,
+    contribution_hash: Bytes32,
+}
+
+/// PHASE 0.6 — phase_contribute
+/// Drives a single participant contribution against the on-chain
+/// Ceremony Singleton produced by `phase_ceremony_deploy`. Generates
+/// a deterministic participant BLS key, builds + signs the contribute
+/// action bundle (StandardLayer funder + AGG_SIG_UNSAFE participant),
+/// pushes it, and waits for the marker CeremonyCoin to land.
+async fn phase_contribute(
+    chain: &CoinsetClient,
+    funding_keys: &WalletKeys,
+    network: NetworkType,
+    args: &Args,
+    ceremony: &Option<CeremonyDeployArtifacts>,
+) -> Result<Vec<ContributionRecord>> {
+    use chia_protocol::Bytes;
+    use chip_voting_sdk::{EveProof, Proof};
+    use sha2::{Digest, Sha256};
+
+    if !args.run_ceremony_contribute || ceremony.is_none() {
+        info!(
+            "=== PHASE 0.6: contribute (skipped — pass --run-ceremony-contribute \
+             after a successful ceremony deploy) ==="
+        );
+        return Ok(vec![]);
+    }
+    let ceremony = ceremony.as_ref().expect("ceremony deploy artifacts present");
+    info!("=== PHASE 0.6: contribute ===");
+    confirm_or_bail(args, "Broadcast a single ceremony contribution?")?;
+
+    // 1. Compute the eve singleton coin deterministically from the
+    //    launcher_id + curried genesis state.
+    let deployer = CeremonyDeployer::new(ceremony.params.clone());
+    let genesis_inner_ph = deployer.genesis_inner_puzzle_hash(ceremony.launcher_id);
+    let eve_outer_ph = chip_voting_sdk::puzzles::election_singleton_puzzle_hash(
+        ceremony.launcher_id,
+        genesis_inner_ph,
+    );
+    let eve_coin = Coin::new(ceremony.launcher_id, eve_outer_ph, 1);
+    let eve_id = eve_coin.coin_id();
+    info!(
+        eve_outer_ph = %hex::encode(eve_outer_ph),
+        eve_id = %hex::encode(eve_id),
+        "phase_contribute: predicted eve singleton coin"
+    );
+    let _ = wait_for_confirmation(chain, eve_id, args, "ceremony eve singleton").await?;
+    let lineage_proof = Proof::Eve(EveProof {
+        parent_parent_coin_info: ceremony.launcher_parent_coin_id,
+        parent_amount: 1,
+    });
+
+    // 2. Generate a deterministic participant key from sha256(funder_pk
+    //    || launcher_id || "live-test-contributor"). Stable across
+    //    re-runs of the same ceremony so a partial bundle that gets
+    //    rejected at push time can be retried with the same key.
+    let mut seed_h = Sha256::new();
+    seed_h.update(funding_keys.synthetic_pk.to_bytes().as_slice());
+    seed_h.update(ceremony.launcher_id.to_bytes().as_slice());
+    seed_h.update(b"live-test-contributor");
+    let participant_seed: [u8; 32] = seed_h.finalize().into();
+    let participant_sk = SecretKey::from_seed(&participant_seed);
+    let participant_pk = participant_sk.public_key();
+
+    // 3. Build the contribution payload + commitment. JSON shape that
+    //    `derive_vk` parses (mirrors the simulator e2e tests).
+    let entropy_bytes: [u8; 32] = sha2::Sha256::new()
+        .chain_update(b"live-test-entropy")
+        .chain_update(participant_seed)
+        .finalize()
+        .into();
+    let entropy_hex_str = hex::encode(entropy_bytes);
+    let payload = format!(
+        r#"{{"entropy_hex":"{entropy_hex_str}","name":"live-test"}}"#
+    )
+    .into_bytes();
+    let contribution_hash = ContributeParams::compute_contribution_hash(&payload);
+
+    // 4. Allocate a small XCH funder for the marker's +1 mojo (the
+    //    contribute action emits a +2 even-amount marker; the singleton
+    //    self-funds 1, the funder coin contributes the other 1 and
+    //    receives change for the rest).
+    let marker_funder = find_xch_coin(chain, funding_keys.p2_puzzle_hash, 10)
+        .await
+        .context("phase_contribute: no XCH funder coin for marker")?;
+    let marker_funder_input_id: Bytes32 = marker_funder.coin_id().into();
+
+    // 5. Build the contribute bundle. The first contribution's
+    //    prev_contribution_hash is the curried genesis vk_seed.
+    let _ = deployer; // genesis_inner_ph already extracted above
+    let contributor =
+        CeremonyContributor::new(ceremony.launcher_id, ceremony.params.clone());
+    let contrib_params = ContributeParams {
+        participant_pubkey: participant_pk.clone(),
+        contribution_hash,
+        prev_contribution_hash: ceremony.params.vk_seed,
+        entropy_hex: Bytes::new(entropy_bytes.to_vec()),
+        payload: payload.clone(),
+    };
+    let coin_spends = contributor
+        .build_contribute_bundle(
+            eve_coin,
+            lineage_proof,
+            CeremonyState::genesis(ceremony.params.vk_seed),
+            marker_funder,
+            funding_keys.synthetic_pk,
+            contrib_params,
+        )
+        .map_err(|e| anyhow::anyhow!("build_contribute_bundle: {e:?}"))?;
+
+    // 6. Pre-flight dry-run for clearer trap-location errors.
+    dry_run_coin_spends(&coin_spends)
+        .map_err(|e| anyhow::anyhow!("contribute dry_run: {e:?}"))?;
+
+    let signature = sign_bundle_signature(
+        &coin_spends,
+        &[funding_keys.synthetic_sk.clone(), participant_sk.clone()],
+        network,
+    )
+    .map_err(|e| anyhow::anyhow!("contribute sign_bundle_signature: {e:?}"))?;
+    let bundle = SpendBundle::new(coin_spends, signature);
+
+    info!(
+        coin_spends = bundle.coin_spends.len(),
+        "contribute bundle assembled — broadcasting"
+    );
+    push_tx(chain, &bundle, "ceremony contribute").await?;
+
+    wait_for_spend(
+        chain,
+        marker_funder_input_id,
+        args,
+        "ceremony contribute funder XCH coin",
+    )
+    .await?;
+
+    // 7. Predict the marker coin and wait for it to confirm.
+    let predicted_marker_ph =
+        chip_voting_sdk::actors::ceremony::ceremony_coin_marker_puzzle_hash(
+            ceremony.launcher_id,
+            &participant_pk,
+            contribution_hash,
+            ceremony.params.vk_seed,
+        );
+    let marker_coin = Coin::new(eve_id, predicted_marker_ph, 2);
+    let marker_id = marker_coin.coin_id();
+    let _ = wait_for_confirmation(chain, marker_id, args, "ceremony contribution marker").await?;
+
+    info!(
+        marker_id = %hex::encode(marker_id),
+        contribution_hash = %hex::encode(contribution_hash),
+        "phase_contribute: marker confirmed"
+    );
+
+    Ok(vec![ContributionRecord {
+        marker_coin_id: marker_id,
+        contribution_hash,
+    }])
+}
+
+/// PHASE 0.7 — phase_derive_vk
+/// Chain-walks the Ceremony Singleton via `CeremonyReader`, validates
+/// the lineage threshold, and derives a Groth16 verifying key.
+/// Returns `None` when the operator hasn't opted in.
+async fn phase_derive_vk(
+    chain: &CoinsetClient,
+    args: &Args,
+    ceremony: &Option<CeremonyDeployArtifacts>,
+    contributions: &[ContributionRecord],
+) -> Result<Option<VerificationKey>> {
+    if !args.run_ceremony_derive_vk || ceremony.is_none() || contributions.is_empty() {
+        info!(
+            "=== PHASE 0.7: derive_vk (skipped — pass --run-ceremony-derive-vk \
+             after ceremony + contributions exist) ==="
+        );
+        return Ok(None);
+    }
+    let ceremony = ceremony.as_ref().expect("ceremony deploy artifacts present");
+    info!("=== PHASE 0.7: derive_vk ===");
+
+    let records = CeremonyReader::list_contributions_via_chain(chain, ceremony.launcher_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("list_contributions_via_chain: {e:?}"))?;
+    info!(
+        records = records.len(),
+        "phase_derive_vk: chain-walked contributions"
+    );
+
+    CeremonyReader::check_threshold(
+        &records,
+        ceremony.params.vk_seed,
+        ceremony.params.min_participants,
+    )
+    .map_err(|e| anyhow::anyhow!("check_threshold: {e:?}"))?;
+
+    let vk = CeremonyReader::derive_vk(
+        &records,
+        ceremony.params.vk_seed,
+        ceremony.params.min_participants,
+    )
+    .map_err(|e| anyhow::anyhow!("derive_vk: {e:?}"))?;
+    info!(
+        vk_bytes = vk.raw_bytes.len(),
+        "phase_derive_vk: derived VK from on-chain transcripts"
+    );
+    Ok(Some(vk))
+}
+
+/// PHASE 0.8 — phase_ceremony_finalize
+/// Drives the (post-D3) `finalize` action against the singleton tip,
+/// committing `(vk_hash, marker_root)` into state and emitting the
+/// voucher coin that V11d's linked deploy will co-spend. Permissionless
+/// on the singleton side (no AGG_SIG_UNSAFE) — only the funder's
+/// StandardLayer AggSigMe needs the operator's synthetic sk.
+async fn phase_ceremony_finalize(
+    chain: &CoinsetClient,
+    funding_keys: &WalletKeys,
+    network: NetworkType,
+    args: &Args,
+    ceremony: &Option<CeremonyDeployArtifacts>,
+    contributions: &[ContributionRecord],
+    vk_from_chain: &Option<VerificationKey>,
+) -> Result<Option<FinalizeArtifacts>> {
+    use sha2::{Digest, Sha256};
+
+    if !args.run_ceremony_derive_vk
+        || ceremony.is_none()
+        || contributions.is_empty()
+        || vk_from_chain.is_none()
+    {
+        info!(
+            "=== PHASE 0.8: finalize (skipped — needs ceremony + contributions + derived VK) ==="
+        );
+        return Ok(None);
+    }
+    let ceremony = ceremony.as_ref().expect("ceremony deploy artifacts present");
+    let vk = vk_from_chain
+        .as_ref()
+        .expect("vk_from_chain present per gate above");
+    info!("=== PHASE 0.8: ceremony finalize ===");
+    confirm_or_bail(args, "Broadcast the ceremony finalize bundle?")?;
+
+    // 1. Wait for the contribution window to close. finalize asserts
+    //    `peak >= start + length` via AssertHeightAbsolute.
+    let close_height = (ceremony.params.start_block_height
+        + ceremony.params.ceremony_length_blocks) as u32;
+    info!(
+        close_height,
+        "waiting for ceremony window to close before finalize"
+    );
+    let _ = args; // poll/timeout intentionally hard-coded for finalize wait
+    wait_for_block_height(chain, close_height, 30, 60 * 60).await?;
+
+    // 2. Walk the singleton tip post-contribute(s) so we have the right
+    //    coin + lineage proof + state for the finalize spend.
+    let (singleton_coin, lineage_proof, current_state) =
+        CeremonyReader::find_current_singleton(
+            chain,
+            ceremony.launcher_id,
+            ceremony.params.vk_seed,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("find_current_singleton: {e:?}"))?;
+    info!(
+        tip_id = %hex::encode(singleton_coin.coin_id()),
+        finalized = current_state.finalized,
+        contribution_count = current_state.contribution_count,
+        "finalize: located singleton tip"
+    );
+
+    // 3. Compute FinalizeParams. vk_hash = sha256(vk_bytes); marker_root
+    //    = merkle_root_of_sorted_coin_ids over the contribution markers.
+    let vk_bytes = vk.raw_bytes.clone();
+    let vk_hash: Bytes32 = {
+        let mut h = Sha256::new();
+        h.update(&vk_bytes);
+        Bytes32::new(h.finalize().into())
+    };
+    let marker_ids: Vec<Bytes32> = contributions.iter().map(|c| c.marker_coin_id).collect();
+    let marker_root = chip_voting_sdk::merkle::merkle_root_of_sorted_coin_ids(&marker_ids);
+
+    let finalize_params = FinalizeParams {
+        vk_hash,
+        marker_root,
+        vk_bytes,
+    };
+
+    // 4. Allocate a small XCH funder for the finalize bundle's marker
+    //    +1 mojo (marker amount = 2; the singleton self-funds 1).
+    let finalize_funder = find_xch_coin(chain, funding_keys.p2_puzzle_hash, 10)
+        .await
+        .context("phase_ceremony_finalize: no XCH funder coin")?;
+    let finalize_funder_id: Bytes32 = finalize_funder.coin_id().into();
+
+    // 5. Build, sign, push.
+    let finalizer =
+        CeremonyFinalizer::new(ceremony.launcher_id, ceremony.params.clone());
+    let artifacts = finalizer
+        .build_finalize_bundle(
+            singleton_coin,
+            lineage_proof,
+            current_state,
+            finalize_funder,
+            funding_keys.synthetic_pk,
+            finalize_params,
+        )
+        .map_err(|e| anyhow::anyhow!("build_finalize_bundle: {e:?}"))?;
+
+    dry_run_coin_spends(&artifacts.coin_spends)
+        .map_err(|e| anyhow::anyhow!("finalize dry_run: {e:?}"))?;
+
+    let signature = sign_bundle_signature(
+        &artifacts.coin_spends,
+        std::slice::from_ref(&funding_keys.synthetic_sk),
+        network,
+    )
+    .map_err(|e| anyhow::anyhow!("finalize sign_bundle_signature: {e:?}"))?;
+    let bundle = SpendBundle::new(artifacts.coin_spends.clone(), signature);
+
+    info!(
+        coin_spends = bundle.coin_spends.len(),
+        voucher_id = %hex::encode(artifacts.voucher_coin_id),
+        "finalize bundle assembled — broadcasting"
+    );
+    push_tx(chain, &bundle, "ceremony finalize").await?;
+
+    wait_for_spend(
+        chain,
+        finalize_funder_id,
+        args,
+        "ceremony finalize funder XCH coin",
+    )
+    .await?;
+    let _ = wait_for_confirmation(
+        chain,
+        artifacts.voucher_coin_id,
+        args,
+        "ceremony voucher coin",
+    )
+    .await?;
+
+    info!(
+        voucher_id = %hex::encode(artifacts.voucher_coin_id),
+        voucher_ph = %hex::encode(artifacts.voucher_puzzle_hash),
+        "phase_ceremony_finalize: voucher confirmed"
+    );
+
+    Ok(Some(artifacts))
+}
+
 async fn phase_deploy(
     chain: &CoinsetClient,
     funding_keys: &WalletKeys,
@@ -1127,9 +1652,19 @@ async fn phase_deploy(
     args: &Args,
     cat_tail_hash: Bytes32,
     vk: &VerificationKey,
+    ceremony: &Option<CeremonyDeployArtifacts>,
+    voucher: &Option<FinalizeArtifacts>,
 ) -> Result<DeployArtifacts> {
     info!("=== PHASE 1: deploy Election Singleton ===");
     confirm_or_bail(args, "Broadcast the deploy bundle?")?;
+
+    // V11d: when a finalized ceremony + voucher are present, deploy via
+    // the linked path so the election commits to the on-chain ceremony's
+    // (vk_hash, max_voters, ceremony_launcher_id) triple by co-spending
+    // the voucher and asserting its canonical announcement. Falls back
+    // to the legacy unlinked path when running the local SimulatedBackend
+    // ceremony only.
+    let linked = ceremony.is_some() && voucher.is_some();
 
     // Find a parent XCH coin big enough to fund the launcher — selected
     // immediately before the deploy bundle is built (fresh UTXO snapshot).
@@ -1159,24 +1694,113 @@ async fn phase_deploy(
         "snapshotting current peak as election_start_height curried into eve singleton state"
     );
 
+    // V8/V9: voucher-link fields. When `phase_ceremony_deploy` ran and produced a
+    // voucher, those values flow in via `ceremony`/`voucher`; otherwise we
+    // fall back to zero placeholders + `allow_unlinked_ceremony=true` for the
+    // legacy single-participant SimulatedBackend path.
+    let vk_hash: Bytes32 = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(vk.serialize().as_slice());
+        let out: [u8; 32] = h.finalize().into();
+        Bytes32::new(out)
+    };
+    let (ceremony_launcher_id_for_deploy, max_signers_for_deploy): (Bytes32, usize) =
+        if let Some(c) = ceremony.as_ref() {
+            (c.launcher_id, c.params.max_voters as usize)
+        } else {
+            (Bytes32::default(), chip_voting_sdk::config::MAX_SIGNERS)
+        };
     let deployer = ElectionDeployer::new(DeployParams {
         verification_key: vk.clone(),
         cat_tail_hash,
         collateral_amount: args.collateral_amount,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: max_signers_for_deploy,
         election_start_height,
+        ceremony_launcher_id: ceremony_launcher_id_for_deploy,
+        vk_hash,
+        vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         label: Some(format!(
             "live-test-{}",
             chrono::Utc::now().format("%Y%m%dT%H%M%S")
         )),
     });
-    let artifacts = deployer
-        .deploy_signed(
-            parent_coin,
-            funding_keys.synthetic_pk,
+    let artifacts: DeploymentArtifacts = if linked {
+        // V11d: linked deploy. Walk for the unspent voucher coin, build
+        // the bundle via the V7 linked path, sign, and post-condition
+        // assert the voucher spend is in the bundle.
+        let ceremony_ref = ceremony.as_ref().expect("linked: ceremony present");
+        let voucher_ref = voucher.as_ref().expect("linked: voucher present");
+        let voucher_coin = CeremonyReader::find_voucher_coin(
+            chain,
+            ceremony_ref.launcher_id,
+            vk_hash,
+            ceremony_ref.params.max_voters,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("find_voucher_coin: {e:?}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "linked deploy: no unspent voucher at predicted ph {}",
+                hex::encode(voucher_ref.voucher_puzzle_hash)
+            )
+        })?;
+        info!(
+            voucher_id = %hex::encode(voucher_coin.coin_id()),
+            voucher_amount = voucher_coin.amount,
+            "linked deploy: located voucher coin"
+        );
+        let (coin_spends, config) = deployer
+            .build_deploy_bundle_with_ceremony_link(
+                parent_coin,
+                funding_keys.synthetic_pk,
+                voucher_coin,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("build_deploy_bundle_with_ceremony_link: {e:?}")
+            })?;
+
+        // Assert the voucher spend is present in the bundle and that the
+        // bundle dry-runs (which exercises the parent's
+        // AssertCoinAnnouncement matching the voucher's
+        // CreateCoinAnnouncement — V11d's invariant).
+        let voucher_spend_count = coin_spends
+            .iter()
+            .filter(|s| s.coin.coin_id() == voucher_coin.coin_id())
+            .count();
+        if voucher_spend_count != 1 {
+            anyhow::bail!(
+                "linked deploy bundle: expected exactly one voucher spend, got {}",
+                voucher_spend_count
+            );
+        }
+        dry_run_coin_spends(&coin_spends)
+            .map_err(|e| anyhow::anyhow!("linked deploy dry_run: {e:?}"))?;
+        info!(
+            coin_spends = coin_spends.len(),
+            "linked deploy: bundle dry-run ok (voucher AssertCoinAnnouncement matched)"
+        );
+        let signature = sign_bundle_signature(
+            &coin_spends,
             std::slice::from_ref(&funding_keys.synthetic_sk),
             network,
         )
-        .map_err(|e| anyhow::anyhow!("deploy_signed: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("linked deploy sign_bundle_signature: {e:?}"))?;
+        DeploymentArtifacts {
+            spend_bundle: SpendBundle::new(coin_spends, signature),
+            config,
+        }
+    } else {
+        deployer
+            .deploy_signed(
+                parent_coin,
+                funding_keys.synthetic_pk,
+                std::slice::from_ref(&funding_keys.synthetic_sk),
+                network,
+            )
+            .map_err(|e| anyhow::anyhow!("deploy_signed: {e:?}"))?
+    };
 
     info!(
         launcher_id = %artifacts.config.election_launcher_id_hex,
@@ -1465,7 +2089,12 @@ async fn phase_register_voter(
     // as the voter's BLS key, so dedup matters; production
     // deployments would use distinct keys and skip the dedup).
     let voter_bundle = voter
-        .register(&smt, cat_collateral.parent_spend.clone(), chain)
+        .register(
+            &smt,
+            cat_collateral.parent_spend.clone(),
+            chain,
+            args.collateral_amount,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("Voter::register: {e:?}"))?;
 
@@ -1666,6 +2295,9 @@ async fn phase_create_ballot(
                 ballot_seed,
                 vote_close_height,
                 outcome_domain_hash,
+                // M14: parse the cli flag (defaults to 0x00…00 = Mode1Free).
+                vote_options_root: parse_b32_str(&args.ballot_vote_options_root)
+                    .context("--ballot-vote-options-root")?,
             },
             funder_spend,
         )
@@ -1784,6 +2416,12 @@ async fn phase_launch_ballot(
                 outcome_domain_hash,
                 vote_threshold_num,
                 vote_threshold_den,
+                // M14: MUST byte-equal the value we passed to
+                // create_ballot's CreateBallotParams.vote_options_root,
+                // or the predicted eve Ballot Coin puzzle hash will
+                // mismatch what create_ballot minted.
+                vote_options_root: parse_b32_str(&args.ballot_vote_options_root)
+                    .context("--ballot-vote-options-root")?,
             },
         )
         .await
@@ -1850,6 +2488,72 @@ async fn phase_wait_window(
 
 // ── Phase 4: Cast votes ──────────────────────────────────────────────
 
+/// M5r-merkle-h: derive `(vote_options_root, vote_option_proof)` for a
+/// cast based on the operator's --ballot-options-csv. When the flag is
+/// absent, returns `(Bytes32::default(), None)` (Mode1Free). When set:
+///   * builds option hashes via `sha256("vote:" + label)`
+///   * constructs a `BallotVoteMode::Restricted`
+///   * if --ballot-vote-options-root is also set (non-zero), asserts
+///     the derived root equals the flag value
+///   * computes `merkle_proof_for_option(vote_data)` and returns the
+///     `(leaf_index, proof)` pair
+fn derive_cast_vote_proof(
+    args: &Args,
+    vote_data: Bytes32,
+) -> Result<(Bytes32, Option<(usize, Vec<Bytes32>)>)> {
+    use chip_voting_sdk::vote_mode::BallotVoteMode;
+    use sha2::{Digest, Sha256};
+
+    let csv = match args.ballot_options_csv.as_deref() {
+        Some(s) => s,
+        None => return Ok((Bytes32::default(), None)),
+    };
+    let labels: Vec<&str> = csv
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if labels.len() < 2 {
+        anyhow::bail!(
+            "--ballot-options-csv must contain at least 2 distinct labels (got {})",
+            labels.len()
+        );
+    }
+    let mut option_hashes: Vec<Bytes32> = Vec::with_capacity(labels.len());
+    for label in &labels {
+        let mut h = Sha256::new();
+        h.update(b"vote:");
+        h.update(label.as_bytes());
+        option_hashes.push(Bytes32::new(h.finalize().into()));
+    }
+    let mode = BallotVoteMode::Restricted {
+        options: option_hashes.clone(),
+    };
+    let root = mode.vote_options_root();
+
+    // Sanity-check against --ballot-vote-options-root if non-zero.
+    let flag_root = parse_b32_str(&args.ballot_vote_options_root)
+        .context("--ballot-vote-options-root for cross-check")?;
+    if flag_root != Bytes32::default() && flag_root != root {
+        anyhow::bail!(
+            "--ballot-options-csv derives root 0x{} but --ballot-vote-options-root is 0x{} \
+             — operator labels don't match the locked ballot",
+            hex::encode(root),
+            hex::encode(flag_root)
+        );
+    }
+
+    let proof = mode.merkle_proof_for_option(vote_data).ok_or_else(|| {
+        anyhow::anyhow!(
+            "vote_data 0x{} is NOT one of the locked options ({} labels) — \
+             cast would raise the mint_voting_coin M5r-merkle-e gate",
+            hex::encode(vote_data),
+            labels.len()
+        )
+    })?;
+    Ok((root, Some(proof)))
+}
+
 async fn phase_vote(
     chain: &CoinsetClient,
     network: NetworkType,
@@ -1876,6 +2580,11 @@ async fn phase_vote(
     // none of them may be defaulted (a stale `Bytes32::default()` /
     // `0` height would re-curry the Voting Coin's puzzle hash and
     // break the Ballot Coin co-spend's oracle assertion).
+    // M5r-merkle-h: derive Mode2Restricted (root, proof) from
+    // --ballot-options-csv if set. Otherwise fall back to Mode1Free
+    // sentinel (no on-chain restriction).
+    let (cast_vote_options_root, cast_vote_option_proof) =
+        derive_cast_vote_proof(args, vote_data)?;
     let voter = Voter::new(deploy.config.clone(), clone_voter_keys(voter_keys), network)
         .with_election_start_height(deploy.election_start_height);
     let cast_result = voter
@@ -1890,6 +2599,8 @@ async fn phase_vote(
                 registration_merkle_root_snapshot: ballot.registration_merkle_root_snapshot,
                 registration_vote_weight_snapshot: ballot.registration_vote_weight_snapshot,
                 voting_coin_amount: 1,
+                vote_options_root: cast_vote_options_root,
+                vote_option_proof: cast_vote_option_proof,
             },
         )
         .await
@@ -2843,14 +3554,46 @@ async fn main() -> Result<()> {
     let ceremony = run_local_ceremony()?;
     let _ = ceremony.verification_key; // typed VK exists for sanity-check use
 
+    // ── Phase 0.5/0.6/0.7: On-chain ceremony scaffolds ─────────────
+    // Real wiring lives in `wasm/integration-tests/live_integration.mjs`
+    // (the canonical mainnet harness). The cli scaffolds these phases
+    // for symmetry — when an operator passes --run-ceremony-deploy etc.
+    // they currently log a clear "use the mjs harness for the live
+    // ceremony flow" pointer.
+    let on_chain_ceremony =
+        phase_ceremony_deploy(&chain, &funding_keys, network, &args).await?;
+    let on_chain_contributions =
+        phase_contribute(&chain, &funding_keys, network, &args, &on_chain_ceremony).await?;
+    let ceremony_vk_from_chain =
+        phase_derive_vk(&chain, &args, &on_chain_ceremony, &on_chain_contributions).await?;
+    let ceremony_voucher = phase_ceremony_finalize(
+        &chain,
+        &funding_keys,
+        network,
+        &args,
+        &on_chain_ceremony,
+        &on_chain_contributions,
+        &ceremony_vk_from_chain,
+    )
+    .await?;
+
     // ── Phase 1: Deploy ─────────────────────────────────────────────
+    // Prefer the chain-derived VK whenever the on-chain ceremony
+    // produced one (linked deploy commits to its sha256 via the
+    // voucher's canonical announcement). Falls back to the local
+    // SimulatedBackend VK for the unlinked legacy path.
+    let deploy_vk: &VerificationKey = ceremony_vk_from_chain
+        .as_ref()
+        .unwrap_or(&ceremony.wire_vk);
     let deploy = phase_deploy(
         &chain,
         &funding_keys,
         network,
         &args,
         cat_tail_hash,
-        &ceremony.wire_vk,
+        deploy_vk,
+        &on_chain_ceremony,
+        &ceremony_voucher,
     )
     .await?;
 

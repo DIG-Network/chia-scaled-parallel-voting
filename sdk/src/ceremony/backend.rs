@@ -71,7 +71,32 @@ pub trait MpcBackend: Send + Sync {
 /// (transcript chain, attestation flow, key extraction shape);
 /// production deployments MUST use a real MPC backend (`phase2`,
 /// `arkworks-snark-mpc`).
-pub struct SimulatedBackend;
+///
+/// # tree_depth
+/// SPT depth used by the Groth16 circuit. Bound at construction so
+/// that contribute / extract_keys produce a (PK, VK) for the right
+/// circuit shape. Default 32 — matches the historical
+/// `crate::config::TREE_DEPTH` for backwards compat with existing
+/// tests. Production callers (E2 onwards) derive this from
+/// `CeremonyParams.max_voters` via `ceil(log2(max_voters))`.
+#[derive(Debug, Clone)]
+pub struct SimulatedBackend {
+    pub tree_depth: usize,
+}
+
+impl Default for SimulatedBackend {
+    fn default() -> Self {
+        Self { tree_depth: 32 }
+    }
+}
+
+impl SimulatedBackend {
+    /// Construct with an explicit tree depth — typically
+    /// `ceil(log2(ceremony_params.max_voters))`.
+    pub fn with_tree_depth(tree_depth: usize) -> Self {
+        Self { tree_depth }
+    }
+}
 
 #[async_trait::async_trait]
 impl MpcBackend for SimulatedBackend {
@@ -171,8 +196,12 @@ impl MpcBackend for SimulatedBackend {
         let mut rng = ark_std::rand::rngs::StdRng::from_seed(rng_seed);
 
         // Run the actual VotingCircuit setup to produce real,
-        // verification-correct (PK, VK) for our circuit shape.
-        let (ark_pk, ark_vk) = crate::prover::circuit::generate_test_setup(&mut rng)?;
+        // verification-correct (PK, VK) for our circuit shape. The
+        // tree_depth bound at SimulatedBackend construction (E2) is
+        // forwarded so the resulting circuit's R1CS shape matches
+        // the SPT depth the election singleton will curry.
+        let (ark_pk, ark_vk) =
+            crate::prover::circuit::generate_test_setup(self.tree_depth, &mut rng)?;
 
         // Serialise both keys to opaque byte buffers for the
         // backend-agnostic ProvingKey / VerificationKey wrappers.

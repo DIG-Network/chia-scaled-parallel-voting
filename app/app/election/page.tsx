@@ -14,7 +14,6 @@ import { useSearchParams } from "next/navigation";
 import { useAppSelector } from "../redux/hooks";
 import {
   coinRecordByName,
-  coinRecordsByPuzzleHash,
   CoinRecord,
   isConsensusRetriablePushError,
   peakHeight,
@@ -25,6 +24,7 @@ import {
   upsertElection,
   parseShareablePayload,
   canonicalCatTail0x,
+  makeChoices,
   type ElectionChoice,
 } from "../lib/elections";
 import {
@@ -33,8 +33,11 @@ import {
   mergeBootstrapPubkeyRegistered,
   type ElectionBootstrap,
 } from "../lib/electionBootstrap";
+import { recoverAndPersistElectionStartHeight } from "../lib/recoverElectionStartHeight";
+import { getElectionBallotsMerged } from "../lib/electionBallots";
 import {
   writeBallotBootstrap,
+  readBallotBootstrap,
   pickOpenBallotForVoting,
   type BallotBootstrap,
 } from "../lib/ballotBootstrap";
@@ -150,24 +153,27 @@ function finalizeCollectHarvestPct(collect: FinalizeCollectPayload): number {
  */
 function BallotsList(props: {
   electionLauncherIdHex: string;
-  selectedBallotId: string | null;
-  setSelectedBallotId: (id: string | null) => void;
+  configJson: string;
   currentPeak: number;
-  myVoteDataHex: string | null;
   refreshKey: number;
 }) {
   const [ballots, setBallots] = useState<
     import("../lib/ballotBootstrap").BallotBootstrap[]
   >([]);
   useEffect(() => {
+    if (!props.configJson) return;
     let cancelled = false;
     void (async () => {
-      const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
+      const all = await getElectionBallotsMerged(
+        props.configJson,
+        props.electionLauncherIdHex
+      );
       if (cancelled) return;
-      const all = listBallotBootstraps(props.electionLauncherIdHex);
-      // Sort: open first (newest), then closed-not-finalized, then finalized.
+      // Sort: open ballots first (sorted by close-height ascending —
+      // soonest-to-close at the top), then closed-not-finalized,
+      // then finalized.
       const status = (b: typeof all[number]): number => {
-        const finalized = !!b.finalizedAtHeight;
+        const finalized = !!b.finalized || !!b.finalizedAtHeight;
         const closed = b.voteCloseHeight <= props.currentPeak;
         if (finalized) return 2;
         if (closed) return 1;
@@ -177,6 +183,9 @@ function BallotsList(props: {
         const sa = status(a);
         const sb = status(b);
         if (sa !== sb) return sa - sb;
+        if (sa === 0) {
+          return a.voteCloseHeight - b.voteCloseHeight;
+        }
         return (b.launchedAtHeight ?? 0) - (a.launchedAtHeight ?? 0);
       });
       setBallots(all);
@@ -184,7 +193,17 @@ function BallotsList(props: {
     return () => {
       cancelled = true;
     };
-  }, [props.electionLauncherIdHex, props.refreshKey, props.currentPeak]);
+  }, [
+    props.electionLauncherIdHex,
+    props.configJson,
+    props.refreshKey,
+    props.currentPeak,
+  ]);
+
+  const electionIdParam = normalizeHex32(props.electionLauncherIdHex).replace(
+    /^0x/,
+    ""
+  );
 
   if (ballots.length === 0) {
     return (
@@ -203,28 +222,19 @@ function BallotsList(props: {
       <h3 className="font-semibold mb-3">Ballots ({ballots.length})</h3>
       <ul className="space-y-2">
         {ballots.map((b) => {
-          const finalized = !!b.finalizedAtHeight;
+          const finalized = !!b.finalized || !!b.finalizedAtHeight;
           const closed = b.voteCloseHeight <= props.currentPeak;
           const blocksLeft = b.voteCloseHeight - props.currentPeak;
           const status = finalized ? "finalized" : closed ? "expired" : "active";
-          const selected =
-            props.selectedBallotId &&
-            normalizeHex32(props.selectedBallotId) ===
-              normalizeHex32(b.ballotLauncherIdHex);
+          const ballotIdParam = normalizeHex32(b.ballotLauncherIdHex).replace(
+            /^0x/,
+            ""
+          );
           return (
             <li key={b.ballotLauncherIdHex}>
-              <button
-                type="button"
-                onClick={() =>
-                  props.setSelectedBallotId(
-                    selected ? null : b.ballotLauncherIdHex
-                  )
-                }
-                className={`w-full text-left rounded-lg border p-3 transition ${
-                  selected
-                    ? "border-[var(--color-accent)] bg-[var(--color-accent)]/[0.08]"
-                    : "border-[var(--color-border)] hover:border-[var(--color-accent)]/50"
-                }`}
+              <Link
+                href={`/ballot?electionId=${electionIdParam}&ballotId=${ballotIdParam}`}
+                className="block w-full text-left rounded-lg border border-[var(--color-border)] p-3 transition hover:border-[var(--color-accent)]/50 hover:bg-[var(--color-accent)]/[0.04]"
               >
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-1">
                   <span
@@ -241,11 +251,9 @@ function BallotsList(props: {
                   <span className="font-mono text-xs">
                     {truncHex(normalizeHex32(b.ballotLauncherIdHex), 10, 6)}
                   </span>
-                  {selected ? (
-                    <span className="text-[11px] text-[var(--color-accent)]">
-                      ✓ selected
-                    </span>
-                  ) : null}
+                  <span className="ml-auto text-[11px] text-[var(--color-muted)]">
+                    Open ballot →
+                  </span>
                 </div>
                 <div className="text-xs text-[var(--color-muted)] flex flex-wrap gap-x-4 gap-y-0.5">
                   <span>close height: {b.voteCloseHeight.toLocaleString()}</span>
@@ -254,7 +262,9 @@ function BallotsList(props: {
                   ) : null}
                   {finalized ? (
                     <span>
-                      finalized @ {(b.finalizedAtHeight ?? 0).toLocaleString()}
+                      {b.finalizedAtHeight && b.finalizedAtHeight > 0
+                        ? `finalized @ ${b.finalizedAtHeight.toLocaleString()}`
+                        : "finalized"}
                     </span>
                   ) : null}
                   {b.registrationVoteWeightSnapshot > 0 ? (
@@ -263,14 +273,15 @@ function BallotsList(props: {
                     </span>
                   ) : null}
                 </div>
-              </button>
+              </Link>
             </li>
           );
         })}
       </ul>
       <p className="text-xs text-[var(--color-muted)] mt-3">
-        Pick a ballot to drive the Step 2 / Step 3 actions below. Active
-        ballots accept votes; expired ones can be finalized by the deployer.
+        Click a ballot to vote, change your vote, or finalize it.
+        Active ballots accept votes; expired ones can be finalized by anyone
+        holding the proving key (imported via share bundle).
       </p>
     </div>
   );
@@ -369,6 +380,11 @@ const ElectionPageInner = dynamic(
         title: string;
         detail: string;
       }>(null);
+      /** Full-screen mint-ballot progress (funder discovery + sign + launch). */
+      const [mintBallotModal, setMintBallotModal] = useState<null | {
+        title: string;
+        detail: string;
+      }>(null);
       /** Blocking overlay while polling coinset until on-chain confirms a submitted bundle. */
       const [broadcastAwait, setBroadcastAwait] = useState<null | {
         title: string;
@@ -400,6 +416,45 @@ const ElectionPageInner = dynamic(
        * (e.g., handleCreateAndLaunchBallot writes a new entry).
        */
       const [ballotsListEpoch, setBallotsListEpoch] = useState(0);
+
+      /**
+       * Synchronously-resolved bootstrap for the currently-selected
+       * ballot. Drives the per-ballot choice rendering in the Step 2
+       * vote / change-vote panels so radio buttons show the
+       * SELECTED ballot's choices, not a stale election-wide list.
+       */
+      const selectedBallotData = useMemo<BallotBootstrap | null>(() => {
+        if (!selectedBallotId) return null;
+        return readBallotBootstrap(launcherIdHex, selectedBallotId);
+      }, [selectedBallotId, launcherIdHex, ballotsListEpoch]);
+
+      /**
+       * Comma-separated voter choice labels for the next ballot mint.
+       * Each label maps to vote_data = sha256("vote:" + label) at
+       * cast time. CHIP rev 2026-05-02 makes choices per-ballot —
+       * different ballots can pose different questions under the same
+       * election.
+       */
+      const [mintBallotChoices, setMintBallotChoices] = useState("Yes,No");
+      // M12: per-election vote-mode lock — null while we haven't read
+      // the chain yet, "ff…ff" sentinel for "no lock" (operator picks
+      // per-ballot), "00…00" for "lock to Mode1Free", any other 32-byte
+      // hex for "lock to that exact sorted-options merkle root".
+      const [electionVoteModeLockHex, setElectionVoteModeLockHex] =
+        useState<string | null>(null);
+      // M12: when election is locked-Restricted, surface the labels
+      // (operator persisted them in localStorage at /create time —
+      // see chipVoteOptionLabels:<root> from M11).
+      const [lockedRestrictedLabels, setLockedRestrictedLabels] =
+        useState<string[] | null>(null);
+      /**
+       * Operator input: how many blocks the new ballot stays open
+       * for voting after launch. The on-chain `vote_close_height`
+       * is set to `peak + mintBallotBlocks` at create-ballot time
+       * and is curried into the eve Ballot Coin. Mainnet block
+       * cadence is ~52s, so 50 blocks ≈ 25 min, 1500 blocks ≈ ~21h.
+       */
+      const [mintBallotBlocks, setMintBallotBlocks] = useState("50");
 
       /**
        * CAT amount (decimal string, 3 fractional digits) to lock when registering.
@@ -517,6 +572,74 @@ const ElectionPageInner = dynamic(
         };
       }, [address, launcherIdHex]);
 
+      // ── Discover prior registrations for the connected Sage on-chain.
+      //     If a fresh browser / share-bundle import has no registered pubkey
+      //     in the bootstrap yet, scan Sage's synthetic keys and look up each
+      //     candidate's voter_hint via coinset. Any match means that key
+      //     already registered for this election — merge it back into the
+      //     bootstrap so the UI immediately reflects "registered" state.
+      const [priorRegScanBusy, setPriorRegScanBusy] = useState<string | null>(null);
+      useEffect(() => {
+        if (!address?.trim() || !session) return;
+        // Already know at least one registered pubkey — don't re-scan.
+        if ((session.registeredPubkeysHex ?? []).length > 0) return;
+        const cfg = (() => {
+          try { return JSON.parse(session.configJson); } catch { return null; }
+        })();
+        if (!cfg?.election_launcher_id_hex || !cfg?.cat_tail_hash_hex) return;
+
+        let cancelled = false;
+        (async () => {
+          try {
+            setPriorRegScanBusy("Checking on-chain for existing registrations…");
+            const { discoverPriorRegistrations } = await import(
+              "../lib/priorRegistrationDiscovery"
+            );
+            const preferredPk = await findSyntheticPkForWalletAddress(address);
+            if (cancelled) return;
+            const hits = await discoverPriorRegistrations({
+              electionLauncherIdHex:
+                "0x" + String(cfg.election_launcher_id_hex).replace(/^0x/, ""),
+              catTailHashHex:
+                "0x" + String(cfg.cat_tail_hash_hex).replace(/^0x/, ""),
+              preferredSyntheticPkHex: preferredPk,
+              stopOnFirst: true,
+              onProgress: (p) => {
+                if (cancelled) return;
+                if (p.phase === "receive_key") {
+                  setPriorRegScanBusy(
+                    "Checking your receive-address synthetic key for an existing registration…"
+                  );
+                } else {
+                  setPriorRegScanBusy(
+                    `Scanning Sage synthetic keys for prior registration ` +
+                      `(${p.keysChecked.toLocaleString()} checked)…`
+                  );
+                }
+              },
+            });
+            if (cancelled) return;
+            if (hits.length > 0) {
+              const found = hits[0].syntheticPkHex;
+              const merged = mergeBootstrapPubkeyRegistered(launcherIdHex, found);
+              if (merged) {
+                setSession(merged);
+                setVoterPk(found);
+              }
+            }
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.warn("[priorRegistrationDiscovery] failed:", msg);
+          } finally {
+            if (!cancelled) setPriorRegScanBusy(null);
+          }
+        })();
+
+        return () => {
+          cancelled = true;
+        };
+      }, [address, launcherIdHex, session]);
+
       // ── Finalize reward destination: standard PH for connected receive address.
       useEffect(() => {
         if (!address?.trim()) {
@@ -575,12 +698,46 @@ const ElectionPageInner = dynamic(
             registrationCount: number;
             registrationVoteWeight: number;
             electionStartHeight: number;
+            voteModeLockHex?: string;
           };
-          const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
-          const ballots = listBallotBootstraps(launcherIdHex);
-          const finalizedBallot = ballots.find((b) => !!b.finalizedAtHeight);
+          // M12: capture the per-election ballot-mode lock so the
+          // mint-ballot modal can render the right UI + reject mismatched
+          // vote_options_root submissions. `null` until first sync.
+          if (state.voteModeLockHex) {
+            setElectionVoteModeLockHex(state.voteModeLockHex);
+            // Hydrate locked-restricted labels from localStorage when
+            // the lock is a non-sentinel root (M11 wrote them under
+            // chipVoteOptionLabels:<root>).
+            const lockHex = state.voteModeLockHex.replace(/^0x/, "");
+            const NO_LOCK = "ff".repeat(32);
+            const FREE_LOCK = "00".repeat(32);
+            if (lockHex !== NO_LOCK && lockHex !== FREE_LOCK) {
+              try {
+                const raw = window.localStorage.getItem(
+                  `chipVoteOptionLabels:${state.voteModeLockHex}`
+                );
+                if (raw) {
+                  const parsed = JSON.parse(raw) as { labels?: string[] };
+                  if (Array.isArray(parsed.labels) && parsed.labels.length > 0) {
+                    setLockedRestrictedLabels(parsed.labels);
+                  }
+                }
+              } catch {
+                // labels aren't local — modal will fall back to showing
+                // just the merkle root.
+              }
+            }
+          }
+          const ballots = await getElectionBallotsMerged(
+            session.configJson,
+            launcherIdHex
+          );
+          const finalizedBallot = ballots.find(
+            (b) => b.finalized || !!b.finalizedAtHeight
+          );
           const snap: SyncSnapshotShape = {
             registrationCount: state.registrationCount,
+            registrationVoteWeight: state.registrationVoteWeight,
             registrationMerkleRootHex: state.registrationMerkleRootHex,
             finalized: !!finalizedBallot,
             voteOutcomeHex: finalizedBallot?.voteOutcomeHex ?? "0x" + "0".repeat(64),
@@ -613,6 +770,38 @@ const ElectionPageInner = dynamic(
         }
       }, [session, launcherIdHex]);
 
+      // Chain-derive electionStartHeight once per launcher, BEFORE
+      // syncSnapshot reads any singleton state. The bootstrap value
+      // is set at deploy time (peak); the launcher confirms 1-N
+      // blocks later, so the cached value can drift. Mirrors
+      // live_integration.mjs:recoverElectionStartHeightOrFail —
+      // every chain read should start from a chain-validated ESH,
+      // not the cached deploy-peak hint. Helper persists the
+      // recovered value back to the bootstrap so all downstream
+      // session?.electionStartHeight reads pick it up.
+      const eshVerifiedRef = useRef<string>("");
+      useEffect(() => {
+        if (chainStatus !== "deployed" || !session) return;
+        const key = `${launcherIdHex}|${session.configJson.length}`;
+        if (eshVerifiedRef.current === key) return;
+        eshVerifiedRef.current = key;
+        let cancelled = false;
+        void (async () => {
+          const recovered = await recoverAndPersistElectionStartHeight(
+            launcherIdHex,
+            session.configJson
+          );
+          if (cancelled) return;
+          if (recovered != null && recovered !== session.electionStartHeight) {
+            const fresh = readElectionBootstrap(launcherIdHex);
+            if (fresh) setSession(fresh);
+          }
+        })();
+        return () => {
+          cancelled = true;
+        };
+      }, [chainStatus, launcherIdHex, session]);
+
       useEffect(() => {
         if (chainStatus === "deployed") {
           syncSnapshot();
@@ -644,8 +833,10 @@ const ElectionPageInner = dynamic(
             // ballot count across every ballot bootstrap we know
             // about; for each, query its on-chain Voting Coin
             // lineage via collectVotesForBallot.
-            const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
-            const allBallots = listBallotBootstraps(launcherIdHex);
+            const allBallots = await getElectionBallotsMerged(
+              configJson,
+              launcherIdHex
+            );
             const voterPubkeysJson = JSON.stringify(
               session?.registeredPubkeysHex ?? []
             );
@@ -670,7 +861,9 @@ const ElectionPageInner = dynamic(
             // bit — that's a per-ballot state in the new model. We
             // treat the snapshot as finalized iff at least one tracked
             // ballot has a finalize confirmation in its bootstrap.
-            const tipFinalized = allBallots.some((b) => !!b.finalizedAtHeight);
+            const tipFinalized = allBallots.some(
+              (b) => b.finalized || !!b.finalizedAtHeight
+            );
 
             if (cancelled) return;
 
@@ -736,11 +929,16 @@ const ElectionPageInner = dynamic(
           registrationVoteWeight: number;
           electionStartHeight: number;
         };
-        const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
-        const ballots = listBallotBootstraps(launcherIdHex);
-        const finalizedBallot = ballots.find((b) => !!b.finalizedAtHeight);
+        const ballots = await getElectionBallotsMerged(
+          session.configJson,
+          launcherIdHex
+        );
+        const finalizedBallot = ballots.find(
+          (b) => b.finalized || !!b.finalizedAtHeight
+        );
         return {
           registrationCount: state.registrationCount,
+          registrationVoteWeight: state.registrationVoteWeight,
           registrationMerkleRootHex: state.registrationMerkleRootHex,
           finalized: !!finalizedBallot,
           voteOutcomeHex: finalizedBallot?.voteOutcomeHex ?? "0x" + "0".repeat(64),
@@ -799,6 +997,65 @@ const ElectionPageInner = dynamic(
 
       const myReg = registeredAsPk !== null;
 
+      // ── Per-voter locked amount lookup (your vote weight) ─────────
+      // Drives the "Your weight" stat. The wasm export syncs the SMT
+      // from chain (parsing real `locked_cat_mojos` from each register
+      // CCA) and reads `smt.locked_amount(pk)`. Re-runs whenever the
+      // chain snapshot mutates so register/release land update the
+      // displayed weight without a manual refresh.
+      const [myLockedAmount, setMyLockedAmount] = useState<bigint | null>(null);
+      useEffect(() => {
+        if (!session || !effectiveVoterPk || !myReg) {
+          setMyLockedAmount(null);
+          return;
+        }
+        const cfg = (() => {
+          try {
+            return JSON.parse(session.configJson);
+          } catch {
+            return null;
+          }
+        })();
+        const electionStartHeight = Number(
+          session?.electionStartHeight ?? cfg?.election_start_height ?? 0
+        );
+        if (!electionStartHeight) {
+          setMyLockedAmount(null);
+          return;
+        }
+        let cancelled = false;
+        void (async () => {
+          try {
+            const backend = createChainBackend();
+            const result = await wasm.getVoterLockedAmount(
+              backend as any,
+              session.configJson,
+              effectiveVoterPk,
+              wasm.WasmNetwork.Mainnet,
+              BigInt(electionStartHeight)
+            );
+            if (cancelled) return;
+            if (result == null || result === undefined) {
+              setMyLockedAmount(null);
+            } else {
+              const n = typeof result === "number" ? result : Number(result);
+              setMyLockedAmount(Number.isFinite(n) ? BigInt(Math.round(n)) : null);
+            }
+          } catch {
+            if (!cancelled) setMyLockedAmount(null);
+          }
+        })();
+        return () => {
+          cancelled = true;
+        };
+      }, [
+        session,
+        effectiveVoterPk,
+        myReg,
+        snapshot?.registrationVoteWeight,
+        snapshot?.registrationCount,
+      ]);
+
       const lifecycleBallotsCast =
         electionLc.status === "ready" ? electionLc.ballotsCast : 0;
 
@@ -821,10 +1078,14 @@ const ElectionPageInner = dynamic(
         void (async () => {
           try {
             const backend = createChainBackend();
-            const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
             // Aggregate this voter's most-recent vote across all
-            // tracked ballots (newest ballot wins if multiple).
-            const allBallots = [...listBallotBootstraps(launcherIdHex)].sort(
+            // ballots on chain (newest ballot wins if multiple).
+            const allBallots = [
+              ...(await getElectionBallotsMerged(
+                session!.configJson,
+                launcherIdHex
+              )),
+            ].sort(
               (a, b) => (b.launchedAtHeight ?? 0) - (a.launchedAtHeight ?? 0)
             );
             const pkWant = normalizeHex32(effectiveVoterPk);
@@ -892,12 +1153,14 @@ const ElectionPageInner = dynamic(
         void (async () => {
           try {
             const backend = createChainBackend();
-            const { listBallotBootstraps } = await import("../lib/ballotBootstrap");
-            // Tally aggregates votes across every tracked ballot
-            // for this election. Aligns with the per-ballot model:
-            // each Voting Coin lineage hangs off a specific ballot,
-            // so we walk each ballot separately and union the rows.
-            const allBallots = listBallotBootstraps(launcherIdHex);
+            // Tally aggregates votes across every ballot for this
+            // election. Per-ballot model: each Voting Coin lineage
+            // hangs off a specific ballot, so we walk each ballot
+            // separately (chain-derived list) and union the rows.
+            const allBallots = await getElectionBallotsMerged(
+              session!.configJson,
+              launcherIdHex
+            );
             const voterPubkeysJson = JSON.stringify(
               session!.registeredPubkeysHex ?? []
             );
@@ -945,13 +1208,17 @@ const ElectionPageInner = dynamic(
       const resolvedMyVoteDataHex =
         indexedMyVoteDataHex ?? optimisticVoteDataHex;
 
-      // CHIP rev 2026-05-02: "votes closed" is per-ballot now. The
-      // election-level votesClosed flag was used to gate the legacy
-      // single-ballot finalize section; that section now operates
-      // on the SELECTED ballot (BallotsList sets selectedBallotId),
-      // so the gate becomes false at the election level — the
-      // selected-ballot's status drives the actual button enabling.
-      const votesClosed = false as const;
+      // CHIP rev 2026-05-02: "votes closed" is per-ballot. The
+      // selected ballot drives whether voting / finalize buttons are
+      // enabled — `votesClosed` here means "the SELECTED ballot's
+      // vote_close_height has passed on chain, so cast/change-vote
+      // would be rejected and finalize is now allowed."
+      const votesClosed = useMemo<boolean>(() => {
+        if (!selectedBallotData) return false;
+        const peak =
+          electionLc.status === "ready" ? electionLc.peak : 0;
+        return peak > 0 && selectedBallotData.voteCloseHeight <= peak;
+      }, [selectedBallotData, electionLc]);
 
       const waitBroadcastConfirm = useCallback(
         async (opts: {
@@ -1017,50 +1284,152 @@ const ElectionPageInner = dynamic(
           return;
         }
         const cfg = JSON.parse(session.configJson);
-        const electionStartHeight = Number(
+        let electionStartHeight = Number(
             session?.electionStartHeight ??
               cfg.election_start_height ??
               0
           );
-        if (!electionStartHeight) {
-          setError("Election start height missing from session config — re-import.");
-          return;
-        }
 
         setError(null);
         setTxStatus(null);
-        setBusy("Creating ballot…");
+        // Helper: keep the busy banner + the full-screen mint-ballot
+        // modal in lockstep so each flow step shows up the same way
+        // the other actions' modals do (deploy, register, finalize).
+        const setMintStatus = (detail: string) => {
+          setBusy(detail);
+          setMintBallotModal({ title: "Mint a new ballot", detail });
+        };
+        setMintStatus("Creating ballot…");
 
         try {
           await walletConnect.waitForInit();
 
-          // ── 1. Find an XCH coin in the operator's wallet to fund the launcher.
-          //     Need amount > 2 so change > 0 (the StandardLayer
-          //     spend panics on `delegatedSpend([])`).
-          setBusy("Finding XCH funder coin…");
-          const userPh = await puzzleHashHexFromWalletAddress(address);
-          if (!userPh) throw new Error("Could not decode Sage wallet address");
-          const xchPh = "0x" + userPh;
-          const xchCoins = await coinRecordsByPuzzleHash(xchPh, false);
-          const candidates = xchCoins
-            .filter((c) => c.spentHeight === 0 && c.amount >= 100)
-            .sort((a, b) => a.amount - b.amount);
-          if (candidates.length === 0) {
+          // Belt-and-suspenders: re-validate ESH against chain right
+          // before a write spend. The session-bootstrap effect above
+          // pre-warms this on launcher confirm, but a long-lived tab
+          // could go stale if the user idled past a reorg. Mirrors
+          // live_integration.mjs:recoverElectionStartHeightOrFail.
+          setMintStatus("Validating electionStartHeight against chain…");
+          const recoveredNum = await recoverAndPersistElectionStartHeight(
+            launcherIdHex,
+            session.configJson
+          );
+          if (recoveredNum == null) {
             throw new Error(
-              "No spendable XCH coin (≥100 mojos) at your connected receive address. " +
-                "Top up the wallet or switch addresses."
+              "Could not match this election's eve singleton against any " +
+                "electionStartHeight in a ±60 block window. The most likely " +
+                "cause is that the election was deployed with a different " +
+                "puzzle revision than the dApp now uses (e.g. before the " +
+                "weighted-voting upgrade). Deploy a fresh election with the " +
+                "current SDK to use create_ballot."
             );
           }
-          const funderCoin = candidates[0];
+          if (recoveredNum !== electionStartHeight) {
+            electionStartHeight = recoveredNum;
+            const fresh = readElectionBootstrap(launcherIdHex);
+            if (fresh) setSession(fresh);
+          }
 
-          // Resolve synthetic pubkey for the funder coin's puzzle hash.
-          const synthPk = await findSyntheticPkForWalletAddress(address);
-          if (!synthPk) {
+          // ── 0. Parse voter choices for THIS ballot. ─────────────
+          const cleanChoiceLabels = mintBallotChoices
+            .split(",")
+            .map((l) => l.trim())
+            .filter((l) => l.length > 0);
+          if (cleanChoiceLabels.length < 2) {
             throw new Error(
-              "Could not resolve synthetic pubkey for receive address from Sage. " +
-                "Wallet may have rejected chip0002_getPublicKeys."
+              "Enter at least two voter choices (comma-separated, e.g. \"Yes,No\")."
             );
           }
+          if (new Set(cleanChoiceLabels).size !== cleanChoiceLabels.length) {
+            throw new Error(
+              "Voter choices must be unique — two labels with the same text would hash to the same vote_data."
+            );
+          }
+          const ballotChoices = await makeChoices(cleanChoiceLabels);
+
+          // ── 0a. M12: honor the election's vote-mode lock. Compute
+          //     the vote_options_root the new ballot will be curried
+          //     with, then validate against the election's lock.
+          //
+          //     vote_options_root scheme: sha256("vote:"+label) per
+          //     option (matches the existing `makeChoices`/cast-vote
+          //     hashing convention), sorted ascending, merkle-rooted
+          //     via wasm.merkleRootOfSortedCoinIds.
+          const NO_LOCK_HEX = "0x" + "ff".repeat(32);
+          const FREE_LOCK_HEX = "0x" + "00".repeat(32);
+          const lockHexNorm = (h: string | null): string =>
+            h ? (h.startsWith("0x") ? h : "0x" + h).toLowerCase() : NO_LOCK_HEX;
+          const electionLock = lockHexNorm(electionVoteModeLockHex);
+
+          const optionHashesHex: string[] = [];
+          for (const label of cleanChoiceLabels) {
+            const enc = new TextEncoder().encode("vote:" + label);
+            const ab = new ArrayBuffer(enc.byteLength);
+            new Uint8Array(ab).set(enc);
+            const buf = await window.crypto.subtle.digest("SHA-256", ab);
+            const arr = new Uint8Array(buf);
+            let s = "";
+            for (let i = 0; i < arr.length; i++) {
+              s += arr[i].toString(16).padStart(2, "0");
+            }
+            optionHashesHex.push(s);
+          }
+          const computedRootRaw = (await wasm.merkleRootOfSortedCoinIds(
+            optionHashesHex.join("")
+          )) as string;
+          const computedRoot = computedRootRaw.startsWith("0x")
+            ? computedRootRaw.toLowerCase()
+            : ("0x" + computedRootRaw).toLowerCase();
+
+          // Decide ballot's vote_options_root + reject mismatches.
+          let ballotVoteOptionsRootHex: string;
+          if (electionLock === FREE_LOCK_HEX) {
+            // Locked Mode1Free — no per-ballot restriction allowed.
+            ballotVoteOptionsRootHex = FREE_LOCK_HEX;
+          } else if (electionLock === NO_LOCK_HEX) {
+            // No election-level lock — per-ballot Restricted.
+            ballotVoteOptionsRootHex = computedRoot;
+          } else {
+            // Locked Restricted — choices MUST hash to the locked root.
+            if (computedRoot !== electionLock) {
+              throw new Error(
+                `This election is locked to a specific options root ` +
+                  `(${electionLock.slice(0, 18)}…) but the entered choices ` +
+                  `hash to ${computedRoot.slice(0, 18)}…. Use the locked ` +
+                  `option list (see the read-only banner above the choices ` +
+                  `field) — operator-set at /create time.`
+              );
+            }
+            ballotVoteOptionsRootHex = electionLock;
+          }
+
+          // ── 1. Find an XCH coin in the operator's wallet to fund the launcher.
+          //     Sage owns the coins — fetch them via chip0002_getAssetCoins
+          //     which returns the puzzle reveal alongside each coin.
+          //     Uncurrying the standard p2 puzzle gives the synthetic_pk
+          //     directly — no chip0002_getPublicKeys scan needed.
+          setMintStatus("Finding XCH funder coin…");
+          const { listXchCoinsWithKeys } = await import("../lib/sageAssetCoins");
+          const sageXch = await listXchCoinsWithKeys({
+            minAmount: 100,
+            includeLocked: false,
+            limit: 200,
+          });
+          if (sageXch.length === 0) {
+            throw new Error(
+              "No spendable XCH coins in your wallet (need ≥ 100 mojos for the funder + change)."
+            );
+          }
+          // Pick the largest coin so change > 0 (the StandardLayer
+          // spend panics on `delegatedSpend([])` if change == 0).
+          sageXch.sort((a, b) => Number(BigInt(b.coin.amount) - BigInt(a.coin.amount)));
+          const sageFunder = sageXch[0];
+          const funderCoin = {
+            parentCoinInfo: sageFunder.coin.parent_coin_info.replace(/^0x/, ""),
+            puzzleHash: sageFunder.coin.puzzle_hash,
+            amount: sageFunder.coin.amount,
+          };
+          const synthPk = sageFunder.syntheticPkHex;
 
           // ── 2. Build the funder StandardLayer spend (unsigned —
           //      Sage signs it later as part of the bundle's AggSigMe
@@ -1080,9 +1449,16 @@ const ElectionPageInner = dynamic(
             "0x" + Array.from(ballotSeed).map((b) => b.toString(16).padStart(2, "0")).join("");
           const peak = await peakHeight();
           if (!peak) throw new Error("Could not read chain peak");
-          // ~25 minutes mainnet (52s/block), ~50 blocks. Configurable
-          // via UI in a follow-up.
-          const voteCloseHeight = peak + 50;
+          // Operator-configurable voting duration. Validates >0 and
+          // an integer to avoid an off-by-one or NaN setting an
+          // immediate-close ballot. Mainnet block cadence is ~52s.
+          const blocksParsed = Number.parseInt(mintBallotBlocks.trim(), 10);
+          if (!Number.isFinite(blocksParsed) || blocksParsed < 1) {
+            throw new Error(
+              "Voting duration (blocks) must be a positive integer."
+            );
+          }
+          const voteCloseHeight = peak + blocksParsed;
           // Deterministic placeholder outcome domain. Production
           // deployments would tree-hash a structured proposal here.
           const outcomeDomainHashHex = "0x" + "01".repeat(32);
@@ -1093,10 +1469,13 @@ const ElectionPageInner = dynamic(
             ballotSeedHex,
             voteCloseHeight,
             outcomeDomainHashHex,
+            // M12: per-ballot vote-mode commitment, gated against the
+            // election's lock above.
+            voteOptionsRootHex: ballotVoteOptionsRootHex,
           };
 
           // ── 4. createBallotBundle (singleton create_ballot action).
-          setBusy("Building createBallot bundle…");
+          setMintStatus("Building createBallot bundle…");
           const backend = createChainBackend();
           const createdJson = await wasm.createBallotBundle(
             backend as any,
@@ -1114,39 +1493,38 @@ const ElectionPageInner = dynamic(
 
           // ── 5. Sage signs the bundle's coin_spends (covers the
           //      funder's StandardLayer AggSigMe).
-          setBusy("Awaiting Sage signature for createBallot…");
+          setMintStatus("Awaiting Sage signature for createBallot…");
           const createBundleBytes = hexToBytes(created.spendBundleHex);
           const wcSpendsJson = wasm.extractWalletCoinSpendsFromBundle(createBundleBytes);
           const wcSpends = JSON.parse(wcSpendsJson);
           const sigHex = await walletConnect.signCoinSpends(wcSpends, false, false);
           if (!sigHex) throw new Error("Wallet rejected the createBallot signature request");
 
-          setBusy("Verifying createBallot bundle locally…");
+          setMintStatus("Verifying createBallot bundle locally…");
           const finalCreateBundleBytes = wasm.assembleSpendBundleFromWalletCoinSpends(
             JSON.stringify(wcSpends),
             sigHex
           );
           wasm.verifyBundleLocally(finalCreateBundleBytes, wasm.WasmNetwork.Mainnet);
 
-          setBusy("Submitting createBallot bundle…");
+          setMintStatus("Submitting createBallot bundle…");
           const createBundleJson = JSON.parse(
             wasm.bundleBytesToWalletJson(finalCreateBundleBytes)
           ) as SpendBundleJson;
           await pushTx(createBundleJson);
 
-          setBusy("Polling for ballot launcher confirmation…");
           const launcherIdToWatch = created.ballotLauncherIdHex;
-          const launcherOk = await pollUntilConfirmed({
+          const launcherOk = await waitBroadcastConfirm({
+            title: "Confirming ballot launcher",
+            intro:
+              `Waiting until the ballot launcher coin lands on chain. ` +
+              `Launcher id ${launcherIdToWatch.slice(0, 10)}…`,
             predicate: async () => {
               const rec = await coinRecordByName(launcherIdToWatch);
               return !!rec && (rec.confirmedHeight ?? 0) > 0;
             },
-            pollMs: 30_000,
-            timeoutMs: 600_000,
           });
-          if (!launcherOk) {
-            throw new Error("ballot launcher coin not confirmed within 10 min");
-          }
+          if (!launcherOk) return;
 
           // ── 6. Capture pre-launch Election Singleton state — the
           //      registration snapshot the eve Ballot Coin will be
@@ -1164,12 +1542,16 @@ const ElectionPageInner = dynamic(
           };
 
           // ── 7. launchBallotBundle (launcher second-spend → eve).
-          setBusy("Building launchBallot bundle…");
+          setMintStatus("Building launchBallot bundle…");
           const launchParams = {
             voteCloseHeight,
             outcomeDomainHashHex,
             voteThresholdNum,
             voteThresholdDen,
+            // M12: MUST match createParams.voteOptionsRootHex byte-for-
+            // byte — the predicted eve Ballot Coin puzzle hash includes
+            // this in oracle's curry.
+            voteOptionsRootHex: ballotVoteOptionsRootHex,
           };
           const launchedJson = await wasm.launchBallotBundle(
             backend as any,
@@ -1186,29 +1568,28 @@ const ElectionPageInner = dynamic(
             spendBundleHex: string;
           };
 
-          setBusy("Verifying launchBallot bundle locally…");
+          setMintStatus("Verifying launchBallot bundle locally…");
           const launchBundleBytes = hexToBytes(launched.spendBundleHex);
           wasm.verifyBundleLocally(launchBundleBytes, wasm.WasmNetwork.Mainnet);
 
-          setBusy("Submitting launchBallot bundle…");
+          setMintStatus("Submitting launchBallot bundle…");
           const launchBundleJson = JSON.parse(
             wasm.bundleBytesToWalletJson(launchBundleBytes)
           ) as SpendBundleJson;
           await pushTx(launchBundleJson);
 
-          setBusy("Polling for eve ballot coin confirmation…");
           const eveIdToWatch = launched.eveBallotCoinIdHex;
-          const eveOk = await pollUntilConfirmed({
+          const eveOk = await waitBroadcastConfirm({
+            title: "Confirming eve ballot coin",
+            intro:
+              `Waiting until the eve Ballot Coin (the launcher's first child) ` +
+              `lands on chain. Eve coin id ${eveIdToWatch.slice(0, 10)}…`,
             predicate: async () => {
               const rec = await coinRecordByName(eveIdToWatch);
               return !!rec && (rec.confirmedHeight ?? 0) > 0;
             },
-            pollMs: 30_000,
-            timeoutMs: 600_000,
           });
-          if (!eveOk) {
-            throw new Error("eve ballot coin not confirmed within 10 min");
-          }
+          if (!eveOk) return;
           const eveRec = await coinRecordByName(eveIdToWatch);
 
           // ── 8. Persist per-ballot bootstrap so castVote / finalize
@@ -1228,6 +1609,11 @@ const ElectionPageInner = dynamic(
             registrationVoteWeightSnapshot: preLaunchState.registrationVoteWeight,
             registrationCountSnapshot: preLaunchState.registrationCount,
             addedAt: new Date().toISOString(),
+            choices: ballotChoices,
+            // M13: persist the per-ballot vote-mode commitment so
+            // /ballot can render the right mode badge + UI without
+            // re-walking chain.
+            voteOptionsRootHex: ballotVoteOptionsRootHex,
           };
           writeBallotBootstrap(bb);
           setBallotsListEpoch((n) => n + 1);
@@ -1241,6 +1627,7 @@ const ElectionPageInner = dynamic(
           setError(e?.message ?? String(e));
         } finally {
           setBusy(null);
+          setMintBallotModal(null);
         }
       };
 
@@ -1375,19 +1762,18 @@ const ElectionPageInner = dynamic(
               cfg.election_start_height ??
               0
           );
-            // SMT input must reflect on-chain registered voters, NOT
-            // including the voter being registered (non-membership
-            // proof). Filter out signingPk if the session bootstrap
-            // already lists it (e.g. on retry).
-            const otherPubkeys = (session.registeredPubkeysHex ?? []).filter(
-              (p) => normalizeHex32(p) !== normalizeHex32(signingPk)
-            );
+            // Weighted voting: the wasm export now syncs the SMT
+            // from chain internally (so per-voter `locked_amount`s
+            // come from the on-chain register CCAs, not a flat
+            // pubkey list this browser session happened to track).
+            // We just pass our chosen lock amount; the puzzle re-
+            // verifies it's >= the curried minimum.
             const unsignedJson = await wasm.registerBuildUnsignedCoinSpends(
               backend as any,
               session.configJson,
               signingPk,
-              JSON.stringify(otherPubkeys),
               catParentSpendBytes,
+              collateralAmount,
               wasm.WasmNetwork.Mainnet,
               BigInt(electionStartHeight)
             );
@@ -1424,6 +1810,12 @@ const ElectionPageInner = dynamic(
             );
             wasm.verifyBundleLocally(regBundleBytes, wasm.WasmNetwork.Mainnet);
 
+            // Capture pre-push chain state. We poll for the SMT
+            // root / registration count to flip — `votersHex` is
+            // session-storage-derived and only updates AFTER this
+            // confirm resolves, so polling it would deadlock.
+            const baseline = snapshotBrief(await pullFreshSnapshot());
+
             try {
               const bundleJson = JSON.parse(
                 wasm.bundleBytesToWalletJson(regBundleBytes)
@@ -1444,16 +1836,13 @@ const ElectionPageInner = dynamic(
 
             setRegistrationModal(null);
 
-            const pkNorm = normalizeHex32(signingPk);
             const regOk = await waitBroadcastConfirm({
               title: "Confirming registration",
               intro:
-                "Waiting until your pubkey appears on the voter list seen from chain snapshots.",
+                "Waiting for the Election Singleton state (registration count + Merkle root) to advance after your register spend confirms.",
               predicate: async () => {
                 const s = await pullFreshSnapshot();
-                return !!s?.votersHex?.some(
-                  (v) => normalizeHex32(v) === pkNorm
-                );
+                return snapshotBrief(s) !== baseline;
               },
             });
             if (!regOk) return;
@@ -1476,7 +1865,10 @@ const ElectionPageInner = dynamic(
               });
             }
             setVoterPk(signingPk);
-            setTxStatus("Registration confirmed on-chain.");
+            setTxStatus(
+              `Registered. Locked ${formatCat(collateralAmount)} ${collateralAssetShort} — ` +
+                `your vote weight on every ballot under this election is ${formatCat(collateralAmount)}.`
+            );
             return;
           }
 
@@ -1497,442 +1889,6 @@ const ElectionPageInner = dynamic(
       //      buttons; we send `choice.voteDataHex` straight through.
       //   2. No choices → fall back to the freeform "type any text"
       //      input (legacy / power-user path); we sha256 the text.
-      const [pickedChoiceIdx, setPickedChoiceIdx] = useState<number | null>(null);
-      const [freeformVote, setFreeformVote] = useState("");
-      /** Replace-ballot flow: new choice index (must differ from current ballot). */
-      const [changeBallotPickIdx, setChangeBallotPickIdx] = useState<number | null>(
-        null
-      );
-      const [changeBallotFreeform, setChangeBallotFreeform] = useState("");
-      // Two-call vote flow:
-      //   1. wasm.voteBuildPreviewSpend → wallet-shape coin spends
-      //      with a placeholder zero-sig in the memo.
-      //   2. Sage signs (partial mode) → returns the canonical
-      //      signature (the spend's only AGG_SIG_UNSAFE has the
-      //      voter's pubkey + canonical message, so the partial
-      //      aggregate IS that single sig).
-      //   3. wasm.voteBuildFinalBundle → rebuilds the spend with
-      //      the real sig embedded in the memo + uses the same
-      //      sig as the bundle's aggregated_signature. Memo
-      //      content doesn't affect the AGG_SIG message, so
-      //      Sage's step-2 sig is still valid for the final
-      //      spend.
-      const handleVote = async () => {
-        if (!session || !effectiveVoterPk) return;
-        setError(null);
-        setTxStatus(null);
-        setBusy("Voting…");
-        try {
-          // ── 1. Resolve vote_data from UI input ────────────────
-          let voteHex: string;
-          if (session.choices && session.choices.length > 0) {
-            if (pickedChoiceIdx === null) {
-              throw new Error("Pick a choice before voting.");
-            }
-            voteHex = session.choices[pickedChoiceIdx].voteDataHex;
-          } else {
-            voteHex = freeformVote.trim();
-            if (!voteHex.startsWith("0x")) voteHex = "0x" + voteHex;
-            if (voteHex.length !== 66) {
-              const enc = new TextEncoder().encode(freeformVote);
-              const hash = await crypto.subtle.digest("SHA-256", enc);
-              voteHex =
-                "0x" +
-                Array.from(new Uint8Array(hash))
-                  .map((b) => b.toString(16).padStart(2, "0"))
-                  .join("");
-            }
-          }
-
-          // ── 2. Pick the ballot to cast against ──────────────────
-          // The user picks via the Ballots list (selectedBallotId).
-          // If unset, fall back to the newest open ballot — keeps the
-          // single-ballot path working for simple elections.
-          setBusy("Locating an open ballot…");
-          const peak = await peakHeight();
-          if (!peak) throw new Error("Could not read chain peak");
-          let ballot: BallotBootstrap | null = null;
-          if (selectedBallotId) {
-            const { readBallotBootstrap } = await import("../lib/ballotBootstrap");
-            ballot = readBallotBootstrap(launcherIdHex, selectedBallotId);
-            if (ballot && ballot.voteCloseHeight <= peak) {
-              throw new Error(
-                "Selected ballot is closed (vote_close_height passed). " +
-                  "Pick an active ballot from the Ballots list."
-              );
-            }
-          }
-          if (!ballot) {
-            ballot = pickOpenBallotForVoting(launcherIdHex, peak);
-          }
-          if (!ballot) {
-            throw new Error(
-              "No open ballot in this session. Ask the deployer to mint one (Mint a new ballot card), " +
-                "or import a share bundle that includes ballot bootstrap."
-            );
-          }
-
-          const params = {
-            ballotLauncherIdHex: ballot.ballotLauncherIdHex,
-            voteDataHex: voteHex,
-            voteCloseHeight: ballot.voteCloseHeight,
-            voteThresholdNum: ballot.voteThresholdNum,
-            voteThresholdDen: ballot.voteThresholdDen,
-            registrationMerkleRootSnapshotHex:
-              ballot.registrationMerkleRootSnapshotHex,
-            registrationVoteWeightSnapshot:
-              ballot.registrationVoteWeightSnapshot,
-            votingCoinAmount: 1,
-          };
-          const cfg = JSON.parse(session.configJson);
-          const electionStartHeight = Number(
-            session?.electionStartHeight ??
-              cfg.election_start_height ??
-              0
-          );
-
-          const backend = createChainBackend();
-
-          // ── 3. Sage signs the vote_message via a one-condition
-          //      AggSigUnsafe shim spend. The wallet's partial-mode
-          //      aggregate is byte-for-byte equal to
-          //      sign_unsafe(vote_message). ─────────────────────────
-          setBusy("Building preview vote spend…");
-          const previewJson = await wasm.castVoteBuildPreviewSpend(
-            backend as any,
-            session.configJson,
-            effectiveVoterPk,
-            JSON.stringify(params)
-          );
-          const preview = JSON.parse(previewJson) as {
-            coinSpends: SpendBundleJson["coin_spends"];
-            voteMessageHex: string;
-          };
-
-          setBusy("Awaiting Sage signature on vote message…");
-          const voteSigHex = await walletConnect.signCoinSpends(
-            preview.coinSpends,
-            true,  // partial — single AGG_SIG_UNSAFE
-            false  // no auto-submit
-          );
-          if (!voteSigHex) {
-            throw new Error("Wallet rejected the vote-message signature request");
-          }
-
-          // ── 4. Build the real cast_vote coin_spends with the
-          //      voter's signature embedded in the mint_voting_coin
-          //      memo. Returns the unsigned bundle in wallet shape;
-          //      Sage will sign it (its AGG_SIG_ME conditions) in the
-          //      next step. ────────────────────────────────────────
-          setBusy("Building cast_vote bundle…");
-          const unsignedJson = await wasm.castVoteBuildUnsignedCoinSpends(
-            backend as any,
-            session.configJson,
-            effectiveVoterPk,
-            JSON.stringify(params),
-            voteSigHex,
-            wasm.WasmNetwork.Mainnet,
-            BigInt(electionStartHeight)
-          );
-          const unsigned = JSON.parse(unsignedJson) as {
-            coinSpends: SpendBundleJson["coin_spends"];
-            votingCoinIdHex: string;
-            voteSignatureHex: string;
-            voteMessageHex: string;
-          };
-
-          // ── 5. Sage signs the full bundle's AGG_SIG_ME conditions.
-          setBusy("Awaiting Sage signature on bundle…");
-          const aggSigHex = await walletConnect.signCoinSpends(
-            unsigned.coinSpends,
-            true,  // partial — wallet returns aggregate without auto-submit
-            false
-          );
-          if (!aggSigHex) {
-            throw new Error("Wallet rejected the bundle signature request");
-          }
-
-          // ── 6. Assemble + verify + push ────────────────────────
-          setBusy("Assembling and verifying bundle…");
-          const bundleBytes = wasm.assembleSpendBundleFromWalletCoinSpends(
-            JSON.stringify(unsigned.coinSpends),
-            aggSigHex
-          );
-          wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
-
-          setBusy("Submitting bundle to mempool (coinset)…");
-          const bundleJson = JSON.parse(
-            wasm.bundleBytesToWalletJson(bundleBytes)
-          ) as SpendBundleJson;
-          await pushTx(bundleJson);
-
-          // ── 7. Optimistic state + on-chain confirm ─────────────
-          const vdCanon = voteHex.trim().startsWith("0x")
-            ? voteHex.trim().toLowerCase()
-            : `0x${normalizeHex32(voteHex)}`;
-          setOptimisticVoteDataHex(vdCanon);
-
-          const pkNorm = normalizeHex32(effectiveVoterPk);
-          const vdNorm = normalizeHex32(voteHex);
-          const voteOk = await waitBroadcastConfirm({
-            title: "Confirming vote",
-            intro:
-              "Waiting until coinset-backed reads detect your ballot (same source as tally).",
-            predicate: async () => {
-              const b = createChainBackend();
-              const rowsJson = (await wasm.collectVotesForBallot(
-                b as any,
-                session.configJson,
-                ballot.ballotLauncherIdHex,
-                JSON.stringify([effectiveVoterPk])
-              )) as string;
-              const rows = JSON.parse(rowsJson) as Array<
-                Record<string, string | undefined>
-              >;
-              for (const row of rows ?? []) {
-                const rk = normalizeHex32(
-                  row.voter_pubkey_hex ?? row.voterPubkeyHex ?? ""
-                );
-                const rv = normalizeHex32(
-                  row.vote_data_hex ?? row.voteDataHex ?? ""
-                );
-                if (rk === pkNorm && rv === vdNorm) return true;
-              }
-              return false;
-            },
-          });
-          if (voteOk) {
-            setTxStatus("Vote confirmed on-chain.");
-          }
-        } catch (e: any) {
-          setError(e?.message ?? String(e));
-        } finally {
-          setBusy(null);
-        }
-      };
-
-      /** Before finalize: oracle + CAT change_vote (two spends; wallet signs full aggregate). */
-      const handleChangeVote = async () => {
-        if (!session || !effectiveVoterPk || !resolvedMyVoteDataHex) return;
-        setError(null);
-        setTxStatus(null);
-        setBusy("Replacing ballot…");
-        try {
-          // ── 1. Resolve new vote_data from UI input ─────────────
-          let voteHex: string;
-          if (session.choices && session.choices.length > 0) {
-            if (changeBallotPickIdx === null) {
-              throw new Error("Pick a new choice before replacing your ballot.");
-            }
-            voteHex = session.choices[changeBallotPickIdx].voteDataHex;
-          } else {
-            voteHex = changeBallotFreeform.trim();
-            if (!voteHex.startsWith("0x")) voteHex = "0x" + voteHex;
-            if (voteHex.length !== 66) {
-              const enc = new TextEncoder().encode(changeBallotFreeform);
-              const hash = await crypto.subtle.digest("SHA-256", enc);
-              voteHex =
-                "0x" +
-                Array.from(new Uint8Array(hash))
-                  .map((b) => b.toString(16).padStart(2, "0"))
-                  .join("");
-            }
-          }
-          if (
-            normalizeHex32(voteHex) === normalizeHex32(resolvedMyVoteDataHex)
-          ) {
-            throw new Error(
-              "New ballot must differ from your current on-chain vote."
-            );
-          }
-
-          // ── 2. Pick the open ballot the existing vote is on ─────
-          setBusy("Locating an open ballot…");
-          const peak = await peakHeight();
-          if (!peak) throw new Error("Could not read chain peak");
-          let ballot: BallotBootstrap | null = null;
-          if (selectedBallotId) {
-            const { readBallotBootstrap } = await import("../lib/ballotBootstrap");
-            ballot = readBallotBootstrap(launcherIdHex, selectedBallotId);
-          }
-          if (!ballot) {
-            ballot = pickOpenBallotForVoting(launcherIdHex, peak);
-          }
-          if (!ballot) {
-            throw new Error(
-              "No open ballot in this session. update_vote is per-ballot — make sure you're voting on a ballot whose snapshot is in your bootstrap."
-            );
-          }
-
-          // ── 3. Find the voter's CURRENT Voting Coin via collectVotesForBallot.
-          //      The row tells us voting_coin_id + registration_coin_id —
-          //      both required by UpdateVoteParams. ──────────────────
-          const backend = createChainBackend();
-          const rowsJson = (await wasm.collectVotesForBallot(
-            backend as any,
-            session.configJson,
-            ballot.ballotLauncherIdHex,
-            JSON.stringify([effectiveVoterPk])
-          )) as string;
-          const rows = JSON.parse(rowsJson) as Array<
-            Record<string, string | undefined>
-          >;
-          const pkNorm = normalizeHex32(effectiveVoterPk);
-          const myRow = rows.find(
-            (r) =>
-              normalizeHex32(
-                r.voter_pubkey_hex ?? r.voterPubkeyHex ?? ""
-              ) === pkNorm
-          );
-          if (!myRow) {
-            throw new Error(
-              "Could not locate your existing Voting Coin on chain — has the prior cast_vote confirmed?"
-            );
-          }
-          const votingCoinIdHex =
-            myRow.voting_coin_id_hex ?? myRow.votingCoinIdHex ?? "";
-          const registrationCoinIdHex =
-            myRow.registration_coin_id_hex ?? myRow.registrationCoinIdHex ?? "";
-          const oldVoteDataHex =
-            myRow.vote_data_hex ?? myRow.voteDataHex ?? resolvedMyVoteDataHex;
-          if (!votingCoinIdHex || !registrationCoinIdHex) {
-            throw new Error("collectVotesForBallot row missing voting / registration coin ids.");
-          }
-
-          const params = {
-            votingCoinIdHex,
-            oldVoteDataHex,
-            newVoteDataHex: voteHex,
-            registrationCoinIdHex,
-            ballotLauncherIdHex: ballot.ballotLauncherIdHex,
-            voteCloseHeight: ballot.voteCloseHeight,
-            voteThresholdNum: ballot.voteThresholdNum,
-            voteThresholdDen: ballot.voteThresholdDen,
-            registrationMerkleRootSnapshotHex:
-              ballot.registrationMerkleRootSnapshotHex,
-            registrationVoteWeightSnapshot:
-              ballot.registrationVoteWeightSnapshot,
-          };
-          const cfg = JSON.parse(session.configJson);
-          const electionStartHeight = Number(
-            session?.electionStartHeight ??
-              cfg.election_start_height ??
-              0
-          );
-
-          // ── 4. Sage signs new_vote_message via the AggSigUnsafe shim.
-          setBusy("Building change-vote preview spend…");
-          const previewJson = await wasm.updateVoteBuildPreviewSpend(
-            backend as any,
-            session.configJson,
-            effectiveVoterPk,
-            JSON.stringify(params)
-          );
-          const preview = JSON.parse(previewJson) as {
-            coinSpends: SpendBundleJson["coin_spends"];
-            voteMessageHex: string;
-          };
-
-          setBusy("Awaiting Sage signature on new vote message…");
-          const newVoteSigHex = await walletConnect.signCoinSpends(
-            preview.coinSpends,
-            true,
-            false
-          );
-          if (!newVoteSigHex) {
-            throw new Error("Wallet rejected the new-vote-message signature request");
-          }
-
-          // ── 5. Build the unsigned update_vote coin_spends. ──────
-          setBusy("Building update_vote bundle…");
-          const unsignedJson = await wasm.updateVoteBuildUnsignedCoinSpends(
-            backend as any,
-            session.configJson,
-            effectiveVoterPk,
-            JSON.stringify(params),
-            newVoteSigHex,
-            wasm.WasmNetwork.Mainnet,
-            BigInt(electionStartHeight)
-          );
-          const unsigned = JSON.parse(unsignedJson) as {
-            coinSpends: SpendBundleJson["coin_spends"];
-            recreatedVotingCoinIdHex: string;
-            newVoteSignatureHex: string;
-            newVoteMessageHex: string;
-          };
-
-          // ── 6. Sage signs the bundle aggregate.
-          setBusy("Awaiting Sage signature on bundle…");
-          const aggSigHex = await walletConnect.signCoinSpends(
-            unsigned.coinSpends,
-            true,
-            false
-          );
-          if (!aggSigHex) {
-            throw new Error("Wallet rejected the bundle signature request");
-          }
-
-          // ── 7. Assemble + verify + push ────────────────────────
-          setBusy("Assembling and verifying bundle…");
-          const bundleBytes = wasm.assembleSpendBundleFromWalletCoinSpends(
-            JSON.stringify(unsigned.coinSpends),
-            aggSigHex
-          );
-          wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
-
-          setBusy("Submitting change-vote bundle…");
-          const bundleJson = JSON.parse(
-            wasm.bundleBytesToWalletJson(bundleBytes)
-          ) as SpendBundleJson;
-          await pushTx(bundleJson);
-
-          // ── 8. Optimistic state + on-chain confirm ─────────────
-          const vdCanon = voteHex.trim().startsWith("0x")
-            ? voteHex.trim().toLowerCase()
-            : `0x${normalizeHex32(voteHex)}`;
-          setOptimisticVoteDataHex(vdCanon);
-
-          const vdNorm = normalizeHex32(voteHex);
-          const ok = await waitBroadcastConfirm({
-            title: "Confirming replaced ballot",
-            intro:
-              "Waiting until coinset-backed reads show your updated vote_data.",
-            predicate: async () => {
-              const b = createChainBackend();
-              const rowsJson2 = (await wasm.collectVotesForBallot(
-                b as any,
-                session.configJson,
-                ballot.ballotLauncherIdHex,
-                JSON.stringify([effectiveVoterPk])
-              )) as string;
-              const rows2 = JSON.parse(rowsJson2) as Array<
-                Record<string, string | undefined>
-              >;
-              for (const row of rows2 ?? []) {
-                const rk = normalizeHex32(
-                  row.voter_pubkey_hex ?? row.voterPubkeyHex ?? ""
-                );
-                const rv = normalizeHex32(
-                  row.vote_data_hex ?? row.voteDataHex ?? ""
-                );
-                if (rk === pkNorm && rv === vdNorm) return true;
-              }
-              return false;
-            },
-          });
-          if (ok) {
-            setTxStatus("Ballot replaced on-chain.");
-            setChangeBallotPickIdx(null);
-            setChangeBallotFreeform("");
-          }
-        } catch (e: unknown) {
-          setError(e instanceof Error ? e.message : String(e));
-        } finally {
-          setBusy(null);
-        }
-      };
-
-      // ── RELEASE COLLATERAL FLOW ─────────────────────────────────
       const handleRelease = async () => {
         if (!session || !effectiveVoterPk) return;
         setError(null);
@@ -1997,7 +1953,10 @@ const ElectionPageInner = dynamic(
           //      session bootstrap tracks every voter we know about.
           //      Empty list = SMT root mismatch downstream; the SDK
           //      surfaces a clear "re-sync" error.
-          const voterPubkeys = session.registeredPubkeysHex ?? [];
+          // Weighted voting: SMT is reconstructed from chain inside
+          // wasm — no need to thread a voter_pubkeys list (each
+          // voter's locked_amount is parsed from the on-chain
+          // register announcement CCAs).
 
           // ── 3. Build unsigned coin_spends (Sage signs externally).
           setBusy("Building release coin_spends…");
@@ -2005,7 +1964,6 @@ const ElectionPageInner = dynamic(
             backend as any,
             session.configJson,
             effectiveVoterPk,
-            JSON.stringify(voterPubkeys),
             regCoinIdHex,
             dest,
             wasm.WasmNetwork.Mainnet,
@@ -2048,7 +2006,17 @@ const ElectionPageInner = dynamic(
             },
           });
           if (released) {
-            setTxStatus("Collateral release reflected on-chain.");
+            setTxStatus(
+              `Deregistered. Your locked ${collateralAssetShort} CAT is back in ` +
+                `your wallet and you've been removed from the election's voter set.`
+            );
+            // Phase 1c: refresh the chain snapshot so the UI immediately
+            // reflects the deregistration. Without this, snapshot
+            // stays stale (myReg → true → release button still shown
+            // → user clicks again → "No unspent Registration Coin"
+            // error). Also re-runs syncSnapshot to refresh the
+            // registered-voter list + per-voter weight derivations.
+            syncSnapshot();
           }
         } catch (e: any) {
           setError(e?.message ?? String(e));
@@ -2058,316 +2026,6 @@ const ElectionPageInner = dynamic(
       };
 
       // ── FINALIZE FLOW — modal + Sage bundle submit ──────────────
-      const handleFinalize = async () => {
-        if (!session || !address) return;
-        if (!votesClosed) {
-          setError(
-            "Finalize is disabled until the voting period has ended " +
-              "(finalize time-lock on the election singleton)."
-          );
-          return;
-        }
-        if (!session.provingKeyBase64) {
-          setError(
-            "This browser session does not have the Groth16 proving key. " +
-              "Import the election share bundle from the organizer (create flow / Share bundle) — " +
-              "it includes the key anyone can use to finalize once the time-lock passes."
-          );
-          return;
-        }
-        setError(null);
-        setTxStatus(null);
-        setBusy("Finalizing election…");
-        setFinalizeModal({
-          title: "Finalize election",
-          phase: "collect",
-          detail: "Initializing Sage Wallet…",
-          collect: null,
-        });
-
-        try {
-          await walletConnect.waitForInit();
-
-          let dest =
-            finalizePayoutPh ??
-            (await puzzleHashHexFromWalletAddress(address.trim()));
-          if (!dest && effectiveVoterPk) {
-            dest = wasm.standardPuzzleHash(effectiveVoterPk);
-          }
-          if (!dest) {
-            throw new Error(
-              "Could not derive an XCH puzzle hash from your Sage address for the finalizer reward. " +
-                "Reconnect the wallet or wait for pubkey resolution."
-            );
-          }
-
-          if (!session.choices || session.choices.length === 0) {
-            throw new Error(
-              "Election has no UI choices defined; cannot auto-tally. " +
-                "Re-import a shareable bundle that includes choices, or " +
-                "extend the finalize flow with a manual outcome input."
-            );
-          }
-
-          const backend = createChainBackend();
-
-          setFinalizeModal({
-            title: "Finalize election",
-            phase: "collect",
-            detail:
-              "Each registered voter may require multiple chain reads " +
-              "(hint → parent spend → memo decode). Stay on this tab.",
-            collect: null,
-          });
-          type VoteWireLite = {
-            vote_data_hex?: string;
-            voteDataHex?: string;
-          };
-
-          type CollectProgressWasm = Partial<FinalizeCollectPayload> & {
-            voter_index?: unknown;
-            voters_total?: unknown;
-            stage?: unknown;
-            ballotsCollected?: unknown;
-            ballots_collected?: unknown;
-          };
-
-          const readCollectProgress = (
-            raw: unknown
-          ): FinalizeCollectPayload | null => {
-            if (!raw || typeof raw !== "object") return null;
-            const o = raw as CollectProgressWasm;
-            const vi =
-              typeof o.voterIndex === "number"
-                ? o.voterIndex
-                : typeof o.voter_index === "number"
-                  ? o.voter_index
-                  : null;
-            const vt =
-              typeof o.votersTotal === "number"
-                ? o.votersTotal
-                : typeof o.voters_total === "number"
-                  ? o.voters_total
-                  : null;
-            const stRaw = typeof o.stage === "string" ? o.stage : null;
-            const bcRaw =
-              typeof o.ballotsCollected === "number"
-                ? o.ballotsCollected
-                : typeof o.ballots_collected === "number"
-                  ? o.ballots_collected
-                  : undefined;
-            if (vi === null || vt === null || stRaw === null) return null;
-            const ballotCount =
-              typeof bcRaw === "number" ? bcRaw : 0;
-            if (
-              !(
-                stRaw === "syncElectionSingleton" ||
-                stRaw === "fetchHintCoins" ||
-                stRaw === "fetchParentSpend" ||
-                stRaw === "decodeBallot"
-              )
-            ) {
-              return null;
-            }
-            return {
-              voterIndex: vi,
-              votersTotal: vt,
-              stage: stRaw,
-              ballotsCollected: ballotCount,
-            };
-          };
-
-          // CHIP rev 2026-05-02: votes are per-ballot. Pick the
-          // newest closed ballot whose snapshot we hold; the
-          // collectVotesForBallot walk traverses the Voting Coin
-          // lineage hint-indexed by voter_hint, scoped to this one
-          // ballot's launcher.
-          const peakNow = await peakHeight();
-          if (!peakNow) throw new Error("Could not read chain peak");
-          const { listBallotBootstraps, readBallotBootstrap } = await import(
-            "../lib/ballotBootstrap"
-          );
-          let finalizeBallot: BallotBootstrap | null = null;
-          if (selectedBallotId) {
-            const sel = readBallotBootstrap(launcherIdHex, selectedBallotId);
-            if (sel && sel.voteCloseHeight <= peakNow && !!sel.eveBallotCoinIdHex) {
-              finalizeBallot = sel;
-            } else if (sel) {
-              throw new Error(
-                "Selected ballot is not yet closed — finalize is gated by " +
-                  "AssertHeightAbsolute(VOTE_CLOSE_HEIGHT) on the eve Ballot Coin."
-              );
-            }
-          }
-          if (!finalizeBallot) {
-            const closedBallots = listBallotBootstraps(launcherIdHex)
-              .filter((b) => b.voteCloseHeight <= peakNow && !!b.eveBallotCoinIdHex)
-              .sort((a, b) => (b.launchedAtHeight ?? 0) - (a.launchedAtHeight ?? 0));
-            finalizeBallot = closedBallots[0];
-          }
-          if (!finalizeBallot) {
-            throw new Error(
-              "No closed ballot in this session. The vote close height must have passed for the ballot you want to finalize."
-            );
-          }
-
-          // Voter pubkey list — the union of every voter we know about
-          // from the session bootstrap. Empty list = no votes; the
-          // SDK errors below if zero ballots collected.
-          const voterPubkeys = session.registeredPubkeysHex ?? [];
-
-          setFinalizeModal({
-            title: "Finalize election",
-            phase: "collect",
-            detail:
-              `Walking Voting Coin lineage for ballot ${finalizeBallot.ballotLauncherIdHex.slice(0, 10)}… ` +
-              `(${voterPubkeys.length} known voter pubkey(s)).`,
-            collect: null,
-          });
-          const wireVotesJson = (await wasm.collectVotesForBallot(
-            backend as any,
-            session.configJson,
-            finalizeBallot.ballotLauncherIdHex,
-            JSON.stringify(voterPubkeys)
-          )) as string;
-          const wireVotes = JSON.parse(wireVotesJson) as VoteWireLite[];
-
-          setFinalizeModal({
-            title: "Finalize election",
-            phase: "tally",
-            detail: "Applying plurality tally to recovered ballot payloads…",
-          });
-
-          const tally = new Map<string, number>();
-          const normHex = (h: unknown) =>
-            String(h ?? "")
-              .toLowerCase()
-              .replace(/^0x/, "");
-          for (const v of wireVotes) {
-            const raw = v.vote_data_hex ?? v.voteDataHex;
-            const k = normHex(raw);
-            if (!k || k === "00".repeat(32)) continue;
-            tally.set(k, (tally.get(k) ?? 0) + 1);
-          }
-          let winner = session.choices[0];
-          let winnerCount = -1;
-          for (const c of session.choices) {
-            const k = normHex(c.voteDataHex);
-            const n = tally.get(k) ?? 0;
-            if (n > winnerCount) {
-              winner = c;
-              winnerCount = n;
-            }
-          }
-          if (winnerCount < 1) {
-            throw new Error(
-              "No valid cast ballots recovered from chain hints — finalize would fail BelowThreshold."
-            );
-          }
-          const outcomeHex = winner.voteDataHex;
-
-          setFinalizeModal({
-            title: "Finalize election",
-            phase: "prove",
-            outcomeSummary:
-              `Outcome: "${winner.label}" (${winnerCount} ballot(s)); ` +
-              `building aggregates + Groth16 proof.`,
-            detail:
-              "The proving step typically runs tens of seconds to a few minutes depending on quorum size — leave this tab open.",
-          });
-          const pkBytes = base64ToBytes(session.provingKeyBase64);
-          const cfg = JSON.parse(session.configJson);
-          const electionStartHeight = Number(
-            session?.electionStartHeight ??
-              cfg.election_start_height ??
-              0
-          );
-          // Per-ballot finalize. Snapshot fields MUST mirror what
-          // `BallotIssuer::launch_ballot` curried into the eve Ballot
-          // Coin (captured by handleCreateAndLaunchBallot via
-          // wasm.readElectionSingletonState).
-          const finalizeParams = {
-            voteCloseHeight: finalizeBallot.voteCloseHeight,
-            voteThresholdNum: finalizeBallot.voteThresholdNum,
-            voteThresholdDen: finalizeBallot.voteThresholdDen,
-            registrationMerkleRootSnapshotHex:
-              finalizeBallot.registrationMerkleRootSnapshotHex,
-            registrationVoteWeightSnapshot:
-              finalizeBallot.registrationVoteWeightSnapshot,
-          };
-          const bundleHex = await wasm.buildBallotFinalizeBundle(
-            backend as any,
-            session.configJson,
-            finalizeBallot.ballotLauncherIdHex,
-            outcomeHex,
-            JSON.stringify(finalizeParams),
-            wireVotesJson,
-            pkBytes,
-            wasm.WasmNetwork.Mainnet,
-            BigInt(electionStartHeight)
-          );
-          const bundleBytes = hexToBytes(bundleHex);
-
-          setFinalizeModal({
-            title: "Finalize election",
-            phase: "verify",
-            detail: "Dry-running CLVM spends and validating BLS / proof shape locally…",
-          });
-          wasm.verifyBundleLocally(bundleBytes, wasm.WasmNetwork.Mainnet);
-
-          const bundleJson = JSON.parse(
-            wasm.bundleBytesToWalletJson(bundleBytes)
-          ) as SpendBundleJson;
-          const finalizedBefore = (await pullFreshSnapshot())?.finalized === true;
-
-          // CHIP‑0002: prefer full-node mempool submit over `chip0002_sendTransaction`.
-          // Finalize has no wallet-owned AGG_SIG (identity agg sig); Sage WC relay often
-          // fails to propagate large proof-bearing bundles. Same path as oracle `pushTx`.
-          setFinalizeModal({
-            title: "Broadcast finalized bundle",
-            phase: "submit",
-            detail:
-              "Sending to api.coinset.org (Groth16 proof + singleton spend included in mempool submit)…",
-          });
-          await pushTx(bundleJson);
-
-          setFinalizeModal(null);
-
-          // Persist finalize state to the ballot bootstrap so
-          // syncSnapshot's `finalized` aggregator picks it up. Done
-          // optimistically right after push: pullFreshSnapshot
-          // already polls until visible, but the snapshot tracker
-          // only sees finalize via this bootstrap field.
-          const peakAfter = await peakHeight();
-          const updatedBootstrap: BallotBootstrap = {
-            ...finalizeBallot,
-            finalizedAtHeight: peakAfter ?? finalizeBallot.voteCloseHeight,
-            voteOutcomeHex: outcomeHex.startsWith("0x")
-              ? outcomeHex
-              : "0x" + outcomeHex,
-          };
-          writeBallotBootstrap(updatedBootstrap);
-
-          const finOk = await waitBroadcastConfirm({
-            title: "Confirming finalization",
-            intro:
-              "Waiting until the election snapshot reflects ballot finalize.",
-            predicate: async () => {
-              const s = await pullFreshSnapshot();
-              return !!(s?.finalized && !finalizedBefore);
-            },
-          });
-          if (finOk) {
-            setTxStatus("Election finalized on-chain.");
-          }
-        } catch (e: any) {
-          setError(e?.message ?? String(e));
-        } finally {
-          setFinalizeModal(null);
-          setBusy(null);
-          void syncSnapshot();
-        }
-      };
 
       // (handleOracle removed — CHIP rev 2026-05-02 dropped the
       //  standalone `buildOracleBundle`. The Ballot Coin oracle
@@ -2575,10 +2233,14 @@ const ElectionPageInner = dynamic(
       const registrationLockSatisfiesMinimum =
         registrationLockParsedMojos !== null &&
         registrationLockParsedMojos >= minCollateralMojos;
+      // CHIP weighted-voting rev: chain canonical total = sum of real
+      // per-voter locks (each register action's `locked_cat_mojos`).
+      // The Election Singleton tracks this in `registration_vote_weight`,
+      // which the chain walker surfaces via readElectionSingletonState.
       const totalLockedCollateral =
         snapshot === null
           ? null
-          : BigInt(snapshot.registrationCount) * minCollateralMojos;
+          : BigInt(snapshot.registrationVoteWeight ?? 0);
       // CHIP rev 2026-05-02 dropped per-voter registration_fee from
       // the on-chain ElectionConfig — the totalRegFees stat is gone
       // from the UI.
@@ -2631,6 +2293,13 @@ const ElectionPageInner = dynamic(
                 </div>
               </div>
             </div>
+          )}
+          {mintBallotModal && (
+            <BroadcastWaitModal
+              title={mintBallotModal.title}
+              detail={mintBallotModal.detail}
+              titleId="mint-ballot-modal-title"
+            />
           )}
           {finalizeModal && (
             <div
@@ -2842,10 +2511,6 @@ const ElectionPageInner = dynamic(
                 value={`${formatCat(cfg.collateral_amount)} (${collateralAssetShort})`}
               />
               <Stat
-                label="Window"
-                value={`${cfg.election_length_blocks} blocks`}
-              />
-              <Stat
                 label="CAT TAIL (asset id)"
                 value={truncHex(
                   "0x" + normalizeHex32(String(cfg.cat_tail_hash_hex ?? "")),
@@ -2889,14 +2554,39 @@ const ElectionPageInner = dynamic(
                 }
               />
               <Stat
-                label="Locked collateral (floor)"
+                label="Total vote weight"
                 value={
                   totalLockedCollateral === null
                     ? "—"
                     : `${formatCat(totalLockedCollateral)} (${collateralAssetShort})`
                 }
-                hint="Uses minimum per registrant; higher locks are supported at registration."
+                hint="Sum of every voter's locked CAT (the chain-canonical
+                  registration_vote_weight). Drives the quorum threshold for
+                  every ballot under this election."
               />
+              {myReg && (
+                <Stat
+                  label="Your weight"
+                  value={(() => {
+                    if (myLockedAmount == null) return "—";
+                    const formatted = formatCat(myLockedAmount);
+                    if (
+                      totalLockedCollateral != null &&
+                      totalLockedCollateral > 0n
+                    ) {
+                      const pct =
+                        Number(
+                          (myLockedAmount * 10000n) / totalLockedCollateral
+                        ) / 100;
+                      return `${formatted} (${pct.toFixed(2)}%)`;
+                    }
+                    return formatted;
+                  })()}
+                  hint="Your share of the total vote weight. Locking more CAT
+                    at register time increases your weight proportionally on
+                    every ballot's quorum check."
+                />
+              )}
               <Stat
                 label="Ballots cast"
                 value={
@@ -2964,7 +2654,7 @@ const ElectionPageInner = dynamic(
           </section>
 
           {/* ────────── Action banner: progress / errors ─────────── */}
-          {(busy || txStatus || error) && (
+          {(busy || priorRegScanBusy || txStatus || error) && (
             <section className="card">
               {busy && (
                 <div className="flex items-center gap-2 text-[var(--color-accent)]">
@@ -2972,12 +2662,35 @@ const ElectionPageInner = dynamic(
                   <span>{busy}</span>
                 </div>
               )}
+              {priorRegScanBusy && !busy && (
+                <div className="flex items-center gap-2 text-[var(--color-muted)] text-sm">
+                  <div className="w-2.5 h-2.5 rounded-full bg-[var(--color-muted)] animate-pulse" />
+                  <span>{priorRegScanBusy}</span>
+                </div>
+              )}
               {txStatus && (
                 <div className="text-[var(--color-accent)]">{txStatus}</div>
               )}
               {error && (
-                <div className="text-[var(--color-danger)] text-sm whitespace-pre-wrap">
-                  {error}
+                <div
+                  role="alert"
+                  className="rounded-xl border-2 border-rose-500/60 bg-rose-500/10 p-4 flex items-start gap-3"
+                >
+                  <span aria-hidden className="text-rose-500 text-lg leading-none mt-0.5">
+                    ⚠
+                  </span>
+                  <div className="flex-1 text-rose-700 dark:text-rose-300 text-sm whitespace-pre-wrap break-words">
+                    <div className="font-semibold mb-1">Something went wrong</div>
+                    <div>{error}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setError(null)}
+                    className="text-rose-700/70 dark:text-rose-300/70 hover:text-rose-700 dark:hover:text-rose-200 text-xs px-2 py-1 rounded border border-rose-500/40 hover:bg-rose-500/10"
+                    aria-label="Dismiss error"
+                  >
+                    Dismiss
+                  </button>
                 </div>
               )}
             </section>
@@ -3105,7 +2818,8 @@ const ElectionPageInner = dynamic(
                         weights ballots by locked CAT at registration.
                       </p>
                       <label className="block text-xs font-medium text-[var(--color-muted)] mb-1.5">
-                        CAT to lock (minimum {formatCat(cfg.collateral_amount)})
+                        Lock amount = your vote weight (minimum{" "}
+                        {formatCat(cfg.collateral_amount)})
                       </label>
                       <input
                         type="text"
@@ -3126,6 +2840,17 @@ const ElectionPageInner = dynamic(
                         }
                         aria-invalid={!registrationLockSatisfiesMinimum}
                       />
+                      {registrationLockSatisfiesMinimum &&
+                        registrationLockCollateralCat.trim() !== "" && (
+                          <p className="text-xs text-[var(--color-accent)] mb-3">
+                            ✓ Your vote weight will be{" "}
+                            <span className="mono font-semibold">
+                              {registrationLockCollateralCat.trim()}
+                            </span>{" "}
+                            {collateralAssetShort}. Weight scales linearly:
+                            5× the floor = 5× the say in finalize tally.
+                          </p>
+                        )}
                       {!registrationLockSatisfiesMinimum &&
                         registrationLockCollateralCat.trim() !== "" && (
                           <p className="text-xs text-rose-700 dark:text-rose-300 mb-3">
@@ -3175,9 +2900,114 @@ const ElectionPageInner = dynamic(
                       your Sage XCH wallet, captures the current
                       registration snapshot, and persists the ballot’s
                       curry pack so voters can cast against it.
-                      Vote-close height defaults to peak + 50 (~25 min on
-                      mainnet).
                     </p>
+                    {(() => {
+                      // M12: render an election-lock banner so the
+                      // operator knows whether choices are gated.
+                      const lockHex =
+                        electionVoteModeLockHex?.replace(/^0x/, "") ?? null;
+                      const NO_LOCK = "ff".repeat(32);
+                      const FREE_LOCK = "00".repeat(32);
+                      if (lockHex == null) return null;
+                      if (lockHex === NO_LOCK) {
+                        return (
+                          <p className="text-xs mb-3" style={{ color: "#666" }}>
+                            Election vote mode: <strong>no lock</strong> —
+                            this ballot's choices set its own merkle root.
+                          </p>
+                        );
+                      }
+                      if (lockHex === FREE_LOCK) {
+                        return (
+                          <p className="text-xs mb-3" style={{ color: "#1a7f1a" }}>
+                            ✓ Election locked to <strong>Mode1Free</strong> —
+                            any 32-byte vote_data accepted; the choices
+                            below are advisory (vote_options_root forced
+                            to 0x00…00).
+                          </p>
+                        );
+                      }
+                      return (
+                        <div className="text-xs mb-3" style={{ color: "#1a7f1a" }}>
+                          ✓ Election locked to <strong>Mode2Restricted</strong>
+                          {" "}(root=0x{lockHex.slice(0, 16)}…). Voter choices
+                          must hash to this exact root.
+                          {lockedRestrictedLabels && lockedRestrictedLabels.length > 0 ? (
+                            <p className="mt-1" style={{ color: "#666" }}>
+                              Locked options:{" "}
+                              <code className="mono">
+                                {lockedRestrictedLabels.join(", ")}
+                              </code>
+                            </p>
+                          ) : (
+                            <p className="mt-1" style={{ color: "#b00020" }}>
+                              ⚠ No labels in localStorage for this root —
+                              ask the operator who deployed for the canonical
+                              comma-separated label list.
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })()}
+                    <label className="block text-xs font-medium text-[var(--color-muted)] mb-1.5">
+                      Voter choices (comma-separated, ≥ 2 unique labels)
+                    </label>
+                    <input
+                      type="text"
+                      value={mintBallotChoices}
+                      onChange={(e) => setMintBallotChoices(e.target.value)}
+                      placeholder="Yes,No"
+                      className="input mono mb-3 w-full sm:max-w-md"
+                      disabled={!!busy}
+                    />
+                    <p className="text-xs text-[var(--color-muted)] mb-3">
+                      Each label hashes to <span className="mono">vote_data = sha256(&quot;vote:&quot; + label)</span>. Voters pick one
+                      at cast time; finalize tallies the winning label.
+                    </p>
+                    <label className="block text-xs font-medium text-[var(--color-muted)] mb-1.5">
+                      Voting duration (blocks)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      step={1}
+                      value={mintBallotBlocks}
+                      onChange={(e) => setMintBallotBlocks(e.target.value)}
+                      placeholder="50"
+                      className="input mono mb-1 w-full sm:max-w-xs"
+                      disabled={!!busy}
+                    />
+                    {(() => {
+                      const n = Number.parseInt(
+                        mintBallotBlocks.trim(),
+                        10
+                      );
+                      if (!Number.isFinite(n) || n < 1) {
+                        return (
+                          <p className="text-xs text-rose-700 dark:text-rose-300 mb-3">
+                            Enter a positive integer.
+                          </p>
+                        );
+                      }
+                      const seconds = n * 52;
+                      const fmtDuration = (s: number) => {
+                        if (s < 60) return `~${s}s`;
+                        const m = s / 60;
+                        if (m < 60) return `~${m.toFixed(0)} min`;
+                        const h = m / 60;
+                        if (h < 48) return `~${h.toFixed(1)} h`;
+                        const d = h / 24;
+                        return `~${d.toFixed(1)} days`;
+                      };
+                      return (
+                        <p className="text-xs text-[var(--color-muted)] mb-3">
+                          {fmtDuration(seconds)} on mainnet (~52s/block).
+                          Sets <code className="mono">vote_close_height = peak + {n}</code>;
+                          voters can cast/change up until that block, then
+                          anyone with the proving key can finalize.
+                        </p>
+                      );
+                    })()}
                     <button
                       type="button"
                       onClick={handleCreateAndLaunchBallot}
@@ -3193,27 +3023,31 @@ const ElectionPageInner = dynamic(
                 ) : null}
 
                 {/* Ballots list — every ballot under this election
-                    plus its status. Selecting a row drives
-                    handleVote / handleChangeVote / handleFinalize. */}
+                    plus its status. Click a row to navigate to
+                    /ballot for voting / finalize / tally view. */}
                 <BallotsList
                   electionLauncherIdHex={launcherIdHex}
-                  selectedBallotId={selectedBallotId}
-                  setSelectedBallotId={setSelectedBallotId}
+                  configJson={session?.configJson ?? ""}
                   currentPeak={
                     electionLc.status === "ready" ? electionLc.peak : 0
                   }
-                  myVoteDataHex={resolvedMyVoteDataHex}
                   refreshKey={ballotsListEpoch}
                 />
 
-                {/* Step 2 — ballot (meaningful UI only once registered + pubkey) */}
+                {/* Step 2 — election-level deregister + claim CAT.
+                    Release operates on the Election Singleton's
+                    release_collateral action — it doesn't care which
+                    ballots are open / closed / finalized. Spending the
+                    voter's reg coin removes them from the SMT, melts
+                    the locked CAT back to a fresh CAT under the same
+                    TAIL, and returns the synthetic-key payout. Voting
+                    + finalize moved to per-ballot pages — click any
+                    row in the Ballots list above to navigate. */}
                 <div
                   className={`rounded-xl border p-5 ${
-                    !myReg
-                      ? "border-dashed border-[var(--color-border)] bg-[var(--color-bg)]/50"
-                      : resolvedMyVoteDataHex
-                        ? "border-[var(--color-accent)]/40 bg-[var(--color-accent)]/[0.04]"
-                        : "border-[var(--color-border)]"
+                    myReg
+                      ? "border-[var(--color-accent)]/35 bg-[var(--color-accent)]/[0.06]"
+                      : "border-[var(--color-border)]"
                   }`}
                 >
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-3">
@@ -3228,418 +3062,22 @@ const ElectionPageInner = dynamic(
                       2
                     </span>
                     <span className="font-semibold">
-                      {resolvedMyVoteDataHex
-                        ? "Your ballot"
-                        : "Cast your ballot"}
+                      Claim your CAT collateral &amp; deregister
                     </span>
-                    {!myReg && (
-                      <span className="text-xs text-[var(--color-muted)]">
-                        Unlocks after step&nbsp;1
-                      </span>
-                    )}
-                  </div>
-
-                  {!myReg ? (
-                    <p className="text-sm text-[var(--color-muted)]">
-                      Ballot choices and the submit button appear here after
-                      you&apos;ve registered. Use{" "}
-                      <span className="font-medium text-[var(--color-foreground)]">
-                        Register to vote
-                      </span>{" "}
-                      above.
-                    </p>
-                  ) : !effectiveVoterPk ? (
-                    <p className="text-sm text-[var(--color-muted)]">
-                      Voting pubkeys aren&apos;t available yet (waiting for Sage
-                      or chain snapshot). Refresh state or reopen this page once
-                      the wallet resolves your synthetic key.
-                    </p>
-                  ) : votesClosed && !resolvedMyVoteDataHex ? (
-                    <p className="text-sm text-[var(--color-muted)]">
-                      {showElectionExpiredNoBallots
-                        ? "Election expired — the voting window closed with no ballots cast."
-                        : "Election finished — the voting window closed before finalization."}{" "}
-                      New ballots aren&apos;t accepted from this UI.
-                    </p>
-                  ) : resolvedMyVoteDataHex ? (
-                    <div className="space-y-3 rounded-lg border border-[var(--color-accent)]/35 bg-[var(--color-accent)]/[0.06] p-4">
-                      <p className="text-sm font-medium text-[var(--color-accent)]">
-                        You already voted in this election.
-                      </p>
-                      {votesClosed && (
-                        <p className="text-xs text-[var(--color-muted)]">
-                          The voting window has closed — your ballot remains
-                          on-chain.
-                        </p>
-                      )}
-                      {optimisticVoteDataHex && !indexedMyVoteDataHex && (
-                        <p className="text-xs text-amber-800 dark:text-amber-300">
-                          Confirming your ballot with the indexer (usually one
-                          block)…
-                        </p>
-                      )}
-                      {(() => {
-                        const vn = normalizeHex32(resolvedMyVoteDataHex);
-                        const matched = session.choices?.find(
-                          (c) => normalizeHex32(c.voteDataHex) === vn
-                        );
-                        return matched ? (
-                          <div className="space-y-1">
-                  <div className="text-sm text-[var(--color-muted)]">
-                              Your choice
-                  </div>
-                            <div className="text-lg font-semibold">
-                              {matched.label}
-                            </div>
-                            <div className="mono text-xs text-[var(--color-muted)]">
-                              {truncHex(resolvedMyVoteDataHex, 12, 6)}
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="space-y-1">
-                            <div className="text-sm text-[var(--color-muted)]">
-                              Vote payload
-                            </div>
-                            <div className="mono text-sm break-all">
-                              {truncHex(resolvedMyVoteDataHex, 18, 8)}
-                            </div>
-                          </div>
-                        );
-                      })()}
-                      {!snapshot?.finalized &&
-                        !votesClosed &&
-                        myReg &&
-                        effectiveVoterPk && (
-                          <div className="mt-4 pt-4 border-t border-[var(--color-border)] space-y-3">
-                            <p className="text-sm font-medium text-[var(--color-foreground)]">
-                              Replace ballot
-                            </p>
-                            <p className="text-xs text-[var(--color-muted)] leading-relaxed">
-                              Until finalization you can publish a corrected vote
-                              (
-                              <code className="mono text-[11px]">change_vote</code>
-                              + oracle). Signing covers two coin spends — approve
-                              the full bundle in Sage.
-                            </p>
-                            {session.choices && session.choices.length > 0 ? (
-                              <>
-                                <div className="space-y-1">
-                                  {session.choices.map((c, i) => (
-                                    <label
-                                      key={`ch-${c.voteDataHex}`}
-                                      className={`flex items-center gap-3 p-2 rounded-lg border cursor-pointer transition-colors ${
-                                        changeBallotPickIdx === i
-                                          ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10"
-                                          : "border-[var(--color-border)] hover:border-[var(--color-accent)]"
-                                      }`}
-                                    >
-                  <input
-                                        type="radio"
-                                        name="changeChoice"
-                                        value={i}
-                                        checked={changeBallotPickIdx === i}
-                                        onChange={() =>
-                                          setChangeBallotPickIdx(i)
-                                        }
-                                        disabled={
-                                          !!busy ||
-                                          normalizeHex32(c.voteDataHex) ===
-                                            normalizeHex32(
-                                              resolvedMyVoteDataHex
-                                            )
-                                        }
-                                        className="accent-[var(--color-accent)]"
-                                      />
-                                      <div className="flex-1">
-                                        <div className="font-medium">{c.label}</div>
-                                        <div className="mono text-xs text-[var(--color-muted)]">
-                                          {truncHex(c.voteDataHex, 10, 6)}
-                                        </div>
-                                      </div>
-                                    </label>
-                                  ))}
-                                </div>
-                                <button
-                                  type="button"
-                                  onClick={handleChangeVote}
-                                  className="btn-secondary text-sm"
-                                  disabled={
-                                    !!busy ||
-                                    changeBallotPickIdx === null ||
-                                    !effectiveVoterPk
-                                  }
-                                >
-                                  Replace with selected choice
-                                </button>
-                              </>
-                            ) : (
-                              <>
-                                <input
-                                  value={changeBallotFreeform}
-                                  onChange={(e) =>
-                                    setChangeBallotFreeform(e.target.value)
-                                  }
-                                  placeholder="New vote payload (text or 0x-hex)"
-                                  className="input text-sm"
-                                />
-                                <button
-                                  type="button"
-                                  onClick={handleChangeVote}
-                                  className="btn-secondary text-sm"
-                                  disabled={
-                                    !!busy ||
-                                    !changeBallotFreeform.trim() ||
-                                    !effectiveVoterPk
-                                  }
-                                >
-                                  Replace with new payload
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        )}
-                    </div>
-                  ) : (
-                    <div className="space-y-3">
-                      {session.choices && session.choices.length > 0 ? (
-                        <>
-                          <div className="text-sm text-[var(--color-muted)]">
-                            Pick one option. On-chain{" "}
-                            <span className="mono font-normal">
-                              vote_data =
-                              sha256(&quot;vote:&quot; + label)
-                            </span>
-                            .
-                          </div>
-                          <div className="space-y-1">
-                            {session.choices.map((c, i) => (
-                              <label
-                                key={c.voteDataHex}
-                                className={`flex items-center gap-3 p-2 rounded-lg border cursor-pointer transition-colors ${
-                                  pickedChoiceIdx === i
-                                    ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10"
-                                    : "border-[var(--color-border)] hover:border-[var(--color-accent)]"
-                                }`}
-                              >
-                                <input
-                                  type="radio"
-                                  name="choice"
-                                  value={i}
-                                  checked={pickedChoiceIdx === i}
-                                  onChange={() => setPickedChoiceIdx(i)}
-                                  disabled={
-                                    !!busy ||
-                                    !myReg ||
-                                    !effectiveVoterPk ||
-                                    snapshot?.finalized ||
-                                    votesClosed
-                                  }
-                                  className="accent-[var(--color-accent)]"
-                                />
-                                <div className="flex-1">
-                                  <div className="font-medium">{c.label}</div>
-                                  <div className="mono text-xs text-[var(--color-muted)]">
-                                    {truncHex(c.voteDataHex, 10, 6)}
-                                  </div>
-                                </div>
-                              </label>
-                            ))}
-                          </div>
-                          <button
-                            type="button"
-                            onClick={handleVote}
-                            className="btn-primary"
-                            disabled={
-                              !!busy ||
-                              !myReg ||
-                              !effectiveVoterPk ||
-                              pickedChoiceIdx === null ||
-                              snapshot?.finalized ||
-                              votesClosed
-                            }
-                          >
-                            Cast vote
-                          </button>
-                        </>
-                      ) : (
-                        <>
-                          <div className="text-sm text-[var(--color-muted)]">
-                            No UI choices defined. Enter text — it is hashed
-                            to a 32-byte vote payload.
-                          </div>
-                          <input
-                            value={freeformVote}
-                            onChange={(e) => setFreeformVote(e.target.value)}
-                    placeholder="yes"
-                    className="input"
-                  />
-                  <button
-                            type="button"
-                    onClick={handleVote}
-                    className="btn-primary"
-                    disabled={
-                              !!busy ||
-                              !myReg ||
-                              !effectiveVoterPk ||
-                              !freeformVote.trim() ||
-                              snapshot?.finalized ||
-                              votesClosed
-                    }
-                  >
-                    Cast vote
-                  </button>
-                        </>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                {/* Step 3 — finalize election (permissionless once time-lock + proving key in session) */}
-                <div
-                  className={`rounded-xl border p-5 ${
-                    snapshot?.finalized
-                      ? "border-[var(--color-border)] opacity-95"
-                      : votesClosed &&
-                          session.provingKeyBase64 &&
-                          address &&
-                          (finalizePayoutPh || effectiveVoterPk)
-                        ? "border-[var(--color-accent)]/40 bg-[var(--color-accent)]/[0.04]"
-                        : "border-[var(--color-border)]"
-                  }`}
-                >
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-3">
-                    <span
-                      className={`inline-flex h-7 min-w-7 shrink-0 items-center justify-center rounded-full px-2 text-[11px] font-bold ${
-                        snapshot?.finalized
-                          ? "border border-[var(--color-muted)]/40 text-[var(--color-muted)]"
-                          : votesClosed
-                            ? "bg-[var(--color-accent)]/20 text-[var(--color-accent)]"
-                            : "border border-[var(--color-muted)]/40 text-[var(--color-muted)]"
-                      }`}
-                      aria-hidden
-                    >
-                      3
-                    </span>
-                    <span className="font-semibold">
-                      Finalize the election tally
-                    </span>
-                  </div>
-
-                  {snapshot?.finalized ? (
-                    <p className="text-sm text-[var(--color-muted)]">
-                      This election is finalized on-chain — tally and rewards are settled.
-                    </p>
-                  ) : chainStatus !== "deployed" ? (
-                    <p className="text-sm text-[var(--color-muted)]">
-                      Wait until deployment completes before finalize is possible.
-                    </p>
-                  ) : !votesClosed ? (
-                    <div className="space-y-2 text-sm text-[var(--color-muted)]">
-                      <p>
-                        Pick an expired ballot from the Ballots list above to
-                        finalize. Each ballot&apos;s vote_close_height gates its
-                        own finalize action; the Election Singleton itself never
-                        expires.
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="space-y-4">
-                      <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)]/80 p-3 text-sm">
-                        <div className="font-medium text-[var(--color-foreground)] mb-2">
-                          Finalize destination
-                        </div>
-                        <ul className="space-y-1.5 text-[var(--color-muted)] text-xs leading-relaxed">
-                          <li>
-                            Pays out to the standard puzzle hash of your{" "}
-                            <span className="font-medium">
-                              connected Sage receive address
-                            </span>
-                            {finalizePayoutPh ? (
-                              <span className="mono block mt-1 break-all opacity-90">
-                                {truncHex(normalizeHex32(finalizePayoutPh), 16, 10)}
-                              </span>
-                            ) : (
-                              <span className="block mt-1 text-amber-800 dark:text-amber-300">
-                                Decoding payout address… (reconnect Sage if stuck)
-                              </span>
-                            )}
-                          </li>
-                          <li>
-                            You need this tab&apos;s imported{" "}
-                            <span className="font-medium">share bundle / proving key</span>{" "}
-                            plus Groth16 in your browser (~30–90s) before mempool
-                            submit.
-                          </li>
-                        </ul>
-                      </div>
-                      {!session.provingKeyBase64 ? (
-                        <p className="text-sm text-[var(--color-muted)]">
-                          Add the organizer&apos;s share bundle via{" "}
-                          <span className="font-medium">Ballot → Import</span> so
-                          the proving key loads into this session — any participant can use it once the window closes.
-                        </p>
-                      ) : !finalizePayoutPh && !effectiveVoterPk ? (
-                        <p className="text-sm text-amber-800 dark:text-amber-300">
-                          Connect Sage Wallet and wait until your receive-address
-                          puzzle hash resolves (needed for payout routing).
-                        </p>
-                      ) : (
-                        <button
-                          type="button"
-                  onClick={handleFinalize}
-                  disabled={
-                            !!busy ||
-                            !!finalizeModal ||
-                            !session.provingKeyBase64 ||
-                            snapshot?.finalized ||
-                            !votesClosed ||
-                            (!finalizePayoutPh && !effectiveVoterPk)
-                          }
-                          className="btn-primary w-full sm:w-auto min-w-[220px]"
-                        >
-                          Finalize election
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                {/* Step 4 — release collateral (registered voters post-finalize) */}
-                <div
-                  className={`rounded-xl border p-5 ${
-                    snapshot?.finalized && myReg
-                      ? "border-[var(--color-accent)]/35 bg-[var(--color-accent)]/[0.06]"
-                      : "border-[var(--color-border)]"
-                  }`}
-                >
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-3">
-                    <span
-                      className={`inline-flex h-7 min-w-7 shrink-0 items-center justify-center rounded-full px-2 text-[11px] font-bold ${
-                        snapshot?.finalized && myReg
-                          ? "bg-[var(--color-accent)]/20 text-[var(--color-accent)]"
-                          : "border border-[var(--color-muted)]/40 text-[var(--color-muted)]"
-                      }`}
-                      aria-hidden
-                    >
-                      4
-                    </span>
-                    <span className="font-semibold">Claim your CAT collateral</span>
                   </div>
                   {!myReg ? (
                     <p className="text-sm text-[var(--color-muted)]">
-                      Only voters who joined this election can reclaim locked CAT
-                      after finalize.
-                    </p>
-                  ) : !snapshot?.finalized ? (
-                    <p className="text-sm text-[var(--color-muted)]">
-                      After finalize, this step unlocks and returns your collateral
-                      (minus consensus rules enforced on-chain).
+                      Only voters who joined this election can reclaim locked CAT.
                     </p>
                   ) : (
                     <>
                       <p className="text-sm text-[var(--color-muted)] mb-4">
-                        Finalize landed — reclaim your CAT at{" "}
-                        <span className="mono">{collateralAssetShort}</span>.
+                        Election-level action — deregisters you from the Election
+                        Singleton (removes your pubkey from the voter SMT) and
+                        returns your locked{" "}
+                        <span className="mono">{collateralAssetShort}</span>{" "}
+                        as a fresh CAT to your wallet. You can re-register
+                        later with another spend if you want.
                       </p>
                       <button
                         type="button"
@@ -3651,7 +3089,7 @@ const ElectionPageInner = dynamic(
                         }
                         className="btn-primary w-full sm:w-auto min-w-[220px]"
                       >
-                        Release collateral
+                        Release collateral &amp; deregister
                       </button>
                     </>
                   )}
@@ -4090,6 +3528,12 @@ function ShareBundleButton({ session }: { session: ElectionBootstrap }) {
 
 interface SyncSnapshotShape {
   registrationCount: number;
+  /**
+   * Sum of every voter's `locked_cat_mojos` (chain-canonical, from
+   * the Election Singleton's `registration_vote_weight` state field).
+   * This is the denominator used by every ballot's quorum threshold.
+   */
+  registrationVoteWeight: number;
   registrationMerkleRootHex: string;
   finalized: boolean;
   voteOutcomeHex: string;

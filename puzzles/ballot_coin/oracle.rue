@@ -16,14 +16,23 @@
 //   * State.finalized == false:
 //       sha256("ballot_oracle_open"
 //              || ballot_launcher_id
-//              || vote_close_height_be8)
+//              || vote_close_height_be8
+//              || vote_options_root)
 //
 //   * State.finalized == true:
 //       sha256("ballot_oracle_closed"
 //              || ballot_launcher_id
 //              || vote_close_height_be8
+//              || vote_options_root
 //              || vote_outcome
 //              || agg_signers)
+//
+// VOTE_OPTIONS_ROOT (M4-revised): committed via the curry arg added
+// in M6 so the oracle's announcement binds the ballot to a specific
+// vote-mode (Mode1Free = 0x00…00 sentinel; Mode2Restricted = a sorted-
+// options merkle root). Voting Coin `update_vote` rebuilds the same
+// 3-field preimage in its `AssertCoinAnnouncement` so a vote cast
+// against a wrong-options-root ballot fails fast.
 //
 // AssertCoinAnnouncement contract: external puzzles must derive the
 // announcer_coin_id (the Ballot Coin's CURRENT coin id) themselves to
@@ -37,6 +46,11 @@ fn main(
     // ── Curried ─────────────────────────────────────────────────────
     BALLOT_LAUNCHER_ID: Bytes32,
     VOTE_CLOSE_HEIGHT: Int,
+    // M4-revised: vote-options merkle root. 0x00…00 = Mode1Free; any
+    // other value = sorted-options merkle root (Mode2Restricted). Bound
+    // into both oracle announcement variants so a malicious mint can't
+    // re-sell a ballot under a different vote mode after creation.
+    VOTE_OPTIONS_ROOT: Bytes32,
     Truth: BallotStateTruth,
     // No solution params.
 ) -> (BallotStateTruth, List<Condition>) {
@@ -44,12 +58,14 @@ fn main(
 
     let ballot_b: Bytes = BALLOT_LAUNCHER_ID as Bytes;
     let close_b: Bytes = int_to_8_bytes_be(VOTE_CLOSE_HEIGHT);
+    let options_b: Bytes = VOTE_OPTIONS_ROOT as Bytes;
 
     let msg: Bytes32 = if State.finalized {
         sha256(
             "ballot_oracle_closed"
             + ballot_b
             + close_b
+            + options_b
             + (State.vote_outcome as Bytes)
             + (State.agg_signers as Bytes)
         )
@@ -58,6 +74,7 @@ fn main(
             "ballot_oracle_open"
             + ballot_b
             + close_b
+            + options_b
         )
     };
 

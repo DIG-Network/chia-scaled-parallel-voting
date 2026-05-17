@@ -84,7 +84,7 @@ fn deployer_build_deploy_bundle_produces_two_spends_and_config() {
     let funder = sim.bls(1);
     let deployer = ElectionDeployer::new(common::dummy_deploy_params());
     let (coin_spends, config) = deployer
-        .build_deploy_bundle(funder.coin, funder.pk)
+        .build_deploy_bundle(funder.coin, funder.pk, true)
         .expect("build_deploy_bundle");
     assert_eq!(
         coin_spends.len(),
@@ -455,7 +455,7 @@ async fn indexer_merkle_tree_returns_empty_smt_after_eve_sync() {
 fn test_proving_key() -> chip_voting_sdk::prover::circuit::ArkProvingKey {
     use ark_std::rand::SeedableRng;
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xBEEF);
-    let (pk, _vk) = chip_voting_sdk::prover::circuit::generate_test_setup(&mut rng).unwrap();
+    let (pk, _vk) = chip_voting_sdk::prover::circuit::generate_test_setup(32, &mut rng).unwrap();
     pk
 }
 

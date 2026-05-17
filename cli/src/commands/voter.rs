@@ -584,6 +584,8 @@ async fn cast_vote(
         registration_merkle_root_snapshot: reg_root_snapshot,
         registration_vote_weight_snapshot,
         voting_coin_amount,
+        vote_options_root: Bytes32::default(),
+        vote_option_proof: None,
     };
     let result = voter
         .cast_vote(&chain, params)
@@ -642,6 +644,8 @@ async fn update_vote(
         vote_threshold_den,
         registration_merkle_root_snapshot: reg_root_snapshot,
         registration_vote_weight_snapshot,
+        vote_options_root: Bytes32::default(),
+        vote_option_proof: None,
     };
     let result = voter
         .update_vote(&chain, params)

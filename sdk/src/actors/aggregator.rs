@@ -81,7 +81,7 @@ impl<C: ChainReader> Aggregator<C> {
     /// WHAT: construct from a validated config + a ChainReader.
     /// COST: precomputes the eve singleton puzzle hash (~few hashes).
     pub fn new(config: ElectionConfig, chain: C, network: NetworkType) -> Self {
-        // Default `election_start_height = 0` matches `ElectionState::genesis(_, 0)`
+        // Default `election_start_height = 0` matches `ElectionState::genesis(_, 0, Bytes32::default(), 0u64, Bytes32::default(), crate::vote_mode::VOTE_MODE_LOCK_NONE)`
         // — appropriate for the eve fast path on a freshly-launched election
         // when the caller has not yet supplied a height. Post-eve
         // reconstruction needs the real value; see `with_election_start_height`.
@@ -415,14 +415,30 @@ pub async fn collect_votes_for_ballot_via_chain<C: ChainReader>(
         };
 
         // The Voting Coin's curried state contains
-        // `registration_coin_id`, but recovering it from the unspent
-        // coin's puzzle hash isn't possible without the reveal. We
-        // surface a sentinel — callers that need the exact value
-        // should resolve it via the registration SPT lookup (one
-        // Registration Coin per voter pubkey). For finalize we don't
-        // need it; for audit/replay it's available via the same hint
-        // walk's spent records.
-        let registration_coin_id = Bytes32::default();
+        // `registration_coin_id`. Recovering it from the unspent
+        // coin's puzzle hash isn't possible (no reveal yet), but we
+        // CAN walk the voter's registration-coin hint and find the
+        // current unspent registration coin — that's the value
+        // curried into the unspent voting coin. Required by the
+        // dApp's update_vote flow (the SDK's update_vote checks
+        // params.registration_coin_id against the voting coin's
+        // curried state; passing default produced a ph mismatch).
+        // Released-CAT coins also share `voter_hint`, so filter them
+        // out by puzzle_hash (released CAT = cat_outer(tail, p2(pk))).
+        let reg_hint = crate::puzzles::voter_hint(election_id, cat_tail_hash, voter_pk);
+        let reg_records = chain.coin_records_by_hint(reg_hint).await?;
+        let dest_p2_inner: Bytes32 =
+            chia_puzzle_types::standard::StandardArgs::curry_tree_hash(voter_pk.clone()).into();
+        let released_cat_ph = crate::puzzles::cat_outer_for_inner_hash(
+            cat_tail_hash,
+            dest_p2_inner,
+        );
+        let registration_coin_id = reg_records
+            .iter()
+            .filter(|r| r.is_unspent() && r.coin.puzzle_hash != released_cat_ph)
+            .max_by_key(|r| r.confirmed_height)
+            .map(|r| r.coin.coin_id())
+            .unwrap_or_default();
 
         records.push(VoteRecord {
             voter_pubkey: *voter_pk,
@@ -557,13 +573,22 @@ impl<C: ChainReader> Aggregator<C> {
         // weighted-quorum gadget enforces on `signed_weight`:
         //   signed_weight * den >= num * total_weight
         // where signed_weight is the sum of per-signer CAT-locked
-        // weights and total_weight is `registration_vote_weight_snapshot`.
-        // CHIP rev 2026-05-02 uses uniform `collateral_amount` per
-        // voter, so signed_weight = votes.len() * collateral_amount.
-        // u128 widening here keeps the multiply overflow-safe for any
-        // realistic CAT mojo amounts (each fits in u64 ≤ 2^64).
-        let collateral_amount = self.config.collateral_amount;
-        let signed_weight = (votes.len() as u128) * (collateral_amount as u128);
+        // weights (per CHIP rev weighted voting, each voter's leaf
+        // binds their actual locked amount; we read it from the SMT)
+        // and total_weight is `registration_vote_weight_snapshot`
+        // (the chain-canonical sum at snapshot time). u128 widening
+        // here keeps the multiply overflow-safe for any realistic CAT
+        // mojo amounts (each fits in u64 ≤ 2^64).
+        let signed_weight: u128 = votes
+            .iter()
+            .map(|v| {
+                smt.locked_amount(&v.voter_pubkey)
+                    .map(|a| a as u128)
+                    .ok_or(VotingError::NotRegistered)
+            })
+            .collect::<VotingResult<Vec<_>>>()?
+            .into_iter()
+            .sum();
         let total_weight = registration_vote_weight_snapshot as u128;
         let lhs = signed_weight.checked_mul(vote_threshold_den as u128).ok_or_else(|| {
             VotingError::Other(anyhow_compat::Error(
@@ -747,8 +772,23 @@ impl<C: ChainReader> Aggregator<C> {
     ///      the bundle signature is the zero point.
     pub async fn build_finalize_for_ballot(
         &self,
-        params: BuildFinalizeForBallotParams<'_>,
+        mut params: BuildFinalizeForBallotParams<'_>,
     ) -> VotingResult<SpendBundle> {
+        // Phase 3: chain-walk override of caller-supplied per-ballot
+        // curry params (Option A's launcher memo). See
+        // build_finalize_with_proof_for_ballot for rationale.
+        let memo = crate::actors::ballot::read_ballot_launcher_memo(
+            &self.chain,
+            params.ballot_launcher_id,
+        )
+        .await?;
+        if let Some(m) = &memo {
+            params.vote_close_height = m.vote_close_height;
+            params.vote_threshold_num = m.vote_threshold_num;
+            params.vote_threshold_den = m.vote_threshold_den;
+            params.registration_merkle_root_snapshot = m.registration_merkle_root_snapshot;
+            params.registration_vote_weight_snapshot = m.registration_vote_weight_snapshot;
+        }
         let witness = self.prepare_finalize_witness_with_threshold(
             params.vote_outcome,
             params.ballot_launcher_id,
@@ -758,19 +798,17 @@ impl<C: ChainReader> Aggregator<C> {
             params.registration_vote_weight_snapshot,
         )?;
 
-        // Build the circuit + prove.
-        // Per CHIP.md every voter contributes a uniform
-        // COLLATERAL_AMOUNT weight in this revision; future deployments
-        // with per-voter variable weights would derive the weight from
-        // the registration record (currently the SPT leaf hash binds
-        // `sha256(pk || COLLATERAL_AMOUNT_be8)`, so the on-chain leaf
-        // already commits to this weight).
-        let per_signer_weight = self.config.collateral_amount;
+        // Build the circuit + prove. Per-voter weight comes from the
+        // SMT leaf — `sha256(pk || locked_amount_be8)` — so the SDK
+        // and the on-chain register / deregister actions agree on
+        // what each voter contributes to `signed_weight`.
+        let smt = self.merkle_tree()?;
         let mut signers: Vec<crate::prover::circuit::SignerWitness> = Vec::new();
         for (pk, mp) in witness.signer_pubkeys.iter().zip(witness.merkle_proofs.iter()) {
+            let weight = smt.locked_amount(pk).ok_or(VotingError::NotRegistered)?;
             signers.push(crate::prover::circuit::SignerWitness {
                 pubkey: *pk,
-                weight: per_signer_weight,
+                weight,
                 leaf_index: SparseMerkleTree::slot_for_pubkey(pk),
                 merkle_proof: mp.clone(),
             });
@@ -802,9 +840,30 @@ impl<C: ChainReader> Aggregator<C> {
     ///       of running the prover inline.
     pub async fn build_finalize_with_proof_for_ballot(
         &self,
-        params: BuildFinalizeForBallotParams<'_>,
+        mut params: BuildFinalizeForBallotParams<'_>,
         proof: crate::prover::Groth16Proof,
     ) -> VotingResult<SpendBundle> {
+        // Phase 3: chain-walk override of caller-supplied per-ballot
+        // curry params (Option A's launcher memo). Mirrors the override
+        // in Voter::cast_vote / Voter::update_vote — removes off-chain-
+        // metadata drift as a failure mode for the BLS aggregate
+        // signature verification (the witness is computed from these
+        // values; if they don't match what the on-chain finalize
+        // action's curry expects, the aggregate signature won't
+        // verify). Falls back to caller params for legacy ballots
+        // minted before the memo was added.
+        let memo = crate::actors::ballot::read_ballot_launcher_memo(
+            &self.chain,
+            params.ballot_launcher_id,
+        )
+        .await?;
+        if let Some(m) = &memo {
+            params.vote_close_height = m.vote_close_height;
+            params.vote_threshold_num = m.vote_threshold_num;
+            params.vote_threshold_den = m.vote_threshold_den;
+            params.registration_merkle_root_snapshot = m.registration_merkle_root_snapshot;
+            params.registration_vote_weight_snapshot = m.registration_vote_weight_snapshot;
+        }
         let witness = self.prepare_finalize_witness_with_threshold(
             params.vote_outcome,
             params.ballot_launcher_id,
@@ -863,13 +922,21 @@ impl<C: ChainReader> Aggregator<C> {
         let finalize_full_hash =
             Bytes32::new(tree_hash(&ctx, finalize_curried).to_bytes());
 
+        // M4-revised oracle curry: (BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT,
+        // VOTE_OPTIONS_ROOT). Aggregator defaults to Mode1Free sentinel
+        // until M7e wires the chain-walked vote_options_root through.
+        let vote_options_root_curry: Bytes32 = Bytes32::default();
         let oracle_program_node = crate::action_spends::load_action_puzzle(
             &mut ctx,
             crate::puzzles::BALLOT_COIN_ORACLE_HEX,
         )?;
         let oracle_curried = CurriedProgram {
             program: oracle_program_node,
-            args: clvm_curried_args!(params.ballot_launcher_id, params.vote_close_height),
+            args: clvm_curried_args!(
+                params.ballot_launcher_id,
+                params.vote_close_height,
+                vote_options_root_curry
+            ),
         }
         .to_clvm(&mut *ctx)
         .map_err(|e| anyhow_other(format!("currying oracle: {e}")))?;
@@ -1346,7 +1413,7 @@ pub async fn sync_with_chain<C: ChainReader>(
         // takes no extra parameters.
         let smt = SparseMerkleTree::new();
         let empty_root = smt.root();
-        let state = ElectionState::genesis(empty_root, election_start_height);
+        let state = ElectionState::genesis_from_config(empty_root, election_start_height, config);
         let voter_set = VoterSet {
             registration_merkle_root: empty_root,
             registration_count: 0,
@@ -1371,19 +1438,26 @@ pub async fn sync_with_chain<C: ChainReader>(
         .map_err(|e| VotingError::Other(anyhow_compat::Error(format!("config: {e}").into())))?;
 
     // Find the eve singleton by querying for children of the
-    // launcher coin.
+    // launcher coin. The Chia SingletonLauncher contract guarantees
+    // exactly one valid child per launcher (the eve), so we accept it
+    // regardless of whether its puzzle_hash matches the
+    // `eve_singleton_puzzle_hash` we predicted from
+    // `election_start_height`. Predictions can drift if the caller
+    // doesn't know the deployer's exact submission peak (legacy
+    // bootstrap import, share-bundle without electionStartHeight,
+    // etc.) — the launcher_id alone is sufficient. Whatever the
+    // launcher minted IS the eve. Mirrors `find_current_singleton`.
     let eve_children = chain.coin_records_by_parent_ids(&[launcher_id]).await?;
     tracing::info!(
         launcher_id = %hex::encode(launcher_id),
         children = eve_children.len(),
-        ph_matches = eve_children.iter().filter(|r| r.coin.puzzle_hash == eve_singleton_puzzle_hash).count(),
         target_ph = %hex::encode(eve_singleton_puzzle_hash),
         actual_ph = ?eve_children.iter().map(|r| hex::encode(r.coin.puzzle_hash)).collect::<Vec<_>>(),
         "sync_with_chain DIAG: slow-path query"
     );
     let eve_record = eve_children
         .into_iter()
-        .find(|r| r.coin.puzzle_hash == eve_singleton_puzzle_hash)
+        .find(|r| r.coin.amount % 2 == 1)
         .ok_or(VotingError::NotDeployed)?;
 
     // Walk forward from the eve singleton. Initialise SPT to
@@ -1393,7 +1467,7 @@ pub async fn sync_with_chain<C: ChainReader>(
     // tracked on the Election Singleton state instead.
     let mut smt = SparseMerkleTree::new();
     let mut voters: Vec<chia_bls::PublicKey> = Vec::new();
-    let mut state = ElectionState::genesis(smt.root(), election_start_height);
+    let mut state = ElectionState::genesis_from_config(smt.root(), election_start_height, config);
     // Ballot Coin snapshots emitted by the singleton's `create_ballot`
     // action. Phase 4.5 (indexer) walks each ballot's own lineage to
     // populate these fully; the aggregator only emits an entry when
@@ -1572,7 +1646,7 @@ pub async fn find_current_singleton<C: ChainReader>(
             parent_amount: launcher_record.coin.amount,
         });
         let smt = SparseMerkleTree::new();
-        let state = ElectionState::genesis(smt.root(), election_start_height);
+        let state = ElectionState::genesis_from_config(smt.root(), election_start_height, config);
         let voter_set = VoterSet {
             registration_merkle_root: smt.root(),
             registration_count: 0,
@@ -1605,7 +1679,7 @@ pub async fn find_current_singleton<C: ChainReader>(
 
     let mut smt = SparseMerkleTree::new();
     let mut voters: Vec<chia_bls::PublicKey> = Vec::new();
-    let mut state = ElectionState::genesis(smt.root(), election_start_height);
+    let mut state = ElectionState::genesis_from_config(smt.root(), election_start_height, config);
     let mut ballots: Vec<BallotCoinSnapshot> = Vec::new();
 
     let mut current = eve_record;
@@ -1990,48 +2064,148 @@ fn apply_singleton_spend(
             // count/weight to mirror `deregister.rue`'s state
             // transition:
             //   `registration_count -= 1`
-            //   `registration_vote_weight -= COLLATERAL_AMOUNT`
+            //   `registration_vote_weight -= locked_cat_mojos` (the
+            //       voter's REAL lock, recovered from the SMT before
+            //       we wipe their leaf — weighted-voting rev)
             //   `registration_merkle_root = <SPT with leaf wiped>`
             // Idempotent against repeated syncs because `remove`
             // returns false when the pk isn't currently in the SPT.
+            let recovered_lock = smt.locked_amount(pk);
             let removed = smt.remove(pk);
             if removed {
                 voters.retain(|v| v != pk);
                 state.registration_count = voters.len() as u64;
                 state.registration_merkle_root = smt.root();
+                let lock = recovered_lock.unwrap_or(collateral_amount);
                 state.registration_vote_weight = state
                     .registration_vote_weight
-                    .saturating_sub(collateral_amount);
+                    .saturating_sub(lock);
             }
             return Ok(());
         }
     }
 
-    // ── Register fallback ────────────────────────────────────────
+    // ── Register detection (weighted-voting rev) ─────────────────
+    //
+    // `register.rue` emits a CCA whose preimage is
+    //   sha256("registered" || new_root || (count+1)_be8 ||
+    //          pk || lock_be8)
+    // — this binds the new SMT root, the new count, the registering
+    // pubkey, AND the voter's chosen lock amount into one hash. We
+    // recover (pk, lock_amount) by:
+    //   (a) collecting all 48-byte BLS-G1 atoms in the solution as
+    //       pubkey candidates,
+    //   (b) collecting all 0-8 byte atoms in the solution as
+    //       lock_amount candidates (the puzzle's `int_to_8_bytes_be`
+    //       expands an arbitrary CLVM int to 8 bytes, but the value
+    //       in the solution can be CLVM-canonical i.e. shorter),
+    //   (c) for each (pk, lock) pair: tentatively insert into the
+    //       SMT, compute the resulting root, hash the candidate
+    //       preimage, and check it matches a CCA message.
+    // This makes the chain walker reconstruct each voter's REAL
+    // locked amount instead of falling back to the curried minimum.
     if registered_count > 0 {
-        if let Some(pk) = candidate_pubkeys.into_iter().next() {
-            if let Err(e) = smt.insert(&pk) {
+        let mut lock_candidates: Vec<u64> = Vec::new();
+        collect_u64_atoms(&allocator, solution_node, &mut lock_candidates);
+        let next_count = state.registration_count.saturating_add(1);
+        let next_count_be = next_count.to_be_bytes();
+        let mut matched: Option<(chia_bls::PublicKey, u64)> = None;
+        'search: for pk in &candidate_pubkeys {
+            let pk_bytes = pk.to_bytes();
+            for lock in &lock_candidates {
+                if *lock < collateral_amount {
+                    // Below the curried minimum — register.rue would
+                    // have rejected the spend, so it cannot be the
+                    // real lock amount.
+                    continue;
+                }
+                let mut tentative = smt.clone();
+                if tentative.insert(pk, *lock).is_err() {
+                    continue;
+                }
+                let new_root = tentative.root();
+                let mut h = sha2::Sha256::new();
+                use sha2::Digest;
+                h.update(b"registered");
+                h.update(new_root.as_ref());
+                h.update(next_count_be);
+                h.update(pk_bytes);
+                h.update(lock.to_be_bytes());
+                let candidate_msg: [u8; 32] = h.finalize().into();
+                if cca_messages.iter().any(|m| m == &candidate_msg) {
+                    matched = Some((*pk, *lock));
+                    break 'search;
+                }
+            }
+        }
+        if let Some((pk, lock)) = matched {
+            if let Err(e) = smt.insert(&pk, lock) {
                 tracing::warn!(error = ?e, "apply_singleton_spend: SMT insert failed");
             } else {
                 voters.push(pk);
                 state.registration_count = voters.len() as u64;
                 state.registration_merkle_root = smt.root();
-                // Mirror register.rue:
-                //   `registration_vote_weight: State.registration_vote_weight
-                //                              + COLLATERAL_AMOUNT`
-                // The on-chain Election Singleton's recreated coin
-                // commits to the new weight in its curried state, so
-                // any caller that wants to spend the post-register
-                // singleton (e.g. release_collateral) needs the same
-                // value here — otherwise the action layer's state
-                // hash diverges from the on-chain coin's puzzle hash
-                // and the singleton outer rejects the spend.
+                state.registration_vote_weight =
+                    state.registration_vote_weight.saturating_add(lock);
+            }
+        } else if let Some(pk) = candidate_pubkeys.into_iter().next() {
+            // Defensive fallback: no (pk, lock) pair matched a CCA.
+            // Should not happen for spends produced by this SDK; the
+            // most likely trigger is a manually-crafted register
+            // bundle whose announcement preimage diverges from
+            // `register.rue`. Fall back to the curried minimum so
+            // sync makes forward progress instead of deadlocking,
+            // and warn loudly.
+            tracing::warn!(
+                pk = %hex::encode(pk.to_bytes()),
+                "apply_singleton_spend: register CCA detected but no \
+                 (pk, lock) pair matched — falling back to curried \
+                 collateral_amount minimum"
+            );
+            if smt.insert(&pk, collateral_amount).is_ok() {
+                voters.push(pk);
+                state.registration_count = voters.len() as u64;
+                state.registration_merkle_root = smt.root();
                 state.registration_vote_weight =
                     state.registration_vote_weight.saturating_add(collateral_amount);
             }
         }
     }
     Ok(())
+}
+
+/// FN: collect_u64_atoms (file-private)
+/// WHAT: walk a CLVM tree and collect every 0-8 byte atom interpreted
+///       as a big-endian unsigned integer (u64). Used by
+///       `apply_singleton_spend` to recover candidate `locked_cat_mojos`
+///       values from a register action's solution. The CLVM canonical
+///       integer encoding is variable-length (no leading zero bytes),
+///       so we reject atoms over 8 bytes to skip 32-byte hashes /
+///       48-byte pubkeys / etc., and parse the rest as BE u64.
+fn collect_u64_atoms(
+    allocator: &clvmr::Allocator,
+    node: clvmr::NodePtr,
+    out: &mut Vec<u64>,
+) {
+    use clvmr::SExp;
+    match allocator.sexp(node) {
+        SExp::Atom => {
+            let atom = allocator.atom(node);
+            let bytes = atom.as_ref();
+            if bytes.len() <= 8 {
+                let mut padded = [0u8; 8];
+                padded[8 - bytes.len()..].copy_from_slice(bytes);
+                let value = u64::from_be_bytes(padded);
+                if !out.contains(&value) {
+                    out.push(value);
+                }
+            }
+        }
+        SExp::Pair(head, tail) => {
+            collect_u64_atoms(allocator, head, out);
+            collect_u64_atoms(allocator, tail, out);
+        }
+    }
 }
 
 /// FN: collect_bytes32_atoms (file-private)
@@ -2042,7 +2216,7 @@ fn apply_singleton_spend(
 ///        atoms — the merkle_root, lineage proofs, and other 32-byte
 ///        atoms are harmless additional candidates because the
 ///        sha256 match is conclusive.
-fn collect_bytes32_atoms(
+pub(crate) fn collect_bytes32_atoms(
     allocator: &clvmr::Allocator,
     node: clvmr::NodePtr,
     out: &mut Vec<[u8; 32]>,
@@ -2211,7 +2385,7 @@ fn canonical_int_bytes32(b: &Bytes32) -> chia_protocol::Bytes {
 ///       which `(vote_data, signature)` pair from an action's
 ///       solution produces a given on-chain `vote_cast` /
 ///       `vote_updated` announcement.
-fn collect_signature_atoms(
+pub(crate) fn collect_signature_atoms(
     allocator: &clvmr::Allocator,
     node: clvmr::NodePtr,
     out: &mut Vec<[u8; 96]>,
@@ -2243,7 +2417,7 @@ fn collect_signature_atoms(
 ///       preimages used by [`Aggregator::collect_votes_for_ballot`]
 ///       to brute-force the `(vote_data, sig)` pair from candidate
 ///       solution atoms.
-fn vote_announcement_matches(
+pub(crate) fn vote_announcement_matches(
     prefix: &[u8],
     ballot_launcher_id: Bytes32,
     voter_pk: &chia_bls::PublicKey,
@@ -2523,7 +2697,7 @@ pub fn compute_eve_inner_puzzle_hash(
     election_start_height: u64,
 ) -> Bytes32 {
     let empty_root = crate::merkle::SparseMerkleTree::new().root();
-    let genesis = ElectionState::genesis(empty_root, election_start_height);
+    let genesis = ElectionState::genesis_from_config(empty_root, election_start_height, config);
     compute_election_inner_puzzle_hash_for_state(config, &genesis)
 }
 
@@ -2634,8 +2808,18 @@ pub fn compute_eve_singleton_puzzle_hash(
     let merkle_root = compute_election_actions_merkle_root(config, launcher_id, cat_tail_hash);
 
     // Step 3: genesis state tree hash via the source-of-truth helper.
+    // V6: read the ceremony back-reference triple from the config so we
+    // match what the deployer commits at launch.
     let empty_root = crate::merkle::SparseMerkleTree::new().root();
-    let state_hash = ElectionState::genesis(empty_root, election_start_height).clvm_tree_hash();
+    let state_hash = ElectionState::genesis(
+        empty_root,
+        election_start_height,
+        config.ceremony_launcher_id(),
+        config.max_signers as u64,
+        config.vk_hash(),
+        crate::vote_mode::VOTE_MODE_LOCK_NONE,
+    )
+    .clvm_tree_hash();
 
     // See `compute_eve_inner_puzzle_hash` above for the curry-arg
     // convention rationale: finalizer_full is a tree hash of a
@@ -2708,13 +2892,18 @@ fn election_action_leaves(
     );
 
     // ── create_ballot ────────────────────────────────────────────
-    // CURRY ORDER: (SINGLETON_LAUNCHER_PUZZLE_HASH, ELECTION_LAUNCHER_ID).
+    // CURRY ORDER (M6-revised): (SINGLETON_LAUNCHER_PUZZLE_HASH,
+    // ELECTION_LAUNCHER_ID, NO_VOTE_MODE_LOCK). NO_VOTE_MODE_LOCK is
+    // the deployment-wide 0xFF…FF sentinel; the puzzle compares
+    // against State.vote_mode_lock to decide whether to enforce the
+    // ballot-mode lock gate.
     let singleton_launcher_ph = Bytes32::from(chia_puzzles::SINGLETON_LAUNCHER_HASH);
     let create_ballot_full = puzzles::curry_tree_hash(
         PuzzleHashes::election_create_ballot(),
         &[
             puzzles::hash_atom_b32(&singleton_launcher_ph),
             puzzles::hash_atom_b32(&launcher_id),
+            puzzles::hash_atom_b32(&crate::vote_mode::VOTE_MODE_LOCK_NONE),
         ],
     );
 
@@ -2782,6 +2971,11 @@ mod tests {
             },
             cat_tail_hash: Bytes32::new([0x77; 32]),
             collateral_amount: 1_000,
+            tree_depth: crate::config::TREE_DEPTH,
+            max_signers: crate::config::MAX_SIGNERS,
+            ceremony_launcher_id: Bytes32::default(),
+            vk_hash: Bytes32::default(),
+            vote_mode_lock: crate::vote_mode::VOTE_MODE_LOCK_NONE,
             // CHIP rev 2026-05-02: registration_fee /
             // election_length_blocks dropped; election_start_height
             // is the new state anchor.
@@ -2809,7 +3003,7 @@ mod tests {
         let funder = sim.bls(1);
         let deployer = ElectionDeployer::new(dummy_deploy_params());
         let (coin_spends, config) = deployer
-            .build_deploy_bundle(funder.coin, funder.pk)
+            .build_deploy_bundle(funder.coin, funder.pk, true)
             .unwrap();
         sim.spend_coins(coin_spends, &[funder.sk])
             .expect("simulator accepts deploy bundle");
@@ -2845,7 +3039,14 @@ mod tests {
         let empty_root = SparseMerkleTree::new().root();
         assert_eq!(
             *cached_state,
-            ElectionState::genesis(empty_root, TEST_ELECTION_START_HEIGHT),
+            ElectionState::genesis(
+                empty_root,
+                TEST_ELECTION_START_HEIGHT,
+                Bytes32::default(),
+                crate::config::MAX_SIGNERS as u64,
+                Bytes32::default(),
+                crate::vote_mode::VOTE_MODE_LOCK_NONE,
+            ),
         );
 
         let cached_smt = agg.merkle_tree().expect("smt populated after sync");
@@ -2879,6 +3080,8 @@ mod tests {
                 336 + (crate::config::PUBLIC_INPUT_COUNT + 1)
                     * 48
             ]),
+            ceremony_launcher_id_hex: String::new(),
+            vk_hash_hex: String::new(),
             label: None,
         };
 
@@ -2906,7 +3109,7 @@ mod tests {
         let funder = sim.bls(1);
         let deployer = ElectionDeployer::new(dummy_deploy_params());
         let (_spends, config) = deployer
-            .build_deploy_bundle(funder.coin, funder.pk)
+            .build_deploy_bundle(funder.coin, funder.pk, true)
             .unwrap();
 
         let launcher_id = derive_launcher_id(funder.coin.coin_id(), 1);
@@ -3098,7 +3301,7 @@ mod tests {
     fn stub_proving_key() -> crate::prover::circuit::ArkProvingKey {
         use ark_std::rand::SeedableRng;
         let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xDEAD);
-        let (pk, _vk) = crate::prover::circuit::generate_test_setup(&mut rng).unwrap();
+        let (pk, _vk) = crate::prover::circuit::generate_test_setup(32, &mut rng).unwrap();
         pk
     }
 
@@ -3119,11 +3322,15 @@ mod tests {
         let mut agg = Aggregator::new(config, chain, NetworkType::Mainnet);
         agg.sync().await.unwrap();
         let voters: Vec<_> = (0..n_voters).map(test_voter).collect();
+        // Test fixture: every voter locks the curried minimum
+        // `collateral_amount` (uniform). Tests covering non-uniform
+        // weighted voting should construct their own helper.
+        let uniform_lock = agg.config.collateral_amount;
         for (_, pk) in &voters {
             agg.voter_set.as_mut().unwrap().voters.push(*pk);
             // Also insert into the SPT so prove() returns realistic
             // sibling paths that match registration_merkle_root.
-            agg.smt.as_mut().unwrap().insert(pk).unwrap();
+            agg.smt.as_mut().unwrap().insert(pk, uniform_lock).unwrap();
         }
         agg.voter_set.as_mut().unwrap().registration_count = n_voters as u64;
         agg.voter_set.as_mut().unwrap().registration_merkle_root = agg.smt.as_ref().unwrap().root();
@@ -3131,6 +3338,103 @@ mod tests {
         agg.state.as_mut().unwrap().registration_count = n_voters as u64;
         (agg, voters)
     }
+
+    /// Build a populated Aggregator with the given per-voter lock
+    /// amounts. Drives weighted-voting tests that assert the
+    /// finalize witness sums REAL per-voter weights instead of
+    /// `count * collateral_amount`.
+    async fn populated_aggregator_with_locks(
+        config: ElectionConfig,
+        chain: SharedSimulator,
+        locks: &[u64],
+    ) -> (
+        Aggregator<SharedSimulator>,
+        Vec<(chia_bls::SecretKey, PublicKey)>,
+    ) {
+        let mut agg = Aggregator::new(config, chain, NetworkType::Mainnet);
+        agg.sync().await.unwrap();
+        let voters: Vec<_> = (0..locks.len() as u32).map(test_voter).collect();
+        let mut total_weight: u64 = 0;
+        for ((_, pk), lock) in voters.iter().zip(locks.iter()) {
+            agg.voter_set.as_mut().unwrap().voters.push(*pk);
+            agg.smt.as_mut().unwrap().insert(pk, *lock).unwrap();
+            total_weight = total_weight.checked_add(*lock).expect("test lock overflow");
+        }
+        agg.voter_set.as_mut().unwrap().registration_count = locks.len() as u64;
+        agg.voter_set.as_mut().unwrap().registration_merkle_root = agg.smt.as_ref().unwrap().root();
+        agg.state.as_mut().unwrap().registration_merkle_root = agg.smt.as_ref().unwrap().root();
+        agg.state.as_mut().unwrap().registration_count = locks.len() as u64;
+        agg.state.as_mut().unwrap().registration_vote_weight = total_weight;
+        (agg, voters)
+    }
+
+    /// WHAT: with non-uniform per-voter lock amounts, the finalize
+    ///       witness's `signed_weight * den >= total_weight * num`
+    ///       check uses the REAL sum (not `count * collateral`).
+    ///       Whale (5000) + minnow (1000) over a 1/2 majority threshold
+    ///       passes when the whale signs alone (5000 ≥ 0.5 × 6000)
+    ///       but FAILS when only the minnow signs (1000 < 0.5 × 6000).
+    /// WHY:  this is the regression bait for weighted-voting work —
+    ///       reverting to uniform `count * collateral` would make BOTH
+    ///       cases pass the threshold (1 voter ≥ 0.5 × 2 voters), so
+    ///       the second assertion catches the regression.
+    #[tokio::test(flavor = "current_thread")]
+    async fn weighted_threshold_uses_real_per_voter_amounts() {
+        let (config, mut sim) = deploy_into_sim();
+        let chain = SharedSimulator::new(&mut sim);
+        let (agg, voters) =
+            populated_aggregator_with_locks(config, chain, &[5_000, 1_000]).await;
+
+        let vote_outcome = Bytes32::new([0x99; 32]);
+        let election_id = agg.config.election_launcher_id().unwrap();
+        let canonical_msg =
+            canonical_vote_message(vote_outcome, placeholder_ballot_id(), election_id);
+        let mk_vote = |sk: &chia_bls::SecretKey, pk: &PublicKey| VoteRecord {
+            voter_pubkey: *pk,
+            vote_data: vote_outcome,
+            vote_signature_hex: sign_canonical(sk, canonical_msg),
+            registration_coin_id: Bytes32::default(),
+            ballot_launcher_id: Bytes32::default(),
+            voting_coin_id: Bytes32::default(),
+        };
+
+        let total_weight = 6_000u64;
+
+        // Whale (5000) alone clears 1/2 of total_weight (3000). Pass.
+        let whale_only = vec![mk_vote(&voters[0].0, &voters[0].1)];
+        let w = agg
+            .prepare_finalize_witness_with_threshold(
+                vote_outcome,
+                placeholder_ballot_id(),
+                &whale_only,
+                1,
+                2,
+                total_weight,
+            )
+            .expect("whale alone clears 1/2 majority on real weights");
+        assert_eq!(w.signer_pubkeys.len(), 1);
+
+        // Minnow (1000) alone is 1/6 of total_weight — below 1/2.
+        // Under the OLD uniform-weight semantics this would have
+        // passed (1 of 2 voters ≥ 1/2), so a failure here proves the
+        // aggregator now reads real per-voter weights from the SMT.
+        let minnow_only = vec![mk_vote(&voters[1].0, &voters[1].1)];
+        let err = agg
+            .prepare_finalize_witness_with_threshold(
+                vote_outcome,
+                placeholder_ballot_id(),
+                &minnow_only,
+                1,
+                2,
+                total_weight,
+            )
+            .unwrap_err();
+        match err {
+            VotingError::BelowThreshold => {}
+            other => panic!("expected BelowThreshold, got {other:?}"),
+        }
+    }
+
     /// WHAT: the aggregated BLS signature in the witness satisfies
     ///       the PoP-style single-pair pairing identity
     ///       `e(agg_signers, H(vote_message)) ==
@@ -3234,7 +3538,12 @@ mod tests {
 
         for (i, pk) in w.signer_pubkeys.iter().enumerate() {
             let slot = SparseMerkleTree::slot_for_pubkey(pk);
-            let leaf = SparseMerkleTree::active_leaf_hash(pk);
+            // populated_aggregator registers every voter with the
+            // uniform `config.collateral_amount`, so the leaf encoding
+            // uses that value here. Tests covering non-uniform amounts
+            // should look up the per-voter amount from
+            // `agg.merkle_tree()?.locked_amount(pk)`.
+            let leaf = SparseMerkleTree::active_leaf_hash(pk, config.collateral_amount);
             assert!(
                 verify_proof(leaf, slot, &w.merkle_proofs[i], w.registration_merkle_root),
                 "merkle proof for signer #{i} must verify",

@@ -1,0 +1,59 @@
+// ceremony_singleton/finalizer.rue
+// Finalizer for the Ceremony Singleton.
+//
+// Standard CHIP-0050 finalizer: recreates the Ceremony Singleton at
+// amount=1 after each inner action runs. State advancement (the
+// updated CeremonyState carrying the new last_contribution_hash and
+// incremented contribution_count) is propagated via the action's
+// returned StateTruth.
+//
+// Recreation puzzle hash format mirrors ballot_coin/finalizer.rue:
+//   curry_tree_hash(
+//     ACTION_LAYER_MOD_HASH,
+//     [
+//       FINALIZER_FULL_HASH,
+//       CEREMONY_ACTIONS_MERKLE_ROOT,
+//       new_state,
+//     ]
+//   )
+
+import super::action::StateTruth;
+import super::finalizer::*;
+import shared::*;
+
+fn main(
+    ACTION_LAYER_MOD_HASH: Bytes32,
+    HINT: Bytes32,
+    // 2nd curry
+    FINALIZER_SELF_HASH: Bytes32,
+    Truth: FinalizerTruths,
+    last_action_output: (StateTruth, List<List<Condition>>),
+    ..._my_solution: Any
+) -> List<Condition> {
+    let new_state = unchecked_cast::<CeremonyState>(last_action_output.first.actual_state);
+
+    let recreation_condition = CreateCoin {
+        puzzle_hash: curry_tree_hash(
+            ACTION_LAYER_MOD_HASH,
+            [
+                curry_tree_hash(
+                    FINALIZER_SELF_HASH,
+                    [
+                        tree_hash_atom(FINALIZER_SELF_HASH),
+                    ]
+                ),
+                tree_hash_atom(Truth.Merkle_Root),
+                tree_hash(new_state),
+            ]
+        ),
+        amount: 1,
+        memos: Memos {
+            value: [HINT],
+        }
+    };
+
+    [
+        recreation_condition,
+        ...flatten_list(last_action_output.rest)
+    ]
+}

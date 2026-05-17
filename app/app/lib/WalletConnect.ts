@@ -53,6 +53,36 @@ export class WalletConnectCoinSpend {
   }
 }
 
+/**
+ * Per-coin entry returned by chip0002_getAssetCoins. The `puzzle`
+ * field carries the CLVM-serialized puzzle reveal (standard p2 for
+ * XCH; CAT-wrapped for CATs). Uncurry it (chia-wallet-sdk-wasm
+ * `Program.uncurry()`) to extract the synthetic_pk — the first
+ * curried arg of the standard p2 puzzle. Field names mirror Sage's
+ * camelCase JSON output; the inner `coin` keeps RPC snake_case.
+ */
+export interface SageAssetCoin {
+  coin: {
+    parent_coin_info: string;
+    puzzle_hash: string;
+    amount: number;
+  };
+  coinName?: string;
+  /** CLVM-serialized puzzle reveal — hex-encoded. */
+  puzzle?: string;
+  confirmedBlockIndex?: number;
+  spentBlockIndex?: number;
+  locked?: boolean;
+  /** Present for CAT coins — needed to sign + chain into the CAT outer puzzle. */
+  lineageProof?: {
+    parentCoinInfo?: string;
+    parent_coin_info?: string;
+    innerPuzzleHash?: string;
+    inner_puzzle_hash?: string;
+    amount?: number;
+  };
+}
+
 export class WalletConnect {
   private client: SignClient | undefined;
   private initPromise: Promise<void>;
@@ -202,8 +232,10 @@ export class WalletConnect {
             "chia_getAddress",
             "chia_send",
             "chip0002_getPublicKeys",
+            "chip0002_getAssetCoins",
             "chip0002_signCoinSpends",
             "chip0002_sendTransaction",
+            "chip0002_filterUnlockedCoins",
           ],
           chains: ["chia:mainnet"],
           events: [],
@@ -301,6 +333,55 @@ export class WalletConnect {
       return response;
     } catch (error) {
       console.error("Failed to get public keys:", error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Get spendable coins owned by the connected wallet, with their
+   * puzzle reveals. Far faster than enumerating synthetic keys via
+   * `getPublicKeys` and matching against coinset.org records — Sage
+   * already knows which keys derived each coin.
+   *
+   * The puzzle reveal in the response is the standard p2 puzzle
+   * curried with the synthetic_pk; uncurry → first arg → synthetic_pk
+   * (no scanning).
+   *
+   * `assetId` should be omitted/null for XCH; for CATs pass the TAIL
+   * hash hex.
+   */
+  async getAssetCoins(
+    /**
+     * Asset type per chip0002 spec. Pass `null` for XCH;
+     * `'cat' | 'nft' | 'did'` for the corresponding asset class
+     * (with `assetId` set to the TAIL hash / launcher id).
+     */
+    type: null | "cat" | "nft" | "did",
+    assetId: string | null,
+    includedLocked: boolean,
+    offset: number,
+    limit: number
+  ): Promise<SageAssetCoin[] | undefined> {
+    if (!this.client) return undefined;
+    const state = store.getState();
+    try {
+      const response = await this.client.request<SageAssetCoin[]>({
+        topic: state.wallet.session?.topic ?? "",
+        chainId: "chia:mainnet",
+        request: {
+          method: "chip0002_getAssetCoins",
+          params: {
+            type,
+            assetId,
+            includedLocked,
+            offset,
+            limit,
+          },
+        },
+      });
+      return response;
+    } catch (error) {
+      console.error("Failed to get asset coins:", error);
       return undefined;
     }
   }

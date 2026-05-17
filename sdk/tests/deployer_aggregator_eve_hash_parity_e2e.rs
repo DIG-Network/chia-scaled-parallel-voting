@@ -39,6 +39,11 @@ fn deploy_params(start_height: u64) -> DeployParams {
         verification_key: placeholder_vk(),
         cat_tail_hash: Bytes32::new([0x77; 32]),
         collateral_amount: 100,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        ceremony_launcher_id: Bytes32::default(),
+        vk_hash: Bytes32::default(),
+        vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         election_start_height: start_height,
         label: Some("deployer-aggregator-parity".into()),
     }

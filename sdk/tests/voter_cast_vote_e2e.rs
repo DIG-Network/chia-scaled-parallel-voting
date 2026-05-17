@@ -26,7 +26,7 @@
 mod common;
 
 use chia_protocol::{Bytes32, Coin};
-use chia_puzzle_types::cat::{CatArgs, GenesisByCoinIdTailArgs};
+use chia_puzzle_types::cat::GenesisByCoinIdTailArgs;
 use chia_sdk_driver::{Cat, SpendContext, StandardLayer};
 use chia_sdk_test::Simulator;
 use chia_sdk_types::conditions::Conditions;
@@ -59,6 +59,11 @@ async fn voter_cast_vote_against_simulator_full_flow() {
         },
         cat_tail_hash,
         collateral_amount,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        ceremony_launcher_id: Bytes32::default(),
+        vk_hash: Bytes32::default(),
+        vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         election_start_height: 0,
         label: None,
     };
@@ -66,7 +71,7 @@ async fn voter_cast_vote_against_simulator_full_flow() {
     // ── 2. Deploy Election Singleton ─────────────────────────
     let deployer = ElectionDeployer::new(params);
     let (deploy_spends, config) = deployer
-        .build_deploy_bundle(funder.coin, funder.pk)
+        .build_deploy_bundle(funder.coin, funder.pk, true)
         .expect("build_deploy_bundle");
     sim.spend_coins(deploy_spends, std::slice::from_ref(&funder.sk))
         .expect("simulator accepts deploy bundle");
@@ -135,7 +140,7 @@ async fn voter_cast_vote_against_simulator_full_flow() {
     let smt_pre_register = SparseMerkleTree::new();
     let chain = common::SharedSim::new(&mut sim);
     let register_bundle = voter
-        .register(&smt_pre_register, cat_parent_spend, &chain)
+        .register(&smt_pre_register, cat_parent_spend, &chain, config.collateral_amount)
         .await
         .expect("Voter::register");
     drop(chain);
@@ -169,6 +174,7 @@ async fn voter_cast_vote_against_simulator_full_flow() {
                 ballot_seed,
                 vote_close_height,
                 outcome_domain_hash,
+                vote_options_root: Bytes32::default(),
             },
             funder_spend,
         )
@@ -195,6 +201,7 @@ async fn voter_cast_vote_against_simulator_full_flow() {
                 outcome_domain_hash,
                 vote_threshold_num,
                 vote_threshold_den,
+                vote_options_root: Bytes32::default(),
             },
         )
         .await
@@ -208,7 +215,7 @@ async fn voter_cast_vote_against_simulator_full_flow() {
     // the voter registered, weight = collateral_amount and root =
     // depth-32 SMT containing voter_pk. Mirror locally.
     let mut smt_post_register = SparseMerkleTree::new();
-    smt_post_register.insert(&voter_pk).expect("smt insert");
+    smt_post_register.insert(&voter_pk, config.collateral_amount).expect("smt insert");
     let registration_merkle_root_snapshot = smt_post_register.root();
     let registration_vote_weight_snapshot = collateral_amount; // exactly 1 voter post-register
 
@@ -229,6 +236,8 @@ async fn voter_cast_vote_against_simulator_full_flow() {
                 registration_merkle_root_snapshot,
                 registration_vote_weight_snapshot,
                 voting_coin_amount,
+                vote_options_root: Bytes32::default(),
+                vote_option_proof: None,
             },
         )
         .await

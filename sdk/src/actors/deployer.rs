@@ -63,13 +63,44 @@ pub struct DeployParams {
     pub cat_tail_hash: Bytes32,
     /// CAT mojos each voter locks at registration. Returned at release.
     pub collateral_amount: u64,
+    /// Per-election registration tree depth, sourced at deploy time
+    /// from the chosen ceremony's `max_voters` (depth = ceil(log2)).
+    /// Curried into `register` / `deregister` and emitted into the
+    /// `ElectionConfig`. Until the SparseMerkleTree itself is
+    /// depth-parametric (E6c), this MUST equal `crate::config::TREE_DEPTH`
+    /// or the genesis root will mismatch the on-chain proof.
+    pub tree_depth: u32,
+    /// Per-election maximum number of registrations, sourced from the
+    /// chosen ceremony's `max_voters`. Emitted into `ElectionConfig`
+    /// so dApps + tooling self-validate the relation
+    /// `max_signers <= 1 << tree_depth`.
+    pub max_signers: usize,
     /// L1 block height the election was launched at. Stored in the
-    /// genesis `ElectionState` (4-field shape per CHIP rev 2026-05-02)
-    /// so per-ballot epochs / timing windows can be derived against a
-    /// stable on-chain anchor. The deployer commits to this value in
-    /// the genesis state hash; voters / aggregators read it back via
-    /// the singleton's state.
+    /// genesis `ElectionState` so per-ballot epochs / timing windows
+    /// can be derived against a stable on-chain anchor. The deployer
+    /// commits to this value in the genesis state hash; voters /
+    /// aggregators read it back via the singleton's state.
     pub election_start_height: u64,
+    /// Launcher ID of the trusted-setup ceremony singleton this
+    /// election is bound to (V6, ceremony→election link). Committed
+    /// into the genesis `ElectionState` so every downstream actor
+    /// (voter, aggregator, indexer) can verify which ceremony
+    /// produced the curried VK.
+    pub ceremony_launcher_id: Bytes32,
+    /// sha256 of the ceremony's derived Groth16 verifying key (V6).
+    /// MUST equal `sha256(verification_key.serialize())` of the
+    /// `verification_key` field above; this redundant commitment is
+    /// what the on-chain voucher's canonical announcement binds. The
+    /// election deployer asserts the voucher's announcement at
+    /// launcher time, so a deployer who sets a vk_hash that doesn't
+    /// match the actual VK can't broadcast a valid bundle.
+    pub vk_hash: Bytes32,
+    /// M3: per-election ballot-mode lock. Default is
+    /// `crate::vote_mode::VOTE_MODE_LOCK_NONE` (= 0xFF…FF) which
+    /// means "no lock — each ballot picks its own vote_options_root".
+    /// Set to a specific 32-byte value to force every ballot's
+    /// curried VOTE_OPTIONS_ROOT to match this byte-for-byte.
+    pub vote_mode_lock: Bytes32,
     /// Optional label for UIs/indexers.
     pub label: Option<String>,
 }
@@ -127,10 +158,46 @@ impl ElectionDeployer {
     ///     burn its remaining balance.
     /// RETURNS: `(coin_spends, ElectionConfig)`. The ElectionConfig is
     ///          only complete once the launcher_id is known.
+    /// FN: build_deploy_bundle (LEGACY — V8-gated)
+    /// WHAT: original deploy path that does NOT co-spend a ceremony
+    ///       voucher. Retained ONLY for tests + tooling that predate
+    ///       the V7 ceremony→election link. Production deploys MUST
+    ///       use [`build_deploy_bundle_with_ceremony_link`] so the
+    ///       election commits to a finalized ceremony's
+    ///       (vk_hash, max_voters, ceremony_launcher_id) triple via
+    ///       AssertCoinAnnouncement.
+    /// CONTRACT:
+    ///   * `allow_unlinked_ceremony=true` (legacy): proceeds as the
+    ///     pre-V7 path (no voucher co-spend, no announcement).
+    ///   * `allow_unlinked_ceremony=false`: returns Err. The error
+    ///     directs the caller to the linked variant.
     pub fn build_deploy_bundle(
         &self,
         parent_coin: Coin,
         parent_pk: PublicKey,
+        allow_unlinked_ceremony: bool,
+    ) -> VotingResult<(Vec<CoinSpend>, ElectionConfig)> {
+        use chia_sdk_types::Conditions;
+        if !allow_unlinked_ceremony {
+            return Err(VotingError::Other(anyhow_compat::Error(
+                "election deploy requires ceremony voucher link — \
+                 use build_deploy_bundle_with_ceremony_link"
+                    .into(),
+            )));
+        }
+        self.build_deploy_bundle_with_extras(parent_coin, parent_pk, Conditions::new())
+    }
+
+    /// FN: build_deploy_bundle_with_extras (private)
+    /// WHAT: shared body for `build_deploy_bundle` + the V7 linked
+    ///       variant. `extra_parent_conditions` is appended to the
+    ///       parent's standard-layer condition list — used by V7 to
+    ///       inject the voucher's `AssertCoinAnnouncement`.
+    fn build_deploy_bundle_with_extras(
+        &self,
+        parent_coin: Coin,
+        parent_pk: PublicKey,
+        extra_parent_conditions: chia_sdk_types::Conditions,
     ) -> VotingResult<(Vec<CoinSpend>, ElectionConfig)> {
         use chia_puzzle_types::standard::StandardArgs;
         use chia_sdk_types::Conditions;
@@ -154,14 +221,20 @@ impl ElectionDeployer {
         // 2. Standard p2 spend of the parent coin → launcher (1 mojo)
         //    + CHANGE coin back to parent's standard p2 puzzle hash
         //    so the funding wallet preserves `parent.amount - 1` mojos.
-        //    Without this, ALL of parent_coin.amount above 1 mojo
-        //    would be burned by consensus (output sum < input sum).
+        //    + caller-supplied extra conditions (V7: the voucher's
+        //    AssertCoinAnnouncement). Without the change, ALL of
+        //    parent_coin.amount above 1 mojo would be burned by
+        //    consensus (output sum < input sum).
         let parent_p2_ph = Bytes32::new(StandardArgs::curry_tree_hash(parent_pk).to_bytes());
         let mut conditions: Conditions = launch_conditions;
         if parent_coin.amount > 1 {
             let change = parent_coin.amount - 1;
             conditions =
                 conditions.create_coin(parent_p2_ph, change, chia_puzzle_types::Memos::None);
+        }
+        // Append caller extras (V7 voucher assertion).
+        for c in extra_parent_conditions {
+            conditions = conditions.with(c);
         }
         StandardLayer::new(parent_pk)
             .spend(&mut ctx, parent_coin, conditions)
@@ -172,6 +245,138 @@ impl ElectionDeployer {
             })?;
 
         Ok((ctx.take(), config))
+    }
+
+    /// FN: build_deploy_bundle_with_ceremony_link
+    /// WHAT: V7 linked-deploy variant. Co-spends `voucher_coin` (the
+    ///       finalized ceremony's anyone-can-spend voucher) AND
+    ///       asserts its canonical announcement in the parent's
+    ///       standard-layer Conditions, binding the deployed election
+    ///       irrevocably to the bound ceremony's (vk_hash, max_voters,
+    ///       ceremony_launcher_id) triple.
+    /// CONTRACT:
+    ///   * `voucher_coin.puzzle_hash` MUST equal
+    ///     `puzzles::ceremony_voucher_puzzle_hash(self.params.vk_hash,
+    ///      self.params.max_signers as u64,
+    ///      self.params.ceremony_launcher_id)`.
+    ///   * `voucher_coin.amount` is propagated through the recreation
+    ///     CreateCoin the voucher emits; typically 2.
+    /// EMITS:
+    ///   * Everything `build_deploy_bundle` emits.
+    ///   * 1 voucher coin spend (anyone-can-spend, empty solution),
+    ///     which fires the canonical CreateCoinAnnouncement and
+    ///     recreates itself at the same puzzle hash + same amount.
+    ///   * `AssertCoinAnnouncement(announcement_id)` injected into the
+    ///     parent spend's Conditions, where
+    ///     `announcement_id = sha256(voucher_coin_id || canonical_msg)`.
+    pub fn build_deploy_bundle_with_ceremony_link(
+        &self,
+        parent_coin: Coin,
+        parent_pk: PublicKey,
+        voucher_coin: Coin,
+    ) -> VotingResult<(Vec<CoinSpend>, ElectionConfig)> {
+        use chia_sdk_types::Conditions;
+        use clvm_traits::{clvm_curried_args, ToClvm};
+        use clvm_utils::{tree_hash, CurriedProgram};
+        use sha2::{Digest, Sha256};
+
+        // 1. Build the curried voucher program for the co-spend.
+        let mut ctx = SpendContext::new();
+        let voucher_bytes = hex::decode(
+            puzzles::CEREMONY_VOUCHER_HEX
+                .trim()
+                .trim_start_matches("0x"),
+        )
+        .map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("decoding CEREMONY_VOUCHER_HEX: {e}").into(),
+            ))
+        })?;
+        let voucher_program = chia_protocol::Program::from(voucher_bytes);
+        let voucher_program_node = voucher_program.to_clvm(&mut *ctx).map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("loading voucher program: {e}").into(),
+            ))
+        })?;
+
+        let mod_hash = PuzzleHashes::ceremony_voucher();
+        let canonical_msg = puzzles::ceremony_voucher_canonical_msg(
+            self.params.vk_hash,
+            self.params.max_signers as u64,
+            self.params.ceremony_launcher_id,
+        );
+
+        // First curry: (MOD_HASH, CANONICAL_MSG, CEREMONY_LAUNCHER_ID).
+        let first_curry = CurriedProgram {
+            program: voucher_program_node,
+            args: clvm_curried_args!(
+                mod_hash,
+                canonical_msg,
+                self.params.ceremony_launcher_id
+            ),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("first-currying voucher: {e}").into(),
+            ))
+        })?;
+        let first_curry_hash = Bytes32::new(tree_hash(&ctx, first_curry).to_bytes());
+        // Second curry: (SELF_HASH = first_curry_hash).
+        let voucher_full = CurriedProgram {
+            program: first_curry,
+            args: clvm_curried_args!(first_curry_hash),
+        }
+        .to_clvm(&mut *ctx)
+        .map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("second-currying voucher: {e}").into(),
+            ))
+        })?;
+        // Empty solution.
+        let voucher_solution = ().to_clvm(&mut *ctx).map_err(|e| {
+            VotingError::Other(anyhow_compat::Error(
+                format!("encoding voucher solution: {e}").into(),
+            ))
+        })?;
+
+        // Materialise the voucher CoinSpend.
+        let voucher_puzzle_bytes = clvmr::serde::node_to_bytes(&ctx, voucher_full)
+            .map_err(|e| {
+                VotingError::Other(anyhow_compat::Error(
+                    format!("voucher reveal -> bytes: {e}").into(),
+                ))
+            })?;
+        let voucher_puzzle_program = chia_protocol::Program::from(voucher_puzzle_bytes);
+        let voucher_solution_bytes = clvmr::serde::node_to_bytes(&ctx, voucher_solution)
+            .map_err(|e| {
+                VotingError::Other(anyhow_compat::Error(
+                    format!("voucher solution -> bytes: {e}").into(),
+                ))
+            })?;
+        let voucher_solution_program = chia_protocol::Program::from(voucher_solution_bytes);
+        let voucher_spend =
+            CoinSpend::new(voucher_coin, voucher_puzzle_program, voucher_solution_program);
+
+        // 2. Compute the announcement id the parent will assert.
+        //    announcement_id = sha256(voucher_coin_id || canonical_msg).
+        let voucher_coin_id = voucher_coin.coin_id();
+        let mut h = Sha256::new();
+        h.update(voucher_coin_id.to_bytes().as_slice());
+        h.update(canonical_msg.to_bytes().as_slice());
+        let announcement_id_bytes: [u8; 32] = h.finalize().into();
+        let announcement_id = Bytes32::new(announcement_id_bytes);
+
+        // 3. Build the deploy bundle with the assertion injected into
+        //    the parent's standard-layer Conditions.
+        let extras = Conditions::new()
+            .assert_coin_announcement(announcement_id);
+        let (mut coin_spends, config) =
+            self.build_deploy_bundle_with_extras(parent_coin, parent_pk, extras)?;
+
+        // 4. Append the voucher spend so the bundle includes it.
+        coin_spends.push(voucher_spend);
+        Ok((coin_spends, config))
     }
 
     /// FN: deploy_signed
@@ -192,7 +397,7 @@ impl ElectionDeployer {
         secret_keys: &[SecretKey],
         network: NetworkType,
     ) -> VotingResult<DeploymentArtifacts> {
-        let (coin_spends, config) = self.build_deploy_bundle(parent_coin, parent_pk)?;
+        let (coin_spends, config) = self.build_deploy_bundle(parent_coin, parent_pk, true)?;
         let signature = sign_bundle_signature(&coin_spends, secret_keys, network)?;
         let spend_bundle = assemble_spend_bundle(coin_spends, signature);
         Ok(DeploymentArtifacts {
@@ -211,9 +416,11 @@ impl ElectionDeployer {
             election_launcher_id_hex: hex::encode(launcher_id),
             cat_tail_hash_hex: hex::encode(self.params.cat_tail_hash),
             collateral_amount: self.params.collateral_amount,
-            tree_depth: crate::config::TREE_DEPTH,
-            max_signers: crate::config::MAX_SIGNERS,
+            tree_depth: self.params.tree_depth,
+            max_signers: self.params.max_signers,
             verification_key_hex: hex::encode(self.params.verification_key.serialize()),
+            ceremony_launcher_id_hex: hex::encode(self.params.ceremony_launcher_id),
+            vk_hash_hex: hex::encode(self.params.vk_hash),
             label: self.params.label.clone(),
         }
     }
@@ -287,12 +494,24 @@ impl ElectionDeployer {
     }
 
     /// Tree hash of the genesis `ElectionState` cons tree.
-    /// SOURCE OF TRUTH: `state::ElectionState::genesis(empty_root,
-    /// election_start_height).clvm_tree_hash()`. Composed via the
-    /// shared helper so any change to the on-chain Rue state shape
-    /// (`shared.rue::ElectionState`) only needs updating in one place.
+    /// SOURCE OF TRUTH: `state::ElectionState::genesis(...).clvm_tree_hash()`.
+    /// Composed via the shared helper so any change to the on-chain
+    /// Rue state shape (`shared.rue::ElectionState`) only needs
+    /// updating in one place. Threads the deployer's ceremony
+    /// back-reference triple (ceremony_launcher_id, max_voters,
+    /// vk_hash) into the committed state — the same values curried
+    /// into the voucher coin's puzzle hash, so the on-chain voucher
+    /// announcement and the election state agree byte-for-byte.
     fn genesis_state_tree_hash(&self, empty_root: Bytes32) -> Bytes32 {
-        ElectionState::genesis(empty_root, self.params.election_start_height).clvm_tree_hash()
+        ElectionState::genesis(
+            empty_root,
+            self.params.election_start_height,
+            self.params.ceremony_launcher_id,
+            self.params.max_signers as u64,
+            self.params.vk_hash,
+            self.params.vote_mode_lock,
+        )
+        .clvm_tree_hash()
     }
 
     /// Curry the `register` action with its deployment-wide constants.
@@ -308,7 +527,7 @@ impl ElectionDeployer {
         puzzles::curry_tree_hash(
             PuzzleHashes::election_register(),
             &[
-                uint_atom_hash(crate::config::TREE_DEPTH as u64),
+                uint_atom_hash(self.params.tree_depth as u64),
                 puzzles::hash_atom_b32(&Bytes32::new(crate::config::EMPTY_LEAF_HASH)),
                 puzzles::hash_atom_b32(&PuzzleHashes::cat_outer()),
                 puzzles::hash_atom_b32(&self.params.cat_tail_hash),
@@ -325,18 +544,23 @@ impl ElectionDeployer {
     }
 
     /// Curry the `create_ballot` action with its deployment-wide
-    /// constants. CURRY ORDER (per `puzzles/election/create_ballot.rue`):
-    ///   `(SINGLETON_LAUNCHER_PUZZLE_HASH, ELECTION_LAUNCHER_ID)`.
+    /// constants. CURRY ORDER (per `puzzles/election/create_ballot.rue`,
+    /// M6-revised): `(SINGLETON_LAUNCHER_PUZZLE_HASH,
+    /// ELECTION_LAUNCHER_ID, NO_VOTE_MODE_LOCK)`.
     /// All per-ballot inputs (vote_close_height, outcome_domain_hash,
-    /// ballot_seed) ride in via the action solution, NOT the curry —
-    /// that's how a single curried `create_ballot` puzzle hash can
-    /// mint arbitrarily many distinct ballots.
+    /// ballot_seed, ballot_vote_options_root) ride in via the action
+    /// solution, NOT the curry — that's how a single curried
+    /// `create_ballot` puzzle hash can mint arbitrarily many distinct
+    /// ballots. NO_VOTE_MODE_LOCK is the deployment-wide 0xFF…FF
+    /// sentinel the puzzle compares against State.vote_mode_lock to
+    /// decide whether to enforce the per-ballot mode lock gate.
     fn election_create_ballot_action_hash(&self, launcher_id: Bytes32) -> Bytes32 {
         puzzles::curry_tree_hash(
             PuzzleHashes::election_create_ballot(),
             &[
                 puzzles::hash_atom_b32(&Bytes32::from(SINGLETON_LAUNCHER_HASH)),
                 puzzles::hash_atom_b32(&launcher_id),
+                puzzles::hash_atom_b32(&crate::vote_mode::VOTE_MODE_LOCK_NONE),
             ],
         )
     }
@@ -354,7 +578,7 @@ impl ElectionDeployer {
         puzzles::curry_tree_hash(
             PuzzleHashes::election_deregister(),
             &[
-                uint_atom_hash(crate::config::TREE_DEPTH as u64),
+                uint_atom_hash(self.params.tree_depth as u64),
                 puzzles::hash_atom_b32(&Bytes32::new(crate::config::EMPTY_LEAF_HASH)),
                 uint_atom_hash(self.params.collateral_amount),
                 puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root(
@@ -528,6 +752,11 @@ mod tests {
             },
             cat_tail_hash: b32(0x77),
             collateral_amount: 1_000,
+            tree_depth: crate::config::TREE_DEPTH,
+            max_signers: crate::config::MAX_SIGNERS,
+            ceremony_launcher_id: Bytes32::default(),
+            vk_hash: Bytes32::default(),
+            vote_mode_lock: crate::vote_mode::VOTE_MODE_LOCK_NONE,
             election_start_height: 5_000_000,
             label: Some("test".into()),
         }
@@ -772,17 +1001,36 @@ mod tests {
         );
 
         // ── Layer 2: state hash equivalence ────────────────────
-        // CHIP rev 2026-05-02: ElectionState is the 4-field shape
+        // V5: ElectionState is the 7-field shape
         // `(registration_merkle_root, registration_count,
-        // registration_vote_weight, election_start_height)` with the
-        // last field declared via Rue's `...` rest-arg syntax — i.e.
-        // the on-chain cons tree omits the trailing nil pair, giving
-        // shape `(root . (count . (weight . start_height)))`.
+        // registration_vote_weight, election_start_height,
+        // ceremony_launcher_id, max_voters, vk_hash)` with the LAST
+        // field declared via Rue's `...vk_hash` rest-arg syntax —
+        // i.e. the on-chain cons tree omits the trailing nil pair,
+        // giving shape
+        // `(root . (count . (weight . (start . (cer . (max . vk))))))`.
         // We compare `ElectionState::genesis(...).clvm_tree_hash()`
         // against the same value built by encoding the genesis tuple
         // through clvm_traits::ToClvm and tree-hashing the result.
         let empty_root = crate::merkle::SparseMerkleTree::new().root();
-        let state_value = (empty_root, (0u64, (0u64, d.params.election_start_height)));
+        let cer = d.params.ceremony_launcher_id;
+        let vk = d.params.vk_hash;
+        let max_voters: u64 = d.params.max_signers as u64;
+        let lock = crate::vote_mode::VOTE_MODE_LOCK_NONE;
+        // M2: 8-field cons tree.
+        let state_value = (
+            empty_root,
+            (
+                0u64,
+                (
+                    0u64,
+                    (
+                        d.params.election_start_height,
+                        (cer, (max_voters, (vk, lock))),
+                    ),
+                ),
+            ),
+        );
         let state_node = state_value.to_clvm(&mut *ctx).unwrap();
         let actual_state_th = Bytes32::new(tree_hash(&ctx, state_node).to_bytes());
         let predicted_state_th = d.genesis_state_tree_hash(empty_root);

@@ -1,0 +1,39 @@
+// ceremony_coin/marker.rue
+// Pure marker coin — created per Ceremony contribution by the
+// ceremony_singleton's `contribute` action. The puzzle returns no
+// conditions; the coin's curry args ARE the on-chain commitment to
+// this participant's contribution.
+//
+// Curry layout (canonical hash binding for chain-discoverable lookup):
+//   CEREMONY_LAUNCHER_ID  — singleton launcher id (also serves as
+//                           hint via the singleton's contribute spend
+//                           emitting CREATE_COIN with hint=launcher).
+//   PARTICIPANT_PUBKEY    — BLS G1 of the contributor; also the
+//                           AGG_SIG_UNSAFE pubkey on the contribute
+//                           spend, providing accountability.
+//   CONTRIBUTION_HASH     — sha256 of the participant's PUBLIC output
+//                           (updated proving-key parameters + PoK).
+//                           The full payload is in the singleton
+//                           spend's announcement; this hash binds it.
+//   PREV_CONTRIBUTION_HASH — links to the previous contributor's
+//                           CONTRIBUTION_HASH in the linear ceremony
+//                           lineage. The genesis contributor uses the
+//                           singleton's curried `vk_seed`.
+//
+// Spendability: the coin emits no conditions when spent. Anyone can
+// spend it (no AGG_SIG required), but the spend produces no output
+// coins, so the coin is effectively a permanent commitment until the
+// holder volunteers to destroy it. amount=0 is fine on Chia.
+
+import super::common_types::*;
+
+fn main(
+    // ── Curried ────────────────────────────────────────────────────
+    CEREMONY_LAUNCHER_ID: Bytes32,
+    PARTICIPANT_PUBKEY: PublicKey,
+    CONTRIBUTION_HASH: Bytes32,
+    PREV_CONTRIBUTION_HASH: Bytes32,
+    // No solution params.
+) -> List<Condition> {
+    []
+}

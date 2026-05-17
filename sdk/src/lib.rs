@@ -64,6 +64,7 @@ pub mod merkle;
 pub mod prover;
 pub mod puzzles;
 pub mod state;
+pub mod vote_mode;
 
 // ── Public re-exports ─────────────────────────────────────────────────
 
@@ -364,7 +365,7 @@ pub use chia_query::{ChiaQuery, ChiaQueryConfig};
 // bypass the peer pool entirely.
 pub use chia_bls::master_to_wallet_unhardened;
 pub use chia_puzzle_types::{
-    cat::CatArgs, standard::StandardArgs, DeriveSynthetic, LineageProof, Memos, Proof,
+    cat::CatArgs, standard::StandardArgs, DeriveSynthetic, EveProof, LineageProof, Memos, Proof,
 };
 pub use chia_puzzles::SINGLETON_LAUNCHER_HASH;
 #[cfg(feature = "native")]

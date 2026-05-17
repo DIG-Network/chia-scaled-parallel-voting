@@ -1,0 +1,84 @@
+// ceremony_singleton/ceremony_voucher.rue
+//
+// Voucher coin spawned by the Ceremony Singleton's `finalize` action.
+//
+// PURPOSE: provide an on-chain anchor for downstream election deploys.
+// An ElectionDeployer that wants to bind its election to a finalized
+// ceremony co-spends one of these voucher coins in the same
+// SpendBundle as the launcher; the launcher spend's parent then
+// asserts the voucher's CreateCoinAnnouncement, binding the deployed
+// election irrevocably to (vk_hash, max_voters, ceremony_launcher_id).
+//
+// PROPERTIES:
+//   * Anyone-can-spend (no AGG_SIG, no auth solution).
+//   * Re-spendable indefinitely: every spend recreates the voucher at
+//     the SAME puzzle hash with the SAME amount, so any number of
+//     elections can reference the same finalized ceremony over time.
+//   * Permanent: ceremony singletons do not expire and the voucher's
+//     terms are immutable in its curry.
+//
+// CURRY ORDER (two-layer self-hash pattern, mirrors CHIP-0050 finalizer):
+//   1st curry: (MOD_HASH, CANONICAL_MSG, CEREMONY_LAUNCHER_ID)
+//   2nd curry: (FIRST_CURRY_HASH = curry_tree_hash(MOD_HASH,
+//              [hash_atom(MOD_HASH), hash_atom(CANONICAL_MSG),
+//               hash_atom(CEREMONY_LAUNCHER_ID)]))
+//
+// CANONICAL_MSG is pre-computed by the SDK so this puzzle avoids
+// re-hashing the variable-length Int representation of MAX_VOTERS:
+//
+//   CANONICAL_MSG = sha256(
+//     "chip:ceremony:voucher"
+//     || vk_hash                        // 32 bytes
+//     || int_to_8_bytes_be(max_voters)  //  8 bytes BE
+//     || ceremony_launcher_id           // 32 bytes
+//   )
+//
+// MUST stay byte-identical to the SDK helper
+// `puzzles::ceremony_voucher_canonical_msg(vk_hash, max_voters,
+// ceremony_launcher_id)`.
+//
+// SOLUTION: () — no inputs.
+
+import super::common_types::*;
+
+fn main(
+    // ── 1st curry ───────────────────────────────────────────────────
+    MOD_HASH: Bytes32,
+    CANONICAL_MSG: Bytes32,
+    CEREMONY_LAUNCHER_ID: Bytes32,
+    // ── 2nd curry (self-hash) ──────────────────────────────────────
+    SELF_HASH: Bytes32,
+    // ── Solution: empty ────────────────────────────────────────────
+) -> List<Condition> {
+    // Recompute the full puzzle hash from SELF_HASH (which already
+    // captures the 1st-curry layer): the 2nd curry binds SELF_HASH
+    // to itself, so the program's puzzle hash is
+    //   curry_tree_hash(SELF_HASH, [tree_hash_atom(SELF_HASH)])
+    let self_ph: Bytes32 = curry_tree_hash(
+        SELF_HASH,
+        [tree_hash_atom(SELF_HASH as Bytes)]
+    );
+
+    // (a) Canonical announcement. ElectionDeployer asserts
+    //     `AssertCoinAnnouncement(sha256(voucher_coin_id || CANONICAL_MSG))`
+    //     in the same SpendBundle, binding (vk_hash, max_voters,
+    //     ceremony_launcher_id) into the election deploy.
+    let announce = CreateCoinAnnouncement {
+        message: CANONICAL_MSG,
+    };
+
+    // (b) Recreate self at SAME puzzle hash & SAME amount (2 — the
+    //     marker convention used elsewhere in this codebase). Memo
+    //     hint = ceremony_launcher_id, so chain walkers querying
+    //     `coin_records_by_hint(ceremony_launcher_id)` discover the
+    //     voucher alongside the marker coin without an extra index.
+    let recreate = CreateCoin {
+        puzzle_hash: self_ph,
+        amount: 2,
+        memos: Memos {
+            value: [CEREMONY_LAUNCHER_ID as Bytes],
+        },
+    };
+
+    [announce, recreate]
+}

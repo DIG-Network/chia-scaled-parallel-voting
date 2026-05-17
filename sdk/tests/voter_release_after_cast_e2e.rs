@@ -63,6 +63,11 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
         },
         cat_tail_hash,
         collateral_amount,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        ceremony_launcher_id: Bytes32::default(),
+        vk_hash: Bytes32::default(),
+        vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         election_start_height: 0,
         label: None,
     };
@@ -70,7 +75,7 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
     // ── 2. Deploy Election Singleton ─────────────────────────
     let deployer = ElectionDeployer::new(params);
     let (deploy_spends, config) = deployer
-        .build_deploy_bundle(funder.coin, funder.pk)
+        .build_deploy_bundle(funder.coin, funder.pk, true)
         .expect("build_deploy_bundle");
     sim.spend_coins(deploy_spends, std::slice::from_ref(&funder.sk))
         .expect("simulator accepts deploy bundle");
@@ -138,7 +143,7 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
 
     let chain = common::SharedSim::new(&mut sim);
     let register_bundle = voter
-        .register(&smt_pre_register, cat_parent_spend, &chain)
+        .register(&smt_pre_register, cat_parent_spend, &chain, config.collateral_amount)
         .await
         .expect("Voter::register");
     drop(chain);
@@ -167,7 +172,7 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
     let vote_threshold_den: u64 = 2;
     let registration_merkle_root_snapshot = {
         let mut s = SparseMerkleTree::new();
-        s.insert(&voter_pk).expect("smt insert");
+        s.insert(&voter_pk, config.collateral_amount).expect("smt insert");
         s.root()
     };
     let registration_vote_weight_snapshot = collateral_amount;
@@ -181,6 +186,7 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
                 ballot_seed: Bytes32::new([0xab; 32]),
                 vote_close_height,
                 outcome_domain_hash,
+                vote_options_root: Bytes32::default(),
             },
             funder_spend,
         )
@@ -199,6 +205,7 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
                 outcome_domain_hash,
                 vote_threshold_num,
                 vote_threshold_den,
+                vote_options_root: Bytes32::default(),
             },
         )
         .await
@@ -222,6 +229,8 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
                 registration_merkle_root_snapshot,
                 registration_vote_weight_snapshot,
                 voting_coin_amount,
+                vote_options_root: Bytes32::default(),
+                vote_option_proof: None,
             },
         )
         .await
@@ -251,7 +260,7 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
 
     // ── 6. release_collateral against the post-cast Registration Coin
     let mut smt_post_register = SparseMerkleTree::new();
-    smt_post_register.insert(&voter_pk).expect("smt insert");
+    smt_post_register.insert(&voter_pk, config.collateral_amount).expect("smt insert");
 
     let destination = Bytes32::new([0xDD; 32]);
     let chain = common::SharedSim::new(&mut sim);

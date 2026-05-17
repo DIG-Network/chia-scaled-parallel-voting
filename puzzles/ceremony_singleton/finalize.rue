@@ -1,0 +1,178 @@
+// ceremony_singleton/finalize.rue
+// Finalize action for the Ceremony Singleton.
+//
+// Permissionless action — anyone can spend the singleton's finalize
+// action ONCE the ceremony window has closed AND the configured
+// minimum participation threshold has been reached. Finalization is
+// the on-chain commitment that "this VK is the canonical output of
+// this ceremony, and these coin ids are the contributions that
+// produced it."
+//
+// On-chain effects:
+//   * Marker CreateCoin (amount=2) hinted with CEREMONY_LAUNCHER_ID,
+//     memos = [LAUNCHER_ID, vk_hash, marker_root, vk_bytes]. Lets
+//     consumers read the VK directly from chain via
+//     `coin_records_by_hint(launcher_id)` without re-deriving from
+//     the chain-walked contribution payloads.
+//   * Voucher CreateCoin (amount=2) at the curried voucher puzzle
+//     hash committed to (vk_hash, max_voters, ceremony_launcher_id).
+//     Re-spendable indefinitely (anyone-can-spend). Election deploys
+//     co-spend this coin in the same SpendBundle and assert its
+//     canonical announcement, binding the deployed election
+//     irrevocably to this finalized ceremony's parameters. Memo hint
+//     = ceremony_launcher_id so chain walkers
+//     `coin_records_by_hint(launcher_id)` discover the voucher
+//     alongside the marker.
+//   * Singleton recreates with state.finalized=1, state.vk_hash and
+//     state.marker_root set. The contribute action's
+//     `assert State.finalized == 0` then traps every subsequent
+//     contribute attempt — the ceremony is sealed.
+//
+// SOLUTION:
+//   * vk_hash       — sha256 of the derived VK bytes. Curried-into-
+//                     state for cheap on-chain reads.
+//   * marker_root   — sha256 binary-tree root over the SORTED set of
+//                     contribution marker coin ids. Convention pinned
+//                     in `sdk::merkle::merkle_root_of_sorted_coin_ids`.
+//   * vk_bytes      — full Groth16 VK bytes; emitted only via the
+//                     marker coin's memo. Not asserted on-chain (the
+//                     `vk_hash` field is the soundness commitment).
+//
+// SECURITY MODEL:
+//   * No AGG_SIG: anyone can pay the funder fee to land the finalize
+//     spend. This is intentional — the gates (window-closed +
+//     threshold-met) make finalize idempotent in spirit (can only
+//     succeed once because state.finalized=1 blocks subsequent
+//     finalize attempts), so first-mover wins.
+//   * The supplied vk_hash + marker_root are NOT cross-checked
+//     against the chain-walked contribution set on-chain. That gate
+//     is off-chain (the dApp/SDK derives both deterministically from
+//     the chain-walked records and uses them as the solution). A
+//     malicious finalizer could in principle land bogus values, but
+//     consumers who recompute from chain-walked records will simply
+//     reject a singleton whose curried vk_hash mismatches what they
+//     compute themselves.
+//
+// MOJO ACCOUNTING:
+//   * Singleton input amount = 1 (eve / recreations).
+//   * Outputs from this spend: recreation (1) + marker (2) +
+//     voucher (2) = 5. Net delta = -4.
+//   * The +4 mojos must come from a co-spent funder coin in the same
+//     SpendBundle (see `CeremonyFinalizer::build_finalize_bundle`'s
+//     funder injection logic).
+
+import super::common_types::*;
+import shared::*;
+
+fn main(
+    // ── Curried ─────────────────────────────────────────────────────
+    CEREMONY_LAUNCHER_ID: Bytes32,
+    START_BLOCK_HEIGHT: Int,
+    CEREMONY_LENGTH_BLOCKS: Int,
+    MAX_VOTERS: Int,
+    CEREMONY_COIN_MOD_HASH: Bytes32,
+    CEREMONY_VOUCHER_MOD_HASH: Bytes32,
+    MIN_PARTICIPANTS: Int,
+    Truth: CeremonyStateTruth,
+    // ── Solution ────────────────────────────────────────────────────
+    vk_hash: Bytes32,
+    marker_root: Bytes32,
+    ...vk_bytes: Bytes,
+) -> (CeremonyStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+    // Gate 1: window must be closed. Anyone could otherwise finalize
+    // mid-window and freeze the ceremony before the full participant
+    // set has had a chance to contribute.
+    let assert_window_closed = AssertHeightAbsolute {
+        height: START_BLOCK_HEIGHT + CEREMONY_LENGTH_BLOCKS,
+    };
+    // Gate 2: enough contributions must have accumulated. Below this,
+    // VK derivation off-chain would either reject or produce an
+    // unsafe VK; either way we don't want the ceremony sealing.
+    assert State.contribution_count >= MIN_PARTICIPANTS;
+    // Gate 3: only one finalize per ceremony. Any subsequent attempt
+    // to spend the finalize action MUST trap.
+    assert State.finalized == 0;
+
+    // Marker coin: emit the VK + marker_root + full vk_bytes via
+    // memos. amount=2 satisfies the singleton outer's
+    // single-odd-CreateCoin invariant (the recreation is the odd
+    // child at amount=1).
+    let marker_ph: Bytes32 = curry_tree_hash(
+        CEREMONY_COIN_MOD_HASH,
+        [
+            tree_hash_atom(CEREMONY_LAUNCHER_ID as Bytes),
+            tree_hash_atom(vk_hash as Bytes),
+            tree_hash_atom(marker_root as Bytes),
+        ]
+    );
+    let create_marker = CreateCoin {
+        puzzle_hash: marker_ph,
+        amount: 2,
+        memos: Memos {
+            value: [
+                CEREMONY_LAUNCHER_ID as Bytes,
+                vk_hash as Bytes,
+                marker_root as Bytes,
+                vk_bytes,
+            ],
+        },
+    };
+
+    // Voucher coin (V3): re-spendable anyone-can-spend coin
+    // committed to (vk_hash, max_voters, ceremony_launcher_id).
+    // ElectionDeployer co-spends this coin and asserts its
+    // canonical announcement to bind the deployed election to this
+    // finalized ceremony.
+    //
+    // canonical_msg + 2-curry self-hash MUST stay byte-identical to
+    // the SDK helpers `puzzles::ceremony_voucher_canonical_msg` /
+    // `puzzles::ceremony_voucher_puzzle_hash`.
+    let canonical_msg: Bytes32 = sha256(
+        "chip:ceremony:voucher"
+        + (vk_hash as Bytes)
+        + int_to_8_bytes_be(MAX_VOTERS)
+        + (CEREMONY_LAUNCHER_ID as Bytes)
+    );
+    let voucher_first_curry: Bytes32 = curry_tree_hash(
+        CEREMONY_VOUCHER_MOD_HASH,
+        [
+            tree_hash_atom(CEREMONY_VOUCHER_MOD_HASH as Bytes),
+            tree_hash_atom(canonical_msg as Bytes),
+            tree_hash_atom(CEREMONY_LAUNCHER_ID as Bytes),
+        ]
+    );
+    let voucher_ph: Bytes32 = curry_tree_hash(
+        voucher_first_curry,
+        [tree_hash_atom(voucher_first_curry as Bytes)]
+    );
+    let create_voucher = CreateCoin {
+        puzzle_hash: voucher_ph,
+        amount: 2,
+        memos: Memos {
+            value: [CEREMONY_LAUNCHER_ID as Bytes],
+        },
+    };
+
+    // Advance state — finalized=1 latches the ceremony shut.
+    let new_state = CeremonyState {
+        contribution_count: State.contribution_count,
+        last_contribution_hash: State.last_contribution_hash,
+        finalized: 1,
+        vk_hash: vk_hash,
+        marker_root: marker_root,
+    };
+    let new_truth = CeremonyStateTruth {
+        Ephemeral_State: Truth.Ephemeral_State,
+        State: new_state,
+    };
+
+    (
+        new_truth,
+        [
+            assert_window_closed,
+            create_marker,
+            create_voucher,
+        ],
+    )
+}

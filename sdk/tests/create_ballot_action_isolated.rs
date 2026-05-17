@@ -19,21 +19,45 @@ fn create_ballot_action_runs_in_isolation() {
     let election_id = Bytes32::new([0xAB; 32]);
     let singleton_launcher_ph = Bytes32::from(SINGLETON_LAUNCHER_HASH);
 
+    // M6/M7d: curry order is now (LAUNCHER_PH, ELECTION_LAUNCHER_ID,
+    // NO_VOTE_MODE_LOCK). Pass the deployment-wide 0xFF…FF sentinel.
+    let no_vote_mode_lock = chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE;
     let create_ballot_program_node =
         load_action_puzzle(&mut ctx, puzzles::ELECTION_CREATE_BALLOT_HEX).expect("load");
     let create_ballot_curried = CurriedProgram {
         program: create_ballot_program_node,
-        args: clvm_curried_args!(singleton_launcher_ph, election_id),
+        args: clvm_curried_args!(singleton_launcher_ph, election_id, no_vote_mode_lock),
     }
     .to_clvm(&mut *ctx)
     .expect("curry");
 
-    // Synthesize a StateTruth: (ephemeral_state . actual_state) where
-    // actual_state is an arbitrary cons (the action returns Truth
-    // unchanged, so the actual values don't matter for the action body).
+    // Synthesize a StateTruth: (ephemeral_state . actual_state). The
+    // M6 mode-lock gate reads State.vote_mode_lock, so we encode the
+    // 8-field ElectionState cons (V5+M2 shape) with vote_mode_lock set
+    // to NO_VOTE_MODE_LOCK (= 0xFF…FF sentinel) so the gate passes.
+    // Other field values don't matter — create_ballot returns Truth
+    // unchanged.
     let actual_state: clvmr::NodePtr = (
-        Bytes32::new([0u8; 32]),
-        (0u64, (0u64, 0u64)),
+        Bytes32::new([0u8; 32]),                     // registration_root
+        (
+            0u64,                                    // count
+            (
+                0u64,                                // weight
+                (
+                    0u64,                            // start_height
+                    (
+                        Bytes32::default(),          // ceremony_launcher_id
+                        (
+                            0u64,                    // max_voters
+                            (
+                                Bytes32::default(),  // vk_hash
+                                no_vote_mode_lock,   // vote_mode_lock (rest)
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
     )
         .to_clvm(&mut *ctx)
         .unwrap();
@@ -41,14 +65,22 @@ fn create_ballot_action_runs_in_isolation() {
         .new_pair(clvmr::NodePtr::NIL, actual_state)
         .expect("state_truth");
 
-    // Solution: (singleton_coin_id, ballot_seed, vote_close_height, ...outcome_domain_hash)
+    // Solution (M6-revised): (singleton_coin_id, ballot_seed,
+    // vote_close_height, outcome_domain_hash, ...ballot_vote_options_root)
     let singleton_coin_id = Bytes32::new([0x12; 32]);
     let ballot_seed = Bytes32::new([0xab; 32]);
     let vote_close_height: u64 = 1000;
     let outcome_domain_hash = Bytes32::new([0xcd; 32]);
+    let ballot_vote_options_root = Bytes32::default();
     let solution_value = (
         singleton_coin_id,
-        (ballot_seed, (vote_close_height, outcome_domain_hash)),
+        (
+            ballot_seed,
+            (
+                vote_close_height,
+                (outcome_domain_hash, ballot_vote_options_root),
+            ),
+        ),
     );
     let solution_node = solution_value.to_clvm(&mut *ctx).expect("solution");
 
@@ -118,24 +150,31 @@ fn create_ballot_action_with_action_layer_only() {
         },
         cat_tail_hash,
         collateral_amount,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        ceremony_launcher_id: Bytes32::default(),
+        vk_hash: Bytes32::default(),
+        vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         election_start_height: 0,
         label: None,
     };
     let deployer = ElectionDeployer::new(params);
     let (_spends, config): (Vec<chia_protocol::CoinSpend>, ElectionConfig) =
-        deployer.build_deploy_bundle(dummy_funder_coin, dummy_funder_pk).expect("deploy");
+        deployer.build_deploy_bundle(dummy_funder_coin, dummy_funder_pk, true).expect("deploy");
 
     let election_id = config.election_launcher_id().expect("launcher id");
     let singleton_launcher_ph = Bytes32::from(SINGLETON_LAUNCHER_HASH);
 
     let mut ctx = SpendContext::new();
 
-    // Build the curried create_ballot action.
+    // M6/M7d: 3-arg curry (LAUNCHER_PH, ELECTION_LAUNCHER_ID,
+    // NO_VOTE_MODE_LOCK).
+    let no_vote_mode_lock = chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE;
     let create_ballot_program_node =
         load_action_puzzle(&mut ctx, puzzles::ELECTION_CREATE_BALLOT_HEX).expect("load");
     let create_ballot_curried = CurriedProgram {
         program: create_ballot_program_node,
-        args: clvm_curried_args!(singleton_launcher_ph, election_id),
+        args: clvm_curried_args!(singleton_launcher_ph, election_id, no_vote_mode_lock),
     }
     .to_clvm(&mut *ctx)
     .expect("curry");
@@ -144,23 +183,48 @@ fn create_ballot_action_with_action_layer_only() {
     let elect_finalizer = build_election_finalizer_full(&mut ctx, election_id).expect("fin");
     let merkle_root = election_actions_merkle_root_for_config(&config);
     // State node — use genesis (matches what the singleton holds at deploy).
+    // 8-field ElectionState cons (V5+M2 shape) with vote_mode_lock set
+    // to NO_VOTE_MODE_LOCK so the M6 mode-lock gate passes.
     let state_node: clvmr::NodePtr = (
         chip_voting_sdk::merkle::SparseMerkleTree::new().root(),
-        (0u64, (0u64, 0u64)),
+        (
+            0u64,
+            (
+                0u64,
+                (
+                    0u64,
+                    (
+                        Bytes32::default(),
+                        (
+                            0u64,
+                            (Bytes32::default(), no_vote_mode_lock),
+                        ),
+                    ),
+                ),
+            ),
+        ),
     )
         .to_clvm(&mut *ctx)
         .unwrap();
     let action_layer_node =
         build_action_layer_puzzle(&mut ctx, elect_finalizer, merkle_root, state_node).expect("al");
 
-    // Build the action-layer solution.
+    // Build the action-layer solution (M6-revised: trailing
+    // ballot_vote_options_root rest-arg).
     let singleton_coin_id = Bytes32::new([0x12; 32]);
     let ballot_seed = Bytes32::new([0xab; 32]);
     let vote_close_height: u64 = 1000;
     let outcome_domain_hash = Bytes32::new([0xcd; 32]);
+    let ballot_vote_options_root = Bytes32::default();
     let solution_value = (
         singleton_coin_id,
-        (ballot_seed, (vote_close_height, outcome_domain_hash)),
+        (
+            ballot_seed,
+            (
+                vote_close_height,
+                (outcome_domain_hash, ballot_vote_options_root),
+            ),
+        ),
     );
     let create_ballot_solution = solution_value.to_clvm(&mut *ctx).expect("sol");
     let action_spends = vec![ActionSpend {

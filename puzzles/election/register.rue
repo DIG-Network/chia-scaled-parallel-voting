@@ -1,22 +1,32 @@
 // election/register.rue
 // Register action for the Election Singleton.
 //
+// Weighted-voting revision: each voter chooses how much CAT to lock
+// (`locked_cat_mojos`), bounded below by `COLLATERAL_AMOUNT`. The
+// locked amount is bound into the SMT leaf preimage so the on-chain
+// register / deregister actions and the off-chain Groth16 finalize
+// circuit all agree on every voter's contribution to `signed_weight`.
+//
 // A voter joins the registered set. The action:
 //   1. Verifies the voter's slot index is the canonical slot derived
 //      from their pubkey (sha256(pubkey) prefix).
 //   2. Verifies an emptiness proof for that slot against the current
 //      SPT root.
-//   3. Computes the new SPT root with sha256(pubkey) inserted at the
-//      slot.
-//   4. Computes the expected CAT-wrapped Registration Coin puzzle hash
+//   3. Verifies `locked_cat_mojos >= COLLATERAL_AMOUNT` (the curried
+//      minimum) — voters may lock more than the floor for higher
+//      weight.
+//   4. Computes the new SPT root with
+//      `sha256(pubkey || locked_cat_mojos_be8)` inserted at the slot.
+//   5. Computes the expected CAT-wrapped Registration Coin puzzle hash
 //      and asserts a CreateCoinAnnouncement from the parent CAT spend
 //      confirming the Registration Coin was created with that puzzle
-//      hash and COLLATERAL_AMOUNT. This binds the on-chain CAT lockup
-//      to the registration so the voter cannot under-collateralize.
-//   5. Updates state: increments registration_count, adds
-//      COLLATERAL_AMOUNT to registration_vote_weight, stores the new
+//      hash and `locked_cat_mojos`. This binds the on-chain CAT lockup
+//      to the registration so the voter cannot under- or over-state
+//      their lock relative to the SMT leaf.
+//   6. Updates state: increments registration_count, adds
+//      `locked_cat_mojos` to registration_vote_weight, stores the new
 //      SPT root.
-//   6. Requires AggSigMe from the registering voter pubkey.
+//   7. Requires AggSigMe from the registering voter pubkey.
 //
 // The Registration Coin puzzle hash that must be created is:
 //
@@ -171,6 +181,7 @@ fn main(
     new_voter_pubkey: PublicKey,
     register_leaf_index: Int,
     register_siblings: HashCons,
+    locked_cat_mojos: Int,
     ...cat_parent_coin_id: Bytes32,
 ) -> (ElectionStateTruth, List<Condition>) {
     inline let State = Truth.State;
@@ -185,18 +196,19 @@ fn main(
     );
     assert pre_root == State.registration_merkle_root;
 
-    // Compute the new root with the canonical SPT leaf inserted at
-    // the slot. Per CHIP.md §88-91 "Sparse Merkle Tree (registration
-    // set)": occupied leaf = sha256(pubkey). Per-voter weight is
-    // tracked on Election Singleton state (registration_vote_weight
-    // += COLLATERAL_AMOUNT per `register` action) rather than encoded
-    // in the leaf, since this revision uses a uniform per-registration
-    // COLLATERAL_AMOUNT. A future revision adding per-voter variable
-    // weights would extend the leaf to sha256(pubkey || locked_cat_mojos_be8)
-    // and require the circuit to consume per-signer weight as a
-    // private witness — out of scope for this revision.
+    // Weighted-voting floor: voters MUST lock at least the curried
+    // COLLATERAL_AMOUNT minimum. Locking more than the minimum gives
+    // proportionally more vote weight (bound into the leaf below).
+    assert locked_cat_mojos >= COLLATERAL_AMOUNT;
+
+    // Compute the new root with the weighted SMT leaf inserted at the
+    // slot. Per the weighted-voting revision: occupied leaf =
+    // sha256(pubkey || locked_cat_mojos_be8). Per-voter weight is
+    // bound into the leaf so the circuit can consume each signer's
+    // real contribution to `signed_weight` from the same merkle proof
+    // the on-chain action verifies.
     let pk_b: Bytes = new_voter_pubkey as Bytes;
-    let active_leaf: Bytes32 = sha256(pk_b);
+    let active_leaf: Bytes32 = sha256(pk_b + int_to_8_bytes_be(locked_cat_mojos));
     let new_root: Bytes32 = compute_root(
         active_leaf, register_leaf_index, register_siblings, TREE_DEPTH,
     );
@@ -215,14 +227,17 @@ fn main(
 
     // The CAT parent must emit this exact CreateCoinAnnouncement,
     // confirming it has created the Registration Coin with the expected
-    // puzzle hash and amount.
+    // puzzle hash and the voter's chosen locked amount. Binding
+    // `locked_cat_mojos` (not the curried minimum) to the announcement
+    // ensures the on-chain CAT lockup, the SMT leaf, and the
+    // registration_vote_weight increment all agree.
     let bbl_b: Bytes = ELECTION_LAUNCHER_ID as Bytes;
     let create_reg_msg: Bytes32 = sha256(
         "create_reg"
         + bbl_b
         + pk_b
         + (reg_full_hash as Bytes)
-        + int_to_8_bytes_be(COLLATERAL_AMOUNT)
+        + int_to_8_bytes_be(locked_cat_mojos)
     );
     let assert_cat_creation = AssertCoinAnnouncement {
         id: sha256((cat_parent_coin_id as Bytes) + (create_reg_msg as Bytes)),
@@ -235,21 +250,28 @@ fn main(
         message: registration_message,
     };
 
-    // Indexer / aggregator announcement.
+    // Indexer / aggregator announcement. Includes `locked_cat_mojos`
+    // so off-chain walkers can recover each voter's per-leaf weight
+    // without re-parsing the action solution.
     let announce_register = CreateCoinAnnouncement {
         message: sha256(
             "registered"
             + (new_root as Bytes)
             + int_to_8_bytes_be(State.registration_count + 1)
             + pk_b
+            + int_to_8_bytes_be(locked_cat_mojos)
         ),
     };
 
     let new_state = ElectionState {
         registration_merkle_root: new_root,
         registration_count: State.registration_count + 1,
-        registration_vote_weight: State.registration_vote_weight + COLLATERAL_AMOUNT,
+        registration_vote_weight: State.registration_vote_weight + locked_cat_mojos,
         election_start_height: State.election_start_height,
+        ceremony_launcher_id: State.ceremony_launcher_id,
+        max_voters: State.max_voters,
+        vk_hash: State.vk_hash,
+        vote_mode_lock: State.vote_mode_lock,
     };
 
     (

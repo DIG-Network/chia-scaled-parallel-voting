@@ -44,6 +44,32 @@
 import super::common_types::*;
 import shared::*;
 
+/// M5r-merkle: inline merkle-inclusion compute_root, mirroring the
+/// pattern in puzzles/election/register.rue:65. Walks the proof
+/// (HashCons of sibling hashes from leaf upward) and re-derives the
+/// expected root. Bit ordering (low-to-high of leaf_index) matches
+/// `chip_voting_sdk::vote_mode::verify_merkle_inclusion`.
+fn compute_options_root(
+    node: Bytes32,
+    index: Int,
+    remaining: HashCons,
+    depth_remaining: Int,
+) -> Bytes32 {
+    if depth_remaining == 0 {
+        node
+    } else {
+        let sibling: Bytes32 = remaining.head;
+        let node_b: Bytes = node as Bytes;
+        let sibling_b: Bytes = sibling as Bytes;
+        let parent: Bytes32 = if index % 2 == 0 {
+            sha256(node_b + sibling_b)
+        } else {
+            sha256(sibling_b + node_b)
+        };
+        compute_options_root(parent, index / 2, remaining.tail, depth_remaining - 1)
+    }
+}
+
 fn main(
     // No curried args — see file header for rationale.
     Truth: VotingCoinStateTruth,
@@ -51,9 +77,28 @@ fn main(
     ballot_launcher_id: Bytes32,
     election_launcher_id: Bytes32,
     vote_close_height: Int,
+    // M5-revised: vote_options_root the Ballot Coin's oracle is
+    // currying. 0x00…00 sentinel = Mode1Free (any 32-byte vote_data
+    // accepted); any other value = the sorted-options merkle root the
+    // Ballot Coin was minted with (Mode2Restricted). Pinned into the
+    // 3-field oracle_message preimage so an updater can't sneak a
+    // different mode through (the AssertCoinAnnouncement would fail),
+    // AND when non-zero, gates the M5r-merkle proof check below.
+    vote_options_root: Bytes32,
     new_vote_data: Bytes32,
     new_signature: Signature,
-    ...ballot_coin_id: Bytes32,
+    ballot_coin_id: Bytes32,
+    // M5r-merkle: leaf-index of new_vote_data within the sorted options
+    // tree. Used to pick `parent = sha256(node || sib)` vs
+    // `sha256(sib || node)` at each level (low-to-high index bits).
+    // Pass 0 for Mode1Free — unused (the gate below skips).
+    vote_option_leaf_index: Int,
+    // M5r-merkle: depth of the merkle tree (= number of siblings in
+    // the proof). Pass 0 for Mode1Free.
+    vote_option_proof_depth: Int,
+    // M5r-merkle: HashCons of sibling hashes from leaf upward to root,
+    // in level order. Pass nil for Mode1Free.
+    ...vote_option_proof: HashCons,
 ) -> (VotingCoinStateTruth, List<Condition>) {
     inline let State = Truth.State;
 
@@ -63,14 +108,15 @@ fn main(
     };
 
     // 2. Ballot Coin oracle co-spend assertion. Pins the Ballot Coin's
-    //    actual curried close height to the value we passed in the
-    //    solution — defends against a malicious mint having lied at
-    //    mint_voting_coin time.
+    //    actual curried close height + curried vote_options_root to the
+    //    values we passed in the solution — defends against a malicious
+    //    mint having lied about either at mint_voting_coin time.
     let ballot_b: Bytes = ballot_launcher_id as Bytes;
     let oracle_message: Bytes32 = sha256(
         "ballot_oracle_open"
         + ballot_b
         + int_to_8_bytes_be(vote_close_height)
+        + (vote_options_root as Bytes)
     );
     let oracle_announcement_id: Bytes32 = sha256(
         (ballot_coin_id as Bytes)
@@ -79,6 +125,27 @@ fn main(
     let assert_ballot_open = AssertCoinAnnouncement {
         id: oracle_announcement_id,
     };
+
+    // 2b. M5r-merkle gate. When vote_options_root != 0x00…00 the
+    //    ballot is Mode2Restricted, and new_vote_data MUST be a leaf
+    //    of the sorted-options merkle tree whose root the Ballot Coin
+    //    was curried with. The conditional below picks a `derived_root`
+    //    that equals `vote_options_root` for Mode1Free (no-op gate)
+    //    and the recomputed proof root for Mode2Restricted. The
+    //    `assert` afterward fails the spend on a mismatched proof.
+    let zero32: Bytes32 = 0x0000000000000000000000000000000000000000000000000000000000000000 as Bytes32;
+    let derived_root: Bytes32 = if vote_options_root == zero32 {
+        vote_options_root
+    } else {
+        let leaf: Bytes32 = sha256(new_vote_data as Bytes);
+        compute_options_root(
+            leaf,
+            vote_option_leaf_index,
+            vote_option_proof,
+            vote_option_proof_depth,
+        )
+    };
+    assert derived_root == vote_options_root;
 
     // 3. Voter signs the new vote_message. Canonical preimage from
     //    CHIP rev 2026-05-02:

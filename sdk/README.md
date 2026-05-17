@@ -4,7 +4,7 @@ Reference Rust driver for the Chia voting CHIP (rev 2026-05-02):
 **orchestrator-only Election Singleton** + CAT-collateralised
 Registration Coin + per-Ballot-Coin Groth16 finalization.
 
-The full spec lives in [`../CHIP.md`](../CHIP.md). The phased migration plan
+The full spec lives in [`../docs/CHIP_DRAFT.md`](../docs/CHIP_DRAFT.md) (companion docs in [`../docs/README.md`](../docs/README.md)). The phased migration plan
 that drove this rev lives in
 [`../app/docs/superpowers/plans/2026-05-02-chip-migration.md`](../app/docs/superpowers/plans/2026-05-02-chip-migration.md).
 
@@ -21,7 +21,7 @@ The voting CHIP runs four coin lineages:
   and gates `release` (deregister + return CAT).
 * **Ballot Coin** — one per ballot. Minted under `createBallot`, carries
   its own `vote_close_height` + `outcome_domain_hash`, and asserts the
-  6-input Groth16 proof at `finalize`. The verification key is curried
+  8-input Groth16 proof at `finalize`. The verification key is curried
   per-ballot, not on the singleton.
 * **Voting Coin** — one per (voter, ballot). Created by
   `mint_voting_coin`; carries the voter's signed payload and is consumed

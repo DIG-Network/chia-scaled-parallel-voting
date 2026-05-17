@@ -1,18 +1,28 @@
 // election/deregister.rue
 // Deregister action for the Election Singleton.
 //
+// Weighted-voting revision: per-voter lockup is bound into the SMT
+// leaf preimage at register time (`sha256(pubkey ||
+// locked_cat_mojos_be8)`), so deregister recovers the voter's actual
+// locked amount via the membership proof — the puzzle only accepts
+// the leaf preimage that re-hashes to the active leaf the proof
+// authenticates. That recovered amount is what gets refunded back
+// out of `registration_vote_weight`, keeping the running total
+// honest with each voter's contribution.
+//
 // A registered voter exits the registered set. The action:
 //   1. Verifies the voter's slot index is the canonical slot derived
 //      from their pubkey (sha256(pubkey) prefix), matching the slot
 //      register.rue would have placed them in.
-//   2. Verifies a membership proof for that slot (active leaf
-//      sha256(pubkey)) against the current SPT root.
+//   2. Verifies a membership proof for that slot — active leaf is
+//      `sha256(pubkey || locked_cat_mojos_be8)` — against the current
+//      SPT root. Honest `locked_cat_mojos` is enforced by the merkle
+//      proof: any other value produces a different leaf and the
+//      proof fails.
 //   3. Computes the new SPT root with EMPTY_LEAF_HASH at the same
 //      slot — i.e. the voter's leaf is wiped.
-//   4. Decrements registration_count and registration_vote_weight by
-//      COLLATERAL_AMOUNT (per-voter weight is curried-constant for
-//      this election; matches the per-voter lockup register.rue
-//      verified via AssertCoinAnnouncement).
+//   4. Decrements registration_count by 1 and
+//      registration_vote_weight by the recovered `locked_cat_mojos`.
 //   5. Emits a coin announcement authorizing the matching Registration
 //      Coin's `release` action to unlock collateral. The release path
 //      asserts this exact announcement.
@@ -67,6 +77,7 @@ fn main(
     // ── Solution ────────────────────────────────────────────────────
     voter_pubkey: PublicKey,
     deregister_leaf_index: Int,
+    locked_cat_mojos: Int,
     ...deregister_siblings: HashCons,
 ) -> (ElectionStateTruth, List<Condition>) {
     inline let State = Truth.State;
@@ -76,13 +87,15 @@ fn main(
     let computed_slot: Int = slot_from_pubkey(voter_pubkey);
     assert deregister_leaf_index == computed_slot;
 
-    // Membership proof: the slot currently holds the canonical SPT
-    // leaf — sha256(pubkey) per CHIP.md §88-91 "Sparse Merkle Tree
-    // (registration set)" — matching the formula register.rue used
-    // at registration time. Per-voter weight is tracked on Election
-    // Singleton state, not in the leaf.
+    // Membership proof: the slot currently holds the weighted SMT
+    // leaf — sha256(pubkey || locked_cat_mojos_be8) — matching the
+    // formula register.rue committed to at registration time. The
+    // proof verifies ONLY for the exact `locked_cat_mojos` the
+    // voter registered with; any other value produces a different
+    // leaf hash and the proof fails. This is what keeps the
+    // recovered amount honest — no separate signature required.
     let pk_b: Bytes = voter_pubkey as Bytes;
-    let active_leaf: Bytes32 = sha256(pk_b);
+    let active_leaf: Bytes32 = sha256(pk_b + int_to_8_bytes_be(locked_cat_mojos));
     let pre_root: Bytes32 = compute_root(
         active_leaf, deregister_leaf_index, deregister_siblings, TREE_DEPTH,
     );
@@ -115,8 +128,12 @@ fn main(
     let new_state = ElectionState {
         registration_merkle_root: new_root,
         registration_count: State.registration_count - 1,
-        registration_vote_weight: State.registration_vote_weight - COLLATERAL_AMOUNT,
+        registration_vote_weight: State.registration_vote_weight - locked_cat_mojos,
         election_start_height: State.election_start_height,
+        ceremony_launcher_id: State.ceremony_launcher_id,
+        max_voters: State.max_voters,
+        vk_hash: State.vk_hash,
+        vote_mode_lock: State.vote_mode_lock,
     };
 
     (

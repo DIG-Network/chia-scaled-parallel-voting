@@ -36,7 +36,7 @@ use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 1. Initialise coordinator + start a fresh ceremony ────────
-    let mut coord = CeremonyCoordinator::new(Box::new(SimulatedBackend));
+    let mut coord = CeremonyCoordinator::new(Box::new(SimulatedBackend::default()));
     coord.start("chip-voting-v1".into())?;
 
     // ── 2. Two independent participants contribute. The MPC
@@ -45,12 +45,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //       coordinator (single-party setups are explicitly rejected
     //       by `finalize` with `UnsafeSingleParty`).
     let alice = CeremonyParticipant::new(
-        Box::new(SimulatedBackend),
+        Box::new(SimulatedBackend::default()),
         "alice".into(),
         Some("CHIP rev 2026-05-02 — phase 5.3 fixture regeneration".into()),
     );
     let bob = CeremonyParticipant::new(
-        Box::new(SimulatedBackend),
+        Box::new(SimulatedBackend::default()),
         "bob".into(),
         Some("CHIP rev 2026-05-02 — phase 5.3 fixture regeneration".into()),
     );

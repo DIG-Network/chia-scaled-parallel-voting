@@ -17,10 +17,16 @@ export default function Navbar() {
               Voting
             </Link>
             <Link
-              href="/create"
+              href="/elections"
               className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors"
             >
-              New Election
+              Elections
+            </Link>
+            <Link
+              href="/ceremonies"
+              className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors"
+            >
+              Ceremonies
             </Link>
           </div>
           <WalletConnector />

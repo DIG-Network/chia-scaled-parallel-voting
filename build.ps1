@@ -16,7 +16,8 @@ $libraries = @(
     "puzzles/finalizer.rue",
     "puzzles/merkle_utils.rue",
     "puzzles/election/shared.rue",
-    "puzzles/registration_coin/shared.rue"
+    "puzzles/registration_coin/shared.rue",
+    "puzzles/ceremony_singleton/shared.rue"
 )
 
 # Find all .rue files under puzzles/, excluding the libraries above.

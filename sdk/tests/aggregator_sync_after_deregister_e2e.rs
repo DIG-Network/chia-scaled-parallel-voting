@@ -75,6 +75,11 @@ async fn aggregator_sync_after_deregister_wipes_voter() {
         },
         cat_tail_hash,
         collateral_amount,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        ceremony_launcher_id: Bytes32::default(),
+        vk_hash: Bytes32::default(),
+        vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         election_start_height: 0,
         label: None,
     };
@@ -82,7 +87,7 @@ async fn aggregator_sync_after_deregister_wipes_voter() {
     // ── 2. Deploy Election Singleton ─────────────────────────
     let deployer = ElectionDeployer::new(params);
     let (deploy_spends, config) = deployer
-        .build_deploy_bundle(funder.coin, funder.pk)
+        .build_deploy_bundle(funder.coin, funder.pk, true)
         .expect("build_deploy_bundle");
     sim.spend_coins(deploy_spends, std::slice::from_ref(&funder.sk))
         .expect("simulator accepts deploy bundle");
@@ -146,7 +151,7 @@ async fn aggregator_sync_after_deregister_wipes_voter() {
 
     let chain = common::SharedSim::new(&mut sim);
     let register_bundle = voter
-        .register(&smt_pre_register, cat_parent_spend, &chain)
+        .register(&smt_pre_register, cat_parent_spend, &chain, config.collateral_amount)
         .await
         .unwrap_or_else(|e| panic!("Voter::register failed: {:?}", e));
     drop(chain);
@@ -179,7 +184,7 @@ async fn aggregator_sync_after_deregister_wipes_voter() {
     // mirroring the on-chain insert.
     let mut smt_post_register = SparseMerkleTree::new();
     smt_post_register
-        .insert(&voter_pk)
+        .insert(&voter_pk, config.collateral_amount)
         .expect("local SMT insert must succeed (post-register state)");
 
     let destination = Bytes32::new([0xDE; 32]);

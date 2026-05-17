@@ -41,7 +41,14 @@ export async function findSyntheticPkMatchingInnerPuzzleHash(
   return null;
 }
 
-/** Match `chia_getAddress` puzzle hash bytes (`Address.decode` → puzzleHash). */
+/**
+ * Match `chia_getAddress` puzzle hash bytes (`Address.decode` →
+ * puzzleHash). Tries the fast `chip0002_getAssetCoins` path first
+ * (Sage owns the coin at this address — the puzzle reveal uncurries
+ * to the synthetic_pk directly); falls back to the slow synthetic-
+ * key scan only when getAssetCoins doesn't return a coin at that
+ * address (e.g., zero-balance address, older Sage build).
+ */
 export async function findSyntheticPkForWalletAddress(
   addr: string
 ): Promise<string | null> {
@@ -50,6 +57,18 @@ export async function findSyntheticPkForWalletAddress(
   try {
     decoded = chia.Address.decode(addr.trim());
     const inner = new Uint8Array(decoded.puzzleHash);
+    // Fast path: Sage knows which key derived this puzzle hash.
+    try {
+      const { syntheticPkForOwnedXchPuzzleHash } = await import("./sageAssetCoins");
+      let phHex = "";
+      for (let i = 0; i < inner.length; i++) {
+        phHex += inner[i].toString(16).padStart(2, "0");
+      }
+      const fast = await syntheticPkForOwnedXchPuzzleHash(phHex);
+      if (fast) return fast;
+    } catch {
+      /* fall through to scan */
+    }
     return await findSyntheticPkMatchingInnerPuzzleHash(inner);
   } catch {
     return null;
@@ -58,13 +77,25 @@ export async function findSyntheticPkForWalletAddress(
   }
 }
 
-/** Match puzzle hash hex from chain / coin records (e.g. XCH parent coin). */
+/**
+ * Match puzzle hash hex from chain / coin records (e.g. XCH parent
+ * coin). Same fast-path-then-fallback pattern as
+ * `findSyntheticPkForWalletAddress`.
+ */
 export async function findSyntheticPkMatchingCoinPuzzleHashHex(
   puzzleHashHex: string
 ): Promise<string | null> {
   const chia = await import("chia-wallet-sdk-wasm");
   const clean = puzzleHashHex.replace(/^0x/i, "").trim().toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(clean)) return null;
+  // Fast path via Sage's getAssetCoins.
+  try {
+    const { syntheticPkForOwnedXchPuzzleHash } = await import("./sageAssetCoins");
+    const fast = await syntheticPkForOwnedXchPuzzleHash(clean);
+    if (fast) return fast;
+  } catch {
+    /* fall through to scan */
+  }
   const target = chia.fromHex(clean);
   return findSyntheticPkMatchingInnerPuzzleHash(target);
 }

@@ -100,10 +100,13 @@ async function tryCollateralAtSyntheticPk(
 }
 
 /**
- * Find unspent CAT collateral:
- * - Tries preferredSyntheticPkHex first (chia_getAddress match).
- * - Then pages chip0002_getPublicKeys until a match, Sage returns no keys,
- *   a short partial page (end of list), or MAX_SAFETY_SYNTHETIC_KEY_LOOKUPS.
+ * Find unspent CAT collateral. Phase 1 (fast path): use Sage's
+ * `chip0002_getAssetCoins({ type: 'cat', assetId: tail })` to get
+ * spendable CAT coins with their puzzle reveals pre-included; uncurry
+ * to extract synthetic_pk per coin. Phase 2 (legacy fallback): if
+ * getAssetCoins isn't available or returns empty, fall back to the
+ * `chip0002_getPublicKeys` pagination + coinset.org puzzle-hash
+ * lookup pattern (slow but works on older Sage builds).
  */
 export async function discoverCatCollateralForRegistration(opts: {
   catTailHashHex: string;
@@ -116,6 +119,51 @@ export async function discoverCatCollateralForRegistration(opts: {
    */
   excludeDedupeKeys?: ReadonlySet<string>;
 }): Promise<CatCollateralDiscoveryResult> {
+  const tailBareEarly = normalizeHex32(String(opts.catTailHashHex ?? ""));
+  if (!/^[0-9a-f]{64}$/.test(tailBareEarly)) {
+    throw new Error("Invalid CAT tail in election config.");
+  }
+  // Fast path: Sage owns the CATs — ask it directly. No key scan, no
+  // coinset hop. The puzzle reveal in the response uncurries to give
+  // us synthetic_pk per coin.
+  try {
+    const { listCatCoinsWithKeys } = await import("./sageAssetCoins");
+    const sageCats = await listCatCoinsWithKeys(tailBareEarly, {
+      minAmount: opts.collateralAmountMojos,
+      includeLocked: false,
+      limit: 200,
+    });
+    const excluded = opts.excludeDedupeKeys;
+    for (const entry of sageCats) {
+      const cr: CoinRecord = {
+        parentCoinInfo: entry.coin.parent_coin_info.startsWith("0x")
+          ? entry.coin.parent_coin_info
+          : `0x${entry.coin.parent_coin_info}`,
+        puzzleHash: entry.coin.puzzle_hash.startsWith("0x")
+          ? entry.coin.puzzle_hash
+          : `0x${entry.coin.puzzle_hash}`,
+        amount: entry.coin.amount,
+        spentHeight: 0,
+        confirmedHeight: 0,
+      };
+      if (excluded?.has(catCollateralDedupeKey(cr))) continue;
+      return {
+        voterPk: entry.syntheticPkHex,
+        catCoin: cr,
+        // Sage gave us this single coin; the legacy field
+        // `allCatCoinsAtOuter` is downgraded to a 1-element list.
+        allCatCoinsAtOuter: [cr],
+      };
+    }
+  } catch (e) {
+    console.warn(
+      "[catCollateralDiscovery] getAssetCoins fast-path failed, falling back to key scan:",
+      e
+    );
+  }
+  // Legacy fallback below — kept verbatim for older Sage builds and
+  // edge cases (e.g. CAT held under a key Sage isn't tracking as
+  // owned). Will be removed once getAssetCoins is reliable everywhere.
   const tailBare = normalizeHex32(String(opts.catTailHashHex ?? ""));
   if (!/^[0-9a-f]{64}$/.test(tailBare)) {
     throw new Error("Invalid CAT tail in election config.");

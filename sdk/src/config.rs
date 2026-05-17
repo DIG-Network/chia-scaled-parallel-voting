@@ -146,16 +146,32 @@ pub struct ElectionConfig {
     /// Per-voter collateral, in CAT mojos.
     pub collateral_amount: u64,
 
-    /// Must equal `TREE_DEPTH`. Stored explicitly for self-validation.
+    /// Per-election registration tree depth. Sourced at deploy time
+    /// from the chosen ceremony's `max_voters` (depth = ceil(log2)).
+    /// Must be in `1..=32`.
     pub tree_depth: u32,
 
-    /// Must equal `MAX_SIGNERS`. Stored explicitly for self-validation.
+    /// Per-election maximum number of registrations. Sourced at
+    /// deploy time from the chosen ceremony's `max_voters`. Must be
+    /// `>= 1` and `<= 1 << tree_depth`.
     pub max_signers: usize,
 
     /// Hex-encoded Groth16 verification key (768 bytes for our
     /// 8-input circuit: 336 base + 9 IC * 48). Produced by the MPC
     /// ceremony.
     pub verification_key_hex: String,
+
+    /// Launcher ID of the trusted-setup ceremony singleton this
+    /// election is bound to (V6, ceremony→election link). Defaults
+    /// to all-zeros for legacy configs that predate the link;
+    /// downstream code treats default as "unlinked".
+    #[serde(default)]
+    pub ceremony_launcher_id_hex: String,
+
+    /// sha256 of the ceremony's derived Groth16 verifying key (V6).
+    /// Defaults to all-zeros for legacy configs.
+    #[serde(default)]
+    pub vk_hash_hex: String,
 
     /// Optional UI label.
     #[serde(default)]
@@ -188,21 +204,50 @@ impl ElectionConfig {
         parse_bytes32(&self.cat_tail_hash_hex)
     }
 
+    /// FN: ceremony_launcher_id
+    /// WHAT: typed accessor for the bound ceremony's launcher_id.
+    /// FALLBACK: empty hex (legacy configs) → all-zeros sentinel,
+    ///           preserving the V6 "unlinked election" semantics.
+    pub fn ceremony_launcher_id(&self) -> Bytes32 {
+        if self.ceremony_launcher_id_hex.is_empty() {
+            Bytes32::default()
+        } else {
+            parse_bytes32(&self.ceremony_launcher_id_hex).unwrap_or_default()
+        }
+    }
+
+    /// FN: vk_hash
+    /// WHAT: typed accessor for the bound ceremony's vk_hash.
+    /// FALLBACK: empty hex → all-zeros sentinel.
+    pub fn vk_hash(&self) -> Bytes32 {
+        if self.vk_hash_hex.is_empty() {
+            Bytes32::default()
+        } else {
+            parse_bytes32(&self.vk_hash_hex).unwrap_or_default()
+        }
+    }
+
     /// FN: validate
     /// WHAT: structural sanity check before using the config.
     /// CHECKS:
-    ///   * tree_depth + max_signers match SDK constants (else our
-    ///     compiled puzzles / circuit can't even verify the proofs)
+    ///   * tree_depth in `1..=32` (the SDK's circuit + EMPTY_LEAF_HASH
+    ///     cache support up to 32; depths beyond that aren't compiled)
+    ///   * max_signers in `1..=(1 << tree_depth)` (so every registrant
+    ///     fits in the tree)
     ///   * launcher / tail hex are decodable Bytes32
     ///   * verification key has the exact length our circuit needs
     ///     (768 bytes = 336 base + (PUBLIC_INPUT_COUNT + 1) * 48 IC,
     ///     i.e. 9 * 48 for our 8-input circuit)
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.tree_depth != TREE_DEPTH {
-            return Err("ElectionConfig.tree_depth must equal TREE_DEPTH (32)");
+        if self.tree_depth == 0 || self.tree_depth > 32 {
+            return Err("ElectionConfig.tree_depth must be in 1..=32");
         }
-        if self.max_signers != MAX_SIGNERS {
-            return Err("ElectionConfig.max_signers must equal MAX_SIGNERS (20000)");
+        if self.max_signers == 0 {
+            return Err("ElectionConfig.max_signers must be at least 1");
+        }
+        let capacity: u64 = 1u64 << self.tree_depth;
+        if (self.max_signers as u64) > capacity {
+            return Err("ElectionConfig.max_signers exceeds 1 << tree_depth");
         }
         let _ = self.election_launcher_id()?;
         let _ = self.cat_tail_hash()?;
@@ -233,6 +278,8 @@ mod tests {
             tree_depth: TREE_DEPTH,
             max_signers: MAX_SIGNERS,
             verification_key_hex: "00".repeat(336 + (PUBLIC_INPUT_COUNT + 1) * 48),
+            ceremony_launcher_id_hex: String::new(),
+            vk_hash_hex: String::new(),
             label: Some("test".into()),
         }
     }
@@ -250,28 +297,60 @@ mod tests {
     }
 
     /// WHAT: `.validate()` rejects a config whose `tree_depth` is
-    ///       not the SDK-pinned value (32).
-    /// HOW:  start from `good_config`, set tree_depth = 16, expect
-    ///       an `Err`.
-    /// WHY:  TREE_DEPTH must match the compiled puzzle; loading a
-    ///       config with a different depth would silently produce
-    ///       wrong puzzle hashes downstream.
+    ///       outside the supported range `1..=32`.
+    /// HOW:  start from `good_config`, set tree_depth = 0 (and
+    ///       separately 33), expect `Err` for each.
+    /// WHY:  the SDK's circuit + EMPTY_LEAF_HASH cache only support
+    ///       depths in 1..=32; values outside that range would corrupt
+    ///       every downstream merkle / proof check.
     #[test]
-    fn validate_rejects_wrong_tree_depth() {
+    fn validate_rejects_out_of_range_tree_depth() {
         let mut c = good_config();
-        c.tree_depth = 16;
+        c.tree_depth = 0;
+        assert!(c.validate().is_err());
+        let mut c = good_config();
+        c.tree_depth = 33;
         assert!(c.validate().is_err());
     }
 
-    /// WHAT: `.validate()` rejects a config whose `max_signers` is
-    ///       not the SDK-pinned value (20000).
-    /// HOW:  set max_signers = 100, expect an `Err`.
-    /// WHY:  MAX_SIGNERS is baked into the trusted setup; mismatches
-    ///       would make every Groth16 verification on-chain reject.
+    /// WHAT: a non-default `tree_depth` within `1..=32` validates so
+    ///       long as `max_signers` fits in the tree.
+    /// HOW:  set tree_depth = 16, max_signers = 1000 (≤ 1<<16), expect
+    ///       Ok.
+    /// WHY:  E6 makes tree_depth a per-election deploy parameter
+    ///       sourced from the ceremony's max_voters — validation must
+    ///       accept any depth the SDK's circuit supports, not just 32.
     #[test]
-    fn validate_rejects_wrong_max_signers() {
+    fn validate_accepts_smaller_tree_depth() {
         let mut c = good_config();
-        c.max_signers = 100;
+        c.tree_depth = 16;
+        c.max_signers = 1000;
+        c.validate().unwrap();
+    }
+
+    /// WHAT: `.validate()` rejects a config whose `max_signers` is
+    ///       zero.
+    /// HOW:  set max_signers = 0, expect `Err`.
+    /// WHY:  an election with zero allowed registrants is meaningless
+    ///       and would divide by zero in downstream tree math.
+    #[test]
+    fn validate_rejects_zero_max_signers() {
+        let mut c = good_config();
+        c.max_signers = 0;
+        assert!(c.validate().is_err());
+    }
+
+    /// WHAT: `.validate()` rejects a config whose `max_signers`
+    ///       exceeds `1 << tree_depth` (i.e. won't fit in the tree).
+    /// HOW:  set tree_depth = 4 (capacity 16), max_signers = 17,
+    ///       expect `Err`.
+    /// WHY:  registering more participants than the tree can hold
+    ///       would silently overflow leaf indices.
+    #[test]
+    fn validate_rejects_max_signers_exceeding_tree_capacity() {
+        let mut c = good_config();
+        c.tree_depth = 4;
+        c.max_signers = 17;
         assert!(c.validate().is_err());
     }
 

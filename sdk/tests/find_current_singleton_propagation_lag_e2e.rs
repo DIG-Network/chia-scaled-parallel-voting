@@ -108,6 +108,8 @@ fn good_config(launcher_id: Bytes32) -> ElectionConfig {
         max_signers: MAX_SIGNERS,
         cat_tail_hash_hex: hex::encode([0x77u8; 32]),
         verification_key_hex: hex::encode(vec![0u8; 336 + (PUBLIC_INPUT_COUNT + 1) * 48]),
+        ceremony_launcher_id_hex: String::new(),
+        vk_hash_hex: String::new(),
         collateral_amount: 100,
         election_launcher_id_hex: hex::encode(launcher_id),
         label: None,

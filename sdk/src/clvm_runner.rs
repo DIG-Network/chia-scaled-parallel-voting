@@ -548,6 +548,8 @@ mod tests {
 
         let ballot_launcher_id = Bytes32::new([0x33; 32]);
         let vote_close_height: u64 = 12345;
+        // M4-revised: VOTE_OPTIONS_ROOT now flows through oracle's curry.
+        let vote_options_root = Bytes32::new([0xEE; 32]);
 
         type BallotStateClvm = (u8, (Bytes32, Bytes32));
         type BallotStateTruthClvm = ((), BallotStateClvm);
@@ -559,7 +561,11 @@ mod tests {
 
         let mut runner = PuzzleRunner::from_hex(crate::puzzles::BALLOT_COIN_ORACLE_HEX).unwrap();
         runner
-            .curry_with(clvm_curried_args!(ballot_launcher_id, vote_close_height))
+            .curry_with(clvm_curried_args!(
+                ballot_launcher_id,
+                vote_close_height,
+                vote_options_root
+            ))
             .unwrap();
         let output = runner.run(&solution).expect("puzzle should execute");
 
@@ -572,13 +578,14 @@ mod tests {
             other => panic!("expected CreateCoinAnnouncement, got {other:?}"),
         };
 
-        // Recompute expected message:
+        // Recompute expected message (M4-revised, 3-field preimage):
         //   sha256("ballot_oracle_open" || ballot_launcher_id ||
-        //          vote_close_height_be8).
+        //          vote_close_height_be8 || vote_options_root).
         let mut h = Sha256::new();
         h.update(b"ballot_oracle_open");
         h.update(ballot_launcher_id.as_ref());
         h.update(vote_close_height.to_be_bytes());
+        h.update(vote_options_root.as_ref());
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(
             msg.as_ref(),
@@ -601,6 +608,7 @@ mod tests {
 
         let ballot_launcher_id = Bytes32::new([0x33; 32]);
         let vote_close_height: u64 = 12345;
+        let vote_options_root = Bytes32::new([0xEE; 32]);
         let vote_outcome = Bytes32::new([0x42; 32]);
         let agg_signers = Bytes32::new([0x55; 32]);
 
@@ -614,7 +622,11 @@ mod tests {
 
         let mut runner = PuzzleRunner::from_hex(crate::puzzles::BALLOT_COIN_ORACLE_HEX).unwrap();
         runner
-            .curry_with(clvm_curried_args!(ballot_launcher_id, vote_close_height))
+            .curry_with(clvm_curried_args!(
+                ballot_launcher_id,
+                vote_close_height,
+                vote_options_root
+            ))
             .unwrap();
         let output = runner.run(&solution).expect("puzzle should execute");
 
@@ -627,14 +639,15 @@ mod tests {
             other => panic!("expected CreateCoinAnnouncement, got {other:?}"),
         };
 
-        // Recompute expected message:
+        // Recompute expected message (M4-revised, 5-field preimage):
         //   sha256("ballot_oracle_closed" || ballot_launcher_id ||
-        //          vote_close_height_be8 || vote_outcome ||
-        //          agg_signers).
+        //          vote_close_height_be8 || vote_options_root ||
+        //          vote_outcome || agg_signers).
         let mut h = Sha256::new();
         h.update(b"ballot_oracle_closed");
         h.update(ballot_launcher_id.as_ref());
         h.update(vote_close_height.to_be_bytes());
+        h.update(vote_options_root.as_ref());
         h.update(vote_outcome.as_ref());
         h.update(agg_signers.as_ref());
         let expected: [u8; 32] = h.finalize().into();

@@ -173,6 +173,17 @@ pub struct CastVoteParams {
     pub registration_merkle_root_snapshot: Bytes32,
     pub registration_vote_weight_snapshot: u64,
     pub voting_coin_amount: u64,
+    /// M5r-merkle-e: per-ballot vote-mode commitment. `Bytes32::default()`
+    /// (= 0x00…00) for Mode1Free; otherwise must equal the Ballot
+    /// Coin's curried `vote_options_root` (the AssertCoinAnnouncement
+    /// over the oracle preimage enforces matching).
+    pub vote_options_root: Bytes32,
+    /// M5r-merkle-e: optional `(leaf_index, proof_siblings)` for
+    /// Mode2Restricted. `None` for Mode1Free — the puzzle's
+    /// short-circuit gate accepts any vote_data when
+    /// `vote_options_root == 0x00…00`. Build via
+    /// `chip_voting_sdk::vote_mode::BallotVoteMode::merkle_proof_for_option`.
+    pub vote_option_proof: Option<(usize, Vec<Bytes32>)>,
 }
 
 /// STRUCT: UpdateVoteParams
@@ -208,6 +219,16 @@ pub struct UpdateVoteParams {
     pub vote_threshold_den: u64,
     pub registration_merkle_root_snapshot: Bytes32,
     pub registration_vote_weight_snapshot: u64,
+    /// M5r-merkle: per-ballot vote-mode commitment. `Bytes32::default()`
+    /// (= 0x00…00) for Mode1Free; otherwise must equal the Ballot
+    /// Coin's curried `vote_options_root` (the puzzle's
+    /// AssertCoinAnnouncement on the oracle preimage enforces this).
+    pub vote_options_root: Bytes32,
+    /// M5r-merkle: optional `(leaf_index, proof_siblings)` for
+    /// Mode2Restricted. `None` for Mode1Free — the on-chain gate
+    /// short-circuits when `vote_options_root == 0x00…00`. Build via
+    /// `chip_voting_sdk::vote_mode::BallotVoteMode::merkle_proof_for_option`.
+    pub vote_option_proof: Option<(usize, Vec<Bytes32>)>,
 }
 
 /// STRUCT: UpdateVoteCoinSpends
@@ -397,9 +418,23 @@ impl Voter {
         smt: &crate::merkle::SparseMerkleTree,
         cat_parent_spend: CoinSpend,
         chain: &C,
+        lock_amount: u64,
     ) -> VotingResult<Vec<CoinSpend>> {
         use clvm_traits::{clvm_curried_args, ToClvm};
         use clvm_utils::CurriedProgram;
+
+        // Per-CHIP-rev weighted voting: voters choose their own lock
+        // amount, bounded below by the curried `COLLATERAL_AMOUNT`
+        // minimum. The puzzle re-asserts both `lock_amount >=
+        // COLLATERAL_AMOUNT` AND `cat_child_amount == lock_amount`
+        // — the SDK pre-checks the minimum here so callers see a
+        // clear Rust error before the CLVM dry-run trap.
+        if lock_amount < self.config.collateral_amount {
+            return Err(voting_other(format!(
+                "Voter::register: lock_amount {} below curried COLLATERAL_AMOUNT minimum {}",
+                lock_amount, self.config.collateral_amount,
+            )));
+        }
 
         let election_id = self
             .config
@@ -479,9 +514,9 @@ impl Voter {
         .map_err(driver_err)?;
 
         // ── 4. Build the register action solution ───────────────
-        // Solution shape (per register.rue):
+        // Solution shape (per register.rue, weighted-voting rev):
         //   (new_voter_pubkey, register_leaf_index, register_siblings,
-        //    ...cat_parent_coin_id)
+        //    locked_cat_mojos, ...cat_parent_coin_id)
         //
         // SLOT ENCODING: register.rue's `slot_from_pubkey` builds
         //   `0x00 || sha256(pk)[0..4]` and casts to Int. We pass the
@@ -497,8 +532,10 @@ impl Voter {
             buf.extend_from_slice(&slot.to_be_bytes());
             chia_protocol::Bytes::new(buf)
         };
-        let register_solution_value =
-            (voter_pk_bytes, (slot_bytes, (siblings, cat_parent_coin_id)));
+        let register_solution_value = (
+            voter_pk_bytes,
+            (slot_bytes, (siblings, (lock_amount, cat_parent_coin_id))),
+        );
         let register_solution = register_solution_value
             .to_clvm(&mut *ctx)
             .map_err(driver_err)?;
@@ -575,9 +612,10 @@ impl Voter {
         smt: &crate::merkle::SparseMerkleTree,
         cat_parent_spend: CoinSpend,
         chain: &C,
+        lock_amount: u64,
     ) -> VotingResult<SpendBundle> {
         let coin_spends = self
-            .register_build_coin_spends(smt, cat_parent_spend, chain)
+            .register_build_coin_spends(smt, cat_parent_spend, chain, lock_amount)
             .await?;
         let signature = sign_bundle_signature(
             &coin_spends,
@@ -674,6 +712,28 @@ impl Voter {
             .election_launcher_id()
             .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
 
+        // Phase 2b: chain-walk override of caller-supplied per-ballot
+        // curry params. With Option A's launcher memo, vote_close_height,
+        // threshold, and registration snapshot fields are all readable
+        // from chain — overriding caller params here removes
+        // off-chain-metadata drift as a failure mode. Falls back to
+        // caller params for legacy ballots minted before the memo was
+        // added.
+        let memo = crate::actors::ballot::read_ballot_launcher_memo(
+            chain,
+            params.ballot_launcher_id,
+        )
+        .await?;
+        let mut effective_params = params.clone();
+        if let Some(m) = &memo {
+            effective_params.vote_close_height = m.vote_close_height;
+            effective_params.vote_threshold_num = m.vote_threshold_num;
+            effective_params.vote_threshold_den = m.vote_threshold_den;
+            effective_params.registration_merkle_root_snapshot = m.registration_merkle_root_snapshot;
+            effective_params.registration_vote_weight_snapshot = m.registration_vote_weight_snapshot;
+        }
+        let params = &effective_params;
+
         // ── 1. Locate the voter's Registration Coin ──────────────
         let predicted_reg_ph = puzzles::fresh_registration_coin_puzzle_hash(
             cat_tail_hash,
@@ -750,11 +810,18 @@ impl Voter {
         .map_err(driver_err)?;
         let finalize_full_hash = Bytes32::new(tree_hash(&ctx, finalize_curried).to_bytes());
 
-        // oracle curry order: (BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT)
+        // oracle curry order (M4-revised): (BALLOT_LAUNCHER_ID,
+        // VOTE_CLOSE_HEIGHT, VOTE_OPTIONS_ROOT). Default to Mode1Free
+        // sentinel until M7e wires the chain-walked value through.
+        let vote_options_root_curry: Bytes32 = Bytes32::default();
         let oracle_program_node = load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_ORACLE_HEX)?;
         let oracle_curried = CurriedProgram {
             program: oracle_program_node,
-            args: clvm_curried_args!(params.ballot_launcher_id, params.vote_close_height),
+            args: clvm_curried_args!(
+                params.ballot_launcher_id,
+                params.vote_close_height,
+                vote_options_root_curry
+            ),
         }
         .to_clvm(&mut *ctx)
         .map_err(driver_err)?;
@@ -911,26 +978,54 @@ impl Voter {
         let ballot_membership_value: (Bytes32, Vec<Bytes32>) =
             (params.ballot_launcher_id, siblings);
 
-        // mint_voting_coin solution shape (per the puzzle):
-        //   (ballot_launcher_id, vote_close_height, vote_data,
-        //    ballot_coin_id, registration_coin_id, initial_signature,
-        //    ballot_membership_witness, ...voting_coin_amount)
-        // The trailing `...voting_coin_amount` makes voting_coin_amount
-        // the cdr of the last cons (no NIL terminator) — Rust nested
-        // tuples end with the last element directly, matching this.
+        // mint_voting_coin solution shape (per the puzzle,
+        // M5r-merkle-e — voting_coin_amount moved from rest-arg to
+        // regular, trailing rest is now ...vote_option_proof):
+        //   (ballot_launcher_id, vote_close_height, vote_options_root,
+        //    vote_data, ballot_coin_id, registration_coin_id,
+        //    initial_signature, ballot_membership_witness,
+        //    voting_coin_amount, vote_option_leaf_index,
+        //    vote_option_proof_depth, ...vote_option_proof)
+        // Caller-supplied vote_options_root + (leaf_index, proof) come
+        // from CastVoteParams. Mode1Free → root=0x00…00, idx=0,
+        // depth=0, proof=nil; the puzzle's gate short-circuits.
+        let vote_options_root_for_solution: Bytes32 = params.vote_options_root;
+        let (vote_option_leaf_index, vote_option_proof_depth, vote_option_proof_cons) =
+            match &params.vote_option_proof {
+                Some((idx, proof)) => {
+                    let cons: Vec<Bytes32> = proof.clone();
+                    (*idx as u64, cons.len() as u64, cons)
+                }
+                None => (0u64, 0u64, Vec::<Bytes32>::new()),
+            };
         let mint_solution_value = (
             params.ballot_launcher_id,
             (
                 params.vote_close_height,
                 (
-                    params.vote_data,
+                    vote_options_root_for_solution,
                     (
-                        ballot_coin_id,
+                        params.vote_data,
                         (
-                            registration_coin_id,
+                            ballot_coin_id,
                             (
-                                initial_signature_bytes.clone(),
-                                (ballot_membership_value, params.voting_coin_amount),
+                                registration_coin_id,
+                                (
+                                    initial_signature_bytes.clone(),
+                                    (
+                                        ballot_membership_value,
+                                        (
+                                            params.voting_coin_amount,
+                                            (
+                                                vote_option_leaf_index,
+                                                (
+                                                    vote_option_proof_depth,
+                                                    vote_option_proof_cons,
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
                             ),
                         ),
                     ),
@@ -1150,6 +1245,23 @@ impl Voter {
             .election_launcher_id()
             .map_err(|e| voting_other(format!("election_launcher_id: {e}")))?;
 
+        // Phase 2b: chain-walk override of caller-supplied per-ballot
+        // curry params (see cast_vote_build_coin_spends for rationale).
+        let memo = crate::actors::ballot::read_ballot_launcher_memo(
+            chain,
+            params.ballot_launcher_id,
+        )
+        .await?;
+        let mut effective_params = params.clone();
+        if let Some(m) = &memo {
+            effective_params.vote_close_height = m.vote_close_height;
+            effective_params.vote_threshold_num = m.vote_threshold_num;
+            effective_params.vote_threshold_den = m.vote_threshold_den;
+            effective_params.registration_merkle_root_snapshot = m.registration_merkle_root_snapshot;
+            effective_params.registration_vote_weight_snapshot = m.registration_vote_weight_snapshot;
+        }
+        let params = &effective_params;
+
         // ── 1. Locate the Voting Coin + verify its predicted ph ──
         let voting_coin_record = chain
             .coin_record_by_id(params.voting_coin_id)
@@ -1219,10 +1331,17 @@ impl Voter {
         .map_err(driver_err)?;
         let finalize_full_hash = Bytes32::new(tree_hash(&ctx, finalize_curried).to_bytes());
 
+        // M4-revised oracle curry adds VOTE_OPTIONS_ROOT (Mode1Free
+        // sentinel default until M7e wires the real value).
+        let vote_options_root_curry: Bytes32 = Bytes32::default();
         let oracle_program_node = load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_ORACLE_HEX)?;
         let oracle_curried = CurriedProgram {
             program: oracle_program_node,
-            args: clvm_curried_args!(params.ballot_launcher_id, params.vote_close_height),
+            args: clvm_curried_args!(
+                params.ballot_launcher_id,
+                params.vote_close_height,
+                vote_options_root_curry
+            ),
         }
         .to_clvm(&mut *ctx)
         .map_err(driver_err)?;
@@ -1351,10 +1470,14 @@ impl Voter {
 
         // update_vote takes NO curry args (post CHIP rev 2026-05-02
         // — see puzzles/voting_coin/update_vote.rue header). Solution
-        // shape:
+        // shape (M5r-merkle-a — adds the on-chain merkle-inclusion
+        // gate's args at the tail):
         //   `(ballot_launcher_id, election_launcher_id,
-        //     vote_close_height, new_vote_data, new_signature,
-        //     ...ballot_coin_id)`
+        //     vote_close_height, vote_options_root, new_vote_data,
+        //     new_signature, ballot_coin_id, vote_option_leaf_index,
+        //     vote_option_proof_depth, ...vote_option_proof)`
+        // Mode1Free → leaf_index=0, depth=0, proof=nil (the rue gate
+        // skips the merkle check). Mode2Restricted → caller-supplied.
         let update_vote_program_node =
             load_action_puzzle(&mut ctx, puzzles::VOTING_COIN_UPDATE_VOTE_HEX)?;
 
@@ -1368,6 +1491,21 @@ impl Voter {
             election_id,
         );
 
+        // M5-revised: vote_options_root that the Ballot Coin's oracle
+        // is curried with. Threaded from UpdateVoteParams so the SDK
+        // emits the matching value into both the oracle preimage and
+        // (when non-zero) the merkle proof check.
+        let vote_options_root_for_solution: Bytes32 = params.vote_options_root;
+        // M5r-merkle-b: caller-supplied (leaf_index, proof) for
+        // Mode2Restricted, or Mode1Free defaults `(0, 0, nil)`.
+        let (vote_option_leaf_index, vote_option_proof_depth, vote_option_proof_cons) =
+            match &params.vote_option_proof {
+                Some((idx, proof)) => {
+                    let cons: Vec<Bytes32> = proof.clone();
+                    (*idx as u64, cons.len() as u64, cons)
+                }
+                None => (0u64, 0u64, Vec::<Bytes32>::new()),
+            };
         let update_vote_solution_value = (
             params.ballot_launcher_id,
             (
@@ -1375,8 +1513,20 @@ impl Voter {
                 (
                     params.vote_close_height,
                     (
-                        params.new_vote_data,
-                        (new_signature_bytes.clone(), ballot_coin_id),
+                        vote_options_root_for_solution,
+                        (
+                            params.new_vote_data,
+                            (
+                                new_signature_bytes.clone(),
+                                (
+                                    ballot_coin_id,
+                                    (
+                                        vote_option_leaf_index,
+                                        (vote_option_proof_depth, vote_option_proof_cons),
+                                    ),
+                                ),
+                            ),
+                        ),
                     ),
                 ),
             ),
@@ -1629,13 +1779,24 @@ impl Voter {
         .to_clvm(&mut *ctx)
         .map_err(driver_err)?;
 
-        // Solution shape (per deregister.rue):
-        //   `(voter_pubkey, deregister_leaf_index, ...deregister_siblings)`
+        // Solution shape (per deregister.rue, weighted-voting rev):
+        //   `(voter_pubkey, deregister_leaf_index, locked_cat_mojos,
+        //     ...deregister_siblings)`
         // with the same 5-byte `0x00 || sha256(pk)[0..4]` slot encoding
         // register.rue uses (re-applied below to keep the two actions
         // byte-identical on the slot atom).
+        //
+        // `locked_cat_mojos` is recovered from the SMT — the membership
+        // proof verifies only for the same value the voter registered
+        // with, so we pass exactly what the SMT has on file.
         let slot = self.slot();
         let siblings = smt.prove(slot);
+        let lock_amount = smt.locked_amount(&self.keys.pubkey).ok_or_else(|| {
+            voting_other(
+                "Voter::release_collateral: SMT has no locked amount for this voter — \
+                 was the SMT synced from chain?",
+            )
+        })?;
         let voter_pk_bytes = chia_protocol::Bytes::new(self.keys.pubkey.to_bytes().to_vec());
         let slot_bytes = {
             let mut buf = Vec::with_capacity(5);
@@ -1643,7 +1804,8 @@ impl Voter {
             buf.extend_from_slice(&slot.to_be_bytes());
             chia_protocol::Bytes::new(buf)
         };
-        let deregister_solution_value = (voter_pk_bytes, (slot_bytes, siblings));
+        let deregister_solution_value =
+            (voter_pk_bytes, (slot_bytes, (lock_amount, siblings)));
         let deregister_solution = deregister_solution_value
             .to_clvm(&mut *ctx)
             .map_err(driver_err)?;
@@ -2177,11 +2339,25 @@ impl Voter {
         ctx: &mut SpendContext,
         state: &crate::state::ElectionState,
     ) -> VotingResult<clvmr::NodePtr> {
+        // M2: 8-field cons tree
+        // (root . (count . (weight . (start . (cer . (max . (vk . lock))))))).
         let value = (
             state.registration_merkle_root,
             (
                 state.registration_count,
-                (state.registration_vote_weight, state.election_start_height),
+                (
+                    state.registration_vote_weight,
+                    (
+                        state.election_start_height,
+                        (
+                            state.ceremony_launcher_id,
+                            (
+                                state.max_voters,
+                                (state.vk_hash, state.vote_mode_lock),
+                            ),
+                        ),
+                    ),
+                ),
             ),
         );
         value.to_clvm(&mut **ctx).map_err(driver_err)
@@ -2443,6 +2619,8 @@ mod tests {
             tree_depth: crate::config::TREE_DEPTH,
             max_signers: crate::config::MAX_SIGNERS,
             verification_key_hex: "00".repeat(336 + (crate::config::PUBLIC_INPUT_COUNT + 1) * 48),
+            ceremony_launcher_id_hex: String::new(),
+            vk_hash_hex: String::new(),
             label: None,
         }
     }

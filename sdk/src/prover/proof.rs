@@ -537,7 +537,7 @@ mod tests {
 
         // Build a real proof to round-trip.
         let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xBEEF);
-        let (pk, _vk) = generate_test_setup(&mut rng).unwrap();
+        let (pk, _vk) = generate_test_setup(32, &mut rng).unwrap();
         let circuit = VotingCircuit {
             registration_merkle_root: b32(0x11),
             registration_vote_weight: 3,

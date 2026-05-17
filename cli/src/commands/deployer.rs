@@ -230,6 +230,8 @@ fn build_deployer(args: &DeployParamsArgs) -> Result<ElectionDeployer> {
         verification_key: vk,
         cat_tail_hash,
         collateral_amount: args.collateral_amount,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
         election_start_height: args.election_start_height,
         label: args.label.clone(),
     }))
@@ -274,7 +276,7 @@ fn dry_run(
     let parent_coin = build_parent_coin(&parent)?;
     let parent_pk = parse_pk(&parent.parent_synthetic_pubkey)?;
     let (coin_spends, config) = deployer
-        .build_deploy_bundle(parent_coin, parent_pk)
+        .build_deploy_bundle(parent_coin, parent_pk, true)
         .map_err(|e| anyhow::anyhow!("build_deploy_bundle failed: {e:?}"))?;
     let json = serde_json::json!({
         "election_config": serde_json::from_str::<serde_json::Value>(&config.to_json())?,

@@ -24,6 +24,7 @@
 
 use chia_bls::PublicKey;
 use chia_protocol::{Bytes, Bytes32};
+use clvm_traits::{FromClvm, ToClvm};
 use serde::{Deserialize, Serialize};
 
 use crate::puzzles;
@@ -62,10 +63,10 @@ fn uint_atom_hash(n: u64) -> Bytes32 {
 ///          Updated on every spend (`register`, `deregister`).
 /// MIRROR: `ElectionState` in `puzzles/election/shared.rue`.
 ///         Field order matches the Rue tuple layout. The last field
-///         (`election_start_height`) is declared with the rest-arg
-///         `...` prefix in Rue, so the on-chain cons tree shape is
-///         `(root . (count . (weight . start_height)))` — no trailing
-///         nil pair.
+///         (`vk_hash`, post-V5) is declared with the rest-arg `...`
+///         prefix in Rue, so the on-chain cons tree shape is
+///         `(root . (count . (weight . (start_height . (ceremony_launcher_id . (max_voters . vk_hash))))))`
+///         — no trailing nil pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElectionState {
     /// SPT root over the set of registered voter pubkeys.
@@ -79,31 +80,86 @@ pub struct ElectionState {
     /// equivalent constants (epoch lengths, etc.) are computed
     /// relative to this anchor.
     pub election_start_height: u64,
+    /// Launcher ID of the trusted-setup ceremony singleton this
+    /// election is bound to. Set at genesis from DeployParams,
+    /// propagated unchanged by every action.
+    pub ceremony_launcher_id: Bytes32,
+    /// Registration capacity (= 1 << TREE_DEPTH of the curried SPT).
+    /// Sourced from the chosen ceremony's `max_voters` via the
+    /// co-spent voucher's canonical announcement.
+    pub max_voters: u64,
+    /// sha256 of the ceremony's derived Groth16 verifying key.
+    /// Committed in state so on-chain consumers can verify the
+    /// election uses the exact VK the bound ceremony produced.
+    pub vk_hash: Bytes32,
+    /// M2: per-election ballot-mode lock. Sentinel
+    /// `crate::vote_mode::VOTE_MODE_LOCK_NONE` (= 0xFF…FF) means
+    /// "no lock" (each ballot picks its own vote_options_root). Any
+    /// other value forces every ballot's curried VOTE_OPTIONS_ROOT
+    /// to equal this value byte-for-byte. Propagated unchanged by
+    /// register/deregister.
+    pub vote_mode_lock: Bytes32,
 }
 
 impl ElectionState {
     /// FN: genesis
     /// WHAT: state at deployment — empty SPT, zero registration
-    ///       count and weight, anchored to a launch height.
+    ///       count and weight, anchored to a launch height with the
+    ///       full ceremony back-reference triple.
     /// USAGE: passed to `Deployer::build_deploy_bundle` to compute
     ///        the Election Singleton's launch puzzle hash. Note:
     ///        callers that don't yet know the start height (e.g.
     ///        unit tests that pre-compute hashes) can pass 0.
-    pub fn genesis(empty_root: Bytes32, election_start_height: u64) -> Self {
+    pub fn genesis(
+        empty_root: Bytes32,
+        election_start_height: u64,
+        ceremony_launcher_id: Bytes32,
+        max_voters: u64,
+        vk_hash: Bytes32,
+        vote_mode_lock: Bytes32,
+    ) -> Self {
         Self {
             registration_merkle_root: empty_root,
             registration_count: 0,
             registration_vote_weight: 0,
             election_start_height,
+            ceremony_launcher_id,
+            max_voters,
+            vk_hash,
+            vote_mode_lock,
         }
+    }
+
+    /// FN: genesis_from_config
+    /// WHAT: convenience constructor that pulls the V6 ceremony
+    ///       back-reference triple (ceremony_launcher_id, max_voters,
+    ///       vk_hash) from an `ElectionConfig`. Used by every actor
+    ///       that needs to predict the deployer's committed genesis
+    ///       state hash from the public config alone (voter,
+    ///       aggregator, indexer).
+    pub fn genesis_from_config(
+        empty_root: Bytes32,
+        election_start_height: u64,
+        config: &crate::config::ElectionConfig,
+    ) -> Self {
+        Self::genesis(
+            empty_root,
+            election_start_height,
+            config.ceremony_launcher_id(),
+            config.max_signers as u64,
+            config.vk_hash(),
+            // M2 defaults to no-lock for legacy/empty-config callers;
+            // the deployer overrides via `genesis_state_tree_hash`.
+            crate::vote_mode::VOTE_MODE_LOCK_NONE,
+        )
     }
 
     /// FN: clvm_tree_hash
     /// WHAT: tree hash of the on-chain cons tree for this state.
-    /// SHAPE: `(root . (count . (weight . start_height)))` — the
-    ///        trailing-tail layout produced by Rue's
-    ///        `...election_start_height` syntax in
-    ///        `puzzles/election/shared.rue`.
+    /// SHAPE: `(root . (count . (weight . (start_height . (
+    ///        ceremony_launcher_id . (max_voters . vk_hash))))))`
+    ///        — the trailing-tail layout produced by Rue's
+    ///        `...vk_hash` syntax in `puzzles/election/shared.rue`.
     /// USAGE: backbone of singleton-state puzzle-hash prediction —
     ///        every singleton spend's lineage proof needs the
     ///        previous coin's exact inner puzzle hash, which depends
@@ -113,9 +169,18 @@ impl ElectionState {
         let count_h = uint_atom_hash(self.registration_count);
         let weight_h = uint_atom_hash(self.registration_vote_weight);
         let start_h = uint_atom_hash(self.election_start_height);
+        let cer_h = puzzles::hash_atom_b32(&self.ceremony_launcher_id);
+        let max_h = uint_atom_hash(self.max_voters);
+        let vk_h = puzzles::hash_atom_b32(&self.vk_hash);
+        let lock_h = puzzles::hash_atom_b32(&self.vote_mode_lock);
 
-        // Rest-arg shape: (root . (count . (weight . start_height)))
-        let pair = puzzles::hash_pair(weight_h, start_h);
+        // M2 rest-arg shape:
+        // (root . (count . (weight . (start . (cer . (max . (vk . lock)))))))
+        let pair = puzzles::hash_pair(vk_h, lock_h);
+        let pair = puzzles::hash_pair(max_h, pair);
+        let pair = puzzles::hash_pair(cer_h, pair);
+        let pair = puzzles::hash_pair(start_h, pair);
+        let pair = puzzles::hash_pair(weight_h, pair);
         let pair = puzzles::hash_pair(count_h, pair);
         puzzles::hash_pair(root_h, pair)
     }
@@ -337,7 +402,7 @@ pub struct BallotCoinSnapshot {
     /// Election this ballot belongs to (curried).
     pub election_launcher_id: Bytes32,
     /// Block height at which voting closes (curried).
-    pub vote_close_height: u32,
+    pub vote_close_height: u64,
     /// Curried domain-separation hash for the outcome encoding —
     /// pins down what `vote_outcome` actually represents for this
     /// ballot.
@@ -347,6 +412,124 @@ pub struct BallotCoinSnapshot {
     pub state: BallotState,
     /// Observed coin id of the latest Ballot Coin singleton.
     pub coin_id: Bytes32,
+    /// Curried into the `finalize` action — numerator of the ballot's
+    /// quorum threshold. `None` for legacy ballots minted before the
+    /// launcher curry-memo was added (pre-CHIP rev 2026-05-07).
+    /// Cross-browser observers should fall back to bootstrap when
+    /// this is `None`.
+    pub vote_threshold_num: Option<u64>,
+    /// Curried into the `finalize` action — denominator of the ballot's
+    /// quorum threshold. `None` for legacy ballots; see
+    /// `vote_threshold_num`.
+    pub vote_threshold_den: Option<u64>,
+    /// Curried into the `finalize` action — Election Singleton's
+    /// `registration_merkle_root` snapshotted at launch time. `None`
+    /// for legacy ballots.
+    pub registration_merkle_root_snapshot: Option<Bytes32>,
+    /// Curried into the `finalize` action — sum of locked CAT
+    /// collateral (per-voter weight) snapshotted at launch time.
+    /// Drives the threshold computation:
+    ///   required_signed_weight =
+    ///       ceil(registration_vote_weight_snapshot
+    ///            * vote_threshold_num / vote_threshold_den)
+    /// `None` for legacy ballots.
+    pub registration_vote_weight_snapshot: Option<u64>,
+    /// M8: per-ballot vote-mode commitment recovered from the launcher
+    /// memo. `Bytes32::default()` (= 0x00…00) means Mode1Free; any
+    /// other value is the sorted-options merkle root the Ballot Coin
+    /// is curried with (Mode2Restricted). `None` for legacy ballots
+    /// (pre-M8 launcher-memo schema v1) — same fallback rule as the
+    /// other Option fields above.
+    pub vote_options_root: Option<Bytes32>,
+}
+
+// ----------------------------------------------------------------------------
+// BallotLauncherMemo
+// ----------------------------------------------------------------------------
+
+/// Magic schema tag prefix written into the launcher second-spend's
+/// `key_value_list` so chain readers can recognize a CHIP ballot
+/// curry memo and version-gate future schema changes.
+///
+/// v2 (M8): adds `vote_options_root` after `registration_vote_weight_snapshot`
+/// so cross-browser readers can recover the per-ballot vote-mode
+/// commitment from chain alone. v1 readers see the v2 tag and
+/// gracefully return None (different schema_tag bytes); v2 readers
+/// reject v1 the same way. The change is intentional —
+/// the layout grew, so a v1 decode would silently mis-bind the new field.
+pub const BALLOT_LAUNCHER_MEMO_TAG: &[u8] = b"chip:ballot:v2";
+
+/// STRUCT: BallotLauncherMemo
+/// PURPOSE: on-chain commitment to the per-ballot curry params,
+///          written as the launcher second-spend's `key_value_list`.
+///          Lets ANY chain reader (cross-browser observer,
+///          share-bundle importer, third-party indexer) recover the
+///          full ballot curry directly from chain — no off-chain
+///          metadata needed. Mirrors the inputs to
+///          `BallotIssuer::launch_ballot`.
+/// SOURCE: written by `BallotIssuer::launch_ballot`; read by
+///         `read_ballot_launcher_memo` in `actors/ballot.rs`, which is
+///         called by `list_ballots_via_chain` and
+///         `get_ballot_via_chain` to populate `BallotCoinSnapshot`'s
+///         optional curry fields.
+/// LAYOUT: tagged CLVM list. First field is `BALLOT_LAUNCHER_MEMO_TAG`
+///         for forward-compat schema versioning; remaining fields are
+///         the curry params in stable order (matches the order curried
+///         into the `finalize` action puzzle).
+#[derive(Clone, Debug, PartialEq, Eq, ToClvm, FromClvm)]
+#[clvm(list)]
+pub struct BallotLauncherMemo {
+    pub schema_tag: Bytes,
+    pub vote_close_height: u64,
+    pub outcome_domain_hash: Bytes32,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+    pub registration_merkle_root_snapshot: Bytes32,
+    pub registration_vote_weight_snapshot: u64,
+    /// M8: per-ballot vote-mode commitment. `Bytes32::default()`
+    /// (= 0x00…00) for Mode1Free; otherwise a sorted-options merkle
+    /// root for Mode2Restricted. Curried into the Ballot Coin's
+    /// oracle action so cross-browser dApps recover it from chain.
+    pub vote_options_root: Bytes32,
+}
+
+/// SCHEMA TAG: prefix the on-chain ceremony launcher memo with this
+/// constant so future readers can identify the schema version. Bumped
+/// when the memo layout changes incompatibly. v2 (E3) adds
+/// `max_voters` so cross-browser readers can recover the circuit's
+/// SPT depth from chain alone.
+pub const CEREMONY_LAUNCHER_MEMO_TAG: &[u8] = b"chip:ceremony:v2";
+
+/// STRUCT: CeremonyLauncherMemo
+/// PURPOSE: on-chain commitment to the per-ceremony curry params,
+///          written as the launcher second-spend's `key_value_list`.
+///          Lets ANY chain reader (cross-browser dApp, third-party
+///          indexer, redeploy after losing localStorage) recover the
+///          full ceremony bootstrap from chain alone — no off-chain
+///          metadata needed.
+/// SOURCE: written by `CeremonyDeployer::build_deploy_bundle`; read by
+///         `recover_ceremony_bootstrap_via_chain` in `actors/ceremony.rs`.
+/// LAYOUT: tagged CLVM list. First field is `CEREMONY_LAUNCHER_MEMO_TAG`
+///         for forward-compat schema versioning; remaining fields are
+///         the deployment params in stable order (matches the inputs
+///         to `CeremonyParams`). `label_bytes` is empty when no label
+///         was supplied (label is dApp-only display metadata).
+///
+/// v2 (E3): adds `max_voters` after `min_participants`. v1 readers
+/// see the v2 tag and gracefully return None (different schema_tag
+/// bytes); v2 readers reject v1 the same way. This is intentional —
+/// the layout grew so a v1 decode would silently mis-bind the new
+/// field.
+#[derive(Clone, Debug, PartialEq, Eq, ToClvm, FromClvm)]
+#[clvm(list)]
+pub struct CeremonyLauncherMemo {
+    pub schema_tag: Bytes,
+    pub start_block_height: u64,
+    pub ceremony_length_blocks: u64,
+    pub min_participants: u64,
+    pub max_voters: u64,
+    pub vk_seed: Bytes32,
+    pub label_bytes: Bytes,
 }
 
 // ----------------------------------------------------------------------------
@@ -404,6 +587,75 @@ impl VotingCoinState {
         let pair = puzzles::hash_pair(vd_h, rci_h);
         let pair = puzzles::hash_pair(bli_h, pair);
         puzzles::hash_pair(pk_h, pair)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// CeremonyState
+// ----------------------------------------------------------------------------
+
+/// STRUCT: CeremonyState
+/// PURPOSE: state curried into the Ceremony Singleton — tracks the
+///          linear lineage of accepted Groth16 contributions.
+/// MIRROR: `CeremonyState` in
+///         `puzzles/ceremony_singleton/shared.rue`. Field order:
+///         `(contribution_count, ...last_contribution_hash)` —
+///         `last_contribution_hash` is the rest-arg field.
+/// SEMANTICS:
+///   * `contribution_count` — number of accepted contributions; 0
+///                            before the genesis contributor lands.
+///   * `last_contribution_hash` — CONTRIBUTION_HASH of the most-recent
+///                                accepted contribution; equals the
+///                                deployer's curried `vk_seed` before
+///                                any contribution lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CeremonyState {
+    pub contribution_count: u64,
+    pub last_contribution_hash: Bytes32,
+    /// Set true by the finalize action once the threshold is met and
+    /// the window has closed. Blocks further contribute spends.
+    pub finalized: bool,
+    /// SHA-256 hash of the derived Groth16 VK bytes. Bytes32::default()
+    /// pre-finalize.
+    pub vk_hash: Bytes32,
+    /// SHA-256 binary-tree merkle root over the sorted marker coin ids
+    /// of every accepted contribution. Bytes32::default() pre-finalize.
+    pub marker_root: Bytes32,
+}
+
+impl CeremonyState {
+    /// FN: genesis
+    /// WHAT: initial state for a brand-new Ceremony Singleton:
+    ///       count=0, last_contribution_hash=`vk_seed`,
+    ///       finalized=false, vk_hash + marker_root zeroed.
+    pub fn genesis(vk_seed: Bytes32) -> Self {
+        Self {
+            contribution_count: 0,
+            last_contribution_hash: vk_seed,
+            finalized: false,
+            vk_hash: Bytes32::default(),
+            marker_root: Bytes32::default(),
+        }
+    }
+
+    /// FN: clvm_tree_hash
+    /// WHAT: tree hash of the on-chain cons tree for this state.
+    /// SHAPE: `(count . (last_hash . (finalized . (vk_hash . marker_root))))`
+    ///        — rest-arg nested cons matching
+    ///        `puzzles/ceremony_singleton/shared.rue`.
+    /// BOOL ENCODING: `finalized` hashes as `uint_atom_hash(0|1)` —
+    ///        Rue's `Int` field with values {0, 1}.
+    pub fn clvm_tree_hash(&self) -> Bytes32 {
+        let count_h = uint_atom_hash(self.contribution_count);
+        let last_h = puzzles::hash_atom_b32(&self.last_contribution_hash);
+        let finalized_h = uint_atom_hash(if self.finalized { 1 } else { 0 });
+        let vk_hash_h = puzzles::hash_atom_b32(&self.vk_hash);
+        let marker_root_h = puzzles::hash_atom_b32(&self.marker_root);
+        // Inside-out cons assembly: (vk_hash . marker_root) first.
+        let pair4 = puzzles::hash_pair(vk_hash_h, marker_root_h);
+        let pair3 = puzzles::hash_pair(finalized_h, pair4);
+        let pair2 = puzzles::hash_pair(last_h, pair3);
+        puzzles::hash_pair(count_h, pair2)
     }
 }
 
@@ -534,7 +786,7 @@ mod tests {
     ///       SDK consumer expects.
     #[test]
     fn election_genesis_has_zero_counters() {
-        let g = ElectionState::genesis(Bytes32::new([0xAA; 32]), 1234);
+        let g = ElectionState::genesis(Bytes32::new([0xAA; 32]), 1234, Bytes32::default(), 0u64, Bytes32::default(), crate::vote_mode::VOTE_MODE_LOCK_NONE);
         assert_eq!(g.registration_count, 0);
         assert_eq!(g.registration_vote_weight, 0);
         assert_eq!(g.election_start_height, 1234);
@@ -552,8 +804,8 @@ mod tests {
     ///       minimum correctness contract.
     #[test]
     fn election_state_tree_hash_is_deterministic_and_field_sensitive() {
-        let a = ElectionState::genesis(Bytes32::new([0xAA; 32]), 1234);
-        let b = ElectionState::genesis(Bytes32::new([0xAA; 32]), 1234);
+        let a = ElectionState::genesis(Bytes32::new([0xAA; 32]), 1234, Bytes32::default(), 0u64, Bytes32::default(), crate::vote_mode::VOTE_MODE_LOCK_NONE);
+        let b = ElectionState::genesis(Bytes32::new([0xAA; 32]), 1234, Bytes32::default(), 0u64, Bytes32::default(), crate::vote_mode::VOTE_MODE_LOCK_NONE);
         assert_eq!(a.clvm_tree_hash(), b.clvm_tree_hash());
 
         let mut c = a.clone();

@@ -53,6 +53,77 @@ import {
 } from "./encoding.mjs";
 
 // ---------------------------------------------------------------------------
+// Chain-discovery helpers — mirror what the dApp does on every page mount.
+// The dApp can't trust prior-session state (fresh browser, share-bundle
+// import, second device). The harness mirrors that: every write phase
+// re-validates `electionStartHeight` against chain, and every read path
+// pulls the voter list from chain instead of from a credentials file.
+// ---------------------------------------------------------------------------
+
+async function recoverElectionStartHeightOrFail(backend, configJson) {
+  const recovered = await wasm.recoverElectionStartHeight(
+    backend,
+    configJson,
+    60
+  );
+  if (recovered == null) {
+    throw new Error(
+      "recoverElectionStartHeight: no match in ±60 block window — " +
+        "election was deployed with a different puzzle revision; " +
+        "redeploy required."
+    );
+  }
+  return BigInt(typeof recovered === "number" ? recovered : Number(recovered));
+}
+
+/**
+ * Treat coinset's `push_tx` response as success when the bundle is
+ * accepted into the mempool, even if it hasn't landed in a block yet.
+ * Codes:
+ *   - "SUCCESS" (1) — full-node accepted; included in next block.
+ *   - "PENDING" (3) — accepted into mempool; awaiting confirmation.
+ *   - error.includes("ALREADY_INCLUDING_TRANSACTION") — duplicate
+ *     submit (e.g. retry after the first push went through but the
+ *     reply didn't reach us). Equivalent to SUCCESS.
+ * Anything else is a real failure (DOUBLE_SPEND, ASSERT_*, etc) and
+ * gets thrown.
+ */
+function checkPushAccepted(response, where) {
+  const isAlreadyIncluded =
+    typeof response.error === "string" &&
+    response.error.includes("ALREADY_INCLUDING_TRANSACTION");
+  const isPending = response.status === "PENDING" || response.status === 3;
+  const isSuccess =
+    response.status === "SUCCESS" ||
+    response.status === 1 ||
+    isAlreadyIncluded ||
+    isPending;
+  if (!isSuccess) {
+    throw new Error(
+      `${where}: push_tx returned: ${response.status} (${response.error ?? "(none)"})`
+    );
+  }
+  return {
+    label: isAlreadyIncluded
+      ? "ALREADY_IN_MEMPOOL"
+      : isPending
+        ? "PENDING_IN_MEMPOOL"
+        : "SUCCESS",
+  };
+}
+
+async function listRegisteredVoterPksFromChain(backend, configJson, esh) {
+  const json = await wasm.listRegisteredVoters(
+    backend,
+    configJson,
+    wasm.WasmNetwork.Mainnet,
+    esh
+  );
+  const list = JSON.parse(json);
+  return list.map((v) => v.pubkeyHex);
+}
+
+// ---------------------------------------------------------------------------
 // Argv parsing
 // ---------------------------------------------------------------------------
 
@@ -71,6 +142,9 @@ function parseArgs(argv) {
     voteChoice: "Yes",
     runFinalize: false,
     runRelease: false,
+    runCeremonyDeploy: false,
+    runCeremonyContribute: false,
+    runCeremonyDeriveVk: false,
     // Default CAT TAIL: DIG token (per app/app/create/page.tsx default).
     // Voters will need a balance of this CAT to register. Override
     // with --cat-tail <hex> for a different election currency.
@@ -107,6 +181,35 @@ function parseArgs(argv) {
       out.runFinalize = true;
     } else if (a === "--run-release") {
       out.runRelease = true;
+    } else if (a === "--run-ceremony-deploy") {
+      out.runCeremonyDeploy = true;
+    } else if (a === "--run-ceremony-contribute") {
+      out.runCeremonyContribute = true;
+    } else if (a === "--run-ceremony-derive-vk") {
+      out.runCeremonyDeriveVk = true;
+    } else if (a === "--linked-ceremony-id") {
+      // V12: optional ceremony→election link. When set, phaseDeploy
+      // discovers the unspent voucher coin spawned by this finalized
+      // ceremony and threads its parent_coin_info + amount into
+      // deployElectionBundle so the election commits to the
+      // (vk_hash, max_voters, ceremony_launcher_id) triple via
+      // AssertCoinAnnouncement.
+      out.linkedCeremonyId = argv[++i];
+    } else if (a === "--ballot-vote-options-root") {
+      // M15: per-ballot vote-mode commitment threaded into both
+      // createBallotBundle and launchBallotBundle. 32-byte hex
+      // (0x-prefix optional). Default 0x00…00 = Mode1Free. Set to a
+      // sorted-options merkle root for Mode2Restricted (must match
+      // the election's vote_mode_lock if the deploy was mode-locked).
+      out.ballotVoteOptionsRootHex = argv[++i];
+    } else if (a === "--ballot-options-csv") {
+      // M5r-merkle-i: comma-separated label list for Mode2Restricted
+      // ballots. phaseCastVote hashes each as sha256("vote:"+label),
+      // builds the sorted-options merkle root (must match
+      // --ballot-vote-options-root if also set), and computes the
+      // inclusion proof for the cast vote_data so the on-chain
+      // mint_voting_coin's M5r-merkle-e gate accepts.
+      out.ballotOptionsCsv = argv[++i];
     }
   }
   return out;
@@ -267,8 +370,9 @@ async function phaseBallotReads(opts) {
   const ballots = JSON.parse(ballotsJson);
   ok(`listBallots returned ${ballots.length} ballot(s)`);
   for (const b of ballots) {
+    const memo = b.vote_threshold_num != null ? "memo:✓" : "memo:✗";
     info(
-      `   ballot ${String(b.ballot_launcher_id).slice(0, 18)}… closes_at=${b.vote_close_height} finalized=${b.state?.finalized}`
+      `   ballot ${String(b.ballot_launcher_id).slice(0, 18)}… closes_at=${b.vote_close_height} finalized=${b.state?.finalized} ${memo}`
     );
   }
 
@@ -281,7 +385,15 @@ async function phaseBallotReads(opts) {
     if (one === null) {
       throw new Error(`getBallot returned null for a ballot that listBallots had just enumerated`);
     }
-    ok(`getBallot round-trips: close_height=${one.vote_close_height}`);
+    // Curry params recovered from launcher memo (Option A). Legacy
+    // ballots minted before the memo was added return null for these.
+    const memoLine =
+      one.vote_threshold_num != null
+        ? `threshold=${one.vote_threshold_num}/${one.vote_threshold_den} reg_weight_snapshot=${one.registration_vote_weight_snapshot} reg_root_snapshot=${String(one.registration_merkle_root_snapshot).slice(0, 18)}…`
+        : "(legacy: no curry memo on launcher)";
+    ok(
+      `getBallot round-trips: close_height=${one.vote_close_height} outcome_domain=${String(one.outcome_domain_hash).slice(0, 18)}… ${memoLine}`
+    );
   } else {
     info("(No ballots to point-look-up; getBallot exercise skipped)");
   }
@@ -345,6 +457,140 @@ async function phaseWalletCeremony(opts) {
       throw new Error(`Wallet ceremony failed for validator ${v.name}: ${e.message}`);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3.5 — phaseCeremonyDeploy (deploy Ceremony Singleton)
+// ---------------------------------------------------------------------------
+//
+// Replaces the prior single-participant Groth16 trusted setup with the
+// on-chain multi-participant ceremony. Invokes the new wasm export
+// `deployCeremonyBundle` and (when --run-ceremony-deploy is set)
+// pushes the bundle. Subsequent contributions and VK derivation run
+// in `phaseContribute` and `phaseDeriveVk`.
+//
+// SCAFFOLD STATUS: bundle assembly is end-to-end; chain push is gated
+// behind the explicit flag because the simulator-side coverage of the
+// on-chain action layer dispatch lands in Phase 5 sub-step 3. Until
+// then, --run-ceremony-deploy on mainnet is a "build-only" smoke test
+// — the bundle round-trips through wasm and is dry-run-validated, but
+// not pushed.
+async function phaseCeremonyDeploy(opts) {
+  step("Phase 3.5: deploy Ceremony Singleton");
+  if (!opts.runCeremonyDeploy) {
+    info("(skip — pass --run-ceremony-deploy to exercise the new on-chain ceremony deploy)");
+    return null;
+  }
+  if (!opts.credentials) {
+    throw new Error("phaseCeremonyDeploy requires --credentials <path-to-.test-credentials>");
+  }
+  const creds = await parseCredentials(opts.credentials);
+  if (!creds.funding.mnemonic) {
+    throw new Error(
+      "phaseCeremonyDeploy: funder mnemonic missing from .test-credentials"
+    );
+  }
+  const funder = deriveSyntheticFromMnemonic(creds.funding.mnemonic);
+  const funderPh = "0x" + funder.puzzleHashHex;
+  const coins = await coinRecordsByPuzzleHash(funderPh, false);
+  const candidate = coins
+    .filter((c) => c.spentHeight === 0 && c.amount >= 100)
+    .sort((a, b) => b.amount - a.amount)[0];
+  if (!candidate) {
+    throw new Error(
+      `phaseCeremonyDeploy: no unspent funder coins ≥100 mojos at ${funderPh}`
+    );
+  }
+
+  const peak = await peakHeight();
+  const params = {
+    startBlockHeight: peak,
+    ceremonyLengthBlocks: 1000,
+    minParticipants: 1,
+    vkSeedHex: "00".repeat(31) + "01", // canonical placeholder seed (bare hex, no 0x prefix)
+    label: "harness-ceremony",
+  };
+  info(
+    `Ceremony deploy params: startBlockHeight=${params.startBlockHeight} ` +
+      `length=${params.ceremonyLengthBlocks} min=${params.minParticipants}`
+  );
+  // Match buildDeployBundle's coin shape: bare hex (no 0x), camelCase fields.
+  const parentJs = {
+    parentCoinInfo: candidate.parentCoinInfo,
+    puzzleHash: candidate.puzzleHash,
+    amount: candidate.amount,
+    spentHeight: candidate.spentHeight,
+    confirmedHeight: candidate.confirmedHeight,
+  };
+  const result = wasm.deployCeremonyBundle(params, parentJs, funder.syntheticPkHex);
+  ok(`built ceremony deploy bundle, launcherId=${result.launcherIdHex.slice(0, 18)}…`);
+  info(
+    "(chain-push of the ceremony bundle is opt-in: not yet enabled even " +
+      "with --push; flip the inner gate when ready to spend mainnet mojos)"
+  );
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3.6 — phaseContribute (loop N participant contributions)
+// ---------------------------------------------------------------------------
+
+async function phaseContribute(opts, ceremony) {
+  step("Phase 3.6: submit ceremony contributions");
+  if (!opts.runCeremonyContribute || !ceremony) {
+    info("(skip — pass --run-ceremony-contribute and ensure phaseCeremonyDeploy ran)");
+    return [];
+  }
+  // Operational model: contributions come from PARTICIPANTS (browsers
+  // hitting /ceremony via Sage), not the harness operator. The
+  // harness exercises the deploy + chain-walk + derive-vk paths;
+  // the contribute path's correctness is covered by the SDK's
+  // simulator e2e (`sdk/tests/ceremony_5_contributions_e2e.rs`)
+  // which runs 5 chained contributions through the action layer.
+  // To submit a real mainnet contribution, open
+  //   http://localhost:3000/ceremony?id=<launcher_hex>
+  // and use the "Generate contribution payload" button (Phase 4
+  // sub-step 11+). Sage integration for the participant signing
+  // path lands when chip0002_signMessageUnsafe ships (Task #26).
+  info(
+    "(intentionally deferred — contributions are submitted by " +
+      "PARTICIPANTS via the /ceremony dApp UI, not the harness " +
+      "operator. SDK simulator e2e covers the contribute path.)"
+  );
+  return [];
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3.7 — phaseDeriveVk (chain-walk + derive VK from contributions)
+// ---------------------------------------------------------------------------
+
+async function phaseDeriveVk(opts, ceremony) {
+  step("Phase 3.7: derive VK from on-chain contributions");
+  if (!opts.runCeremonyDeriveVk || !ceremony) {
+    info("(skip — pass --run-ceremony-derive-vk after a ceremony deploy)");
+    return null;
+  }
+  const backend = createChainBackend();
+  const contributionsJson = await wasm.listCeremonyContributions(
+    backend,
+    ceremony.launcherIdHex
+  );
+  const contributions = JSON.parse(contributionsJson);
+  ok(`chain-walked ${contributions.length} contribution(s)`);
+  if (contributions.length === 0) {
+    info("No contributions on chain yet; cannot derive a VK");
+    return null;
+  }
+  // vk_seed is the canonical placeholder used by phaseCeremonyDeploy.
+  const vkSeedHex = "00".repeat(31) + "01";
+  // Min participants matches the deploy params; bump if the deploy
+  // params change to keep this gate honest.
+  const minParticipants = 1n;
+  const vk = wasm.deriveVkFromCeremony(contributions, vkSeedHex, minParticipants);
+  ok(
+    `derived VK: ${(vk.raw_bytes ?? vk.rawBytes ?? []).length || "?"} bytes`
+  );
+  return vk;
 }
 
 // ---------------------------------------------------------------------------
@@ -425,12 +671,71 @@ async function phaseDeploy(opts) {
 
   // ── 5. Build the deploy bundle ────────────────────────────────
   step(" → buildDeployBundle");
+
+  // V12: optional ceremony→election link. When --linked-ceremony-id
+  // is supplied, discover the unspent voucher and thread the four
+  // ceremony-link fields into params; otherwise stay on the legacy
+  // unlinked path (params omits the optional fields). The wasm export
+  // enforces an all-or-none rule (V10b) so partial population would
+  // hard-fail at decode time.
+  let linkedFields = {};
+  if (opts.linkedCeremonyId) {
+    step(` → V12 ceremony link discovery (id=${opts.linkedCeremonyId.slice(0, 18)}…)`);
+    const backend = createChainBackend();
+    const bootstrapJson = await wasm.recoverCeremonyBootstrap(
+      backend,
+      opts.linkedCeremonyId
+    );
+    if (!bootstrapJson) {
+      throw new Error(
+        `linked deploy: could not recover ceremony bootstrap for ${opts.linkedCeremonyId} ` +
+          `(launcher unspent or memo schema mismatch)`
+      );
+    }
+    const bootstrap = JSON.parse(bootstrapJson);
+    const vkBytes = Buffer.from(
+      ceremony.verificationKeyHex.replace(/^0x/, ""),
+      "hex"
+    );
+    const { createHash } = await import("node:crypto");
+    const vkHashHex = "0x" + createHash("sha256").update(vkBytes).digest("hex");
+    info(`vk_hash=${vkHashHex.slice(0, 18)}… (sha256 of curried VK)`);
+    const voucherRaw = await wasm.findCeremonyVoucherCoin(
+      backend,
+      opts.linkedCeremonyId,
+      vkHashHex,
+      BigInt(bootstrap.maxVoters)
+    );
+    if (voucherRaw == null) {
+      throw new Error(
+        `linked deploy: no unspent voucher found for ceremony ` +
+          `${opts.linkedCeremonyId} (vk_hash=${vkHashHex}, ` +
+          `max_voters=${bootstrap.maxVoters}). Verify the SimulatedBackend ` +
+          `VK matches the ceremony's derived VK and that finalize has run.`
+      );
+    }
+    const voucher = voucherRaw instanceof Map
+      ? Object.fromEntries(voucherRaw)
+      : voucherRaw;
+    ok(
+      `voucher coin: parent=${String(voucher.parentCoinIdHex).slice(0, 18)}… ` +
+        `amount=${voucher.amount}`
+    );
+    linkedFields = {
+      ceremonyLauncherIdHex: opts.linkedCeremonyId,
+      vkHashHex,
+      ceremonyVoucherCoinParentIdHex: voucher.parentCoinIdHex,
+      ceremonyVoucherAmount: voucher.amount,
+    };
+  }
+
   const params = {
     verificationKeyHex: ceremony.verificationKeyHex,
     catTailHashHex: opts.catTailHashHex,
     collateralAmount: 1, // 1 CAT mojo per voter (placeholder; voters need actual CATs to register)
     electionStartHeight: peak,
     label: "wasm-integration-smoke",
+    ...linkedFields,
   };
   // Pass parent coin in JsCoinRecord shape (bare hex, no 0x).
   const parentJs = {
@@ -517,6 +822,11 @@ async function phaseDeploy(opts) {
     catTailHashHex: opts.catTailHashHex,
     ceremony,
     funder,
+    // Threaded through so phaseFinalize can build the Groth16 proof
+    // without re-reading the artifact file.
+    provingKeyBytesB64: Buffer.from(ceremony.provingKeyBytes).toString(
+      "base64"
+    ),
   };
 }
 
@@ -658,22 +968,40 @@ async function phaseCreateBallot(opts, deploy) {
   info(`outcome_domain_hash = ${outcomeDomainHashHex.slice(0, 18)}…`);
   info(`vote_close_height   = ${voteCloseHeight} (peak ${peak} + 50)`);
 
+  // M15: per-ballot vote-mode commitment. Default 0x00…00 = Mode1Free.
+  const ballotVoteOptionsRootHex = (() => {
+    const raw = opts.ballotVoteOptionsRootHex ?? ("0x" + "00".repeat(32));
+    return raw.startsWith("0x") ? raw : "0x" + raw;
+  })();
+  info(
+    `ballot vote_options_root = ${ballotVoteOptionsRootHex.slice(0, 18)}…` +
+      (opts.ballotVoteOptionsRootHex ? " (Mode2Restricted)" : " (Mode1Free)")
+  );
+
   const params = {
     ballotSeedHex,
     voteCloseHeight,
     outcomeDomainHashHex,
+    voteOptionsRootHex: ballotVoteOptionsRootHex,
   };
 
   // ── 4. Call wasm.createBallotBundle ───────────────────────────
   step(" → wasm.createBallotBundle");
   const backend = createChainBackend({ verbose: opts.verbose });
+  // Mirror the dApp: re-validate electionStartHeight against chain
+  // before any write spend. Off-by-one in this value produces a
+  // completely different eve_ph (sha cascade) and dry_run rejects.
+  const chainEsh = await recoverElectionStartHeightOrFail(
+    backend,
+    deploy.configJson
+  );
   const resultJson = await wasm.createBallotBundle(
     backend,
     deploy.configJson,
     funderSpendBytes,
     JSON.stringify(params),
     wasm.WasmNetwork.Mainnet,
-    BigInt(deploy.electionStartHeight)
+    chainEsh
   );
   const created = JSON.parse(resultJson);
   ok(`ballot_launcher_id = ${created.ballotLauncherIdHex}`);
@@ -707,7 +1035,7 @@ async function phaseCreateBallot(opts, deploy) {
   if (opts.pushDeploy) {
     step(" → push createBallot bundle");
     const response = await pushSpendBundleBytes(finalBundleBytes, { network: "mainnet" });
-    if (response.status !== "SUCCESS" && response.status !== 1) {
+    if (response.status !== "SUCCESS" && response.status !== 1 && response.status !== "PENDING" && response.status !== 3) {
       throw new Error(`push_tx returned: ${response.status} (${response.error ?? "(none)"})`);
     }
     ok(`push_tx accepted: ${response.status}`);
@@ -789,11 +1117,18 @@ async function phaseLaunchBallot(opts, deploy, createdBallot) {
 
   // Per-ballot params: same vote_close_height + outcome_domain we used
   // at create. Threshold = 1/2 (strict majority of weight).
+  // M15: vote_options_root MUST byte-equal what create_ballot used,
+  // or the predicted eve Ballot Coin puzzle hash mismatches chain.
+  const launchVoteOptionsRootHex = (() => {
+    const raw = opts.ballotVoteOptionsRootHex ?? ("0x" + "00".repeat(32));
+    return raw.startsWith("0x") ? raw : "0x" + raw;
+  })();
   const params = {
     voteCloseHeight: createdBallot.voteCloseHeight ?? deploy.electionStartHeight + 50,
     outcomeDomainHashHex: createdBallot.outcomeDomainHashHex ?? "0x" + "01".repeat(32),
     voteThresholdNum: 1,
     voteThresholdDen: 2,
+    voteOptionsRootHex: launchVoteOptionsRootHex,
   };
 
   // Capture the Election Singleton's state RIGHT BEFORE launch so the
@@ -804,11 +1139,16 @@ async function phaseLaunchBallot(opts, deploy, createdBallot) {
   // launchBallot; ours observe the same chain tip so they agree by
   // construction (modulo a concurrent register landing mid-phase).
   const snapshotBackend = createChainBackend({ verbose: opts.verbose });
+  // Recover esh from chain (mirrors dApp behavior).
+  const chainEsh = await recoverElectionStartHeightOrFail(
+    snapshotBackend,
+    deploy.configJson
+  );
   step(" → wasm.readElectionSingletonState (snapshot pre-launch)");
   const stateJson = await wasm.readElectionSingletonState(
     snapshotBackend,
     deploy.configJson,
-    BigInt(deploy.electionStartHeight)
+    chainEsh
   );
   const preLaunchState = JSON.parse(stateJson);
   ok(
@@ -825,7 +1165,7 @@ async function phaseLaunchBallot(opts, deploy, createdBallot) {
     ballotLauncherIdHex,
     JSON.stringify(params),
     wasm.WasmNetwork.Mainnet,
-    BigInt(deploy.electionStartHeight)
+    chainEsh
   );
   const launched = JSON.parse(resultJson);
   ok(`eve_ballot_coin_id    = ${launched.eveBallotCoinIdHex}`);
@@ -840,7 +1180,7 @@ async function phaseLaunchBallot(opts, deploy, createdBallot) {
 
   step(" → push launchBallot bundle");
   const response = await pushSpendBundleBytes(bundleBytes, { network: "mainnet" });
-  if (response.status !== "SUCCESS" && response.status !== 1) {
+  if (response.status !== "SUCCESS" && response.status !== 1 && response.status !== "PENDING" && response.status !== 3) {
     throw new Error(`push_tx returned: ${response.status} (${response.error ?? "(none)"})`);
   }
   ok(`push_tx accepted: ${response.status}`);
@@ -921,17 +1261,34 @@ async function phaseRegisterVoter(opts, deploy) {
     });
   }
 
+  // Recover esh from chain ONCE before the loop (mirrors dApp's
+  // self-heal in handleRegister — every write spend re-validates esh).
+  const eshBackend = createChainBackend({ verbose: opts.verbose });
+  const chainEsh = await recoverElectionStartHeightOrFail(
+    eshBackend,
+    deploy.configJson
+  );
+
   const registered = [];
   for (const entry of validatorsToRegister) {
     info(`\n--- Registering ${entry.v.name} (${entry.accountPkHex.slice(0, 18)}…) ---`);
+
+    // Weighted-voting revision: each voter chooses how much CAT to
+    // lock, bounded below by the curried `collateral_amount`
+    // minimum. For this harness every validator locks the floor —
+    // varied amounts require pre-minted CAT coins at multiple sizes,
+    // see harness setup. Locking 5x at one validator (whale) +
+    // floor at others would prove non-uniform weights end-to-end.
+    const lockAmount = collateral;
+
     // Find a CAT coin owned by this validator
     const catOuter = wasm.catOuterPuzzleHash(catTail, entry.p2);
     const catCoins = await coinRecordsByPuzzleHash(catOuter, false);
     const ready = catCoins
-      .filter((c) => c.spentHeight === 0 && c.amount >= collateral)
+      .filter((c) => c.spentHeight === 0 && c.amount >= lockAmount)
       .sort((a, b) => a.amount - b.amount);
     if (ready.length === 0) {
-      info(`  no CAT coin >= ${collateral} mojos for ${entry.v.name}; skipping`);
+      info(`  no CAT coin >= ${lockAmount} mojos for ${entry.v.name}; skipping`);
       continue;
     }
     const catCoin = ready[0];
@@ -939,7 +1296,11 @@ async function phaseRegisterVoter(opts, deploy) {
     const catCoinIdHex = await computeCoinId(catCoin);
     ok(`  CAT input coin: amount=${catCoin.amount} id=${catCoinIdHex.slice(0, 18)}…`);
 
-    // Build the CAT registration parent spend
+    // Build the CAT registration parent spend.
+    // Final positional arg here is the voter's chosen `lock_amount`
+    // (formerly `collateral_amount`) — what the on-chain register
+    // action will assert against `int_to_8_bytes_be(locked_cat_mojos)`
+    // in the create_reg announcement preimage.
     step("   → wasm.buildCatRegistrationSpend");
     const backend = createChainBackend({ verbose: opts.verbose });
     const catParentSpendBytes = await wasm.buildCatRegistrationSpend(
@@ -948,16 +1309,9 @@ async function phaseRegisterVoter(opts, deploy) {
       "0x" + catCoinIdHex,
       electionLauncherIdHex,
       catTail,
-      BigInt(collateral)
+      BigInt(lockAmount)
     );
     ok(`  CAT parent spend: ${catParentSpendBytes.length} streamable bytes`);
-
-    // Pubkeys for SMT — only those ALREADY registered on-chain (so
-    // the SMT root we compute matches the on-chain registration_merkle_root).
-    // The voter being registered must NOT be in the list (non-membership
-    // proof). `registered` is the list of voters confirmed earlier in
-    // THIS run; for the first register against a fresh singleton it's empty.
-    const otherPubkeys = registered.map((r) => r.accountPkHex);
 
     // Call wasm.registerBuildSpends
     step("   → wasm.registerBuildSpends");
@@ -966,10 +1320,10 @@ async function phaseRegisterVoter(opts, deploy) {
       backend2,
       deploy.configJson,
       "0x" + bytesToHex(entry.accountSecretBytes),
-      JSON.stringify(otherPubkeys),
       catParentSpendBytes,
+      BigInt(lockAmount),
       wasm.WasmNetwork.Mainnet,
-      BigInt(deploy.electionStartHeight)
+      chainEsh
     );
     const bundleBytes = hexToBytesU8(bundleHex);
     ok(`  register bundle: ${bundleBytes.length} bytes (SDK-signed: voter account_sk only)`);
@@ -1004,7 +1358,7 @@ async function phaseRegisterVoter(opts, deploy) {
       // treat as success and proceed to poll for the reg coin.
       const isAlreadyIncluded =
         typeof response.error === "string" && response.error.includes("ALREADY_INCLUDING_TRANSACTION");
-      if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded) {
+      if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded && response.status !== "PENDING" && response.status !== 3) {
         throw new Error(`push: ${response.status} (${response.error ?? "(none)"})`);
       }
       ok(`  push_tx accepted: ${isAlreadyIncluded ? "ALREADY_IN_MEMPOOL" : response.status}`);
@@ -1129,6 +1483,69 @@ async function phaseCastVote(opts, deploy) {
       `--- Casting ${v.name} (pk=${accountPkHex.slice(0, 18)}…, reg_coin amount=${unspentReg.amount}) ---`
     );
 
+    // M5r-merkle-i: when --ballot-options-csv is set, derive the
+    // (vote_options_root, leaf_index, proof) trio for the cast and
+    // thread into params so the puzzle's M5r-merkle-e gate accepts.
+    let modeRestrictedFields = {};
+    if (opts.ballotOptionsCsv) {
+      const labels = opts.ballotOptionsCsv
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      if (labels.length < 2) {
+        throw new Error(
+          `--ballot-options-csv must contain at least 2 labels (got ${labels.length})`
+        );
+      }
+      const optionHashes = [];
+      for (const label of labels) {
+        const enc = new TextEncoder().encode("vote:" + label);
+        const h = await sha256Bytes(enc);
+        optionHashes.push(bytesToHex(h));
+      }
+      const concat = optionHashes.join("");
+      const derivedRootRaw = await wasm.merkleRootOfSortedCoinIds(concat);
+      const derivedRoot = derivedRootRaw.startsWith("0x")
+        ? derivedRootRaw.toLowerCase()
+        : "0x" + derivedRootRaw.toLowerCase();
+      // Cross-check against --ballot-vote-options-root if non-zero.
+      if (opts.ballotVoteOptionsRootHex) {
+        const flagRoot = opts.ballotVoteOptionsRootHex.startsWith("0x")
+          ? opts.ballotVoteOptionsRootHex.toLowerCase()
+          : "0x" + opts.ballotVoteOptionsRootHex.toLowerCase();
+        const FREE = "0x" + "00".repeat(32);
+        if (flagRoot !== FREE && flagRoot !== derivedRoot) {
+          throw new Error(
+            `--ballot-options-csv derives ${derivedRoot} but ` +
+              `--ballot-vote-options-root is ${flagRoot} — operator ` +
+              `labels don't match the locked ballot`
+          );
+        }
+      }
+      const target = voteDataHex.startsWith("0x")
+        ? voteDataHex
+        : "0x" + voteDataHex;
+      const proofRaw = await wasm.merkleProofForOption(concat, target);
+      if (proofRaw == null) {
+        throw new Error(
+          `vote choice "${choice}" is NOT in --ballot-options-csv — cast ` +
+            `would raise the M5r-merkle-e gate`
+        );
+      }
+      const proof = proofRaw instanceof Map
+        ? Object.fromEntries(proofRaw)
+        : proofRaw;
+      modeRestrictedFields = {
+        voteOptionsRootHex: derivedRoot,
+        voteOptionLeafIndex: Number(proof.leafIndex),
+        voteOptionProofHex: proof.proofHex,
+      };
+      info(
+        `Mode2Restricted: leaf_index=${modeRestrictedFields.voteOptionLeafIndex}, ` +
+          `proof_depth=${modeRestrictedFields.voteOptionProofHex.length}`
+      );
+    }
+
     const params = {
       ballotLauncherIdHex: "0x" + candidate.ballotLauncherIdHex.replace(/^0x/, ""),
       voteDataHex,
@@ -1138,17 +1555,23 @@ async function phaseCastVote(opts, deploy) {
       registrationMerkleRootSnapshotHex: candidate.registrationMerkleRootSnapshotHex,
       registrationVoteWeightSnapshot: candidate.registrationVoteWeightSnapshot,
       votingCoinAmount: 1,
+      ...modeRestrictedFields,
     };
 
     step("   → wasm.castVoteBuildFinalBundle");
     const backend = createChainBackend({ verbose: opts.verbose });
+    // Mirror dApp: re-validate esh against chain before each write.
+    const chainEsh = await recoverElectionStartHeightOrFail(
+      backend,
+      deploy.configJson
+    );
     const resultJson = await wasm.castVoteBuildFinalBundle(
       backend,
       deploy.configJson,
       "0x" + bytesToHex(accountSecretBytes),
       JSON.stringify(params),
       wasm.WasmNetwork.Mainnet,
-      BigInt(deploy.electionStartHeight)
+      chainEsh
     );
     const result = JSON.parse(resultJson);
     ok(`  voting_coin_id  = ${result.votingCoinIdHex}`);
@@ -1166,7 +1589,7 @@ async function phaseCastVote(opts, deploy) {
       const isAlreadyIncluded =
         typeof response.error === "string" &&
         response.error.includes("ALREADY_INCLUDING_TRANSACTION");
-      if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded) {
+      if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded && response.status !== "PENDING" && response.status !== 3) {
         throw new Error(`push_tx returned: ${response.status} (${response.error ?? "(none)"})`);
       }
       ok(`  push_tx accepted: ${isAlreadyIncluded ? "ALREADY_IN_MEMPOOL" : response.status}`);
@@ -1178,6 +1601,72 @@ async function phaseCastVote(opts, deploy) {
         timeoutMs: 600_000,
       });
       ok(`  voting coin confirmed at height ${rec.confirmedHeight}`);
+
+      // Chain-discovery: prove the voting coin is reachable through
+      // BOTH paths the SDK + dApp use elsewhere — by hint
+      // (voterHint + coinRecordsByHint) AND by pubkey
+      // (collectVotesForBallot, which is itself hint-indexed but
+      // exposes the wire-extracted vote_data so we can verify the
+      // memo decoded correctly).
+      step("   → discover by voter_hint + coinRecordsByHint");
+      const _cfg = JSON.parse(deploy.configJson);
+      const _electionLauncherIdHex =
+        "0x" + String(_cfg.election_launcher_id_hex ?? "").replace(/^0x/, "");
+      const _catTail =
+        "0x" + String(_cfg.cat_tail_hash_hex ?? "").replace(/^0x/, "");
+      const discoveryHintHex = String(
+        wasm.voterHint(_electionLauncherIdHex, _catTail, accountPkHex)
+      );
+      const hintRecords = await coinRecordsByHint(discoveryHintHex, true);
+      ok(
+        `  voter_hint ${discoveryHintHex.slice(0, 18)}… returned ` +
+          `${hintRecords.length} hint-indexed coin record(s) on chain`
+      );
+
+      step("   → discover by pubkey + wasm.collectVotesForBallot");
+      const collectBackend = createChainBackend({ verbose: opts.verbose });
+      const wireVotesJson = await wasm.collectVotesForBallot(
+        collectBackend,
+        deploy.configJson,
+        "0x" + candidate.ballotLauncherIdHex.replace(/^0x/, ""),
+        JSON.stringify([accountPkHex])
+      );
+      const wireVotes = JSON.parse(wireVotesJson);
+      const myWireVote = wireVotes.find((row) => {
+        const rowPk = String(
+          row.voter_pubkey_hex ?? row.voterPubkeyHex ?? ""
+        )
+          .toLowerCase()
+          .replace(/^0x/, "");
+        return rowPk === accountPkHex.toLowerCase().replace(/^0x/, "");
+      });
+      if (!myWireVote) {
+        throw new Error(
+          `chain discovery: collectVotesForBallot did not surface a ` +
+            `vote for ${v.name} (pk=${accountPkHex.slice(0, 18)}…) on ` +
+            `ballot ${candidate.ballotLauncherIdHex.slice(0, 18)}…`
+        );
+      }
+      const wireVoteData = String(
+        myWireVote.vote_data_hex ?? myWireVote.voteDataHex ?? ""
+      )
+        .toLowerCase()
+        .replace(/^0x/, "");
+      const expectedVoteData = voteDataHex
+        .toLowerCase()
+        .replace(/^0x/, "");
+      if (wireVoteData !== expectedVoteData) {
+        throw new Error(
+          `chain discovery: collectVotesForBallot reported vote_data ` +
+            `${wireVoteData.slice(0, 18)}… for ${v.name} but expected ` +
+            `${expectedVoteData.slice(0, 18)}… — walker/memo divergence`
+        );
+      }
+      ok(
+        `  ✓ vote reachable via collectVotesForBallot ` +
+          `(vote_data ${wireVoteData.slice(0, 18)}… matches)`
+      );
+
       cast.push({
         validator: v.name,
         accountPkHex,
@@ -1313,6 +1802,36 @@ async function phaseFinalize(opts, deploy) {
 
   step(" → wasm.buildBallotFinalizeBundle (runs Groth16 prover — may take seconds)");
   const finalizeBackend = createChainBackend({ verbose: opts.verbose });
+  // Mirror dApp: re-validate esh against chain before finalize.
+  const chainEsh = await recoverElectionStartHeightOrFail(
+    finalizeBackend,
+    deploy.configJson
+  );
+
+  // Idempotency: a prior `PENDING` finalize bundle may have confirmed
+  // on chain after the harness errored out. Walk the ballot's lineage
+  // and detect a state-advanced (post-finalize) coin BEFORE rebuilding
+  // the bundle — re-finalizing produces a "Ballot Coin ph doesn't
+  // match predicted" trap from the SDK because the on-chain ballot's
+  // inner state is no longer fresh `(0, 0, 0)`.
+  step(" → check whether ballot is already finalized on chain");
+  const eveBallotPh = "0x" + candidate.eveBallotPuzzleHashHex.replace(/^0x/, "");
+  const recordsAtEvePh = await coinRecordsByPuzzleHash(eveBallotPh, true);
+  const unspentAtEve = recordsAtEvePh.find((c) => c.spentHeight === 0);
+  if (recordsAtEvePh.length > 0 && !unspentAtEve) {
+    // Eve and any state-preserving co-spent (cast_vote oracle)
+    // children all show as SPENT at this puzzle hash. The current
+    // singleton coin is at a DIFFERENT puzzle hash — the only action
+    // that changes the ballot inner state is finalize, so this is
+    // proof that finalize already landed.
+    ok(
+      `ballot ${candidate.ballotLauncherIdHex.slice(0, 18)}… eve and ` +
+        `${recordsAtEvePh.length} co-spent recreations are all spent at ` +
+        `the eve ph; finalize must have landed in a prior run. Skipping.`
+    );
+    return;
+  }
+
   const bundleHex = await wasm.buildBallotFinalizeBundle(
     finalizeBackend,
     deploy.configJson,
@@ -1322,7 +1841,7 @@ async function phaseFinalize(opts, deploy) {
     votesJson,
     provingKeyBytes,
     wasm.WasmNetwork.Mainnet,
-    BigInt(deploy.electionStartHeight)
+    chainEsh
   );
   const bundleBytes = hexToBytesU8(bundleHex);
   ok(`finalize bundle: ${bundleBytes.length} bytes`);
@@ -1337,10 +1856,30 @@ async function phaseFinalize(opts, deploy) {
     const isAlreadyIncluded =
       typeof response.error === "string" &&
       response.error.includes("ALREADY_INCLUDING_TRANSACTION");
-    if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded) {
+    // Coinset returns "PENDING" when the bundle is in the mempool
+    // but not yet in a block — same as SUCCESS for our purposes.
+    // Real failures surface as "FAILED" or other non-success codes
+    // (DOUBLE_SPEND, ASSERT_HEIGHT, etc).
+    const isPending =
+      response.status === "PENDING" ||
+      response.status === 3;
+    const isSuccess =
+      response.status === "SUCCESS" ||
+      response.status === 1 ||
+      isAlreadyIncluded ||
+      isPending;
+    if (!isSuccess) {
       throw new Error(`push_tx returned: ${response.status} (${response.error ?? "(none)"})`);
     }
-    ok(`push_tx accepted: ${isAlreadyIncluded ? "ALREADY_IN_MEMPOOL" : response.status}`);
+    ok(
+      `push_tx accepted: ${
+        isAlreadyIncluded
+          ? "ALREADY_IN_MEMPOOL"
+          : isPending
+            ? "PENDING_IN_MEMPOOL"
+            : response.status
+      }`
+    );
 
     // Confirm by polling for the LATEST ballot coin (post-cast_vote)
     // to become spent — that's what the finalize bundle consumes. The
@@ -1517,17 +2056,28 @@ async function phaseRelease(opts, deploy) {
     const destCatOuter = wasm.catOuterPuzzleHash(catTail, destinationPhHex);
     info(`  expected CAT outer ph = ${String(destCatOuter).slice(0, 18)}…`);
 
+    // Weighted-voting revision: wasm reconstructs the SMT from chain
+    // (with each voter's real per-leaf locked_amount), so the dApp
+    // / harness no longer threads the pubkey list. The deregister
+    // membership proof recovers `locked_cat_mojos` from the SMT
+    // entry — passing the wrong value here would produce a leaf
+    // that doesn't match the on-chain root and the spend would
+    // reject.
     step("   → wasm.releaseCollateralBuildSpends");
     const backend = createChainBackend({ verbose: opts.verbose });
+    // Mirror dApp: re-validate esh against chain before release.
+    const chainEsh = await recoverElectionStartHeightOrFail(
+      backend,
+      deploy.configJson
+    );
     const bundleHex = await wasm.releaseCollateralBuildSpends(
       backend,
       deploy.configJson,
       "0x" + bytesToHex(entry.accountSecretBytes),
-      JSON.stringify(allVoterPubkeysHex),
       "0x" + regCoinIdHex,
       destinationPhHex,
       wasm.WasmNetwork.Mainnet,
-      BigInt(deploy.electionStartHeight)
+      chainEsh
     );
     const bundleBytes = hexToBytesU8(bundleHex);
     ok(`  release bundle: ${bundleBytes.length} bytes (SDK-signed: voter account_sk only)`);
@@ -1558,7 +2108,7 @@ async function phaseRelease(opts, deploy) {
       const isAlreadyIncluded =
         typeof response.error === "string" &&
         response.error.includes("ALREADY_INCLUDING_TRANSACTION");
-      if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded) {
+      if (response.status !== "SUCCESS" && response.status !== 1 && !isAlreadyIncluded && response.status !== "PENDING" && response.status !== 3) {
         throw new Error(`push_tx returned: ${response.status} (${response.error ?? "(none)"})`);
       }
       ok(`  push_tx accepted: ${isAlreadyIncluded ? "ALREADY_IN_MEMPOOL" : response.status}`);
@@ -1635,11 +2185,16 @@ async function main() {
     console.log("");
     await phaseVoterReadiness(opts, deploy);
     console.log("");
+    // CHIP rev 2026-05-02: register MUST run before create_ballot.
+    // The ballot's curried snapshot freezes registration state at
+    // launch time — if create_ballot runs first, the resulting
+    // ballot has registration_vote_weight_snapshot = 0 and
+    // cast_vote / finalize both reject it as below-threshold.
+    await phaseRegisterVoter(opts, deploy);
+    console.log("");
     const createdBallot = await phaseCreateBallot(opts, deploy);
     console.log("");
     await phaseLaunchBallot(opts, deploy, createdBallot);
-    console.log("");
-    await phaseRegisterVoter(opts, deploy);
     console.log("");
     await phaseCastVote(opts, deploy);
     console.log("");

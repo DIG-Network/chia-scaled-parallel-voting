@@ -49,13 +49,38 @@ fn main(
     // ── Curried ─────────────────────────────────────────────────────
     SINGLETON_LAUNCHER_PUZZLE_HASH: Bytes32,
     ELECTION_LAUNCHER_ID: Bytes32,
+    // M6: sentinel "no lock" for VOTE_MODE_LOCK. When State.vote_mode_lock
+    // equals this, ballot creators can pick any vote_options_root.
+    NO_VOTE_MODE_LOCK: Bytes32,
     Truth: ElectionStateTruth,
     // ── Solution ────────────────────────────────────────────────────
     singleton_coin_id: Bytes32,
     ballot_seed: Bytes32,
     vote_close_height: Int,
-    ...outcome_domain_hash: Bytes32,
+    outcome_domain_hash: Bytes32,
+    // M6: per-ballot vote-mode root the new Ballot Coin will be curried
+    // with. 0x00…00 = Mode1Free; any other value = sorted-options merkle
+    // root (Mode2Restricted). Threaded through the new ballot's curry
+    // composition (off-chain in the SDK) so the ballot's oracle can
+    // commit to it. Gated below against State.vote_mode_lock when the
+    // election was deployed mode-locked.
+    ...ballot_vote_options_root: Bytes32,
 ) -> (ElectionStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    // M6: if the election is mode-locked, the ballot creator MUST use
+    // the locked options root byte-for-byte. Implemented as an
+    // AssertSeconds-style hard equality: emit nothing on success;
+    // raise on mismatch by feeding a tautological hash assertion.
+    // The simpler form: encode the gate as a trinary value the
+    // condition layer can drop.
+    let mode_lock_ok: Bool = if State.vote_mode_lock == NO_VOTE_MODE_LOCK {
+        true
+    } else {
+        State.vote_mode_lock == ballot_vote_options_root
+    };
+    assert mode_lock_ok;
+
     // Pin the singleton's current coin id. CLVM ASSERT_MY_COIN_ID will
     // reject the spend if `singleton_coin_id` doesn't match the actual
     // coin being spent — this is what lets the puzzle compute the eve
@@ -93,6 +118,8 @@ fn main(
     // create_ballot spends in the same block (which would otherwise
     // produce identical announcement preimages because the singleton
     // coin id is fresh per-spend) are still distinguishable to relays.
+    // M6: ballot_vote_options_root is appended so observers can recover
+    // the ballot's vote-mode commitment from chain alone.
     let announce_create = CreateCoinAnnouncement {
         message: sha256(
             "ballot_created"
@@ -101,6 +128,7 @@ fn main(
             + (ballot_seed as Bytes)
             + int_to_8_bytes_be(vote_close_height)
             + (outcome_domain_hash as Bytes)
+            + (ballot_vote_options_root as Bytes)
         ),
     };
 

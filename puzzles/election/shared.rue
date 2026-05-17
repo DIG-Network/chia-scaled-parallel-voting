@@ -18,6 +18,18 @@ import super::common_types::*;
 //                               launched. Curried-equivalent constants
 //                               (epoch lengths, etc.) are computed
 //                               relative to this anchor.
+//   ceremony_launcher_id      — launcher_id of the trusted-setup ceremony
+//                               singleton this election is bound to.
+//                               Set at genesis, propagated unchanged by
+//                               every action.
+//   max_voters                — registration capacity (= 1 << TREE_DEPTH
+//                               of the curried SPT). Matches the chosen
+//                               ceremony's max_voters; sourced via the
+//                               co-spent voucher's canonical announcement.
+//   vk_hash                   — sha256 of the ceremony's derived Groth16
+//                               verifying key. Committed in state so any
+//                               on-chain consumer can verify the election
+//                               uses the exact VK the ceremony produced.
 //
 // In the multi-ballot architecture, the election singleton no longer
 // tracks finalization or a single vote_outcome — those move to
@@ -30,7 +42,14 @@ export struct ElectionState {
     registration_merkle_root: Bytes32,
     registration_count: Int,
     registration_vote_weight: Int,
-    ...election_start_height: Int,
+    election_start_height: Int,
+    ceremony_launcher_id: Bytes32,
+    max_voters: Int,
+    vk_hash: Bytes32,
+    // M2: per-election ballot-mode lock. Sentinel 0xFF…FF = no lock
+    // (each ballot picks its own vote_options_root). Any other value
+    // = exact vote_options_root every ballot must commit to.
+    ...vote_mode_lock: Bytes32,
 }
 
 export struct ElectionStateTruth {

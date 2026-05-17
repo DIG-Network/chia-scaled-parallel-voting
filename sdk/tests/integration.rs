@@ -54,6 +54,11 @@ fn dummy_deploy_params() -> DeployParams {
         },
         cat_tail_hash: Bytes32::new([0x77; 32]),
         collateral_amount: 1_000,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        ceremony_launcher_id: Bytes32::default(),
+        vk_hash: Bytes32::default(),
+        vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         // CHIP rev 2026-05-02: registration_fee + election_length_blocks dropped.
         election_start_height: 0,
         label: Some("integration-test".into()),
@@ -98,7 +103,7 @@ fn deploy_creates_eve_singleton_at_predicted_puzzle_hash() {
     let deployer = ElectionDeployer::new(dummy_deploy_params());
 
     let (coin_spends, config) = deployer
-        .build_deploy_bundle(parent_coin, funder.pk)
+        .build_deploy_bundle(parent_coin, funder.pk, true)
         .expect("build_deploy_bundle should succeed");
 
     // Pre-flight: predict the launcher_id + on-chain singleton hash.
@@ -159,8 +164,8 @@ fn deploy_then_redeploy_with_different_funder_yields_different_election_id() {
     let funder_b = sim.bls(1);
 
     let d = ElectionDeployer::new(dummy_deploy_params());
-    let (_a_spends, a_config) = d.build_deploy_bundle(funder_a.coin, funder_a.pk).unwrap();
-    let (_b_spends, b_config) = d.build_deploy_bundle(funder_b.coin, funder_b.pk).unwrap();
+    let (_a_spends, a_config) = d.build_deploy_bundle(funder_a.coin, funder_a.pk, true).unwrap();
+    let (_b_spends, b_config) = d.build_deploy_bundle(funder_b.coin, funder_b.pk, true).unwrap();
     assert_ne!(
         a_config.election_launcher_id_hex,
         b_config.election_launcher_id_hex,
@@ -180,7 +185,7 @@ fn config_emitted_by_deploy_self_validates() {
     let mut sim = Simulator::new();
     let funder = sim.bls(1);
     let d = ElectionDeployer::new(dummy_deploy_params());
-    let (_spends, config) = d.build_deploy_bundle(funder.coin, funder.pk).unwrap();
+    let (_spends, config) = d.build_deploy_bundle(funder.coin, funder.pk, true).unwrap();
     config.validate().unwrap();
 }
 
@@ -234,11 +239,10 @@ fn tree_depth_constant_is_32() {
 //   * Coin announcements / agg_sig conditions / etc. take effect
 //     on-chain as expected.
 
-use chia_bls::{aggregate, sign, SecretKey, Signature};
-use chia_protocol::{Coin, CoinSpend, Program, SpendBundle};
+use chia_bls::{aggregate, sign, SecretKey};
 use clvm_traits::{clvm_curried_args, ToClvm};
 use clvm_utils::{tree_hash, CurriedProgram};
-use clvmr::{serde::node_to_bytes, Allocator};
+use clvmr::Allocator;
 
 /// Adapter puzzle bytecode: `(r (a 2 5))`.
 /// CLVM serialised form:

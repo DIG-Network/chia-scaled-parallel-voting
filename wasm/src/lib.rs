@@ -208,6 +208,22 @@ impl JsChainReader {
     }
 }
 
+// `JsChainBackend` is a `wasm_bindgen` extern type; the auto-derived
+// `Clone` doesn't carry through to wrapper structs reliably. Implement
+// it via the JsValue deref so we can pass an owned `JsChainReader` to
+// `Aggregator::new(...)` (which consumes its `ChainReader`) AND keep
+// the original around for follow-up actor calls in the same wasm
+// export.
+impl Clone for JsChainReader {
+    fn clone(&self) -> Self {
+        use wasm_bindgen::JsCast;
+        let as_val: &wasm_bindgen::JsValue = AsRef::<wasm_bindgen::JsValue>::as_ref(&self.backend);
+        Self {
+            backend: as_val.clone().unchecked_into(),
+        }
+    }
+}
+
 /// Async helper: await a JS Promise and decode its resolved JSON
 /// value into a Rust type via `serde_wasm_bindgen`.
 async fn await_decode<T: for<'de> Deserialize<'de>>(p: Promise, op: &str) -> VotingResult<T> {
@@ -835,7 +851,7 @@ pub struct WasmCeremonyArtifacts {
 }
 
 /// Run a single-participant trusted-setup ceremony using
-/// [`SimulatedBackend`](chip_voting_sdk::SimulatedBackend) and return
+/// [`SimulatedBackend`](chip_voting_sdk::SimulatedBackend::default()) and return
 /// `(verificationKeyHex, provingKeyBytes)`.
 ///
 /// SECURITY: the simulated backend is a deterministic toy — anyone
@@ -850,13 +866,13 @@ pub fn run_single_participant_ceremony_js() -> Result<JsValue, JsError> {
     use chip_voting_sdk::ceremony::{CeremonyCoordinator, CeremonyParticipant, MpcBackend};
     use chip_voting_sdk::SimulatedBackend;
 
-    let mut coord = CeremonyCoordinator::new(Box::new(SimulatedBackend));
+    let mut coord = CeremonyCoordinator::new(Box::new(SimulatedBackend::default()));
     coord
         .start("chip-voting-v1".into())
         .map_err(|e| JsError::new(&format!("ceremony start: {e:?}")))?;
 
     let alice = CeremonyParticipant::new(
-        Box::new(SimulatedBackend),
+        Box::new(SimulatedBackend::default()),
         "wasm-single-participant".into(),
         Some("wasm runSingleParticipantCeremony".into()),
     );
@@ -879,7 +895,7 @@ pub fn run_single_participant_ceremony_js() -> Result<JsValue, JsError> {
     let final_transcript = coord
         .current_transcript()
         .map_err(|e| JsError::new(&format!("current_transcript: {e:?}")))?;
-    let backend = SimulatedBackend;
+    let backend = SimulatedBackend::default();
     let (pk_wire, vk_wire) = backend
         .extract_keys(final_transcript)
         .map_err(|e| JsError::new(&format!("extract_keys: {e:?}")))?;
@@ -990,6 +1006,34 @@ pub fn build_deploy_bundle_js(
         cat_tail_hash_hex: String,
         collateral_amount: u64,
         election_start_height: u64,
+        // V9 + V10-finish: ceremony-link fields.
+        // ALL-OR-NONE semantics:
+        //   * All four fields present (and parseable) → use the V7
+        //     linked-deploy path: co-spend the voucher and assert
+        //     its canonical announcement.
+        //   * All four fields absent (or empty/null) → fall back to
+        //     the legacy unlinked path (`build_deploy_bundle` with
+        //     `allow_unlinked_ceremony=true`). This keeps single-
+        //     participant test-mode deploys working until the dApp
+        //     /create page learns to discover real vouchers from a
+        //     finalized ceremony.
+        //   * Mixed presence → error (caller is in an inconsistent
+        //     state and we can't safely default the missing fields).
+        #[serde(default)]
+        ceremony_launcher_id_hex: Option<String>,
+        #[serde(default)]
+        vk_hash_hex: Option<String>,
+        #[serde(default)]
+        ceremony_voucher_coin_parent_id_hex: Option<String>,
+        #[serde(default)]
+        ceremony_voucher_amount: Option<u64>,
+        // M9: per-election ballot-mode lock. Optional. Defaults to
+        // VOTE_MODE_LOCK_NONE sentinel ("no lock" — each ballot picks
+        // its own mode). 32-byte hex; "ff..ff" = no lock,
+        // "00..00" = lock to Mode1Free, anything else = lock to that
+        // exact sorted-options-merkle-root.
+        #[serde(default)]
+        vote_mode_lock_hex: Option<String>,
         #[serde(default)]
         label: Option<String>,
     }
@@ -1013,16 +1057,84 @@ pub fn build_deploy_bundle_js(
     let funder_pk = PublicKey::from_bytes(&pk_arr)
         .map_err(|e| JsError::new(&format!("PublicKey::from_bytes: {e:?}")))?;
 
+    // V9 + V10-finish: route between linked and unlinked deploy paths
+    // based on whether the caller supplied the full voucher field set.
+    let voucher_fields_present = p.ceremony_launcher_id_hex.as_deref().filter(|s| !s.is_empty()).is_some()
+        && p.vk_hash_hex.as_deref().filter(|s| !s.is_empty()).is_some()
+        && p.ceremony_voucher_coin_parent_id_hex.as_deref().filter(|s| !s.is_empty()).is_some()
+        && p.ceremony_voucher_amount.is_some();
+    let voucher_fields_absent = p.ceremony_launcher_id_hex.as_deref().unwrap_or("").is_empty()
+        && p.vk_hash_hex.as_deref().unwrap_or("").is_empty()
+        && p.ceremony_voucher_coin_parent_id_hex.as_deref().unwrap_or("").is_empty()
+        && p.ceremony_voucher_amount.is_none();
+    if !voucher_fields_present && !voucher_fields_absent {
+        return Err(JsError::new(
+            "ceremony-link fields must be ALL provided (linked deploy) or ALL absent \
+             (legacy unlinked deploy); mixed state rejected to prevent silent fallback",
+        ));
+    }
+
+    // Parse ceremony-link inputs (only meaningful when present; default to
+    // sentinel zeros for the unlinked path so DeployParams stays well-formed).
+    let ceremony_launcher_id = match p.ceremony_launcher_id_hex.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => parse_hex32(s)
+            .map_err(|e| JsError::new(&format!("ceremony_launcher_id_hex: {e:?}")))?,
+        None => chia_protocol::Bytes32::default(),
+    };
+    let vk_hash = match p.vk_hash_hex.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => parse_hex32(s)
+            .map_err(|e| JsError::new(&format!("vk_hash_hex: {e:?}")))?,
+        None => chia_protocol::Bytes32::default(),
+    };
+
+    let vote_mode_lock = match &p.vote_mode_lock_hex {
+        Some(s) if !s.is_empty() => parse_hex32(s)
+            .map_err(|e| JsError::new(&format!("vote_mode_lock_hex: {e:?}")))?,
+        _ => chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
+    };
+
     let deployer = ElectionDeployer::new(DeployParams {
         verification_key: VerificationKey { raw_bytes: vk_bytes },
         cat_tail_hash: cat_tail,
         collateral_amount: p.collateral_amount,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
         election_start_height: p.election_start_height,
+        ceremony_launcher_id,
+        vk_hash,
+        vote_mode_lock,
         label: p.label,
     });
-    let (coin_spends, config) = deployer
-        .build_deploy_bundle(parent_coin_obj, funder_pk)
-        .map_err(|e| JsError::new(&format!("build_deploy_bundle: {e:?}")))?;
+
+    let (coin_spends, config) = if voucher_fields_present {
+        // Linked deploy: reconstruct the voucher coin from supplied fields,
+        // then call build_deploy_bundle_with_ceremony_link.
+        let voucher_parent = parse_hex32(
+            p.ceremony_voucher_coin_parent_id_hex
+                .as_deref()
+                .expect("voucher_fields_present checked above"),
+        )
+        .map_err(|e| JsError::new(&format!("ceremony_voucher_coin_parent_id_hex: {e:?}")))?;
+        let voucher_ph = chip_voting_sdk::puzzles::ceremony_voucher_puzzle_hash(
+            vk_hash,
+            chip_voting_sdk::config::MAX_SIGNERS as u64,
+            ceremony_launcher_id,
+        );
+        let voucher_coin = chia_protocol::Coin::new(
+            voucher_parent,
+            voucher_ph,
+            p.ceremony_voucher_amount.unwrap(),
+        );
+        deployer
+            .build_deploy_bundle_with_ceremony_link(parent_coin_obj, funder_pk, voucher_coin)
+            .map_err(|e| JsError::new(&format!("build_deploy_bundle_with_ceremony_link: {e:?}")))?
+    } else {
+        // Unlinked legacy path (test-mode + back-compat). Caller MUST be aware
+        // the deploy lacks the on-chain ceremony binding.
+        deployer
+            .build_deploy_bundle(parent_coin_obj, funder_pk, true)
+            .map_err(|e| JsError::new(&format!("build_deploy_bundle (unlinked): {e:?}")))?
+    };
 
     let launcher_id = derive_launcher_id(parent_coin_obj.coin_id(), 1);
     let eve_inner_ph = compute_eve_inner_puzzle_hash(&config, p.election_start_height);
@@ -1045,9 +1157,1131 @@ pub fn build_deploy_bundle_js(
     Ok(result)
 }
 
+/// FN: deploy_ceremony_bundle_js
+/// WHAT: Build the genesis spend bundle for a Ceremony Singleton
+///       (Phase 4 wasm export). Mirrors `buildDeployBundle` in shape:
+///       takes JS params + parent coin + funder pk; returns the
+///       coin-spends bytes plus the predicted launcher id.
+/// JS NAME: `deployCeremonyBundle`.
+/// CONTRACT (JS shape):
+///   params = {
+///     startBlockHeight: number,
+///     ceremonyLengthBlocks: number,
+///     minParticipants: number,
+///     vkSeedHex: string,        // 32-byte hex (with or without 0x)
+///     label?: string,
+///   }
+///   parentCoin = JsCoinRecord
+///   funderPkHex = 48-byte BLS G1 hex.
+/// RETURNS:
+///   { coinSpendsBytes, launcherIdHex }
+#[wasm_bindgen(js_name = "deployCeremonyBundle")]
+pub fn deploy_ceremony_bundle_js(
+    params: JsValue,
+    parent_coin: JsValue,
+    funder_pk_hex: &str,
+) -> Result<JsValue, JsError> {
+    use chip_voting_sdk::actors::ceremony::{CeremonyDeployer, CeremonyParams};
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsCeremonyParams {
+        start_block_height: u64,
+        ceremony_length_blocks: u64,
+        min_participants: u64,
+        /// Post-E4: deploy-time circuit cap. Default 20_000 if missing
+        /// (legacy callers); E5 makes the dApp form always send it.
+        #[serde(default)]
+        max_voters: Option<u64>,
+        vk_seed_hex: String,
+        #[serde(default)]
+        label: Option<String>,
+    }
+    let p: JsCeremonyParams = serde_wasm_bindgen::from_value(params)
+        .map_err(|e| JsError::new(&format!("CeremonyParams decode: {e}")))?;
+    let pc: JsCoinRecord = serde_wasm_bindgen::from_value(parent_coin)
+        .map_err(|e| JsError::new(&format!("parent_coin decode: {e}")))?;
+
+    let vk_seed = parse_hex32(&p.vk_seed_hex)
+        .map_err(|e| JsError::new(&format!("vk_seed_hex: {e:?}")))?;
+    let parent_coin_obj = coin_from_js(&pc)
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
+
+    let pk_bytes = hex::decode(funder_pk_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("funder_pk_hex decode: {e}")))?;
+    let pk_arr: [u8; 48] = pk_bytes
+        .try_into()
+        .map_err(|_| JsError::new("funder_pk_hex must be 48 bytes"))?;
+    let funder_pk = PublicKey::from_bytes(&pk_arr)
+        .map_err(|e| JsError::new(&format!("PublicKey::from_bytes: {e:?}")))?;
+
+    let deployer = CeremonyDeployer::new(CeremonyParams {
+        start_block_height: p.start_block_height,
+        ceremony_length_blocks: p.ceremony_length_blocks,
+        min_participants: p.min_participants,
+        max_voters: p.max_voters.unwrap_or(20_000),
+        vk_seed,
+        label: p.label,
+    });
+    let (coin_spends, launcher_id) = deployer
+        .build_deploy_bundle(parent_coin_obj, funder_pk)
+        .map_err(|e| JsError::new(&format!("build_deploy_bundle: {e:?}")))?;
+
+    let coin_spends_bytes = encode_coin_spends(&coin_spends)?;
+
+    let result = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "coinSpendsBytes": coin_spends_bytes,
+        "launcherIdHex": format!("0x{}", hex::encode(launcher_id)),
+    }))
+    .map_err(|e| JsError::new(&format!("result encode: {e}")))?;
+    Ok(result)
+}
+
+/// FN: contribute_to_ceremony_js
+/// WHAT: Build the spend bundle for a single Ceremony contribution.
+///       The dApp UI calls this AFTER off-chain Groth16 contribution
+///       computation finishes — passing in the (locally-derived)
+///       contribution_hash + payload bytes plus the chain-walked
+///       singleton tip + lineage proof.
+/// JS NAME: `contributeToCeremony`.
+/// CONTRACT (JS shape):
+///   ceremony = {                       // matches deployCeremonyBundle params
+///     launcherIdHex: string,
+///     startBlockHeight: number,
+///     ceremonyLengthBlocks: number,
+///     minParticipants: number,
+///     vkSeedHex: string,
+///   }
+///   singleton = {
+///     coin: JsCoinRecord,              // the unspent singleton tip
+///     lineageProof: { kind: "eve"|"lineage", ... },
+///     state: { contributionCount: number, lastContributionHashHex: string },
+///   }
+///   funderCoin = JsCoinRecord
+///   funderPkHex = 48-byte BLS G1 hex
+///   contribution = {
+///     participantPkHex: string,        // 48-byte BLS G1 hex
+///     contributionHashHex: string,     // 32-byte hex (caller-computed)
+///     prevContributionHashHex: string, // 32-byte hex
+///     payloadHex: string,              // off-chain Groth16 contribution bytes (hex)
+///   }
+/// RETURNS:
+///   { coinSpendsBytes, signatureMsgHex, markerCoinIdHex }
+///   * `signatureMsgHex` is the UNAUGMENTED 32-byte digest the
+///     participant must sign with `sign_raw` to satisfy the action's
+///     AGG_SIG_UNSAFE.
+///   * `markerCoinIdHex` is the predicted coin id of the marker
+///     CeremonyCoin emitted by the spend (handy for UI tracking).
+#[wasm_bindgen(js_name = "contributeToCeremony")]
+pub fn contribute_to_ceremony_js(
+    ceremony: JsValue,
+    singleton: JsValue,
+    funder_coin: JsValue,
+    funder_pk_hex: &str,
+    contribution: JsValue,
+) -> Result<JsValue, JsError> {
+    use chia_protocol::Coin;
+    use chia_puzzle_types::{EveProof, LineageProof, Proof};
+    use chip_voting_sdk::actors::ceremony::{
+        ceremony_coin_marker_puzzle_hash, CeremonyContributor, CeremonyParams,
+        ContributeParams,
+    };
+    use chip_voting_sdk::state::CeremonyState;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsCeremony {
+        launcher_id_hex: String,
+        start_block_height: u64,
+        ceremony_length_blocks: u64,
+        min_participants: u64,
+        vk_seed_hex: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(tag = "kind", rename_all = "lowercase")]
+    enum JsLineageProof {
+        Eve {
+            #[serde(rename = "parentParentCoinInfoHex")]
+            parent_parent_coin_info_hex: String,
+            #[serde(rename = "parentAmount")]
+            parent_amount: u64,
+        },
+        Lineage {
+            #[serde(rename = "parentParentCoinInfoHex")]
+            parent_parent_coin_info_hex: String,
+            #[serde(rename = "parentInnerPuzzleHashHex")]
+            parent_inner_puzzle_hash_hex: String,
+            #[serde(rename = "parentAmount")]
+            parent_amount: u64,
+        },
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsSingletonState {
+        contribution_count: u64,
+        last_contribution_hash_hex: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsSingleton {
+        coin: JsCoinRecord,
+        lineage_proof: JsLineageProof,
+        state: JsSingletonState,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsContribution {
+        participant_pk_hex: String,
+        contribution_hash_hex: String,
+        prev_contribution_hash_hex: String,
+        /// Raw 32-byte τ entropy hex. Embedded in the marker coin's
+        /// memos (post-B1) so chain-walkers can recover entropy
+        /// directly from `coin_records_by_hint(launcher_id)` without
+        /// parsing the full puzzle_and_solution.
+        #[serde(default)]
+        entropy_hex: String,
+        /// Off-chain Groth16 payload as hex (with or without `0x`).
+        /// Hex over base64 keeps the wasm dep set tight; the payload
+        /// only travels through this boundary once per contribution.
+        payload_hex: String,
+    }
+
+    let c: JsCeremony = serde_wasm_bindgen::from_value(ceremony)
+        .map_err(|e| JsError::new(&format!("ceremony decode: {e}")))?;
+    let s: JsSingleton = serde_wasm_bindgen::from_value(singleton)
+        .map_err(|e| JsError::new(&format!("singleton decode: {e}")))?;
+    let fc: JsCoinRecord = serde_wasm_bindgen::from_value(funder_coin)
+        .map_err(|e| JsError::new(&format!("funder_coin decode: {e}")))?;
+    let cb: JsContribution = serde_wasm_bindgen::from_value(contribution)
+        .map_err(|e| JsError::new(&format!("contribution decode: {e}")))?;
+
+    let launcher_id = parse_hex32(&c.launcher_id_hex)
+        .map_err(|e| JsError::new(&format!("launcherIdHex: {e:?}")))?;
+    let vk_seed = parse_hex32(&c.vk_seed_hex)
+        .map_err(|e| JsError::new(&format!("vkSeedHex: {e:?}")))?;
+    let last_hash = parse_hex32(&s.state.last_contribution_hash_hex)
+        .map_err(|e| JsError::new(&format!("lastContributionHashHex: {e:?}")))?;
+    let contrib_hash = parse_hex32(&cb.contribution_hash_hex)
+        .map_err(|e| JsError::new(&format!("contributionHashHex: {e:?}")))?;
+    let prev_hash = parse_hex32(&cb.prev_contribution_hash_hex)
+        .map_err(|e| JsError::new(&format!("prevContributionHashHex: {e:?}")))?;
+
+    let singleton_coin: Coin = coin_from_js(&s.coin)
+        .map_err(|e| JsError::new(&format!("singleton coin: {e:?}")))?;
+    let funder_coin_obj: Coin = coin_from_js(&fc)
+        .map_err(|e| JsError::new(&format!("funder coin: {e:?}")))?;
+
+    let lineage_proof = match s.lineage_proof {
+        JsLineageProof::Eve {
+            parent_parent_coin_info_hex,
+            parent_amount,
+        } => Proof::Eve(EveProof {
+            parent_parent_coin_info: parse_hex32(&parent_parent_coin_info_hex)
+                .map_err(|e| JsError::new(&format!("parentParentCoinInfoHex: {e:?}")))?,
+            parent_amount,
+        }),
+        JsLineageProof::Lineage {
+            parent_parent_coin_info_hex,
+            parent_inner_puzzle_hash_hex,
+            parent_amount,
+        } => Proof::Lineage(LineageProof {
+            parent_parent_coin_info: parse_hex32(&parent_parent_coin_info_hex)
+                .map_err(|e| JsError::new(&format!("parentParentCoinInfoHex: {e:?}")))?,
+            parent_inner_puzzle_hash: parse_hex32(&parent_inner_puzzle_hash_hex)
+                .map_err(|e| JsError::new(&format!("parentInnerPuzzleHashHex: {e:?}")))?,
+            parent_amount,
+        }),
+    };
+
+    let funder_pk_bytes = hex::decode(funder_pk_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("funder_pk_hex decode: {e}")))?;
+    let funder_pk_arr: [u8; 48] = funder_pk_bytes
+        .try_into()
+        .map_err(|_| JsError::new("funder_pk_hex must be 48 bytes"))?;
+    let funder_pk = PublicKey::from_bytes(&funder_pk_arr)
+        .map_err(|e| JsError::new(&format!("funder PublicKey::from_bytes: {e:?}")))?;
+
+    let participant_pk_bytes = hex::decode(cb.participant_pk_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("participant_pk_hex decode: {e}")))?;
+    let participant_pk_arr: [u8; 48] = participant_pk_bytes
+        .try_into()
+        .map_err(|_| JsError::new("participant_pk_hex must be 48 bytes"))?;
+    let participant_pk = PublicKey::from_bytes(&participant_pk_arr)
+        .map_err(|e| JsError::new(&format!("participant PublicKey::from_bytes: {e:?}")))?;
+
+    let payload = hex::decode(cb.payload_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("payload_hex decode: {e}")))?;
+
+    let entropy_bytes = if cb.entropy_hex.is_empty() {
+        Vec::new()
+    } else {
+        hex::decode(cb.entropy_hex.trim_start_matches("0x"))
+            .map_err(|e| JsError::new(&format!("entropy_hex decode: {e}")))?
+    };
+
+    let params = CeremonyParams {
+        start_block_height: c.start_block_height,
+        ceremony_length_blocks: c.ceremony_length_blocks,
+        min_participants: c.min_participants,
+        max_voters: 20_000,
+        vk_seed,
+        label: None,
+    };
+    let contributor = CeremonyContributor::new(launcher_id, params);
+
+    let state = CeremonyState {
+        contribution_count: s.state.contribution_count,
+        last_contribution_hash: last_hash,
+        // D5 will extend JsSingleton state with finalized/vkHash/markerRoot.
+        // For now contribute on a finalized ceremony will trap on the
+        // puzzle's `assert state.finalized == false`, which is the
+        // correct outcome — these defaults only describe the
+        // pre-finalize case the dApp uses today.
+        finalized: false,
+        vk_hash: chia_protocol::Bytes32::default(),
+        marker_root: chia_protocol::Bytes32::default(),
+    };
+    let contrib_params = ContributeParams {
+        participant_pubkey: participant_pk.clone(),
+        contribution_hash: contrib_hash,
+        prev_contribution_hash: prev_hash,
+        entropy_hex: chia_protocol::Bytes::new(entropy_bytes),
+        payload,
+    };
+
+    let coin_spends = contributor
+        .build_contribute_bundle(
+            singleton_coin,
+            lineage_proof,
+            state,
+            funder_coin_obj,
+            funder_pk,
+            contrib_params.clone(),
+        )
+        .map_err(|e| JsError::new(&format!("build_contribute_bundle: {e:?}")))?;
+
+    let coin_spends_bytes = encode_coin_spends(&coin_spends)?;
+    let sig_msg = contributor.contribution_signature_msg(&contrib_params);
+    let marker_ph = ceremony_coin_marker_puzzle_hash(
+        launcher_id,
+        &participant_pk,
+        contrib_hash,
+        prev_hash,
+    );
+    // Marker coin id = sha256(parent || ph || amount). Parent is the
+    // singleton coin id (the singleton emits the marker). Amount is 2
+    // (even — singleton outer requires only one odd CreateCoin per
+    // spend, claimed by the recreation; see contribute.rue).
+    let marker_coin = Coin::new(singleton_coin.coin_id(), marker_ph, 2);
+    let marker_id = marker_coin.coin_id();
+
+    let result = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "coinSpendsBytes": coin_spends_bytes,
+        "signatureMsgHex": format!("0x{}", hex::encode(sig_msg)),
+        "markerCoinIdHex": format!("0x{}", hex::encode(marker_id)),
+    }))
+    .map_err(|e| JsError::new(&format!("result encode: {e}")))?;
+    Ok(result)
+}
+
+/// FN: finalize_ceremony_js
+/// WHAT: Build the (unsigned) coin spends for the singleton's
+///       finalize action — bakes (vk_hash, marker_root, vk_bytes)
+///       into the singleton's curried state and emits a marker coin
+///       hinted with launcher_id whose memos carry the full VK.
+///       Permissionless on the singleton side: only the funder coin
+///       requires Sage AGG_SIG_ME; no participant signing needed.
+/// JS NAME: `finalizeCeremony`.
+/// CONTRACT (JS):
+///   ceremony   = { launcherIdHex, startBlockHeight, ceremonyLengthBlocks,
+///                  minParticipants, vkSeedHex }
+///   singleton  = { coin: JsCoinRecord, lineageProof: {...},
+///                  state: { contributionCount, lastContributionHashHex,
+///                           finalized?, vkHashHex?, markerRootHex? } }
+///   funderCoin = JsCoinRecord
+///   funderPkHex = 48-byte hex
+///   inputs     = { vkHashHex, markerRootHex, vkHex }
+/// RETURNS (Map → Object via dApp wrapper):
+///   { coinSpendsBytes: Uint8Array, finalizedMarkerCoinIdHex: string }
+#[wasm_bindgen(js_name = "finalizeCeremony")]
+pub fn finalize_ceremony_js(
+    ceremony: JsValue,
+    singleton: JsValue,
+    funder_coin: JsValue,
+    funder_pk_hex: String,
+    inputs: JsValue,
+) -> Result<JsValue, JsError> {
+    use chia_protocol::Coin;
+    use chia_puzzle_types::{EveProof, LineageProof, Proof};
+    use chip_voting_sdk::actors::ceremony::{
+        CeremonyFinalizer, CeremonyParams, FinalizeParams,
+    };
+    use chip_voting_sdk::state::CeremonyState;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsCeremony {
+        launcher_id_hex: String,
+        start_block_height: u64,
+        ceremony_length_blocks: u64,
+        min_participants: u64,
+        vk_seed_hex: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(tag = "kind", rename_all = "lowercase")]
+    enum JsLineageProof {
+        Eve {
+            #[serde(rename = "parentParentCoinInfoHex")]
+            parent_parent_coin_info_hex: String,
+            #[serde(rename = "parentAmount")]
+            parent_amount: u64,
+        },
+        Lineage {
+            #[serde(rename = "parentParentCoinInfoHex")]
+            parent_parent_coin_info_hex: String,
+            #[serde(rename = "parentInnerPuzzleHashHex")]
+            parent_inner_puzzle_hash_hex: String,
+            #[serde(rename = "parentAmount")]
+            parent_amount: u64,
+        },
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsSingletonState {
+        contribution_count: u64,
+        last_contribution_hash_hex: String,
+        #[serde(default)]
+        finalized: bool,
+        #[serde(default)]
+        vk_hash_hex: String,
+        #[serde(default)]
+        marker_root_hex: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsSingleton {
+        coin: JsCoinRecord,
+        lineage_proof: JsLineageProof,
+        state: JsSingletonState,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsFinalizeInputs {
+        vk_hash_hex: String,
+        marker_root_hex: String,
+        vk_hex: String,
+    }
+
+    let c: JsCeremony = serde_wasm_bindgen::from_value(ceremony)
+        .map_err(|e| JsError::new(&format!("ceremony decode: {e}")))?;
+    let s: JsSingleton = serde_wasm_bindgen::from_value(singleton)
+        .map_err(|e| JsError::new(&format!("singleton decode: {e}")))?;
+    let fc: JsCoinRecord = serde_wasm_bindgen::from_value(funder_coin)
+        .map_err(|e| JsError::new(&format!("funder_coin decode: {e}")))?;
+    let inp: JsFinalizeInputs = serde_wasm_bindgen::from_value(inputs)
+        .map_err(|e| JsError::new(&format!("finalize inputs decode: {e}")))?;
+
+    let launcher_id = parse_hex32(&c.launcher_id_hex)
+        .map_err(|e| JsError::new(&format!("launcherIdHex: {e:?}")))?;
+    let vk_seed = parse_hex32(&c.vk_seed_hex)
+        .map_err(|e| JsError::new(&format!("vkSeedHex: {e:?}")))?;
+    let last_hash = parse_hex32(&s.state.last_contribution_hash_hex)
+        .map_err(|e| JsError::new(&format!("lastContributionHashHex: {e:?}")))?;
+    let state_vk_hash = if s.state.vk_hash_hex.is_empty() {
+        chia_protocol::Bytes32::default()
+    } else {
+        parse_hex32(&s.state.vk_hash_hex)
+            .map_err(|e| JsError::new(&format!("state.vkHashHex: {e:?}")))?
+    };
+    let state_marker_root = if s.state.marker_root_hex.is_empty() {
+        chia_protocol::Bytes32::default()
+    } else {
+        parse_hex32(&s.state.marker_root_hex)
+            .map_err(|e| JsError::new(&format!("state.markerRootHex: {e:?}")))?
+    };
+    let in_vk_hash = parse_hex32(&inp.vk_hash_hex)
+        .map_err(|e| JsError::new(&format!("inputs.vkHashHex: {e:?}")))?;
+    let in_marker_root = parse_hex32(&inp.marker_root_hex)
+        .map_err(|e| JsError::new(&format!("inputs.markerRootHex: {e:?}")))?;
+    let in_vk_bytes = hex::decode(inp.vk_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("inputs.vkHex decode: {e}")))?;
+
+    let singleton_coin: Coin = coin_from_js(&s.coin)
+        .map_err(|e| JsError::new(&format!("singleton coin: {e:?}")))?;
+    let funder_coin_obj: Coin = coin_from_js(&fc)
+        .map_err(|e| JsError::new(&format!("funder coin: {e:?}")))?;
+
+    let lineage_proof = match s.lineage_proof {
+        JsLineageProof::Eve {
+            parent_parent_coin_info_hex,
+            parent_amount,
+        } => Proof::Eve(EveProof {
+            parent_parent_coin_info: parse_hex32(&parent_parent_coin_info_hex)
+                .map_err(|e| JsError::new(&format!("parentParentCoinInfoHex: {e:?}")))?,
+            parent_amount,
+        }),
+        JsLineageProof::Lineage {
+            parent_parent_coin_info_hex,
+            parent_inner_puzzle_hash_hex,
+            parent_amount,
+        } => Proof::Lineage(LineageProof {
+            parent_parent_coin_info: parse_hex32(&parent_parent_coin_info_hex)
+                .map_err(|e| JsError::new(&format!("parentParentCoinInfoHex: {e:?}")))?,
+            parent_inner_puzzle_hash: parse_hex32(&parent_inner_puzzle_hash_hex)
+                .map_err(|e| JsError::new(&format!("parentInnerPuzzleHashHex: {e:?}")))?,
+            parent_amount,
+        }),
+    };
+
+    let funder_pk_bytes = hex::decode(funder_pk_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("funder_pk_hex decode: {e}")))?;
+    let funder_pk_arr: [u8; 48] = funder_pk_bytes
+        .try_into()
+        .map_err(|_| JsError::new("funder_pk_hex must be 48 bytes"))?;
+    let funder_pk = PublicKey::from_bytes(&funder_pk_arr)
+        .map_err(|e| JsError::new(&format!("funder PublicKey::from_bytes: {e:?}")))?;
+
+    let params = CeremonyParams {
+        start_block_height: c.start_block_height,
+        ceremony_length_blocks: c.ceremony_length_blocks,
+        min_participants: c.min_participants,
+        max_voters: 20_000,
+        vk_seed,
+        label: None,
+    };
+    let finalizer = CeremonyFinalizer::new(launcher_id, params);
+
+    let state = CeremonyState {
+        contribution_count: s.state.contribution_count,
+        last_contribution_hash: last_hash,
+        finalized: s.state.finalized,
+        vk_hash: state_vk_hash,
+        marker_root: state_marker_root,
+    };
+    let fparams = FinalizeParams {
+        vk_hash: in_vk_hash,
+        marker_root: in_marker_root,
+        vk_bytes: in_vk_bytes,
+    };
+
+    let artifacts = finalizer
+        .build_finalize_bundle(
+            singleton_coin,
+            lineage_proof,
+            state,
+            funder_coin_obj,
+            funder_pk,
+            fparams,
+        )
+        .map_err(|e| JsError::new(&format!("build_finalize_bundle: {e:?}")))?;
+
+    let coin_spends_bytes = encode_coin_spends(&artifacts.coin_spends)?;
+
+    // Predict the finalize marker ph the same way `finalize.rue` does:
+    //   curry_tree_hash(CEREMONY_COIN_MOD_HASH, [launcher, vk_hash, marker_root]).
+    let marker_ph = chip_voting_sdk::puzzles::curry_tree_hash(
+        chip_voting_sdk::puzzles::PuzzleHashes::ceremony_coin_marker(),
+        &[
+            chip_voting_sdk::puzzles::hash_atom_b32(&launcher_id),
+            chip_voting_sdk::puzzles::hash_atom_b32(&in_vk_hash),
+            chip_voting_sdk::puzzles::hash_atom_b32(&in_marker_root),
+        ],
+    );
+    let marker_coin = Coin::new(singleton_coin.coin_id(), marker_ph, 2);
+    let marker_id = marker_coin.coin_id();
+
+    let result = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "coinSpendsBytes": coin_spends_bytes,
+        "finalizedMarkerCoinIdHex": format!("0x{}", hex::encode(marker_id)),
+        "voucherCoinIdHex": format!("0x{}", hex::encode(artifacts.voucher_coin_id)),
+        "voucherPuzzleHashHex": format!("0x{}", hex::encode(artifacts.voucher_puzzle_hash)),
+    }))
+    .map_err(|e| JsError::new(&format!("finalize result encode: {e}")))?;
+    Ok(result)
+}
+
+/// FN: merkle_root_of_sorted_coin_ids_js
+/// WHAT: Compute the SHA-256 binary-tree merkle root over the sorted
+///       set of contribution marker coin ids — used by the finalize
+///       action to commit to the contribution set on-chain.
+/// JS NAME: `merkleRootOfSortedCoinIds`.
+/// CONTRACT: `idsHexConcat` is one or more 32-byte hex coin ids
+///       concatenated (each 64 hex chars, no `0x` prefix or with).
+///       Order in the input doesn't matter — the helper sorts
+///       ascending internally.
+#[wasm_bindgen(js_name = "merkleRootOfSortedCoinIds")]
+pub fn merkle_root_of_sorted_coin_ids_js(
+    ids_hex_concat: String,
+) -> Result<String, JsError> {
+    let trimmed = ids_hex_concat.trim_start_matches("0x");
+    let bytes = hex::decode(trimmed)
+        .map_err(|e| JsError::new(&format!("ids_hex_concat decode: {e}")))?;
+    if bytes.len() % 32 != 0 {
+        return Err(JsError::new(&format!(
+            "ids_hex_concat must be a multiple of 32 bytes (got {})",
+            bytes.len()
+        )));
+    }
+    let ids: Vec<chia_protocol::Bytes32> = bytes
+        .chunks_exact(32)
+        .map(|c| chia_protocol::Bytes32::try_from(c).unwrap())
+        .collect();
+    let root = chip_voting_sdk::merkle::merkle_root_of_sorted_coin_ids(&ids);
+    Ok(format!("0x{}", hex::encode(root)))
+}
+
+/// FN: merkle_proof_for_option_js
+/// WHAT: Index-aware merkle inclusion proof generator for the M5r-merkle
+///       Mode2Restricted gate in `puzzles/voting_coin/update_vote.rue`.
+///       Bridges `chip_voting_sdk::vote_mode::BallotVoteMode::merkle_proof_for_option`
+///       so the dApp can build the proof a voter must supply alongside
+///       their `vote_data` when the ballot is locked-Restricted.
+/// JS NAME: `merkleProofForOption`.
+/// CONTRACT (JS shape returned):
+///   { leafIndex: number, proofHex: string[] }
+/// `optionsHexConcat` is one or more 32-byte hex option hashes
+/// concatenated (each 64 hex chars). The wrapper sorts them ascending
+/// internally to match `merkle_root_of_sorted_coin_ids`. `targetOptionHex`
+/// must be one of the entries — returns null if not found.
+#[wasm_bindgen(js_name = "merkleProofForOption")]
+pub fn merkle_proof_for_option_js(
+    options_hex_concat: String,
+    target_option_hex: String,
+) -> Result<JsValue, JsError> {
+    use chip_voting_sdk::vote_mode::BallotVoteMode;
+
+    let trimmed = options_hex_concat.trim_start_matches("0x");
+    let bytes = hex::decode(trimmed)
+        .map_err(|e| JsError::new(&format!("options_hex_concat decode: {e}")))?;
+    if bytes.len() % 32 != 0 {
+        return Err(JsError::new(&format!(
+            "options_hex_concat must be a multiple of 32 bytes (got {})",
+            bytes.len()
+        )));
+    }
+    let options: Vec<chia_protocol::Bytes32> = bytes
+        .chunks_exact(32)
+        .map(|c| chia_protocol::Bytes32::try_from(c).unwrap())
+        .collect();
+    let target = parse_hex32(&target_option_hex)
+        .map_err(|e| JsError::new(&format!("target_option_hex: {e}")))?;
+    let mode = BallotVoteMode::Restricted { options };
+    match mode.merkle_proof_for_option(target) {
+        None => Ok(JsValue::NULL),
+        Some((leaf_index, proof)) => {
+            let proof_hex: Vec<String> =
+                proof.iter().map(|b| format!("0x{}", hex::encode(b))).collect();
+            serde_wasm_bindgen::to_value(&serde_json::json!({
+                "leafIndex": leaf_index,
+                "proofHex": proof_hex,
+            }))
+            .map_err(|e| JsError::new(&format!("encode merkle proof: {e}")))
+        }
+    }
+}
+
+/// FN: find_current_ceremony_singleton_js
+/// WHAT: Chain-walk the ceremony singleton lineage and return the
+///       unspent tip's coin record + lineage proof + curried state.
+/// JS NAME: `findCurrentCeremonySingleton`.
+/// CONTRACT (JS shape returned):
+///   {
+///     coin: { parentCoinInfoHex, puzzleHashHex, amount },
+///     lineageProof: { kind: "eve" | "lineage", ... },
+///     state: { contributionCount: number, lastContributionHashHex: string }
+///   }
+/// USE: dApp calls this just before invoking `contributeToCeremony` so
+///      it can supply the singleton tip + state + lineage proof.
+#[wasm_bindgen(js_name = "findCurrentCeremonySingleton")]
+pub async fn find_current_ceremony_singleton_js(
+    backend: JsChainBackend,
+    launcher_id_hex: String,
+    vk_seed_hex: String,
+) -> Result<String, JsError> {
+    use chia_puzzle_types::Proof;
+    use chip_voting_sdk::actors::ceremony::CeremonyReader;
+
+    let launcher_id = parse_hex32(&launcher_id_hex)
+        .map_err(|e| JsError::new(&format!("launcher_id_hex: {e}")))?;
+    let vk_seed = parse_hex32(&vk_seed_hex)
+        .map_err(|e| JsError::new(&format!("vk_seed_hex: {e}")))?;
+    let chain = JsChainReader::new(backend);
+    let (coin, proof, state) =
+        CeremonyReader::find_current_singleton(&chain, launcher_id, vk_seed)
+            .await
+            .map_err(|e| JsError::new(&format!("find_current_singleton: {e:?}")))?;
+
+    let proof_json = match proof {
+        Proof::Eve(p) => serde_json::json!({
+            "kind": "eve",
+            "parentParentCoinInfoHex": format!("0x{}", hex::encode(p.parent_parent_coin_info)),
+            "parentAmount": p.parent_amount,
+        }),
+        Proof::Lineage(p) => serde_json::json!({
+            "kind": "lineage",
+            "parentParentCoinInfoHex": format!("0x{}", hex::encode(p.parent_parent_coin_info)),
+            "parentInnerPuzzleHashHex": format!("0x{}", hex::encode(p.parent_inner_puzzle_hash)),
+            "parentAmount": p.parent_amount,
+        }),
+    };
+
+    let coin_id = coin.coin_id();
+    serde_json::to_string(&serde_json::json!({
+        "launcherIdHex": format!("0x{}", hex::encode(launcher_id)),
+        "coinIdHex": format!("0x{}", hex::encode(coin_id)),
+        "coin": {
+            "parentCoinInfoHex": format!("0x{}", hex::encode(coin.parent_coin_info)),
+            "puzzleHashHex": format!("0x{}", hex::encode(coin.puzzle_hash)),
+            "amount": coin.amount,
+        },
+        "lineageProof": proof_json,
+        "state": {
+            "contributionCount": state.contribution_count,
+            "lastContributionHashHex": format!("0x{}", hex::encode(state.last_contribution_hash)),
+            "finalized": state.finalized,
+            "vkHashHex": format!("0x{}", hex::encode(state.vk_hash)),
+            "markerRootHex": format!("0x{}", hex::encode(state.marker_root)),
+        },
+    }))
+    .map_err(|e| JsError::new(&format!("encode singleton tip: {e}")))
+}
+
+/// FN: find_ceremony_voucher_coin_js
+/// WHAT: locate the unspent voucher coin spawned by a finalized
+///       ceremony. Returns the coin's parent_coin_info + amount so
+///       the dApp can pass them into `deployElectionBundle` for the
+///       V7 linked-deploy path.
+/// JS NAME: `findCeremonyVoucherCoin`.
+/// CONTRACT (JS shape returned):
+///   { parentCoinIdHex: string, amount: number } | null
+/// `null` means no unspent voucher exists at the predicted puzzle
+/// hash — either the ceremony hasn't been finalized yet, or every
+/// historical voucher has been consumed without re-creation (which
+/// can't happen with the V1 voucher puzzle, but the dApp should
+/// still handle the null case defensively).
+#[wasm_bindgen(js_name = "findCeremonyVoucherCoin")]
+pub async fn find_ceremony_voucher_coin_js(
+    backend: JsChainBackend,
+    launcher_id_hex: String,
+    vk_hash_hex: String,
+    max_voters: u64,
+) -> Result<JsValue, JsError> {
+    use chip_voting_sdk::actors::ceremony::CeremonyReader;
+
+    let launcher_id = parse_hex32(&launcher_id_hex)
+        .map_err(|e| JsError::new(&format!("launcher_id_hex: {e}")))?;
+    let vk_hash = parse_hex32(&vk_hash_hex)
+        .map_err(|e| JsError::new(&format!("vk_hash_hex: {e}")))?;
+    let chain = JsChainReader::new(backend);
+
+    let coin_opt = CeremonyReader::find_voucher_coin(&chain, launcher_id, vk_hash, max_voters)
+        .await
+        .map_err(|e| JsError::new(&format!("find_voucher_coin: {e:?}")))?;
+
+    match coin_opt {
+        None => Ok(JsValue::NULL),
+        Some(coin) => serde_wasm_bindgen::to_value(&serde_json::json!({
+            "parentCoinIdHex": format!("0x{}", hex::encode(coin.parent_coin_info)),
+            "amount": coin.amount,
+        }))
+        .map_err(|e| JsError::new(&format!("encode voucher coin: {e}"))),
+    }
+}
+
+/// FN: recover_ceremony_bootstrap_js
+/// WHAT: Cross-browser bootstrap recovery — fetches the launcher
+///       coin's `key_value_list` from chain and decodes it as a
+///       `CeremonyLauncherMemo`. Lets a dApp running on a fresh
+///       browser populate the /ceremony page from the URL alone.
+/// JS NAME: `recoverCeremonyBootstrap`.
+/// RETURNS: JSON string `{startBlockHeight, ceremonyLengthBlocks,
+///   minParticipants, vkSeedHex, label}` or `null` if the launcher
+///   has not been spent / the memo is missing or doesn't carry the
+///   schema tag (legacy ceremonies deployed before D6).
+#[wasm_bindgen(js_name = "recoverCeremonyBootstrap")]
+pub async fn recover_ceremony_bootstrap_js(
+    backend: JsChainBackend,
+    launcher_id_hex: String,
+) -> Result<JsValue, JsError> {
+    let launcher_id = parse_hex32(&launcher_id_hex)
+        .map_err(|e| JsError::new(&format!("launcher_id_hex: {e}")))?;
+    let chain = JsChainReader::new(backend);
+    let memo =
+        chip_voting_sdk::actors::ceremony::read_ceremony_launcher_memo(&chain, launcher_id)
+            .await
+            .map_err(|e| JsError::new(&format!("read_ceremony_launcher_memo: {e:?}")))?;
+    let memo = match memo {
+        Some(m) => m,
+        None => return Ok(JsValue::NULL),
+    };
+    // `label_bytes` is empty for unset labels; surface as `null` to JS.
+    let label_str = if memo.label_bytes.as_ref().is_empty() {
+        serde_json::Value::Null
+    } else {
+        match std::str::from_utf8(memo.label_bytes.as_ref()) {
+            Ok(s) => serde_json::Value::String(s.to_string()),
+            Err(_) => serde_json::Value::Null,
+        }
+    };
+    let json = serde_json::json!({
+        "startBlockHeight": memo.start_block_height,
+        "ceremonyLengthBlocks": memo.ceremony_length_blocks,
+        "minParticipants": memo.min_participants,
+        "maxVoters": memo.max_voters,
+        "vkSeedHex": format!("0x{}", hex::encode(memo.vk_seed)),
+        "label": label_str,
+    });
+    let s = serde_json::to_string(&json)
+        .map_err(|e| JsError::new(&format!("encode ceremony bootstrap: {e}")))?;
+    Ok(JsValue::from_str(&s))
+}
+
+/// FN: list_ceremony_contributions_js
+/// WHAT: Chain-walk the Ceremony Singleton lineage and return every
+///       accepted contribution as a JSON array of records. Mirrors
+///       `listBallots`'s shape: takes a JsChainBackend + launcher id,
+///       returns the JSON-encoded `Vec<ContributionRecord>` (with each
+///       BLS pubkey + Bytes32 + payload field hex-encoded for JS).
+/// JS NAME: `listCeremonyContributions`.
+/// DOWNSTREAM: dApp passes the parsed array back into
+///       `validateCeremonyContributions` / `deriveVkFromCeremony`.
+#[wasm_bindgen(js_name = "listCeremonyContributions")]
+pub async fn list_ceremony_contributions_js(
+    backend: JsChainBackend,
+    launcher_id_hex: String,
+) -> Result<String, JsError> {
+    use chip_voting_sdk::actors::ceremony::CeremonyReader;
+
+    let launcher_id = parse_hex32(&launcher_id_hex)
+        .map_err(|e| JsError::new(&format!("launcher_id_hex: {e}")))?;
+    let chain = JsChainReader::new(backend);
+    let records = CeremonyReader::list_contributions_via_chain(&chain, launcher_id)
+        .await
+        .map_err(|e| JsError::new(&format!("list_contributions_via_chain: {e:?}")))?;
+
+    // Hand-encode JSON (PublicKey lacks Serialize).
+    let json_records: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "participantPkHex": format!("0x{}", hex::encode(r.participant_pubkey.to_bytes())),
+                "contributionHashHex": format!("0x{}", hex::encode(r.contribution_hash)),
+                "prevContributionHashHex": format!("0x{}", hex::encode(r.prev_contribution_hash)),
+                "coinIdHex": format!("0x{}", hex::encode(r.coin_id)),
+                "blockHeight": r.block_height,
+                "entropyHex": format!("0x{}", hex::encode(r.entropy_hex.as_ref())),
+                "payloadHex": format!("0x{}", hex::encode(&r.payload)),
+            })
+        })
+        .collect();
+    serde_json::to_string(&json_records)
+        .map_err(|e| JsError::new(&format!("encode contributions: {e}")))
+}
+
+/// FN: validate_ceremony_contributions_js
+/// WHAT: Run the cheap precondition gates on a JS-collected list of
+///       contribution records — `validate_lineage` + `check_threshold`
+///       from `CeremonyReader`. Lets the dApp UI surface a meaningful
+///       "ceremony incomplete / lineage broken" error BEFORE it asks
+///       wasm to do expensive VK derivation.
+/// JS NAME: `validateCeremonyContributions`.
+/// CONTRACT (JS shape):
+///   contributions = [
+///     {
+///       participantPkHex: string,   // 48-byte BLS G1 hex
+///       contributionHashHex: string,
+///       prevContributionHashHex: string,
+///       coinIdHex: string,
+///       blockHeight: number,
+///     },
+///     ...
+///   ]                                // chain-ordered, oldest first
+///   vkSeedHex: string                // 32-byte hex
+///   minParticipants: number
+/// RETURNS: `{ ok: true, count: <records.length> }` on pass, or a
+///   `JsError` with the exact rule violation on fail.
+#[wasm_bindgen(js_name = "validateCeremonyContributions")]
+pub fn validate_ceremony_contributions_js(
+    contributions: JsValue,
+    vk_seed_hex: &str,
+    min_participants: u64,
+) -> Result<JsValue, JsError> {
+    use chip_voting_sdk::actors::ceremony::{CeremonyReader, ContributionRecord};
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsContributionRecord {
+        participant_pk_hex: String,
+        contribution_hash_hex: String,
+        prev_contribution_hash_hex: String,
+        coin_id_hex: String,
+        block_height: u32,
+        #[serde(default)]
+        entropy_hex: String,
+    }
+
+    let records_js: Vec<JsContributionRecord> = serde_wasm_bindgen::from_value(contributions)
+        .map_err(|e| JsError::new(&format!("contributions decode: {e}")))?;
+
+    let mut records = Vec::with_capacity(records_js.len());
+    for (idx, r) in records_js.into_iter().enumerate() {
+        let pk_bytes = hex::decode(r.participant_pk_hex.trim_start_matches("0x"))
+            .map_err(|e| JsError::new(&format!("contributions[{idx}].participantPkHex: {e}")))?;
+        let pk_arr: [u8; 48] = pk_bytes.try_into().map_err(|_| {
+            JsError::new(&format!(
+                "contributions[{idx}].participantPkHex must be 48 bytes"
+            ))
+        })?;
+        let pk = PublicKey::from_bytes(&pk_arr)
+            .map_err(|e| JsError::new(&format!("contributions[{idx}] PublicKey: {e:?}")))?;
+        let contribution_hash = parse_hex32(&r.contribution_hash_hex)
+            .map_err(|e| JsError::new(&format!("contributions[{idx}].contributionHashHex: {e:?}")))?;
+        let prev_contribution_hash = parse_hex32(&r.prev_contribution_hash_hex).map_err(|e| {
+            JsError::new(&format!(
+                "contributions[{idx}].prevContributionHashHex: {e:?}"
+            ))
+        })?;
+        let coin_id = parse_hex32(&r.coin_id_hex)
+            .map_err(|e| JsError::new(&format!("contributions[{idx}].coinIdHex: {e:?}")))?;
+        let entropy_bytes = if r.entropy_hex.is_empty() {
+            Vec::new()
+        } else {
+            hex::decode(r.entropy_hex.trim_start_matches("0x"))
+                .map_err(|e| JsError::new(&format!("contributions[{idx}].entropyHex: {e:?}")))?
+        };
+        records.push(ContributionRecord {
+            participant_pubkey: pk,
+            contribution_hash,
+            prev_contribution_hash,
+            coin_id,
+            block_height: r.block_height,
+            entropy_hex: chia_protocol::Bytes::new(entropy_bytes),
+            payload: vec![],
+        });
+    }
+
+    let vk_seed = parse_hex32(vk_seed_hex)
+        .map_err(|e| JsError::new(&format!("vk_seed_hex: {e:?}")))?;
+
+    CeremonyReader::check_threshold(&records, vk_seed, min_participants)
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
+
+    let result = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "ok": true,
+        "count": records.len() as u64,
+    }))
+    .map_err(|e| JsError::new(&format!("result encode: {e}")))?;
+    Ok(result)
+}
+
+/// FN: derive_vk_from_ceremony_js
+/// WHAT: Phase-5-pending VK derivation. Currently runs the gates and
+///       surfaces the bridge-pending message. Wired into the dApp UI
+///       so "Create election" stays disabled until either the gates
+///       pass AND the Phase 5 bridge ships.
+/// JS NAME: `deriveVkFromCeremony`.
+/// CONTRACT: same `contributions` shape as
+///   `validateCeremonyContributions`, plus `vkSeedHex` +
+///   `minParticipants`. Each contribution should also carry
+///   `payloadHex` (Groth16 contribution bytes recovered from
+///   `puzzle_and_solution`); the gate-only check ignores it for now.
+#[wasm_bindgen(js_name = "deriveVkFromCeremony")]
+pub fn derive_vk_from_ceremony_js(
+    contributions: JsValue,
+    vk_seed_hex: &str,
+    min_participants: u64,
+) -> Result<JsValue, JsError> {
+    use chip_voting_sdk::actors::ceremony::{CeremonyReader, ContributionRecord};
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct JsContributionRecord {
+        participant_pk_hex: String,
+        contribution_hash_hex: String,
+        prev_contribution_hash_hex: String,
+        coin_id_hex: String,
+        block_height: u32,
+        #[serde(default)]
+        entropy_hex: String,
+        #[serde(default)]
+        payload_hex: String,
+    }
+
+    let records_js: Vec<JsContributionRecord> = serde_wasm_bindgen::from_value(contributions)
+        .map_err(|e| JsError::new(&format!("contributions decode: {e}")))?;
+
+    let mut records = Vec::with_capacity(records_js.len());
+    for (idx, r) in records_js.into_iter().enumerate() {
+        let pk_bytes = hex::decode(r.participant_pk_hex.trim_start_matches("0x"))
+            .map_err(|e| JsError::new(&format!("contributions[{idx}].participantPkHex: {e}")))?;
+        let pk_arr: [u8; 48] = pk_bytes.try_into().map_err(|_| {
+            JsError::new(&format!(
+                "contributions[{idx}].participantPkHex must be 48 bytes"
+            ))
+        })?;
+        let pk = PublicKey::from_bytes(&pk_arr)
+            .map_err(|e| JsError::new(&format!("contributions[{idx}] PublicKey: {e:?}")))?;
+        let contribution_hash = parse_hex32(&r.contribution_hash_hex)
+            .map_err(|e| JsError::new(&format!("contributions[{idx}].contributionHashHex: {e:?}")))?;
+        let prev_contribution_hash = parse_hex32(&r.prev_contribution_hash_hex).map_err(|e| {
+            JsError::new(&format!(
+                "contributions[{idx}].prevContributionHashHex: {e:?}"
+            ))
+        })?;
+        let coin_id = parse_hex32(&r.coin_id_hex)
+            .map_err(|e| JsError::new(&format!("contributions[{idx}].coinIdHex: {e:?}")))?;
+        let payload = if r.payload_hex.is_empty() {
+            vec![]
+        } else {
+            hex::decode(r.payload_hex.trim_start_matches("0x"))
+                .map_err(|e| JsError::new(&format!("contributions[{idx}].payloadHex: {e}")))?
+        };
+        let entropy_bytes = if r.entropy_hex.is_empty() {
+            Vec::new()
+        } else {
+            hex::decode(r.entropy_hex.trim_start_matches("0x"))
+                .map_err(|e| JsError::new(&format!("contributions[{idx}].entropyHex: {e:?}")))?
+        };
+        records.push(ContributionRecord {
+            participant_pubkey: pk,
+            contribution_hash,
+            prev_contribution_hash,
+            coin_id,
+            block_height: r.block_height,
+            entropy_hex: chia_protocol::Bytes::new(entropy_bytes),
+            payload,
+        });
+    }
+
+    let vk_seed = parse_hex32(vk_seed_hex)
+        .map_err(|e| JsError::new(&format!("vk_seed_hex: {e:?}")))?;
+
+    let vk = CeremonyReader::derive_vk(&records, vk_seed, min_participants)
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
+
+    serde_wasm_bindgen::to_value(&serde_json::json!({
+        "rawBytes": vk.raw_bytes,
+    }))
+    .map_err(|e| JsError::new(&format!("vk encode: {e}")))
+}
+
 // ============================================================================
 // SECTION 7 — Pure puzzle-hash helpers
 // ============================================================================
+
+/// FN: sign_participant_unsafe_js
+/// WHAT: BLS-sign an UNAUGMENTED 32-byte message with a JS-supplied
+///       32-byte secret-key SEED. Mirrors `chia_bls::sign` with no
+///       augmentation prefix.
+/// USE: ceremony participants create a fresh BLS keypair locally
+///      (not from Sage) and need to satisfy the contribute action's
+///      AGG_SIG_UNSAFE condition. The dApp computes
+///      `ceremony_contribution_msg(launcher, contrib_hash, prev_hash)`
+///      and calls this to produce the 96-byte G2 signature.
+/// JS NAME: `signParticipantUnsafe`.
+/// SK DERIVATION: input 32 bytes are passed through
+///   `SecretKey::from_seed` (HKDF-Mod-R per IETF BLS draft v4) so
+///   any 32-byte random value lands in-group. `from_bytes` would
+///   reject ~half of `crypto.getRandomValues(32)` outputs because
+///   they are ≥ the BLS12-381 scalar order. MUST match the
+///   derivation in `publicKeyFromSecretKeyBytes`.
+/// CONTRACT:
+///   * `secret_key_hex` — 32-byte hex (with or without `0x`).
+///   * `message_hex`    — 32-byte hex (the digest to sign).
+///   * RETURNS: `0x`-prefixed 96-byte hex G2 signature.
+#[wasm_bindgen(js_name = "signParticipantUnsafe")]
+pub fn sign_participant_unsafe_js(
+    secret_key_hex: &str,
+    message_hex: &str,
+) -> Result<String, JsError> {
+    let sk_bytes = hex::decode(secret_key_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("secret_key_hex decode: {e}")))?;
+    if sk_bytes.len() != 32 {
+        return Err(JsError::new(&format!(
+            "secret_key_hex must be 32 bytes (got {})",
+            sk_bytes.len()
+        )));
+    }
+    let sk = SecretKey::from_seed(&sk_bytes);
+    let msg_bytes = hex::decode(message_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("message_hex decode: {e}")))?;
+    if msg_bytes.len() != 32 {
+        return Err(JsError::new(&format!(
+            "message_hex must be 32 bytes (got {})",
+            msg_bytes.len()
+        )));
+    }
+    let sig = chia_bls::sign(&sk, &msg_bytes);
+    Ok(format!("0x{}", hex::encode(sig.to_bytes())))
+}
+
+/// FN: public_key_from_secret_key_bytes_js
+/// WHAT: Derive the BLS G1 public key from a 32-byte secret-key SEED.
+/// USE: ceremony participants generate a fresh client-side keypair
+///      via crypto.getRandomValues(32 bytes), then need the matching
+///      pk to populate the contribute action's curry args (the
+///      marker CeremonyCoin's puzzle hash binds participant_pubkey).
+/// JS NAME: `publicKeyFromSecretKeyBytes`.
+/// SK DERIVATION: see `signParticipantUnsafe` — both use
+///   `SecretKey::from_seed` so the seed→pk and seed→sig paths
+///   share the same in-group SK.
+/// CONTRACT:
+///   * `secret_key_hex` — 32-byte hex (with or without `0x`).
+///   * RETURNS: `0x`-prefixed 48-byte hex G1 pubkey.
+#[wasm_bindgen(js_name = "publicKeyFromSecretKeyBytes")]
+pub fn public_key_from_secret_key_bytes_js(
+    secret_key_hex: &str,
+) -> Result<String, JsError> {
+    let sk_bytes = hex::decode(secret_key_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("secret_key_hex decode: {e}")))?;
+    if sk_bytes.len() != 32 {
+        return Err(JsError::new(&format!(
+            "secret_key_hex must be 32 bytes (got {})",
+            sk_bytes.len()
+        )));
+    }
+    let sk = SecretKey::from_seed(&sk_bytes);
+    let pk = sk.public_key();
+    Ok(format!("0x{}", hex::encode(pk.to_bytes())))
+}
+
+/// FN: aggregate_signatures_g2_js
+/// WHAT: Aggregate N BLS G2 signatures into a single 96-byte
+///       signature. Mirrors `chia_bls::aggregate`.
+/// USE: combine the funder's Sage-signed AGG_SIG_ME signature with
+///      the participant's locally-signed AGG_SIG_UNSAFE signature
+///      into the final bundle signature. Standard BLS aggregate is
+///      addition in G2; the order of inputs does not matter.
+/// JS NAME: `aggregateSignaturesG2`.
+/// CONTRACT:
+///   * `sigs_concat_hex` — concatenation of N×96 byte hex sigs
+///     (with or without `0x`). Empty input → BLS identity (zero
+///     signature, decoded as `Signature::default()`).
+///   * RETURNS: `0x`-prefixed 96-byte hex aggregate signature.
+#[wasm_bindgen(js_name = "aggregateSignaturesG2")]
+pub fn aggregate_signatures_g2_js(
+    sigs_concat_hex: &str,
+) -> Result<String, JsError> {
+    use chia_bls::Signature;
+    let bytes = hex::decode(sigs_concat_hex.trim_start_matches("0x"))
+        .map_err(|e| JsError::new(&format!("sigs_concat_hex decode: {e}")))?;
+    if bytes.len() % 96 != 0 {
+        return Err(JsError::new(&format!(
+            "sigs_concat_hex must be a multiple of 96 bytes (got {})",
+            bytes.len()
+        )));
+    }
+    let mut agg = Signature::default();
+    for chunk in bytes.chunks_exact(96) {
+        let arr: [u8; 96] = chunk
+            .try_into()
+            .expect("chunks_exact(96) yields 96-byte slices");
+        let sig = Signature::from_bytes(&arr)
+            .map_err(|e| JsError::new(&format!("Signature::from_bytes: {e:?}")))?;
+        agg += &sig;
+    }
+    Ok(format!("0x{}", hex::encode(agg.to_bytes())))
+}
 
 /// Compute `standard_p2(synthetic_pk)` puzzle hash. Used to map a
 /// wallet's synthetic pubkey → the puzzle hash they spend coins under.
@@ -1187,10 +2421,41 @@ pub struct WasmCastVoteParams {
     pub registration_merkle_root_snapshot_hex: String,
     pub registration_vote_weight_snapshot: u64,
     pub voting_coin_amount: u64,
+    /// M5r-merkle-e: per-ballot vote-mode commitment.
+    /// None / empty / "0x00…00" = Mode1Free.
+    #[serde(default)]
+    pub vote_options_root_hex: Option<String>,
+    /// M5r-merkle-e: leaf index of vote_data in the sorted-options
+    /// merkle tree (Mode2Restricted only).
+    #[serde(default)]
+    pub vote_option_leaf_index: Option<u64>,
+    /// M5r-merkle-e: HashCons sibling proof (level-order, leaf→root).
+    /// Each entry is 32-byte hex. Empty / None for Mode1Free.
+    #[serde(default)]
+    pub vote_option_proof_hex: Option<Vec<String>>,
 }
 
 impl WasmCastVoteParams {
     fn into_sdk(self) -> VotingResult<chip_voting_sdk::actors::voter::CastVoteParams> {
+        let vote_options_root = match self
+            .vote_options_root_hex
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => parse_hex32(s)?,
+            None => chia_protocol::Bytes32::default(),
+        };
+        let vote_option_proof = match (self.vote_option_proof_hex, self.vote_option_leaf_index) {
+            (Some(siblings), Some(idx)) if !siblings.is_empty() => {
+                let mut proof: Vec<chia_protocol::Bytes32> = Vec::with_capacity(siblings.len());
+                for s in siblings {
+                    proof.push(parse_hex32(&s)?);
+                }
+                Some((idx as usize, proof))
+            }
+            _ => None,
+        };
         Ok(chip_voting_sdk::actors::voter::CastVoteParams {
             ballot_launcher_id: parse_hex32(&self.ballot_launcher_id_hex)?,
             vote_data: parse_hex32(&self.vote_data_hex)?,
@@ -1202,6 +2467,8 @@ impl WasmCastVoteParams {
             )?,
             registration_vote_weight_snapshot: self.registration_vote_weight_snapshot,
             voting_coin_amount: self.voting_coin_amount,
+            vote_options_root,
+            vote_option_proof,
         })
     }
 }
@@ -1220,10 +2487,44 @@ pub struct WasmUpdateVoteParams {
     pub vote_threshold_den: u64,
     pub registration_merkle_root_snapshot_hex: String,
     pub registration_vote_weight_snapshot: u64,
+    /// M5r-merkle-c: the Ballot Coin's curried `vote_options_root`.
+    /// Empty / None / "0x00…00" = Mode1Free; any other 32-byte hex
+    /// = Mode2Restricted (caller MUST also supply
+    /// `voteOptionLeafIndex` + `voteOptionProofHex`).
+    #[serde(default)]
+    pub vote_options_root_hex: Option<String>,
+    /// M5r-merkle-c: leaf index of `new_vote_data` in the sorted-options
+    /// merkle tree. Required for Mode2Restricted; defaulted to 0 for
+    /// Mode1Free (the puzzle's gate short-circuits).
+    #[serde(default)]
+    pub vote_option_leaf_index: Option<u64>,
+    /// M5r-merkle-c: HashCons sibling proof (level-order, leaf→root).
+    /// Each entry is 32-byte hex. Empty / None for Mode1Free.
+    #[serde(default)]
+    pub vote_option_proof_hex: Option<Vec<String>>,
 }
 
 impl WasmUpdateVoteParams {
     fn into_sdk(self) -> VotingResult<chip_voting_sdk::actors::voter::UpdateVoteParams> {
+        let vote_options_root = match self
+            .vote_options_root_hex
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => parse_hex32(s)?,
+            None => chia_protocol::Bytes32::default(),
+        };
+        let vote_option_proof = match (self.vote_option_proof_hex, self.vote_option_leaf_index) {
+            (Some(siblings), Some(idx)) if !siblings.is_empty() => {
+                let mut proof: Vec<chia_protocol::Bytes32> = Vec::with_capacity(siblings.len());
+                for s in siblings {
+                    proof.push(parse_hex32(&s)?);
+                }
+                Some((idx as usize, proof))
+            }
+            _ => None,
+        };
         Ok(chip_voting_sdk::actors::voter::UpdateVoteParams {
             voting_coin_id: parse_hex32(&self.voting_coin_id_hex)?,
             old_vote_data: parse_hex32(&self.old_vote_data_hex)?,
@@ -1237,6 +2538,8 @@ impl WasmUpdateVoteParams {
                 &self.registration_merkle_root_snapshot_hex,
             )?,
             registration_vote_weight_snapshot: self.registration_vote_weight_snapshot,
+            vote_options_root,
+            vote_option_proof,
         })
     }
 }
@@ -1248,14 +2551,30 @@ pub struct WasmCreateBallotParams {
     pub ballot_seed_hex: String,
     pub vote_close_height: u64,
     pub outcome_domain_hash_hex: String,
+    /// M10: optional 32-byte hex of the per-ballot vote-mode commitment.
+    /// `None` / empty / `"00…00"` = Mode1Free (any 32-byte vote_data
+    /// accepted). Otherwise = sorted-options merkle root the Ballot
+    /// Coin's oracle will commit to (Mode2Restricted).
+    #[serde(default)]
+    pub vote_options_root_hex: Option<String>,
 }
 
 impl WasmCreateBallotParams {
     fn into_sdk(self) -> VotingResult<chip_voting_sdk::actors::ballot::CreateBallotParams> {
+        let vote_options_root = match self
+            .vote_options_root_hex
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => parse_hex32(s)?,
+            None => chia_protocol::Bytes32::default(),
+        };
         Ok(chip_voting_sdk::actors::ballot::CreateBallotParams {
             ballot_seed: parse_hex32(&self.ballot_seed_hex)?,
             vote_close_height: self.vote_close_height,
             outcome_domain_hash: parse_hex32(&self.outcome_domain_hash_hex)?,
+            vote_options_root,
         })
     }
 }
@@ -1268,15 +2587,31 @@ pub struct WasmLaunchBallotParams {
     pub outcome_domain_hash_hex: String,
     pub vote_threshold_num: u64,
     pub vote_threshold_den: u64,
+    /// M10: optional 32-byte hex of the per-ballot vote-mode commitment.
+    /// MUST equal the value passed in the matching create_ballot call
+    /// (the SDK enforces this — predicted ballot puzzle hash will
+    /// mismatch on chain otherwise).
+    #[serde(default)]
+    pub vote_options_root_hex: Option<String>,
 }
 
 impl WasmLaunchBallotParams {
     fn into_sdk(self) -> VotingResult<chip_voting_sdk::actors::ballot::LaunchBallotParams> {
+        let vote_options_root = match self
+            .vote_options_root_hex
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => parse_hex32(s)?,
+            None => chia_protocol::Bytes32::default(),
+        };
         Ok(chip_voting_sdk::actors::ballot::LaunchBallotParams {
             vote_close_height: self.vote_close_height,
             outcome_domain_hash: parse_hex32(&self.outcome_domain_hash_hex)?,
             vote_threshold_num: self.vote_threshold_num,
             vote_threshold_den: self.vote_threshold_den,
+            vote_options_root,
         })
     }
 }
@@ -1386,21 +2721,31 @@ fn parse_pubkey_hex(s: &str, label: &str) -> VotingResult<PublicKey> {
 /// `releaseCollateralBuildSpends` (caller passes the SMT WITH the
 /// voter — proving membership). The dApp obtains the appropriate
 /// pubkey list from a prior aggregator/indexer pass.
-fn build_smt_from_pubkey_json(
-    voter_pubkeys_hex_json: &str,
-    label: &str,
+/// Sync the Election Singleton's SMT from chain. Replaces the legacy
+/// `build_smt_from_pubkey_json` helper — under the weighted-voting
+/// revision the SMT root depends on each voter's per-leaf locked
+/// amount, which the dApp can no longer reconstruct from a flat
+/// pubkey list. Internally drives `Aggregator::sync` (whose chain
+/// walker brute-forces the announce_register CCA preimage to recover
+/// each voter's REAL `locked_cat_mojos` — see
+/// `apply_singleton_spend`), then takes the populated `smt` field.
+async fn sync_smt_via_chain(
+    chain: &JsChainReader,
+    cfg: chip_voting_sdk::ElectionConfig,
+    network: chip_voting_sdk::NetworkType,
+    election_start_height: u64,
 ) -> VotingResult<chip_voting_sdk::merkle::SparseMerkleTree> {
-    let voter_hex_list: Vec<String> = serde_json::from_str(voter_pubkeys_hex_json).map_err(|e| {
-        VotingError::Other(anyhow_compat::Error(
-            format!("{label}: JSON parse: {e}").into(),
-        ))
-    })?;
-    let mut smt = chip_voting_sdk::merkle::SparseMerkleTree::new();
-    for (idx, h) in voter_hex_list.iter().enumerate() {
-        let pk = parse_pubkey_hex(h, &format!("{label}[{idx}]"))?;
-        smt.insert(&pk)?;
-    }
-    Ok(smt)
+    let mut aggregator = chip_voting_sdk::actors::aggregator::Aggregator::new(
+        cfg,
+        chain.clone(),
+        network,
+    )
+    .with_election_start_height(election_start_height);
+    let _ = aggregator.sync().await?;
+    aggregator
+        .merkle_tree()
+        .cloned()
+        .map_err(|e| VotingError::Other(anyhow_compat::Error(format!("sync_smt: {e:?}").into())))
 }
 
 /// Decode a 32-byte BLS secret key from hex (with or without `0x`
@@ -1482,8 +2827,8 @@ pub async fn register_build_spends_js(
     backend: JsChainBackend,
     election_config_json: String,
     voter_secret_hex: String,
-    voter_pubkeys_hex_json: String,
     cat_parent_spend_bytes: Vec<u8>,
+    lock_amount: u64,
     network: WasmNetwork,
     election_start_height: u64,
 ) -> Result<String, JsError> {
@@ -1494,14 +2839,20 @@ pub async fn register_build_spends_js(
     let secret = parse_secret_hex(&voter_secret_hex, "voter_secret_hex")
         .map_err(|e| JsError::new(&format!("{e}")))?;
     let keys = chip_voting_sdk::actors::voter::VoterKeys::new(secret);
-    let smt = build_smt_from_pubkey_json(&voter_pubkeys_hex_json, "voter_pubkeys_hex_json")
-        .map_err(|e| JsError::new(&format!("{e}")))?;
     let cat_parent_spend: chia_protocol::CoinSpend = decode_streamable(&cat_parent_spend_bytes)?;
+    let chain = JsChainReader::new(backend);
+    let smt = sync_smt_via_chain(
+        &chain,
+        cfg.clone(),
+        wasm_network_to_sdk(network),
+        election_start_height,
+    )
+    .await
+    .map_err(|e| JsError::new(&format!("sync_smt_via_chain: {e}")))?;
     let voter = chip_voting_sdk::actors::voter::Voter::new(cfg, keys, wasm_network_to_sdk(network))
         .with_election_start_height(election_start_height);
-    let chain = JsChainReader::new(backend);
     let bundle = voter
-        .register(&smt, cat_parent_spend, &chain)
+        .register(&smt, cat_parent_spend, &chain, lock_amount)
         .await
         .map_err(|e| JsError::new(&format!("register: {e}")))?;
     let bundle_bytes = encode_streamable(&bundle)?;
@@ -1520,8 +2871,8 @@ pub async fn register_build_unsigned_coin_spends_js(
     backend: JsChainBackend,
     election_config_json: String,
     voter_pk_hex: String,
-    voter_pubkeys_hex_json: String,
     cat_parent_spend_bytes: Vec<u8>,
+    lock_amount: u64,
     network: WasmNetwork,
     election_start_height: u64,
 ) -> Result<String, JsError> {
@@ -1531,14 +2882,21 @@ pub async fn register_build_unsigned_coin_spends_js(
         .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
     let voter_pk = parse_pubkey_hex(&voter_pk_hex, "voter_pk_hex")
         .map_err(|e| JsError::new(&format!("{e}")))?;
-    let smt = build_smt_from_pubkey_json(&voter_pubkeys_hex_json, "voter_pubkeys_hex_json")
-        .map_err(|e| JsError::new(&format!("{e}")))?;
     let cat_parent_spend: chia_protocol::CoinSpend = decode_streamable(&cat_parent_spend_bytes)?;
 
-    let voter = build_voter_for_external_signing(cfg, voter_pk, network, election_start_height)?;
     let chain = JsChainReader::new(backend);
+    let smt = sync_smt_via_chain(
+        &chain,
+        cfg.clone(),
+        wasm_network_to_sdk(network),
+        election_start_height,
+    )
+    .await
+    .map_err(|e| JsError::new(&format!("sync_smt_via_chain: {e}")))?;
+
+    let voter = build_voter_for_external_signing(cfg, voter_pk, network, election_start_height)?;
     let coin_spends = voter
-        .register_build_coin_spends(&smt, cat_parent_spend, &chain)
+        .register_build_coin_spends(&smt, cat_parent_spend, &chain, lock_amount)
         .await
         .map_err(|e| JsError::new(&format!("register_build_coin_spends: {e}")))?;
     let wallet_spends: Vec<WalletCoinSpend> =
@@ -2298,8 +3656,174 @@ pub async fn read_election_singleton_state_js(
         "registrationCount": cs.state.registration_count,
         "registrationVoteWeight": cs.state.registration_vote_weight,
         "electionStartHeight": cs.state.election_start_height,
+        // M12: per-election ballot-mode lock. Sentinel 0xFF…FF = "no
+        // lock"; 0x00…00 = lock to Mode1Free; any other value = lock to
+        // that exact sorted-options merkle root. /create-ballot UI
+        // honors this when minting fresh ballots.
+        "voteModeLockHex": format!("0x{}", hex::encode(cs.state.vote_mode_lock)),
     });
     Ok(out.to_string())
+}
+
+/// Recover `election_start_height` from chain by matching the eve
+/// singleton's actual puzzle hash against candidates derived from the
+/// launcher's confirmed height. The deployer signs the launcher with
+/// `electionStartHeight = peak` at submission time; the launcher
+/// confirms 1-N blocks later. Without the value in the bootstrap, the
+/// dApp can't predict the eve_ph (and every subsequent spend's
+/// declared puzzle hash diverges from chain). This walks a window of
+/// candidate heights and finds the unique value whose computed eve_ph
+/// matches the launcher's actual on-chain child.
+///
+/// Returns the recovered height as a number, or null if no candidate
+/// in the window matches (caller should widen the window or fall back
+/// to share-bundle re-import).
+#[wasm_bindgen(js_name = "recoverElectionStartHeight")]
+pub async fn recover_election_start_height_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    window_blocks: u32,
+) -> Result<JsValue, JsError> {
+    use chip_voting_sdk::actors::aggregator::compute_eve_singleton_puzzle_hash;
+
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let launcher_id = cfg
+        .election_launcher_id()
+        .map_err(|e| JsError::new(&format!("election_launcher_id: {e}")))?;
+
+    let chain = JsChainReader::new(backend);
+
+    // 1. Fetch the launcher's confirmed_height — gives us the search center.
+    let launcher_record = chain
+        .coin_record_by_id(launcher_id)
+        .await
+        .map_err(|e| JsError::new(&format!("launcher coin_record_by_id: {e}")))?
+        .ok_or_else(|| JsError::new("launcher coin not found on chain"))?;
+    let center: u64 = launcher_record.confirmed_height as u64;
+    if center == 0 {
+        return Err(JsError::new(
+            "launcher coin has no confirmed_height — not yet on chain",
+        ));
+    }
+
+    // 2. Get the actual eve coin (the launcher's only valid child).
+    let children = chain
+        .coin_records_by_parent_ids(&[launcher_id])
+        .await
+        .map_err(|e| JsError::new(&format!("launcher children query: {e}")))?;
+    let eve = children
+        .into_iter()
+        .find(|r| r.coin.amount % 2 == 1)
+        .ok_or_else(|| {
+            JsError::new(
+                "launcher has no valid singleton child — election not deployed yet",
+            )
+        })?;
+    let actual_eve_ph = eve.coin.puzzle_hash;
+
+    // 3. Scan candidate heights. The deployer's `peak` ≤ launcher's
+    //    confirmed_height, but we widen on both sides for robustness
+    //    (e.g. clock-skew between dApp + node).
+    let lo = center.saturating_sub(window_blocks as u64);
+    let hi = center.saturating_add(window_blocks as u64);
+    for candidate in lo..=hi {
+        let predicted = compute_eve_singleton_puzzle_hash(&cfg, candidate);
+        if predicted == actual_eve_ph {
+            return Ok(JsValue::from_f64(candidate as f64));
+        }
+    }
+    Ok(JsValue::NULL)
+}
+
+/// Walk the Election Singleton's lineage and return EVERY registered
+/// voter's pubkey + locked amount as a JSON array. Drives finalize +
+/// tally flows on browsers that didn't witness register actions
+/// directly (share-bundle imports, second-device finalize, etc) so
+/// they can pass `voter_pubkeys` to `collectVotesForBallot` /
+/// `buildBallotFinalizeBundle` without depending on
+/// session-storage-tracked lists.
+///
+/// JSON shape: `[{ "pubkeyHex": "0x...", "lockedAmount": 1000 }, ...]`
+#[wasm_bindgen(js_name = "listRegisteredVoters")]
+pub async fn list_registered_voters_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<String, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let chain = JsChainReader::new(backend);
+    let mut aggregator = chip_voting_sdk::actors::aggregator::Aggregator::new(
+        cfg,
+        chain,
+        wasm_network_to_sdk(network),
+    )
+    .with_election_start_height(election_start_height);
+    aggregator
+        .sync()
+        .await
+        .map_err(|e| JsError::new(&format!("Aggregator::sync: {e}")))?;
+    let voter_set = aggregator
+        .voter_set()
+        .map_err(|e| JsError::new(&format!("voter_set: {e:?}")))?;
+    let smt = aggregator
+        .merkle_tree()
+        .map_err(|e| JsError::new(&format!("merkle_tree: {e:?}")))?;
+    let entries: Vec<serde_json::Value> = voter_set
+        .voters
+        .iter()
+        .map(|pk| {
+            let amount = smt.locked_amount(pk).unwrap_or(0);
+            serde_json::json!({
+                "pubkeyHex": format!("0x{}", hex::encode(pk.to_bytes())),
+                "lockedAmount": amount,
+            })
+        })
+        .collect();
+    serde_json::to_string(&entries)
+        .map_err(|e| JsError::new(&format!("encode listRegisteredVoters: {e}")))
+}
+
+/// Look up a specific voter's `locked_cat_mojos` from the on-chain SMT.
+/// Returns `null` if the voter isn't currently registered (not in the
+/// SMT). Drives the dApp's "Your weight = N CAT" stat without exposing
+/// the full per-voter mapping (which would require listing every
+/// registered voter on-chain — possible but heavier).
+#[wasm_bindgen(js_name = "getVoterLockedAmount")]
+pub async fn get_voter_locked_amount_js(
+    backend: JsChainBackend,
+    election_config_json: String,
+    voter_pk_hex: String,
+    network: WasmNetwork,
+    election_start_height: u64,
+) -> Result<JsValue, JsError> {
+    let cfg: chip_voting_sdk::ElectionConfig = serde_json::from_str(&election_config_json)
+        .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
+    cfg.validate()
+        .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    let voter_pk = parse_pubkey_hex(&voter_pk_hex, "voter_pk_hex")
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    let chain = JsChainReader::new(backend);
+    let smt = sync_smt_via_chain(
+        &chain,
+        cfg,
+        wasm_network_to_sdk(network),
+        election_start_height,
+    )
+    .await
+    .map_err(|e| JsError::new(&format!("sync_smt_via_chain: {e}")))?;
+
+    Ok(match smt.locked_amount(&voter_pk) {
+        Some(amount) => JsValue::from_f64(amount as f64),
+        None => JsValue::NULL,
+    })
 }
 
 /// JS-side input mirror of
@@ -2400,7 +3924,6 @@ pub async fn release_collateral_build_spends_js(
     backend: JsChainBackend,
     election_config_json: String,
     voter_secret_hex: String,
-    voter_pubkeys_hex_json: String,
     registration_coin_id_hex: String,
     destination_puzzle_hash_hex: String,
     network: WasmNetwork,
@@ -2413,15 +3936,21 @@ pub async fn release_collateral_build_spends_js(
     let secret = parse_secret_hex(&voter_secret_hex, "voter_secret_hex")
         .map_err(|e| JsError::new(&format!("{e}")))?;
     let keys = chip_voting_sdk::actors::voter::VoterKeys::new(secret);
-    let smt = build_smt_from_pubkey_json(&voter_pubkeys_hex_json, "voter_pubkeys_hex_json")
-        .map_err(|e| JsError::new(&format!("{e}")))?;
     let registration_coin_id = parse_hex32(&registration_coin_id_hex)
         .map_err(|e| JsError::new(&format!("registration_coin_id_hex: {e}")))?;
     let destination = parse_hex32(&destination_puzzle_hash_hex)
         .map_err(|e| JsError::new(&format!("destination_puzzle_hash_hex: {e}")))?;
+    let chain = JsChainReader::new(backend);
+    let smt = sync_smt_via_chain(
+        &chain,
+        cfg.clone(),
+        wasm_network_to_sdk(network),
+        election_start_height,
+    )
+    .await
+    .map_err(|e| JsError::new(&format!("sync_smt_via_chain: {e}")))?;
     let voter = chip_voting_sdk::actors::voter::Voter::new(cfg, keys, wasm_network_to_sdk(network))
         .with_election_start_height(election_start_height);
-    let chain = JsChainReader::new(backend);
     let bundle = voter
         .release_collateral(&chain, &smt, registration_coin_id, destination)
         .await
@@ -2443,7 +3972,6 @@ pub async fn release_collateral_build_unsigned_coin_spends_js(
     backend: JsChainBackend,
     election_config_json: String,
     voter_pk_hex: String,
-    voter_pubkeys_hex_json: String,
     registration_coin_id_hex: String,
     destination_puzzle_hash_hex: String,
     network: WasmNetwork,
@@ -2455,15 +3983,21 @@ pub async fn release_collateral_build_unsigned_coin_spends_js(
         .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
     let voter_pk = parse_pubkey_hex(&voter_pk_hex, "voter_pk_hex")
         .map_err(|e| JsError::new(&format!("{e}")))?;
-    let smt = build_smt_from_pubkey_json(&voter_pubkeys_hex_json, "voter_pubkeys_hex_json")
-        .map_err(|e| JsError::new(&format!("{e}")))?;
     let registration_coin_id = parse_hex32(&registration_coin_id_hex)
         .map_err(|e| JsError::new(&format!("registration_coin_id_hex: {e}")))?;
     let destination = parse_hex32(&destination_puzzle_hash_hex)
         .map_err(|e| JsError::new(&format!("destination_puzzle_hash_hex: {e}")))?;
 
-    let voter = build_voter_for_external_signing(cfg, voter_pk, network, election_start_height)?;
     let chain = JsChainReader::new(backend);
+    let smt = sync_smt_via_chain(
+        &chain,
+        cfg.clone(),
+        wasm_network_to_sdk(network),
+        election_start_height,
+    )
+    .await
+    .map_err(|e| JsError::new(&format!("sync_smt_via_chain: {e}")))?;
+    let voter = build_voter_for_external_signing(cfg, voter_pk, network, election_start_height)?;
     let coin_spends = voter
         .release_collateral_build_coin_spends(&chain, &smt, registration_coin_id, destination)
         .await

@@ -1,0 +1,105 @@
+// ceremony_singleton/shared.rue
+// State and types for the Ceremony Singleton.
+//
+// The Ceremony Singleton orchestrates an on-chain Groth16 trusted
+// setup: it accepts an ordered sequence of public contributions over
+// a curried block-height window, then "freezes". The singleton
+// itself never holds the toxic waste — each participant generates
+// their τ locally, applies it to the public parameters off chain,
+// publishes the updated parameters + Proof of Knowledge via the
+// `contribute` action, then deletes τ on their own machine.
+//
+// Security model:
+//   * 1-of-N honest assumption: as long as ANY single participant
+//     deletes their toxic waste, the resulting VK is sound.
+//   * Linear lineage: each contribution's PREV_CONTRIBUTION_HASH must
+//     equal the previous CONTRIBUTION_HASH (or `vk_seed` for the
+//     genesis contributor). The singleton enforces this via curried
+//     state (`last_contribution_hash`).
+//   * Per-contribution AGG_SIG_UNSAFE: participants prove ownership
+//     of their submitting pubkey by signing
+//     sha256(ceremony_launcher_id || contribution_hash || prev).
+//   * Time bound: contributions accepted only when
+//       start_block_height <= current_height < start + length.
+//   * Min participants: enforced OFF-CHAIN at VK derivation time
+//     (see SDK::ceremony::derive_vk). On-chain enforcement would
+//     require an extra action puzzle and isn't security-relevant —
+//     a deployer who tries to derive a VK below the threshold
+//     simply fails to produce a usable proving key.
+
+import super::common_types::*;
+
+//
+// CeremonyState semantics:
+//   contribution_count       — number of accepted contributions; 0
+//                              before the genesis contributor lands.
+//   last_contribution_hash   — CONTRIBUTION_HASH of the most-recent
+//                              accepted contribution. Equals the
+//                              curried `vk_seed` before any
+//                              contribution lands. The next
+//                              contributor MUST supply this exact
+//                              hash as their PREV_CONTRIBUTION_HASH.
+//   finalized                — Int boolean (0 / 1). Set to 1 by the
+//                              finalize action once the threshold
+//                              is met and the window has closed;
+//                              the contribute action asserts this
+//                              field is 0 before accepting another
+//                              contribution.
+//   vk_hash                  — sha256 of the derived Groth16 VK
+//                              bytes. Bytes32(0x00…) pre-finalize.
+//   marker_root              — sha256 binary-tree merkle root over
+//                              the sorted marker coin ids of every
+//                              accepted contribution. Bytes32(0x00…)
+//                              pre-finalize.
+
+export struct CeremonyState {
+    contribution_count: Int,
+    last_contribution_hash: Bytes32,
+    finalized: Int,
+    vk_hash: Bytes32,
+    ...marker_root: Bytes32,
+}
+
+export struct CeremonyStateTruth {
+    Ephemeral_State: Any,
+    ...State: CeremonyState,
+}
+
+/// Compute the per-contribution signature message — what the
+/// participant signs (UNAUGMENTED, sign_raw) to authorize their
+/// submission. Domain-separated by the literal "ceremony_contribute"
+/// prefix so this signature can never be confused with anything else
+/// (vote messages, registration messages, etc.).
+///
+/// MUST stay in sync with sdk/src/actors/ceremony.rs's
+/// `ceremony_contribution_msg` helper.
+export inline fn ceremony_contribution_msg(
+    ceremony_launcher_id: Bytes32,
+    contribution_hash: Bytes32,
+    prev_contribution_hash: Bytes32,
+) -> Bytes32 {
+    sha256(
+        "ceremony_contribute"
+        + (ceremony_launcher_id as Bytes)
+        + (contribution_hash as Bytes)
+        + (prev_contribution_hash as Bytes)
+    )
+}
+
+/// Compute the per-contribution announcement message emitted by the
+/// `contribute` action. Carries the contribution_hash so observers
+/// can chain-walk the singleton lineage and reconstruct the linear
+/// sequence of contributions (each spend's announcement points to
+/// its CeremonyCoin).
+export inline fn ceremony_contribution_announcement_msg(
+    ceremony_launcher_id: Bytes32,
+    contribution_hash: Bytes32,
+    participant_pubkey: PublicKey,
+) -> Bytes32 {
+    sha256(
+        "ceremony_contributed"
+        + (ceremony_launcher_id as Bytes)
+        + (contribution_hash as Bytes)
+        + (participant_pubkey as Bytes)
+    )
+}

@@ -73,12 +73,17 @@ async fn create_ballot_against_simulator_full_flow() {
         },
         cat_tail_hash,
         collateral_amount,
+        tree_depth: chip_voting_sdk::config::TREE_DEPTH,
+        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        ceremony_launcher_id: Bytes32::default(),
+        vk_hash: Bytes32::default(),
+        vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         election_start_height: 0,
         label: None,
     };
     let deployer = ElectionDeployer::new(params);
     let (deploy_spends, config) = deployer
-        .build_deploy_bundle(funder.coin, funder.pk)
+        .build_deploy_bundle(funder.coin, funder.pk, true)
         .expect("build_deploy_bundle");
     sim.spend_coins(deploy_spends, std::slice::from_ref(&funder.sk))
         .expect("simulator accepts deploy bundle");
@@ -119,6 +124,7 @@ async fn create_ballot_against_simulator_full_flow() {
                 ballot_seed,
                 vote_close_height,
                 outcome_domain_hash,
+                vote_options_root: Bytes32::default(),
             },
             funder_spend,
         )

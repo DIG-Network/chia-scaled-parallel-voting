@@ -556,6 +556,7 @@ impl ArkVerifyingKey {
 /// layout; arkworks consumes only the structure (number of public
 /// inputs + R1CS shape), not the witness values.
 pub fn generate_test_setup<R: Rng + ark_std::rand::CryptoRng>(
+    tree_depth: usize,
     rng: &mut R,
 ) -> VotingResult<(ArkProvingKey, ArkVerifyingKey)> {
     // Shape-defining circuit — single signer over a single voter,
@@ -564,9 +565,9 @@ pub fn generate_test_setup<R: Rng + ark_std::rand::CryptoRng>(
     //   1 * 2  >=  1 * 1
     // Witness values are evaluated by arkworks during setup so the
     // constraint must actually be satisfied here (not just well-
-    // formed). Under CHIP rev 2026-05-02 the resulting VK has 7 IC
-    // points (ic0 + ic1..ic6) ⇒ 672 bytes total via
-    // `chia_chunked_bytes`.
+    // formed). The merkle_proof length must equal `tree_depth` so
+    // the resulting circuit constraints scale with the configured
+    // SPT depth (post-E2: derived from CeremonyParams.max_voters).
     let shape_circuit = VotingCircuit {
         registration_merkle_root: Bytes32::default(),
         registration_vote_weight: 1,
@@ -579,7 +580,7 @@ pub fn generate_test_setup<R: Rng + ark_std::rand::CryptoRng>(
             pubkey: PublicKey::default(),
             weight: 1,
             leaf_index: 0,
-            merkle_proof: vec![Bytes32::default(); 32],
+            merkle_proof: vec![Bytes32::default(); tree_depth],
         }],
     };
     let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(shape_circuit, rng)
@@ -666,7 +667,7 @@ mod tests {
     #[test]
     fn generate_test_setup_succeeds() {
         let mut rng = deterministic_rng();
-        let (_pk, vk) = generate_test_setup(&mut rng).unwrap();
+        let (_pk, vk) = generate_test_setup(32, &mut rng).unwrap();
         assert_eq!(
             vk.0.gamma_abc_g1.len(),
             9,
@@ -686,7 +687,7 @@ mod tests {
     #[test]
     fn prove_then_verify_offchain_roundtrips() {
         let mut rng = deterministic_rng();
-        let (pk, vk) = generate_test_setup(&mut rng).unwrap();
+        let (pk, vk) = generate_test_setup(32, &mut rng).unwrap();
 
         let circuit = make_circuit(2, 3);
         let inputs = circuit.public_inputs_as_fr();
@@ -728,7 +729,7 @@ mod tests {
     #[test]
     fn verify_offchain_rejects_tampered_inputs() {
         let mut rng = deterministic_rng();
-        let (pk, vk) = generate_test_setup(&mut rng).unwrap();
+        let (pk, vk) = generate_test_setup(32, &mut rng).unwrap();
 
         let circuit = make_circuit(2, 3);
         let inputs = circuit.public_inputs_as_fr();
@@ -765,7 +766,7 @@ mod tests {
         // see `VotingCircuit::prove`'s comment for the rationale.
         // The full weighted-quorum gadget is Phase 6 work.
         let mut rng = deterministic_rng();
-        let (pk, _vk) = generate_test_setup(&mut rng).unwrap();
+        let (pk, _vk) = generate_test_setup(32, &mut rng).unwrap();
         let circuit = make_circuit(0, 4); // empty signer set
         match circuit.prove(&pk) {
             Err(VotingError::BelowThreshold) => {}
@@ -782,7 +783,7 @@ mod tests {
     #[test]
     fn prove_succeeds_at_boundary_majority() {
         let mut rng = deterministic_rng();
-        let (pk, vk) = generate_test_setup(&mut rng).unwrap();
+        let (pk, vk) = generate_test_setup(32, &mut rng).unwrap();
         let circuit = make_circuit(3, 4); // 2k = 6 > 4 ✓
         let proof = circuit.prove(&pk).unwrap();
         let inputs = circuit.public_inputs_as_fr();
@@ -809,7 +810,7 @@ mod tests {
     #[test]
     fn vk_chia_chunked_bytes_is_768_bytes() {
         let mut rng = deterministic_rng();
-        let (_pk, vk) = generate_test_setup(&mut rng).unwrap();
+        let (_pk, vk) = generate_test_setup(32, &mut rng).unwrap();
         let bytes = vk.chia_chunked_bytes().unwrap();
         assert_eq!(
             bytes.len(),
@@ -828,7 +829,7 @@ mod tests {
     #[test]
     fn vk_serialize_deserialize_roundtrip() {
         let mut rng = deterministic_rng();
-        let (pk, vk) = generate_test_setup(&mut rng).unwrap();
+        let (pk, vk) = generate_test_setup(32, &mut rng).unwrap();
         let bytes = vk.serialize_compressed().unwrap();
         let vk2 = ArkVerifyingKey::deserialize_compressed(&bytes).unwrap();
 

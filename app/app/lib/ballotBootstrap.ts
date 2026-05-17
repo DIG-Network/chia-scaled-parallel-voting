@@ -14,11 +14,16 @@
 // Mirrors `electionBootstrap.ts`'s session-storage pattern (key
 // `chip-ballot-bootstrap:<electionLauncher>:<ballotLauncher>`).
 //
-// The dApp doesn't try to enumerate ballots from chain (the
-// `listBallots` walk works but is slow); it just remembers what it
-// just minted, plus what it picks up from imported share bundles.
+// As of Phase B (2026-05-06), the dApp's canonical ballot list is the
+// chain walk via `wasm.listBallots` (see lib/electionBallots.ts). This
+// per-ballot bootstrap is now a CACHE that augments chain rows with
+// dApp-only metadata (label, choices, voteThresholdNum/Den, the
+// registration snapshots) and a "pending mint" hint window for
+// freshly-minted ballots whose eve singleton hasn't yet appeared in
+// the chain walk.
 
 import { normalizeHex32 } from "./units";
+import type { ElectionChoice } from "./elections";
 
 export interface BallotBootstrap {
   /** Election the ballot belongs to. 0x-hex 32 bytes. */
@@ -53,8 +58,35 @@ export interface BallotBootstrap {
   label?: string;
   /** Block height the finalize bundle confirmed at (post-finalize). */
   finalizedAtHeight?: number;
+  /**
+   * Chain-derived finalize bit (from `wasm.getBallot` / `wasm.listBallots`
+   * BallotState.finalized). Use this for boolean checks instead of
+   * `!!finalizedAtHeight` — it stays correct when the dApp didn't
+   * witness the finalize broadcast itself (e.g. cross-browser
+   * finalize). `finalizedAtHeight` may still be undefined in that
+   * case; callers needing the actual height should fall back to "—".
+   */
+  finalized?: boolean;
   /** Canonical 32-byte vote outcome (`sha256("vote:" + label)`). */
   voteOutcomeHex?: string;
+  /**
+   * Voter choices for THIS ballot. CHIP rev 2026-05-02: choices are
+   * per-ballot, not per-election (different ballots can ask
+   * different questions). Each entry pairs a human label with the
+   * canonical `vote_data` (sha256("vote:" + label)) the voter casts.
+   * Set by the operator when minting via "Mint a new ballot".
+   */
+  choices?: ElectionChoice[];
+  /**
+   * M13: per-ballot vote-mode commitment that the Ballot Coin's
+   * oracle action is curried with. `0x00…00` (or omitted) = Mode1Free
+   * — voters can submit any 32-byte vote_data. Anything else =
+   * Mode2Restricted — sorted-options merkle root the voter must
+   * supply a membership proof for (M5-revised, future). For M13's
+   * UI scope: drives the "Mode: free / restricted (N options)"
+   * header badge and disables the freeform input under restricted.
+   */
+  voteOptionsRootHex?: string;
 }
 
 function normKey(electionLauncherIdHex: string, ballotLauncherIdHex: string): string {

@@ -190,6 +190,62 @@ pub const VOTING_COIN_UPDATE_VOTE_HEX: &str =
 pub const VOTING_COIN_UPDATE_VOTE_HASH_HEX: &str =
     include_str!("../../puzzles/compiled/voting_coin/update_vote.rue.hash");
 
+// ── Ceremony Coin (per-contribution marker) ───────────────────────────
+
+/// CeremonyCoin marker puzzle — a coin per Groth16 ceremony
+/// contribution. Curry binds (CEREMONY_LAUNCHER_ID, PARTICIPANT_PK,
+/// CONTRIBUTION_HASH, PREV_CONTRIBUTION_HASH); puzzle body returns
+/// no conditions (pure marker, effectively unspendable but
+/// chain-discoverable via hint=CEREMONY_LAUNCHER_ID).
+pub const CEREMONY_COIN_MARKER_HEX: &str =
+    include_str!("../../puzzles/compiled/ceremony_coin/marker.rue.hex");
+pub const CEREMONY_COIN_MARKER_HASH_HEX: &str =
+    include_str!("../../puzzles/compiled/ceremony_coin/marker.rue.hash");
+
+// ── Ceremony Singleton (multi-participant trusted setup) ──────────────
+
+/// Ceremony Singleton custom finalizer — recreates the singleton at
+/// amount=1 carrying the advanced CeremonyState (count+1,
+/// last_contribution_hash <- new contribution hash).
+pub const CEREMONY_SINGLETON_FINALIZER_HEX: &str =
+    include_str!("../../puzzles/compiled/ceremony_singleton/finalizer.rue.hex");
+pub const CEREMONY_SINGLETON_FINALIZER_HASH_HEX: &str =
+    include_str!("../../puzzles/compiled/ceremony_singleton/finalizer.rue.hash");
+
+/// Ceremony Singleton `contribute` action — permissionless. Validates
+/// height bounds, lineage (prev_contribution_hash matches singleton
+/// state), and an UNAUGMENTED participant signature; emits a marker
+/// CeremonyCoin (hinted with launcher) plus an announcement carrying
+/// the contribution hash. Full PoK + parameters payload travels in
+/// the spend's solution and is recovered off-chain by the dApp.
+pub const CEREMONY_SINGLETON_CONTRIBUTE_HEX: &str =
+    include_str!("../../puzzles/compiled/ceremony_singleton/contribute.rue.hex");
+pub const CEREMONY_SINGLETON_CONTRIBUTE_HASH_HEX: &str =
+    include_str!("../../puzzles/compiled/ceremony_singleton/contribute.rue.hash");
+
+/// `finalize` action puzzle (post-D3): sealed by anyone once the
+/// window has closed and the threshold has been reached. Emits a
+/// marker coin with vk_hash + marker_root + full vk_bytes in memos
+/// and advances the singleton's curried state to `finalized=1`,
+/// blocking further contribute spends.
+pub const CEREMONY_SINGLETON_FINALIZE_HEX: &str =
+    include_str!("../../puzzles/compiled/ceremony_singleton/finalize.rue.hex");
+pub const CEREMONY_SINGLETON_FINALIZE_HASH_HEX: &str =
+    include_str!("../../puzzles/compiled/ceremony_singleton/finalize.rue.hash");
+
+/// Voucher coin spawned by the Ceremony Singleton's `finalize` action.
+/// Anyone-can-spend, re-spendable indefinitely. Emits a canonical
+/// CreateCoinAnnouncement(sha256("chip:ceremony:voucher" || vk_hash ||
+/// max_voters_be8 || ceremony_launcher_id)) on every spend, plus a
+/// CreateCoin recreating itself at the same puzzle hash. ElectionDeployer
+/// co-spends one of these in the same SpendBundle as the launcher and
+/// asserts the announcement to bind the deployed election to the
+/// finalized ceremony.
+pub const CEREMONY_VOUCHER_HEX: &str =
+    include_str!("../../puzzles/compiled/ceremony_singleton/ceremony_voucher.rue.hex");
+pub const CEREMONY_VOUCHER_HASH_HEX: &str =
+    include_str!("../../puzzles/compiled/ceremony_singleton/ceremony_voucher.rue.hash");
+
 // ── Ballot SPT constants ──────────────────────────────────────────────
 
 /// Empty leaf marker for the per-registration ballot SPT. Voting on
@@ -276,6 +332,25 @@ impl PuzzleHashes {
     }
     pub fn voting_coin_update_vote() -> Bytes32 {
         decode_hash(VOTING_COIN_UPDATE_VOTE_HASH_HEX)
+    }
+
+    // Ceremony Coin (per-contribution marker)
+    pub fn ceremony_coin_marker() -> Bytes32 {
+        decode_hash(CEREMONY_COIN_MARKER_HASH_HEX)
+    }
+
+    // Ceremony Singleton (multi-participant trusted setup)
+    pub fn ceremony_singleton_finalizer() -> Bytes32 {
+        decode_hash(CEREMONY_SINGLETON_FINALIZER_HASH_HEX)
+    }
+    pub fn ceremony_singleton_contribute() -> Bytes32 {
+        decode_hash(CEREMONY_SINGLETON_CONTRIBUTE_HASH_HEX)
+    }
+    pub fn ceremony_singleton_finalize() -> Bytes32 {
+        decode_hash(CEREMONY_SINGLETON_FINALIZE_HASH_HEX)
+    }
+    pub fn ceremony_voucher() -> Bytes32 {
+        decode_hash(CEREMONY_VOUCHER_HASH_HEX)
     }
 
     /// Standard CAT v2 outer puzzle tree hash. Sourced from
@@ -1005,18 +1080,26 @@ pub fn deregister_announcement_msg(voter_pubkey: &PublicKey) -> Bytes32 {
 /// FN: ballot_oracle_open_msg
 /// WHAT: byte-form of the open-variant message emitted by
 ///       `puzzles/ballot_coin/oracle.rue` when `State.finalized == false`.
-/// FORMULA: `sha256("ballot_oracle_open" ||
+/// FORMULA (M4-revised, 3-field preimage): `sha256("ballot_oracle_open" ||
 ///                  ballot_launcher_id ||
-///                  vote_close_height_be8)`.
+///                  vote_close_height_be8 ||
+///                  vote_options_root)`.
 /// USAGE: Voting Coin's `update_vote` action asserts a
 ///        `CoinAnnouncement` with this preimage to pin the Ballot
-///        Coin's actual curried close height (defends against a
-///        malicious mint having lied about close height).
-pub fn ballot_oracle_open_msg(ballot_launcher_id: Bytes32, vote_close_height: u64) -> Bytes32 {
+///        Coin's actual curried close height + curried vote_options_root
+///        (defends against a malicious mint having lied about either).
+/// SENTINEL: pass `Bytes32::default()` (= 0x00…00) for `vote_options_root`
+///        when the ballot is Mode1Free (no vote-mode lock).
+pub fn ballot_oracle_open_msg(
+    ballot_launcher_id: Bytes32,
+    vote_close_height: u64,
+    vote_options_root: Bytes32,
+) -> Bytes32 {
     let mut h = Sha256::new();
     h.update(b"ballot_oracle_open");
     h.update(ballot_launcher_id.as_ref());
     h.update(vote_close_height.to_be_bytes());
+    h.update(vote_options_root.as_ref());
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&h.finalize());
     Bytes32::new(arr)
@@ -1025,9 +1108,10 @@ pub fn ballot_oracle_open_msg(ballot_launcher_id: Bytes32, vote_close_height: u6
 /// FN: ballot_oracle_closed_msg
 /// WHAT: byte-form of the closed-variant message emitted by
 ///       `puzzles/ballot_coin/oracle.rue` when `State.finalized == true`.
-/// FORMULA: `sha256("ballot_oracle_closed" ||
+/// FORMULA (M4-revised, 5-field preimage): `sha256("ballot_oracle_closed" ||
 ///                  ballot_launcher_id ||
 ///                  vote_close_height_be8 ||
+///                  vote_options_root ||
 ///                  vote_outcome ||
 ///                  agg_signers_commitment)`.
 /// PREFIX SAFETY: distinct ASCII prefix from `ballot_oracle_open_msg`
@@ -1037,6 +1121,7 @@ pub fn ballot_oracle_open_msg(ballot_launcher_id: Bytes32, vote_close_height: u6
 pub fn ballot_oracle_closed_msg(
     ballot_launcher_id: Bytes32,
     vote_close_height: u64,
+    vote_options_root: Bytes32,
     vote_outcome: Bytes32,
     agg_signers_commitment: Bytes32,
 ) -> Bytes32 {
@@ -1044,6 +1129,7 @@ pub fn ballot_oracle_closed_msg(
     h.update(b"ballot_oracle_closed");
     h.update(ballot_launcher_id.as_ref());
     h.update(vote_close_height.to_be_bytes());
+    h.update(vote_options_root.as_ref());
     h.update(vote_outcome.as_ref());
     h.update(agg_signers_commitment.as_ref());
     let mut arr = [0u8; 32];
@@ -1370,6 +1456,63 @@ pub fn ballot_coin_puzzle_hash(
     let inner_th = TreeHash::new(inner_hash.to_bytes());
     let curried = SingletonArgs::curry_tree_hash(ballot_launcher_id, inner_th);
     Bytes32::new(curried.to_bytes())
+}
+
+// ============================================================================
+// Ceremony voucher helpers (V-series Option 1)
+// ============================================================================
+
+/// Domain-separation prefix committed into every voucher coin's
+/// canonical announcement message. MUST stay byte-identical to the
+/// literal in `puzzles/ceremony_singleton/ceremony_voucher.rue`.
+pub const CEREMONY_VOUCHER_DOMAIN: &[u8] = b"chip:ceremony:voucher";
+
+/// Compute the canonical announcement message a voucher coin emits
+/// on every spend. Pre-supplied to the puzzle as a 1st-curry arg so
+/// the rue puzzle never has to re-hash the variable-length CLVM
+/// representation of `max_voters`.
+///
+/// FORMULA: `sha256(CEREMONY_VOUCHER_DOMAIN || vk_hash ||
+///           max_voters_be8 || ceremony_launcher_id)`.
+pub fn ceremony_voucher_canonical_msg(
+    vk_hash: Bytes32,
+    max_voters: u64,
+    ceremony_launcher_id: Bytes32,
+) -> Bytes32 {
+    let mut h = Sha256::new();
+    h.update(CEREMONY_VOUCHER_DOMAIN);
+    h.update(vk_hash.to_bytes().as_slice());
+    h.update(&max_voters.to_be_bytes());
+    h.update(ceremony_launcher_id.to_bytes().as_slice());
+    let digest: [u8; 32] = h.finalize().into();
+    Bytes32::new(digest)
+}
+
+/// Predict the puzzle hash of a curried `ceremony_voucher` coin.
+///
+/// CURRY LAYOUT (mirrors `puzzles/ceremony_singleton/ceremony_voucher.rue`):
+///   1st curry: `(MOD_HASH, CANONICAL_MSG, CEREMONY_LAUNCHER_ID)`
+///   2nd curry: `(SELF_HASH = curry_tree_hash(MOD_HASH,
+///               [hash_atom(MOD_HASH), hash_atom(CANONICAL_MSG),
+///                hash_atom(CEREMONY_LAUNCHER_ID)]))`
+/// Final puzzle hash = `curry_tree_hash(SELF_HASH, [hash_atom(SELF_HASH)])`.
+pub fn ceremony_voucher_puzzle_hash(
+    vk_hash: Bytes32,
+    max_voters: u64,
+    ceremony_launcher_id: Bytes32,
+) -> Bytes32 {
+    let mod_hash = PuzzleHashes::ceremony_voucher();
+    let canonical_msg =
+        ceremony_voucher_canonical_msg(vk_hash, max_voters, ceremony_launcher_id);
+    let first_curry = curry_tree_hash(
+        mod_hash,
+        &[
+            hash_atom_b32(&mod_hash),
+            hash_atom_b32(&canonical_msg),
+            hash_atom_b32(&ceremony_launcher_id),
+        ],
+    );
+    curry_tree_hash(first_curry, &[hash_atom_b32(&first_curry)])
 }
 
 // ============================================================================
@@ -1870,30 +2013,35 @@ mod tests {
         assert_eq!(deregister_announcement_msg(&pk), Bytes32::new(arr));
     }
 
-    /// WHAT: `ballot_oracle_open_msg` byte-exact matches its preimage.
+    /// WHAT: `ballot_oracle_open_msg` byte-exact matches its
+    ///       3-field preimage (M4-revised: vote_options_root added).
     #[test]
     fn ballot_oracle_open_msg_is_canonical_sha256() {
         let ballot_id = b32(0xBB);
         let close_h: u64 = 1_234_567;
+        let options_root = b32(0xEE);
 
         let mut h = Sha256::new();
         h.update(b"ballot_oracle_open");
         h.update(ballot_id.as_ref());
         h.update(close_h.to_be_bytes());
+        h.update(options_root.as_ref());
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&h.finalize());
 
         assert_eq!(
-            ballot_oracle_open_msg(ballot_id, close_h),
+            ballot_oracle_open_msg(ballot_id, close_h, options_root),
             Bytes32::new(arr)
         );
     }
 
-    /// WHAT: `ballot_oracle_closed_msg` byte-exact matches its preimage.
+    /// WHAT: `ballot_oracle_closed_msg` byte-exact matches its
+    ///       5-field preimage (M4-revised: vote_options_root added).
     #[test]
     fn ballot_oracle_closed_msg_is_canonical_sha256() {
         let ballot_id = b32(0xBB);
         let close_h: u64 = 1_234_567;
+        let options_root = b32(0xEE);
         let outcome = b32(0xCC);
         let agg = b32(0xDD);
 
@@ -1901,13 +2049,14 @@ mod tests {
         h.update(b"ballot_oracle_closed");
         h.update(ballot_id.as_ref());
         h.update(close_h.to_be_bytes());
+        h.update(options_root.as_ref());
         h.update(outcome.as_ref());
         h.update(agg.as_ref());
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&h.finalize());
 
         assert_eq!(
-            ballot_oracle_closed_msg(ballot_id, close_h, outcome, agg),
+            ballot_oracle_closed_msg(ballot_id, close_h, options_root, outcome, agg),
             Bytes32::new(arr),
         );
     }
@@ -1919,9 +2068,15 @@ mod tests {
     fn ballot_oracle_open_and_closed_messages_diverge() {
         let ballot_id = b32(0xBB);
         let close_h: u64 = 99;
-        let m_open = ballot_oracle_open_msg(ballot_id, close_h);
-        let m_closed =
-            ballot_oracle_closed_msg(ballot_id, close_h, Bytes32::default(), Bytes32::default());
+        let options_root = Bytes32::default();
+        let m_open = ballot_oracle_open_msg(ballot_id, close_h, options_root);
+        let m_closed = ballot_oracle_closed_msg(
+            ballot_id,
+            close_h,
+            options_root,
+            Bytes32::default(),
+            Bytes32::default(),
+        );
         assert_ne!(
             m_open, m_closed,
             "ballot_oracle open vs closed messages must NEVER collide",
@@ -2218,5 +2373,77 @@ mod tests {
             "compose(inner_state, cat_outer) at fresh state MUST equal \
              fresh_registration_coin_puzzle_hash",
         );
+    }
+
+    /// WHAT: `ceremony_voucher_canonical_msg` is byte-exact `sha256(
+    ///       "chip:ceremony:voucher" || vk_hash || max_voters_be8 ||
+    ///       ceremony_launcher_id)`.
+    /// HOW:  hand-recompute the same sha256 from the same inputs;
+    ///       compare to the helper's output.
+    /// WHY:  this hash is curried into every voucher coin AND
+    ///       reproduced inside `puzzles/ceremony_singleton/
+    ///       ceremony_voucher.rue`. Any drift between the SDK helper
+    ///       and the rue puzzle would make every election deploy fail
+    ///       its AssertCoinAnnouncement.
+    #[test]
+    fn ceremony_voucher_canonical_msg_matches_handwritten_sha256() {
+        let vk_hash = b32(0xAA);
+        let max_voters: u64 = 20_000;
+        let launcher = b32(0xBB);
+
+        let mut h = Sha256::new();
+        h.update(b"chip:ceremony:voucher");
+        h.update(vk_hash.to_bytes().as_slice());
+        h.update(&max_voters.to_be_bytes());
+        h.update(launcher.to_bytes().as_slice());
+        let expected: [u8; 32] = h.finalize().into();
+
+        assert_eq!(
+            ceremony_voucher_canonical_msg(vk_hash, max_voters, launcher),
+            Bytes32::new(expected),
+        );
+    }
+
+    /// WHAT: `ceremony_voucher_puzzle_hash` composes the standard
+    ///       two-curry self-hash pattern matching `ceremony_voucher.rue`.
+    /// HOW:  rebuild the curry chain manually using the same primitives
+    ///       (`PuzzleHashes::ceremony_voucher`, `curry_tree_hash`,
+    ///       `hash_atom_b32`) and compare. Then mutate one input byte
+    ///       and assert the puzzle hash changes (sensitivity).
+    /// WHY:  the on-chain link guarantee (election asserts voucher's
+    ///       announcement) only works if every consumer agrees on the
+    ///       voucher's puzzle hash for a given (vk_hash, max_voters,
+    ///       launcher) triple. This test pins the composition and
+    ///       proves all three inputs are committed.
+    #[test]
+    fn ceremony_voucher_puzzle_hash_composes_two_curry_self_hash() {
+        let vk_hash = b32(0xCC);
+        let max_voters: u64 = 20_000;
+        let launcher = b32(0xDD);
+
+        let mod_hash = PuzzleHashes::ceremony_voucher();
+        let canonical = ceremony_voucher_canonical_msg(vk_hash, max_voters, launcher);
+        let first = curry_tree_hash(
+            mod_hash,
+            &[
+                hash_atom_b32(&mod_hash),
+                hash_atom_b32(&canonical),
+                hash_atom_b32(&launcher),
+            ],
+        );
+        let expected = curry_tree_hash(first, &[hash_atom_b32(&first)]);
+
+        assert_eq!(
+            ceremony_voucher_puzzle_hash(vk_hash, max_voters, launcher),
+            expected,
+        );
+
+        // Sensitivity: every input must be committed.
+        let with_diff_vk = ceremony_voucher_puzzle_hash(b32(0xCD), max_voters, launcher);
+        let with_diff_max = ceremony_voucher_puzzle_hash(vk_hash, 19_999, launcher);
+        let with_diff_launcher = ceremony_voucher_puzzle_hash(vk_hash, max_voters, b32(0xDE));
+        assert_ne!(expected, with_diff_vk);
+        assert_ne!(expected, with_diff_max);
+        assert_ne!(expected, with_diff_launcher);
     }
 }

@@ -22,55 +22,51 @@ use sha2::{Digest, Sha256};
 
 /// CHIP.md §88-91: `Occupied leaf: sha256(pubkey)`. Per-voter weight is
 /// tracked on the Election Singleton state (`registration_vote_weight`),
-/// NOT in the leaf, in this revision.
+/// IS bound into the leaf, in the weighted-voting revision.
 ///
 /// Positive (SDK property): the SDK's `active_leaf_hash` helper computes
-/// exactly `sha256(pubkey)`. The puzzle's structural leaf is pinned by
-/// `puzzles/compiled/election/register.rue.hash` (verified by
+/// `sha256(pubkey || locked_amount_be8)`. The puzzle's structural leaf is
+/// pinned by `puzzles/compiled/election/register.rue.hash` (verified by
 /// `puzzle_constants.rs`); the SDK and puzzle agree by construction.
 #[test]
 fn chip_spt_leaf_format_accepts_spec_leaf() {
     let (_sk, pk) = common::test_voter(0x42);
-    let observed = SparseMerkleTree::active_leaf_hash(&pk);
+    let lock = 1_000u64;
+    let observed = SparseMerkleTree::active_leaf_hash(&pk, lock);
 
     let mut expected = Sha256::new();
     expected.update(pk.to_bytes());
+    expected.update(lock.to_be_bytes());
     let expected: [u8; 32] = expected.finalize().into();
 
     assert_eq!(
         observed.as_ref(),
         &expected[..],
-        "CHIP.md §88-91 requires occupied leaf = sha256(pubkey); SDK \
-         active_leaf_hash returned a different value"
+        "weighted-voting revision requires occupied leaf = sha256(pubkey || \
+         locked_amount_be8); SDK active_leaf_hash returned a different value"
     );
 }
 
-/// CHIP.md §88-91 (negative): the leaf MUST NOT include the per-voter locked
-/// CAT amount. The forward-compatible variant
-/// `sha256(pubkey || locked_cat_mojos_be8)` is described in CHIP.md as "not
-/// yet implemented" for this revision.
-///
-/// Guards against silent regression to the prior (divergent) implementation
-/// where the leaf was `sha256(pubkey || COLLATERAL_AMOUNT.to_be_bytes())`.
+/// Negative: the legacy uniform-weight leaf `sha256(pubkey)` is rejected by
+/// the weighted-voting revision. Guards against silent regression to the
+/// pre-rev implementation where every voter contributed `COLLATERAL_AMOUNT`
+/// regardless of their actual lockup.
 #[test]
-fn chip_spt_leaf_format_rejects_appended_weight_leaf() {
+fn chip_spt_leaf_format_rejects_naked_pubkey_leaf() {
     let (_sk, pk) = common::test_voter(0x42);
-    let observed = SparseMerkleTree::active_leaf_hash(&pk);
+    let lock = 1_000u64;
+    let observed = SparseMerkleTree::active_leaf_hash(&pk, lock);
 
-    // The divergent form (NOT permitted in this revision per
-    // CHIP.md §88-91 and §143-146).
-    const COLLATERAL_AMOUNT: u64 = 1_000;
-    let mut divergent = Sha256::new();
-    divergent.update(pk.to_bytes());
-    divergent.update(COLLATERAL_AMOUNT.to_be_bytes());
-    let divergent: [u8; 32] = divergent.finalize().into();
+    // The legacy uniform-weight form (REJECTED in the weighted-voting rev).
+    let mut legacy = Sha256::new();
+    legacy.update(pk.to_bytes());
+    let legacy: [u8; 32] = legacy.finalize().into();
 
     assert_ne!(
         observed.as_ref(),
-        &divergent[..],
-        "CHIP.md §88-91 / §143-146 explicitly mark the appended-weight leaf \
-         as 'not yet implemented' for this revision; SDK helper must NOT \
-         use it"
+        &legacy[..],
+        "weighted-voting revision must NOT use the naked-pubkey leaf; per-voter \
+         locked amount must be bound into the leaf preimage"
     );
 }
 
@@ -332,6 +328,8 @@ fn chip_circuit_vk_length_rejects_wrong_size() {
             tree_depth: TREE_DEPTH,
             max_signers: MAX_SIGNERS,
             verification_key_hex: "00".repeat(vk_bytes),
+            ceremony_launcher_id_hex: String::new(),
+            vk_hash_hex: String::new(),
             label: None,
         }
     }
@@ -382,7 +380,7 @@ fn chip_election_state_has_no_accumulated_fees_field() {
     use chip_voting_sdk::config::{ElectionConfig, MAX_SIGNERS, TREE_DEPTH};
     use chip_voting_sdk::state::ElectionState;
 
-    let state = ElectionState::genesis(Bytes32::default(), 12345);
+    let state = ElectionState::genesis(Bytes32::default(), 12345, Bytes32::default(), 0u64, Bytes32::default(), chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE);
 
     // Exhaustive destructuring — compile-time enforces field set.
     let ElectionState {
@@ -390,12 +388,20 @@ fn chip_election_state_has_no_accumulated_fees_field() {
         registration_count,
         registration_vote_weight,
         election_start_height,
+        ceremony_launcher_id,
+        max_voters,
+        vk_hash,
+        vote_mode_lock,
     } = state;
+    assert_eq!(vote_mode_lock, chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE);
     // Touch every value so the bindings aren't dead.
     assert_eq!(registration_merkle_root, Bytes32::default());
     assert_eq!(registration_count, 0);
     assert_eq!(registration_vote_weight, 0);
     assert_eq!(election_start_height, 12345);
+    assert_eq!(ceremony_launcher_id, Bytes32::default());
+    assert_eq!(max_voters, 0);
+    assert_eq!(vk_hash, Bytes32::default());
 
     // ElectionConfig has serde — assert `registration_fee` field name
     // is absent from its JSON shape.
@@ -406,6 +412,8 @@ fn chip_election_state_has_no_accumulated_fees_field() {
         tree_depth: TREE_DEPTH,
         max_signers: MAX_SIGNERS,
         verification_key_hex: "00".repeat(672),
+        ceremony_launcher_id_hex: String::new(),
+        vk_hash_hex: String::new(),
         label: None,
     };
     let cfg_json = serde_json::to_value(&cfg).expect("ElectionConfig serializes");
@@ -756,14 +764,16 @@ fn chip_spt_empty_leaf_hash_is_sha256_of_48_zero_bytes() {
 #[test]
 fn chip_spt_internal_node_uses_no_clvm_prefix() {
     let (_sk, pk) = common::test_voter(0x33);
+    let lock = 1_000u64;
     let mut smt = SparseMerkleTree::new();
-    smt.insert(&pk).unwrap();
+    smt.insert(&pk, lock).unwrap();
     let observed_root = smt.root();
     let slot = SparseMerkleTree::slot_for_pubkey(&pk);
 
-    // Leaf = sha256(pubkey).
+    // Leaf = sha256(pubkey || locked_amount_be8) per weighted-voting rev.
     let mut leaf_h = Sha256::new();
     leaf_h.update(pk.to_bytes());
+    leaf_h.update(lock.to_be_bytes());
     let leaf: [u8; 32] = leaf_h.finalize().into();
 
     // Empty subtree table for raw form.
@@ -873,12 +883,13 @@ fn chip_spt_tracks_voters_not_vote_choices() {
     let r0 = smt.root();
 
     // Insert voter A — root must change.
-    smt.insert(&pk_a).unwrap();
+    let lock = 1_000u64;
+    smt.insert(&pk_a, lock).unwrap();
     let r1 = smt.root();
     assert_ne!(r0, r1, "inserting an eligible voter must change the SPT root");
 
     // Insert voter B — root must change again.
-    smt.insert(&pk_b).unwrap();
+    smt.insert(&pk_b, lock).unwrap();
     let r2 = smt.root();
     assert_ne!(r1, r2, "inserting a second voter must change the SPT root");
 
@@ -887,19 +898,21 @@ fn chip_spt_tracks_voters_not_vote_choices() {
     assert!(smt.contains(&pk_b));
 
     // Type-level pin (load-bearing): the SDK's insertion API takes a
-    // `&PublicKey` and ONLY a `&PublicKey`. There is NO insertion
-    // path that accepts vote_data, vote_choice, ballot_id, etc. —
-    // confirming the SPT's key domain is exactly the voter pubkey.
-    // If anyone added an `insert_with_vote(...)` overload, the
-    // call below would have to change.
-    let _ : fn(&mut SparseMerkleTree, &chia_bls::PublicKey) -> Result<(), chip_voting_sdk::VotingError>
+    // `&PublicKey` plus a per-voter `locked_amount: u64`. There is NO
+    // insertion path that accepts vote_data, vote_choice, ballot_id,
+    // etc. — confirming the SPT's key domain is the voter pubkey
+    // (with locked CAT amount bound into the leaf preimage). If
+    // anyone added an `insert_with_vote(...)` overload, the call
+    // below would have to change.
+    let _ : fn(&mut SparseMerkleTree, &chia_bls::PublicKey, u64) -> Result<(), chip_voting_sdk::VotingError>
         = SparseMerkleTree::insert;
 
-    // Two voters with DIFFERENT pubkeys and the same (i.e. no) vote
-    // choice produce DIFFERENT leaves: confirms the leaf is keyed by
-    // pubkey, not by vote choice.
-    let leaf_a = SparseMerkleTree::active_leaf_hash(&pk_a);
-    let leaf_b = SparseMerkleTree::active_leaf_hash(&pk_b);
+    // Two voters with DIFFERENT pubkeys and the SAME locked amount
+    // (i.e. no vote choice) produce DIFFERENT leaves: confirms the
+    // leaf is keyed by pubkey, not by vote choice.
+    let lock = 1_000u64;
+    let leaf_a = SparseMerkleTree::active_leaf_hash(&pk_a, lock);
+    let leaf_b = SparseMerkleTree::active_leaf_hash(&pk_b, lock);
     assert_ne!(
         leaf_a, leaf_b,
         "CHIP.md §93: distinct voters MUST produce distinct SPT leaves \
@@ -1608,6 +1621,11 @@ fn chip_ballot_finalize_snapshot_fields_exist_on_snapshot() {
         outcome_domain_hash: Bytes32::new([0xDD; 32]),
         state: BallotState::fresh(),
         coin_id: Bytes32::new([0xC0; 32]),
+        vote_threshold_num: Some(1),
+        vote_threshold_den: Some(3),
+        registration_merkle_root_snapshot: Some(Bytes32::new([0x11; 32])),
+        registration_vote_weight_snapshot: Some(42),
+        vote_options_root: Some(Bytes32::default()),
     };
 
     // The aggregator's launch-time observation captures the curry
@@ -1622,6 +1640,11 @@ fn chip_ballot_finalize_snapshot_fields_exist_on_snapshot() {
         outcome_domain_hash,
         state,
         coin_id,
+        vote_threshold_num,
+        vote_threshold_den,
+        registration_merkle_root_snapshot,
+        registration_vote_weight_snapshot,
+        vote_options_root: _,
     } = &snapshot;
     assert_eq!(ballot_launcher_id, &Bytes32::new([0xBB; 32]));
     assert_eq!(election_launcher_id, &Bytes32::new([0xEE; 32]));
@@ -1629,6 +1652,13 @@ fn chip_ballot_finalize_snapshot_fields_exist_on_snapshot() {
     assert_eq!(outcome_domain_hash, &Bytes32::new([0xDD; 32]));
     assert!(!state.finalized);
     assert_eq!(coin_id, &Bytes32::new([0xC0; 32]));
+    assert_eq!(*vote_threshold_num, Some(1));
+    assert_eq!(*vote_threshold_den, Some(3));
+    assert_eq!(
+        registration_merkle_root_snapshot,
+        &Some(Bytes32::new([0x11; 32]))
+    );
+    assert_eq!(*registration_vote_weight_snapshot, Some(42));
 
     // Negative: the SNAPSHOT values MUST NOT live on `BallotState`
     // (otherwise they would be mutable, defeating the "snapshot at
@@ -2834,7 +2864,7 @@ fn chip_ballot_announce_finalization_clvm_message_is_bound_to_state() {
 /// election_start_height)`.
 ///
 /// What this test pins:
-///   1. `ElectionState::genesis(empty_root, h)` returns a state
+///   1. `ElectionState::genesis(empty_root, h, Bytes32::default(), 0u64, Bytes32::default(), chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE)` returns a state
 ///      whose four fields equal exactly the spec's values.
 ///   2. ANY divergence in any single field (non-empty root, nonzero
 ///      count, nonzero weight, different start height) yields a
@@ -2851,7 +2881,7 @@ fn chip_flow_deploy_genesis_state_matches_spec() {
     let empty_root = Bytes32::new(EMPTY_LEAF_HASH);
     let start_height: u64 = 1_234_567;
 
-    let g = ElectionState::genesis(empty_root, start_height);
+    let g = ElectionState::genesis(empty_root, start_height, Bytes32::default(), 0u64, Bytes32::default(), chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE);
 
     // (1) Each of the four spec-pinned fields matches verbatim.
     assert_eq!(

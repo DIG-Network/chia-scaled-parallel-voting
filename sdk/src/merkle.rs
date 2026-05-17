@@ -22,9 +22,12 @@
 //   * Internal node hash is `sha256(left || right)` (raw concat) to
 //     match the on-chain `compute_root` Rue helper — NOT the CLVM
 //     tree-hash convention.
-//   * Occupied leaf hash is `sha256(pubkey)` per CHIP.md §88-91 —
-//     uniform per-voter weight is tracked on Election Singleton state
-//     (`registration_vote_weight`), NOT encoded into the leaf.
+//   * Occupied leaf hash is `sha256(pubkey || locked_amount_be8)` —
+//     each voter's weight (= the CAT mojos they locked at register
+//     time) is bound into their leaf so the on-chain register /
+//     deregister actions can verify it without trusting the
+//     `registration_vote_weight` total. The aggregator sums real
+//     per-voter amounts when building the finalize witness.
 //
 // CORRESPONDENCE TO RUE:
 //   `compute_root(node, index, siblings, depth)` in
@@ -45,6 +48,150 @@ use crate::config::{EMPTY_LEAF_HASH, TREE_DEPTH};
 ///        index to reconstruct the root.
 pub type MerkleProof = Vec<Bytes32>;
 
+/// FN: merkle_root_of_sorted_coin_ids
+/// WHAT: SHA-256 binary-tree merkle root over the sorted set of marker
+///       coin ids that contributed to a Ceremony Singleton. Used by
+///       the finalize action to commit to the contribution set.
+/// CONVENTION:
+///   * Sort the input ascending (lexicographic on raw 32-byte ids).
+///     The on-chain finalize action recomputes the same root from the
+///     supplied list, so the dApp / SDK and the puzzle MUST agree on
+///     ordering.
+///   * Build a balanced binary tree bottom-up. At each level, if the
+///     count is odd, the last node is duplicated (paired with itself)
+///     before pairing — same convention as the action_layer's
+///     actions_merkle_root and many other Chia merkle constructions.
+///   * Internal node hash = `sha256(left || right)` raw concat (NOT
+///     CLVM tree-hash). Single-leaf trees return the leaf hash
+///     directly. Empty input returns `Bytes32::default()`.
+/// EDGE CASES:
+///   * Empty: returns `0x0000…00`.
+///   * Single id: the leaf is hashed once (`sha256(id)`) and returned
+///     as the root — matches "tree of height 0" semantics.
+pub fn merkle_root_of_sorted_coin_ids(ids: &[Bytes32]) -> Bytes32 {
+    if ids.is_empty() {
+        return Bytes32::default();
+    }
+    let mut sorted: Vec<Bytes32> = ids.to_vec();
+    sorted.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    // Hash leaves: sha256(id_bytes).
+    let mut level: Vec<Bytes32> = sorted
+        .into_iter()
+        .map(|id| {
+            let mut h = Sha256::new();
+            h.update(id.as_ref());
+            Bytes32::new(h.finalize().into())
+        })
+        .collect();
+    // Bottom-up pairing.
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            // Pad odd level by duplicating the last node.
+            let last = level[level.len() - 1];
+            level.push(last);
+        }
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for chunk in level.chunks_exact(2) {
+            let mut h = Sha256::new();
+            h.update(chunk[0].as_ref());
+            h.update(chunk[1].as_ref());
+            next.push(Bytes32::new(h.finalize().into()));
+        }
+        level = next;
+    }
+    level[0]
+}
+
+#[cfg(test)]
+mod merkle_root_of_sorted_coin_ids_tests {
+    use super::*;
+
+    fn b32(byte: u8) -> Bytes32 {
+        Bytes32::new([byte; 32])
+    }
+
+    /// Empty input yields the zero hash sentinel.
+    #[test]
+    fn empty_input_is_zero() {
+        assert_eq!(merkle_root_of_sorted_coin_ids(&[]), Bytes32::default());
+    }
+
+    /// Single-leaf root equals `sha256(leaf)`.
+    #[test]
+    fn single_leaf_is_sha256_of_leaf() {
+        let id = b32(0x42);
+        let root = merkle_root_of_sorted_coin_ids(&[id]);
+        let mut h = Sha256::new();
+        h.update(id.as_ref());
+        let expected = Bytes32::new(h.finalize().into());
+        assert_eq!(root, expected);
+    }
+
+    /// Two-leaf tree: root = sha256(sha256(min) || sha256(max)).
+    /// Sort matters: passing in reversed order must give the same root.
+    #[test]
+    fn two_leaves_sorted() {
+        let a = b32(0x01);
+        let b = b32(0xFF);
+        let root_in_order = merkle_root_of_sorted_coin_ids(&[a, b]);
+        let root_reversed = merkle_root_of_sorted_coin_ids(&[b, a]);
+        assert_eq!(root_in_order, root_reversed);
+
+        // Manual recomputation.
+        let mut h_a = Sha256::new();
+        h_a.update(a.as_ref());
+        let leaf_a = h_a.finalize();
+        let mut h_b = Sha256::new();
+        h_b.update(b.as_ref());
+        let leaf_b = h_b.finalize();
+        let mut h_root = Sha256::new();
+        h_root.update(leaf_a);
+        h_root.update(leaf_b);
+        let expected = Bytes32::new(h_root.finalize().into());
+        assert_eq!(root_in_order, expected);
+    }
+
+    /// Odd-count level: 3 leaves → pair (0,1) at level 0, level 1 has
+    /// {pair01, leaf2}; pad with leaf2 to {pair01, leaf2, leaf2,
+    /// leaf2}? No — level 1 has only 2 entries (pair01 + leaf2), so
+    /// level 1 already has even count. Trace: level 0 = [a, b, c] →
+    /// pad to [a, b, c, c] → level 1 = [hash(a,b), hash(c,c)] → root
+    /// = hash(hash(a,b), hash(c,c)).
+    #[test]
+    fn three_leaves_pads_last() {
+        let a = b32(0x01);
+        let b = b32(0x02);
+        let c = b32(0x03);
+        let root = merkle_root_of_sorted_coin_ids(&[c, a, b]); // unsorted
+
+        let leaf = |id: &Bytes32| -> [u8; 32] {
+            let mut h = Sha256::new();
+            h.update(id.as_ref());
+            h.finalize().into()
+        };
+        let pair = |l: [u8; 32], r: [u8; 32]| -> [u8; 32] {
+            let mut h = Sha256::new();
+            h.update(l);
+            h.update(r);
+            h.finalize().into()
+        };
+        let la = leaf(&a);
+        let lb = leaf(&b);
+        let lc = leaf(&c);
+        let expected = Bytes32::new(pair(pair(la, lb), pair(lc, lc)));
+        assert_eq!(root, expected);
+    }
+
+    /// Determinism: same input twice → same root.
+    #[test]
+    fn deterministic() {
+        let ids: Vec<Bytes32> = (0u8..7).map(b32).collect();
+        let r1 = merkle_root_of_sorted_coin_ids(&ids);
+        let r2 = merkle_root_of_sorted_coin_ids(&ids);
+        assert_eq!(r1, r2);
+    }
+}
+
 /// STRUCT: SparseMerkleTree
 /// PURPOSE: in-memory SPT that stores only registered voters; empty
 ///          subtree hashes are reused from a precomputed table.
@@ -58,10 +205,13 @@ pub type MerkleProof = Vec<Bytes32>;
 ///                across tasks.
 #[derive(Debug, Clone)]
 pub struct SparseMerkleTree {
-    /// Slot index → 48-byte voter pubkey bytes. BTreeMap so range
-    /// queries (used by `subtree_hash` for sparsity short-circuit)
-    /// are O(log n).
-    leaves: BTreeMap<u32, [u8; 48]>,
+    /// Slot index → (48-byte voter pubkey, locked CAT mojos). BTreeMap
+    /// so range queries (used by `subtree_hash` for sparsity
+    /// short-circuit) are O(log n). The locked amount is part of the
+    /// leaf preimage, so two voters with the same pubkey but
+    /// different lock amounts produce different leaves (and would also
+    /// be rejected by the singleton's anti-double-register check).
+    leaves: BTreeMap<u32, ([u8; 48], u64)>,
 
     /// Precomputed empty-subtree hashes. `empty_subtree[L]` is the
     /// hash of an all-empty subtree spanning `2^L` leaves.
@@ -110,36 +260,45 @@ impl SparseMerkleTree {
     }
 
     /// FN: active_leaf_hash
-    /// WHAT: leaf hash for a registered voter — per CHIP.md §88-91
-    ///       `sha256(pubkey)`. Per-voter weight is tracked on the
-    ///       Election Singleton state (`registration_vote_weight +=
-    ///       COLLATERAL_AMOUNT` per `register` action) rather than
-    ///       encoded in the leaf, since this revision uses a uniform
-    ///       per-registration `COLLATERAL_AMOUNT`.
+    /// WHAT: leaf hash for a registered voter — `sha256(pubkey ||
+    ///       locked_amount_be8)`. The 8-byte big-endian encoding of the
+    ///       locked CAT mojos is fixed-width so concatenation is
+    ///       collision-resistant.
     /// MIRRORS: `puzzles/election/register.rue` (and `deregister.rue`)
-    ///          which compute the same hash via `sha256(pk_b)`.
-    pub fn active_leaf_hash(pubkey: &PublicKey) -> Bytes32 {
+    ///          which compute the same hash via
+    ///          `sha256(pk_b + int_to_8_bytes_be(locked_cat_mojos))`.
+    pub fn active_leaf_hash(pubkey: &PublicKey, locked_amount: u64) -> Bytes32 {
         let pk_bytes = pubkey.to_bytes();
-        active_leaf_hash_bytes(&pk_bytes)
+        active_leaf_hash_bytes(&pk_bytes, locked_amount)
     }
 
     /// FN: insert
-    /// WHAT: add a voter to the tree.
-    /// IDEMPOTENT: re-inserting the same pubkey is a no-op.
-    /// ERRORS: `SlotCollision` if two distinct pubkeys hash to the
-    ///         same SPT slot. Vanishingly unlikely (birthday-bound
-    ///         on 2^32 slots) but checked anyway — a collision in
-    ///         production would corrupt the on-chain state otherwise.
-    pub fn insert(&mut self, pubkey: &PublicKey) -> Result<(), crate::VotingError> {
+    /// WHAT: add a voter to the tree at their canonical slot, binding
+    ///       their locked CAT mojos into the leaf preimage.
+    /// IDEMPOTENT: re-inserting the same `(pubkey, locked_amount)` is
+    ///             a no-op. Re-inserting the same pubkey with a
+    ///             different `locked_amount` is rejected as a
+    ///             `SlotCollision` — the on-chain singleton would
+    ///             reject it too (a voter can't change their lockup
+    ///             without first deregistering).
+    /// ERRORS: `SlotCollision` if (a) two distinct pubkeys hash to the
+    ///         same slot (vanishingly unlikely — birthday-bound on 2^32
+    ///         slots), or (b) the same pubkey is re-inserted with a
+    ///         changed `locked_amount`.
+    pub fn insert(
+        &mut self,
+        pubkey: &PublicKey,
+        locked_amount: u64,
+    ) -> Result<(), crate::VotingError> {
         let slot = Self::slot_for_pubkey(pubkey);
         let pk_bytes = pubkey.to_bytes();
-        if let Some(existing) = self.leaves.get(&slot) {
-            if existing != &pk_bytes {
+        if let Some((existing_pk, existing_amount)) = self.leaves.get(&slot) {
+            if existing_pk != &pk_bytes || *existing_amount != locked_amount {
                 return Err(crate::VotingError::SlotCollision { slot: slot as u64 });
             }
             return Ok(());
         }
-        self.leaves.insert(slot, pk_bytes);
+        self.leaves.insert(slot, (pk_bytes, locked_amount));
         Ok(())
     }
 
@@ -159,7 +318,7 @@ impl SparseMerkleTree {
         let slot = Self::slot_for_pubkey(pubkey);
         let pk_bytes = pubkey.to_bytes();
         match self.leaves.get(&slot) {
-            Some(stored) if stored == &pk_bytes => {
+            Some((stored_pk, _)) if stored_pk == &pk_bytes => {
                 self.leaves.remove(&slot);
                 true
             }
@@ -174,8 +333,23 @@ impl SparseMerkleTree {
         let slot = Self::slot_for_pubkey(pubkey);
         self.leaves
             .get(&slot)
-            .map(|stored| stored == &pubkey.to_bytes())
+            .map(|(stored_pk, _)| stored_pk == &pubkey.to_bytes())
             .unwrap_or(false)
+    }
+
+    /// FN: locked_amount
+    /// WHAT: the CAT mojos a registered voter locked at register time,
+    ///       or `None` if the voter isn't registered.
+    /// USAGE: aggregator's finalize witness builder reads each signer's
+    ///        weight from here; deregister flow reads it to construct
+    ///        the puzzle solution.
+    pub fn locked_amount(&self, pubkey: &PublicKey) -> Option<u64> {
+        let slot = Self::slot_for_pubkey(pubkey);
+        let pk_bytes = pubkey.to_bytes();
+        self.leaves
+            .get(&slot)
+            .filter(|(stored_pk, _)| stored_pk == &pk_bytes)
+            .map(|(_, amount)| *amount)
     }
 
     /// FN: len
@@ -211,7 +385,7 @@ impl SparseMerkleTree {
     fn subtree_hash(&self, lo: u64, hi: u64, level: u32) -> Bytes32 {
         if level == 0 {
             return match self.leaves.get(&(lo as u32)) {
-                Some(pk) => active_leaf_hash_bytes(pk),
+                Some((pk, amount)) => active_leaf_hash_bytes(pk, *amount),
                 None => Bytes32::new(EMPTY_LEAF_HASH),
             };
         }
@@ -266,12 +440,15 @@ impl SparseMerkleTree {
 }
 
 /// FN: active_leaf_hash_bytes (file-private)
-/// WHAT: leaf hash from raw 48-byte pubkey buffer (skip the typed
-///       PublicKey roundtrip — used inside SPT recursion). Per
-///       CHIP.md §88-91: `sha256(pubkey)`.
-fn active_leaf_hash_bytes(pk_bytes: &[u8; 48]) -> Bytes32 {
+/// WHAT: leaf hash from raw 48-byte pubkey buffer + locked CAT mojos
+///       (skip the typed PublicKey roundtrip — used inside SPT
+///       recursion). Encoding: `sha256(pubkey || locked_amount_be8)`.
+///       The fixed 8-byte big-endian width is collision-resistant and
+///       mirrors `int_to_8_bytes_be` in the on-chain RUE puzzles.
+fn active_leaf_hash_bytes(pk_bytes: &[u8; 48], locked_amount: u64) -> Bytes32 {
     let mut h = Sha256::new();
     h.update(pk_bytes);
+    h.update(locked_amount.to_be_bytes());
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&h.finalize());
     Bytes32::new(arr)
@@ -403,7 +580,7 @@ mod tests {
     fn insert_changes_root() {
         let mut tree = SparseMerkleTree::new();
         let r0 = tree.root();
-        tree.insert(&pk_at(0)).unwrap();
+        tree.insert(&pk_at(0), 1).unwrap();
         let r1 = tree.root();
         assert_ne!(r0, r1, "root must change after inserting a voter");
     }
@@ -418,9 +595,9 @@ mod tests {
     #[test]
     fn insert_is_idempotent() {
         let mut t1 = SparseMerkleTree::new();
-        t1.insert(&pk_at(0)).unwrap();
+        t1.insert(&pk_at(0), 1).unwrap();
         let r_after_first = t1.root();
-        t1.insert(&pk_at(0)).unwrap();
+        t1.insert(&pk_at(0), 1).unwrap();
         assert_eq!(t1.root(), r_after_first);
     }
 
@@ -437,9 +614,9 @@ mod tests {
     fn proof_for_inserted_voter_verifies() {
         let mut tree = SparseMerkleTree::new();
         let pk = pk_at(0);
-        tree.insert(&pk).unwrap();
+        tree.insert(&pk, 1).unwrap();
         let slot = SparseMerkleTree::slot_for_pubkey(&pk);
-        let leaf = SparseMerkleTree::active_leaf_hash(&pk);
+        let leaf = SparseMerkleTree::active_leaf_hash(&pk, 1);
         let proof = tree.prove(slot);
         let root = tree.root();
         assert!(verify_proof(leaf, slot, &proof, root));
@@ -458,7 +635,7 @@ mod tests {
     #[test]
     fn proof_for_empty_slot_verifies_with_empty_leaf() {
         let mut tree = SparseMerkleTree::new();
-        tree.insert(&pk_at(0)).unwrap(); // someone else
+        tree.insert(&pk_at(0), 1).unwrap(); // someone else
         let unregistered_slot = SparseMerkleTree::slot_for_pubkey(&pk_at(99));
         let proof = tree.prove(unregistered_slot);
         let root = tree.root();
@@ -492,12 +669,12 @@ mod tests {
     fn populated_voter_proof_only_verifies_with_active_leaf() {
         let mut tree = SparseMerkleTree::new();
         let pk = pk_at(0);
-        tree.insert(&pk).unwrap();
+        tree.insert(&pk, 1).unwrap();
         let slot = SparseMerkleTree::slot_for_pubkey(&pk);
         let proof = tree.prove(slot);
         let root = tree.root();
 
-        let active_leaf = SparseMerkleTree::active_leaf_hash(&pk);
+        let active_leaf = SparseMerkleTree::active_leaf_hash(&pk, 1);
         let empty_leaf = Bytes32::new(EMPTY_LEAF_HASH);
 
         assert!(verify_proof(active_leaf, slot, &proof, root));
@@ -514,12 +691,12 @@ mod tests {
     #[test]
     fn root_changes_when_voter_count_changes() {
         let mut t1 = SparseMerkleTree::new();
-        t1.insert(&pk_at(0)).unwrap();
+        t1.insert(&pk_at(0), 1).unwrap();
         let r1 = t1.root();
 
         let mut t2 = SparseMerkleTree::new();
-        t2.insert(&pk_at(0)).unwrap();
-        t2.insert(&pk_at(1)).unwrap();
+        t2.insert(&pk_at(0), 1).unwrap();
+        t2.insert(&pk_at(1), 1).unwrap();
         let r2 = t2.root();
 
         assert_ne!(r1, r2);
@@ -538,10 +715,10 @@ mod tests {
         let mut t2 = SparseMerkleTree::new();
 
         for i in 0..5u32 {
-            t1.insert(&pk_at(i)).unwrap();
+            t1.insert(&pk_at(i), 1).unwrap();
         }
         for i in (0..5u32).rev() {
-            t2.insert(&pk_at(i)).unwrap();
+            t2.insert(&pk_at(i), 1).unwrap();
         }
         assert_eq!(t1.root(), t2.root());
     }
@@ -587,8 +764,85 @@ mod tests {
         let pk = pk_at(0);
         assert!(!tree.contains(&pk));
         assert!(tree.is_empty());
-        tree.insert(&pk).unwrap();
+        tree.insert(&pk, 1).unwrap();
         assert!(tree.contains(&pk));
         assert_eq!(tree.len(), 1);
+    }
+
+    /// WHAT: voters with different `locked_amount` produce different
+    ///       leaf hashes and therefore different roots.
+    /// HOW:  insert pk into two trees with different amounts; assert
+    ///       roots differ AND leaf hashes differ.
+    /// WHY:  weighted voting requires the locked amount to be bound
+    ///       into the leaf preimage so the on-chain register /
+    ///       deregister actions can verify it without trusting the
+    ///       running `registration_vote_weight` total.
+    #[test]
+    fn leaf_binds_locked_amount() {
+        let pk = pk_at(0);
+        let mut t_a = SparseMerkleTree::new();
+        let mut t_b = SparseMerkleTree::new();
+        t_a.insert(&pk, 1_000).unwrap();
+        t_b.insert(&pk, 5_000).unwrap();
+        assert_ne!(t_a.root(), t_b.root());
+        assert_ne!(
+            SparseMerkleTree::active_leaf_hash(&pk, 1_000),
+            SparseMerkleTree::active_leaf_hash(&pk, 5_000),
+        );
+    }
+
+    /// WHAT: re-inserting the same pubkey with a CHANGED locked amount
+    ///       is rejected as a slot collision.
+    /// WHY:  on chain, a voter cannot mutate their lockup without
+    ///       first deregistering — the SMT must surface the same
+    ///       constraint or a chain replay would build a divergent
+    ///       state.
+    #[test]
+    fn changing_locked_amount_rejected_as_slot_collision() {
+        let mut tree = SparseMerkleTree::new();
+        let pk = pk_at(0);
+        tree.insert(&pk, 1_000).unwrap();
+        let err = tree.insert(&pk, 2_000).unwrap_err();
+        match err {
+            crate::VotingError::SlotCollision { .. } => {}
+            other => panic!("expected SlotCollision, got {other:?}"),
+        }
+    }
+
+    /// WHAT: a proof for a weighted leaf verifies against the new root
+    ///       AND a proof using the WRONG amount is rejected.
+    /// WHY:  this is the round-trip the on-chain register action
+    ///       performs: it computes `sha256(pk || amount_be8)` and
+    ///       walks the proof up to the curried merkle root. Forgery
+    ///       resistance requires that swapping in a different amount
+    ///       — even by 1 mojo — breaks verification.
+    #[test]
+    fn weighted_proof_roundtrip_and_forgery_resistance() {
+        let mut tree = SparseMerkleTree::new();
+        let pk = pk_at(0);
+        let lock = 1_234_567u64;
+        tree.insert(&pk, lock).unwrap();
+        let slot = SparseMerkleTree::slot_for_pubkey(&pk);
+        let proof = tree.prove(slot);
+        let root = tree.root();
+
+        let real_leaf = SparseMerkleTree::active_leaf_hash(&pk, lock);
+        let wrong_leaf = SparseMerkleTree::active_leaf_hash(&pk, lock + 1);
+
+        assert!(verify_proof(real_leaf, slot, &proof, root));
+        assert!(!verify_proof(wrong_leaf, slot, &proof, root));
+        assert_eq!(tree.locked_amount(&pk), Some(lock));
+    }
+
+    /// WHAT: `locked_amount(pk)` round-trips for inserted voters and
+    ///       returns `None` for un-registered ones.
+    #[test]
+    fn locked_amount_lookup() {
+        let mut tree = SparseMerkleTree::new();
+        let pk = pk_at(0);
+        let other = pk_at(1);
+        tree.insert(&pk, 9_999).unwrap();
+        assert_eq!(tree.locked_amount(&pk), Some(9_999));
+        assert_eq!(tree.locked_amount(&other), None);
     }
 }

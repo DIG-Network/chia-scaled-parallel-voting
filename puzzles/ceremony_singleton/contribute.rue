@@ -1,0 +1,146 @@
+// ceremony_singleton/contribute.rue
+// Contribute action for the Ceremony Singleton.
+//
+// Permissionless action — anyone can submit a Groth16 contribution
+// (their PUBLIC output: updated proving-key parameters + Proof of
+// Knowledge of the new τ). The participant signs sha256(launcher ||
+// contribution_hash || prev_contribution_hash) UNAUGMENTED via
+// `sign_raw` to prove they authorize the submission. The full
+// contribution payload (PoK + parameters) is recovered off-chain by
+// the dApp from the spend's puzzle_and_solution; this puzzle commits
+// only to its hash on-chain (cheap), with the marker coin's curry
+// bound to (launcher, participant_pk, contribution_hash,
+// prev_contribution_hash).
+//
+// Lineage: each contribution's prev_contribution_hash MUST equal the
+// singleton's curried last_contribution_hash. The genesis contributor
+// supplies the deployer's curried `vk_seed` (see SDK::ceremony for
+// the concrete value — typically a known canonical Powers-of-Tau
+// starting point hash).
+//
+// Time bound: contributions accepted only when
+//     START_BLOCK_HEIGHT <= current_height < START + LENGTH.
+// Outside this window the action fails (height-assertion conditions).
+//
+// The marker coin is created at amount=1 to avoid the "amount must be
+// > 0" consensus check in some chia versions; the contributor's spend
+// bundle MUST provide an XCH funder for the +1 mojo produced beyond
+// the singleton's recreation. Hinted with CEREMONY_LAUNCHER_ID so the
+// dApp can enumerate all contributions for a given ceremony in one
+// hint walk.
+
+import super::common_types::*;
+import shared::*;
+
+fn main(
+    // ── Curried ─────────────────────────────────────────────────────
+    CEREMONY_LAUNCHER_ID: Bytes32,
+    START_BLOCK_HEIGHT: Int,
+    CEREMONY_LENGTH_BLOCKS: Int,
+    CEREMONY_COIN_MOD_HASH: Bytes32,
+    Truth: CeremonyStateTruth,
+    // ── Solution ────────────────────────────────────────────────────
+    participant_pk: PublicKey,
+    contribution_hash: Bytes32,
+    prev_contribution_hash: Bytes32,
+    // Raw 32-byte τ entropy. Embedded in the marker coin's memos so
+    // dApps can recover the contribution directly from
+    // `coin_records_by_hint(launcher_id)` without parsing the spend's
+    // full puzzle_and_solution. The on-chain commitment is still via
+    // `contribution_hash` (which the participant signs over and which
+    // commits to the full off-chain payload).
+    entropy_hex: Bytes,
+    // Off-chain payload (Groth16 PoK + updated parameters). Ignored
+    // on-chain — only its hash (committed via `contribution_hash`,
+    // which the participant signs over) matters for soundness. Carried
+    // here so the dApp's chain-walk can recover the bytes via
+    // `puzzle_and_solution`. Rest-arg `..._` rules: the cdr of the
+    // last cons IS the payload bytes directly, no nil terminator.
+    ..._payload: Any,
+) -> (CeremonyStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+    // Once the ceremony has been finalized, the singleton must reject
+    // every further contribute spend — the VK + marker_root in the
+    // curried state are an immutable on-chain commitment.
+    assert State.finalized == 0;
+    assert State.last_contribution_hash == prev_contribution_hash;
+    // BISECTION step 3: add height conditions.
+    let assert_started = AssertHeightAbsolute {
+        height: START_BLOCK_HEIGHT,
+    };
+    let assert_open = AssertBeforeHeightAbsolute {
+        height: START_BLOCK_HEIGHT + CEREMONY_LENGTH_BLOCKS,
+    };
+    // BISECTION step 4: add AggSigUnsafe.
+    let sig_msg: Bytes32 = ceremony_contribution_msg(
+        CEREMONY_LAUNCHER_ID,
+        contribution_hash,
+        prev_contribution_hash,
+    );
+    let agg_sig_contribute = AggSigUnsafe {
+        public_key: participant_pk,
+        message: sig_msg,
+    };
+    // BISECTION step 5: add marker CreateCoin.
+    let marker_ph: Bytes32 = curry_tree_hash(
+        CEREMONY_COIN_MOD_HASH,
+        [
+            tree_hash_atom(CEREMONY_LAUNCHER_ID as Bytes),
+            tree_hash_atom(participant_pk as Bytes),
+            tree_hash_atom(contribution_hash as Bytes),
+            tree_hash_atom(prev_contribution_hash as Bytes),
+        ]
+    );
+    // EVEN amount: the singleton outer's
+    // `check_and_morph_conditions_for_singleton` raises if more than
+    // one ODD-amount CreateCoin appears. The finalizer already emits
+    // an odd recreation (amount=1), so the marker MUST be even —
+    // mirrors the rationale in create_ballot.rue's launcher mint.
+    let create_marker = CreateCoin {
+        puzzle_hash: marker_ph,
+        amount: 2,
+        memos: Memos {
+            value: [CEREMONY_LAUNCHER_ID as Bytes, entropy_hex],
+        },
+    };
+
+    // Public announcement — observers chain-walk the singleton lineage
+    // and parse this announcement to enumerate accepted contributions.
+    // Commits to (launcher, contribution_hash, participant_pk).
+    let announce_msg: Bytes32 = ceremony_contribution_announcement_msg(
+        CEREMONY_LAUNCHER_ID,
+        contribution_hash,
+        participant_pk,
+    );
+    let announce = CreateCoinAnnouncement {
+        message: announce_msg,
+    };
+
+    // Advance state — the next contributor must reference this
+    // contribution_hash as their prev_contribution_hash. The
+    // finalize-state fields (finalized / vk_hash / marker_root) are
+    // preserved unchanged; finalize-time D3 work will set them via
+    // its own action puzzle.
+    let new_state = CeremonyState {
+        contribution_count: State.contribution_count + 1,
+        last_contribution_hash: contribution_hash,
+        finalized: State.finalized,
+        vk_hash: State.vk_hash,
+        marker_root: State.marker_root,
+    };
+    let new_truth = CeremonyStateTruth {
+        Ephemeral_State: Truth.Ephemeral_State,
+        State: new_state,
+    };
+
+    (
+        new_truth,
+        [
+            assert_started,
+            assert_open,
+            agg_sig_contribute,
+            create_marker,
+            announce,
+        ],
+    )
+}
