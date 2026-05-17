@@ -1,6 +1,10 @@
 # Election, Ballot, Registration, and Voting coins (companion to CHIP draft)
 
-Puzzle-level detail for election-facing coins. Overview: [CHIP_DRAFT.md](./CHIP_DRAFT.md) § Specification. **Flow:** [chip-protocol-flow.md](./chip-protocol-flow.md). *Reference repo (open source):* [DIG-Network/chia-parallel-voting](https://github.com/DIG-Network/chia-parallel-voting) on `main`. CHIP-0050 action routing for singleton inners: [`puzzles/action.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/action.rue).
+**What this doc is:** **puzzle-level** detail for election-facing coins: fields, inner actions, and where **`finalize`** is *not* allowed. Lifecycle order lives in [chip-protocol-flow.md](./chip-protocol-flow.md). CHIP-0050 routing for singleton inners: [`puzzles/action.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/action.rue).
+
+**Code:** [DIG-Network/chia-parallel-voting](https://github.com/DIG-Network/chia-parallel-voting) on `main`.
+
+---
 
 ## Election state (`ElectionState`)
 
@@ -17,13 +21,15 @@ Puzzle-level detail for election-facing coins. Overview: [CHIP_DRAFT.md](./CHIP_
 
 Shared types and election constants: [`puzzles/election/shared.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/election/shared.rue).
 
-Additional deploy curries (VK, IC, threshold pack, `MAX_SIGNERS`, `election_launcher_id`, CHIP-0050 action roots) **MUST** stay consistent across all Ballot Coins from `createBallot`.
+**Deploy curries** (VK, IC, threshold pack, `MAX_SIGNERS`, `election_launcher_id`, CHIP-0050 action roots) **MUST** stay consistent across all Ballot Coins from `createBallot`.
 
 This CHIP does **not** specify an on-chain XCH fee in `register` or `accumulated_fees` on the singleton.
 
-Ballot end time: **`VOTE_CLOSE_HEIGHT`** on each Ballot Coin, not a global election timer.
+**Ballot close time** is **`VOTE_CLOSE_HEIGHT`** on each Ballot Coin, not one global election timer.
 
-## Election Singleton — inner actions
+---
+
+## Election Singleton: inner actions
 
 | Action | Behavior |
 |--------|----------|
@@ -34,6 +40,8 @@ Ballot end time: **`VOTE_CLOSE_HEIGHT`** on each Ballot Coin, not a global elect
 *Rue:* [`register.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/election/register.rue), [`create_ballot.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/election/create_ballot.rue), [`deregister.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/election/deregister.rue). *Deploy / orchestration:* [`sdk/src/actors/deployer.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/actors/deployer.rs).
 
 `finalize`, `oracle`, `announce_finalization` **MUST NOT** appear on the Election Singleton; they belong on the Ballot Coin.
+
+---
 
 ## Ballot Coin
 
@@ -51,6 +59,8 @@ Inner action Merkle **MUST** be exactly `{ finalize, oracle, announce_finalizati
 
 *Rue:* [`finalize.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/finalize.rue), [`oracle.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/oracle.rue), [`announce_finalization.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/ballot_coin/announce_finalization.rue). *Ballot actor:* [`sdk/src/actors/ballot.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/actors/ballot.rs).
 
+---
+
 ## Registration Coin
 
 **State:** `(voter_pubkey, election_launcher_id, voted_ballots_root, release_destination)`.
@@ -62,9 +72,11 @@ Inner action Merkle **MUST** be exactly `{ finalize, oracle, announce_finalizati
 
 *Rue:* [`mint_voting_coin.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/registration_coin/mint_voting_coin.rue), [`release.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/registration_coin/release.rue); shared: [`registration_coin/shared.rue`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/puzzles/registration_coin/shared.rue).
 
+---
+
 ## Voting Coin
 
-**State:** `(voter_pubkey, ballot_launcher_id, vote_data, registration_coin_id)` — 1 mojo lineage token; stake on Registration Coin.
+**State:** `(voter_pubkey, ballot_launcher_id, vote_data, registration_coin_id)`; 1 mojo lineage token; stake on Registration Coin.
 
 | Action | Behavior |
 |--------|----------|
@@ -74,6 +86,8 @@ Inner action Merkle **MUST** be exactly `{ finalize, oracle, announce_finalizati
 
 Witness builders **MUST** use the **current** Voting Coin tip per `(registration_coin_id, ballot_launcher_id)`.
 
+---
+
 ## Lineage (normative)
 
 - Registration ← `register` (Election Singleton).
@@ -81,5 +95,7 @@ Witness builders **MUST** use the **current** Voting Coin tip per `(registration
 - Voting ← `mint_voting_coin` (Registration Coin).
 
 **Compiled bytecode** (run [`build.sh`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/build.sh) / [`build.ps1`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/build.ps1)): [`puzzles/compiled/election/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/compiled/election), [`ballot_coin/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/compiled/ballot_coin), [`registration_coin/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/compiled/registration_coin), [`voting_coin/`](https://github.com/DIG-Network/chia-parallel-voting/tree/main/puzzles/compiled/voting_coin). **Loader:** [`sdk/src/puzzles.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/puzzles.rs). **Finalize bundles:** [`sdk/src/actors/aggregator.rs`](https://github.com/DIG-Network/chia-parallel-voting/blob/main/sdk/src/actors/aggregator.rs).
+
+---
 
 Companion index: [README.md](./README.md).
