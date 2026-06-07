@@ -197,6 +197,15 @@ launcher memo the ballot's own puzzle re-asserts), so a ballot that
 traces to the election provably uses the election's VK and a real
 snapshot.
 
+**Sequencing note.** This binding closes F5 too (the canonical ballot ph
+also encodes `VOTE_OPTIONS_ROOT`). It must target the FINALIZE VK that F1
+produces: F1 (see `docs/F1-finalize-redesign.md`) rewrites `finalize.rue`
+and the verification key (Option B drops `agg_signers`/`bls_verify`/`g2_map`
+and moves the registration accumulator to Poseidon-over-Jubjub). Committing
+the *current* finalize VK now would be thrown away by F1's VK rebuild, so
+**F3+F5's create_ballot binding should land WITH/AFTER F1 step 5** (finalize
++ VK rewrite). Until then F3/F5 remain open with this plan recorded.
+
 ---
 
 ## F4 — Collateral release via forgeable deregister announcement (HIGH, FIXED ✅)
@@ -273,6 +282,18 @@ mode-locked election can still have ballots created under any vote mode.
 eve-coin derivation (or launcher memo the ballot's oracle re-asserts), so
 `create_ballot`'s lock check binds the value the ballot will actually
 use.
+
+**Implementation note (shared with F3).** The clean fix is the SAME
+launcher-binding redesign F3 needs: `create_ballot` computes the canonical
+Ballot Coin puzzle hash (which already encodes `VOTE_OPTIONS_ROOT` via the
+curried `oracle` action) and commits it so the permissionless launch cannot
+deviate — closing F3 and F5 together. The cheaper-but-not-shared alternative
+(enforce at the vote path) is rejected as too invasive: `mint_voting_coin`
+would need `vote_mode_lock` in scope, which means threading it through
+`RegistrationState` (or the `mint_voting_coin` curry) and therefore through
+every reg-coin puzzle-hash predictor and ~41 test call sites — an
+F2-`locked_weight`-scale ripple for a value that is already pinned to votes
+by the `oracle` announcement. Prefer the create_ballot binding.
 
 ---
 
