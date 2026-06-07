@@ -1,66 +1,72 @@
 // ============================================================================
-// prover/circuit_v2.rs — F1 redesign: in-circuit signer-set membership (WIP)
+// prover/circuit_v2.rs — F1 redesign, Option B: in-circuit signer set (WIP)
 // ============================================================================
 //
 // STATUS: research-grade WORK IN PROGRESS toward closing finding F1
-// (finalize forgery — see docs/F1-finalize-redesign.md). This module is
-// built ALONGSIDE the live `circuit.rs`/`finalize.rue` path and is NOT yet
-// wired into finalization, so the existing test suite stays green.
+// (finalize forgery — see docs/F1-finalize-redesign.md). Built ALONGSIDE
+// the live `circuit.rs` / `finalize.rue` path and NOT yet wired into
+// finalization, so the existing suite stays green.
 //
-// WHAT THIS PROVES (the shared foundation both redesign options need):
-//   * G2 — per-signer MEMBERSHIP: each present signer's leaf
-//     `Poseidon(pubkey_id, weight)` is verified, IN-CIRCUIT, against a
-//     depth-`DEPTH` Poseidon Merkle root that is a public input. A signer
-//     who is not actually in the tree CANNOT produce a satisfying witness.
-//   * G1 — WEIGHT/threshold: the summed VERIFIED weight meets the curried
-//     quorum threshold (`signed * den >= num * total`), so the numerator is
-//     the real registered weight, not a free witness.
+// OPTION B (chosen): make the Groth16 proof attest, entirely in-circuit and
+// at O(1) on-chain cost, that "registered voters whose combined weight
+// meets the quorum threshold SIGNED `vote_message`". This drops the BLS
+// aggregate / on-chain `bls_verify` / `agg_signers` entirely (in-circuit
+// BLS12-381 G1 is structurally infeasible in arkworks 0.4 — see the design
+// doc). Voters instead sign with a SNARK-friendly **Schnorr signature over
+// Jubjub** (the embedded curve of BLS12-381, whose BASE field IS the
+// constraint field `Fr`), verified natively in-circuit.
 //
-// WHY POSEIDON (not the production SHA256 SPT): in-circuit SHA256 is
-// ~1M constraints per depth-32 membership proof — infeasible at scale.
-// Poseidon is ~8–10k constraints per proof. The production redesign
-// migrates the registration accumulator to Poseidon on-chain too
-// (register/deregister) — see the design doc.
+// PER PRESENT SIGNER the circuit enforces:
+//   * MEMBERSHIP (G2): `leaf = Poseidon(pubkey.x, pubkey.y, weight)` is a
+//     leaf of the depth-`DEPTH` Poseidon registration tree whose root is a
+//     public input. A non-registered key (or a tampered weight) cannot
+//     satisfy this.
+//   * SIGNATURE: a Jubjub Schnorr signature `(R, s)` by `pubkey` over the
+//     public `vote_message`: `s·G == R + c·P`, `c = Poseidon(R.x, P.x, m)`.
+//     So only a key whose holder actually signed THIS outcome contributes.
+//   * WEIGHT (G1): the verified weights sum to the curried quorum threshold
+//     (`signed * den >= num * total`).
 //
-// WHAT IS NOT DONE HERE (the remaining F1 work):
-//   * G3 — binding `agg_signers` to the proven set. In-circuit BLS12-381
-//     G1 addition over an `Fr` constraint system is structurally absent in
-//     arkworks 0.4 (verified). The recommended resolution (design doc
-//     Option B) is to drop the BLS aggregate and have each signer sign
-//     `vote_message` with a SNARK-friendly signature verified in-circuit.
-//     This module does not yet verify signatures.
-//   * Real pubkey encoding (a 48-byte G1 key → multiple Fr limbs) — here a
-//     single `pubkey_id: Fr` stands in for the voter identity.
-//   * A range proof on the threshold `slack` (currently mirrors the
-//     existing circuit's slack-identity; a bit-decomposition range check is
-//     required for full soundness).
-//   * Matching the on-chain finalize.rue public-input encoding / VK.
+// `finalize` then just verifies ONE Groth16 proof + commits the outcome —
+// constant cost regardless of voter count.
 //
-// The unit tests below pin the load-bearing property: a forged signer set
-// (a member with a tampered leaf, or a non-member with a bogus path)
-// fails to satisfy the constraints — which is exactly what closes F1's
-// "fabricated weight / unregistered signer" forgery at the circuit level.
+// REMAINING (multi-session, see design doc):
+//   * Migrate the on-chain registration accumulator (register/deregister +
+//     sdk/merkle.rs) to this Poseidon tree over the voters' Jubjub pubkeys.
+//   * Soundness hardening: range-check `slack` (threshold), constrain
+//     `s`/`c` to the inner-scalar bit-width (252) + cofactor/prime-order
+//     checks on witnessed points; feed `vote_message` as ≤254-bit or split.
+//   * Wire into finalize.rue (new public-input set; drop VK BLS bits) +
+//     ceremony/VK + aggregator/voter signing + flip
+//     exploit_finalize_forgery_e2e to assert REJECTION.
+//
+// The unit tests pin the load-bearing properties: a forged non-member, a
+// weight-tamper, and a wrong-message/forged signature each FAIL the
+// constraints — exactly the forgery exploit_finalize_forgery_e2e.rs shows
+// against the live circuit.
 
 use ark_bls12_381::Fr;
-use ark_crypto_primitives::crh::poseidon::constraints::{CRHParametersVar, TwoToOneCRHGadget};
-use ark_crypto_primitives::crh::poseidon::TwoToOneCRH;
-use ark_crypto_primitives::crh::{TwoToOneCRHScheme, TwoToOneCRHSchemeGadget};
-use ark_crypto_primitives::sponge::poseidon::{find_poseidon_ark_and_mds, PoseidonConfig};
-use ark_ff::PrimeField;
+use ark_crypto_primitives::sponge::constraints::CryptographicSpongeVar;
+use ark_crypto_primitives::sponge::poseidon::constraints::PoseidonSpongeVar;
+use ark_crypto_primitives::sponge::poseidon::{find_poseidon_ark_and_mds, PoseidonConfig, PoseidonSponge};
+use ark_crypto_primitives::sponge::CryptographicSponge;
+use ark_ec::Group;
+use ark_ed_on_bls12_381::constraints::EdwardsVar;
+use ark_ed_on_bls12_381::{EdwardsAffine, EdwardsProjective as Jub, Fr as JubScalar};
+use ark_ff::{BigInteger, PrimeField};
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::boolean::Boolean;
 use ark_r1cs_std::eq::EqGadget;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::fields::FieldVar;
+use ark_r1cs_std::groups::CurveVar;
+use ark_r1cs_std::ToBitsGadget;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 
-/// Canonical 2-to-1 Poseidon parameters over BLS12-381 `Fr`.
-///
-/// NOTE: `find_poseidon_ark_and_mds` deterministically derives the round
-/// constants + MDS for the given (rounds, width). The round numbers here
-/// are a reasonable width-3 set; a production deployment MUST pin an
-/// audited parameter set (and the SAME set is used on-chain in the
-/// Poseidon-in-Rue register verifier and in `sdk/src/merkle.rs`).
+/// Canonical Poseidon parameters over BLS12-381 `Fr` (width 3, rate 2).
+/// The SAME config is used for the leaf hash, the Merkle node hash, and the
+/// Schnorr challenge. Production MUST pin an audited parameter set shared
+/// with `sdk/merkle.rs` and the on-chain Poseidon-in-Rue register verifier.
 pub fn poseidon_config() -> PoseidonConfig<Fr> {
     let full_rounds = 8usize;
     let partial_rounds = 57usize;
@@ -77,44 +83,67 @@ pub fn poseidon_config() -> PoseidonConfig<Fr> {
     PoseidonConfig::<Fr>::new(full_rounds, partial_rounds, alpha, mds, ark, rate, capacity)
 }
 
-/// Off-circuit 2-to-1 Poseidon compression — MUST match the in-circuit
-/// `TwoToOneCRHGadget::compress` so test witnesses reconstruct the same
-/// root the circuit computes.
-pub fn poseidon2(cfg: &PoseidonConfig<Fr>, left: Fr, right: Fr) -> Fr {
-    <TwoToOneCRH<Fr> as TwoToOneCRHScheme>::compress(cfg, left, right)
-        .expect("poseidon compress")
+/// Off-circuit Poseidon over a list of field elements (absorb all, squeeze
+/// one) — MUST match the in-circuit `poseidon_n_var`.
+pub fn poseidon_n(cfg: &PoseidonConfig<Fr>, xs: &[Fr]) -> Fr {
+    let mut s = PoseidonSponge::<Fr>::new(cfg);
+    for x in xs {
+        s.absorb(x);
+    }
+    s.squeeze_field_elements(1)[0]
 }
 
-/// A single signer's private membership witness (prototype encoding).
+/// In-circuit counterpart of [`poseidon_n`].
+fn poseidon_n_var(
+    cs: ConstraintSystemRef<Fr>,
+    cfg: &PoseidonConfig<Fr>,
+    xs: &[FpVar<Fr>],
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let mut s = PoseidonSpongeVar::<Fr>::new(cs, cfg);
+    for x in xs {
+        s.absorb(x)?;
+    }
+    Ok(s.squeeze_field_elements(1)?.pop().unwrap())
+}
+
+/// Reduce a base-field Poseidon challenge `c` into the Jubjub inner scalar
+/// field by integer value — matches the in-circuit interpretation where
+/// `c.to_bits_le()` is consumed by Jubjub double-and-add (reduced mod the
+/// group order).
+pub fn challenge_to_inner(c: Fr) -> JubScalar {
+    JubScalar::from_le_bytes_mod_order(&c.into_bigint().to_bytes_le())
+}
+
+/// A single signer's witness: their Jubjub pubkey + membership proof +
+/// a Schnorr signature `(R, s)` over `vote_message`.
 #[derive(Clone, Debug)]
 pub struct SignerV2 {
-    /// Field-element stand-in for the voter's identity (production: an
-    /// Fr commitment to the 48-byte G1 pubkey).
-    pub pubkey_id: Fr,
-    /// The voter's registered weight (bound into the leaf).
+    pub pubkey: EdwardsAffine, // P = x·G  (the registered signing key)
     pub weight: u64,
-    /// Sibling hashes leaf→root (length == DEPTH).
-    pub path: Vec<Fr>,
-    /// Direction bits leaf→root (true ⇒ this node is the RIGHT child).
-    pub path_bits: Vec<bool>,
-    /// Whether this fixed slot carries a real signer (false ⇒ padded).
+    pub path: Vec<Fr>,        // Merkle siblings leaf→root
+    pub path_bits: Vec<bool>, // direction bits (true ⇒ node is right child)
+    pub sig_r: EdwardsAffine, // R = k·G
+    pub sig_s: JubScalar,     // s = k + c·x  (inner scalar field)
     pub present: bool,
 }
 
 impl SignerV2 {
-    /// The leaf value the tree commits: `Poseidon(pubkey_id, weight)`.
+    /// Registration leaf = `Poseidon(P.x, P.y, weight)`.
     pub fn leaf(&self, cfg: &PoseidonConfig<Fr>) -> Fr {
-        poseidon2(cfg, self.pubkey_id, Fr::from(self.weight))
+        poseidon_n(
+            cfg,
+            &[self.pubkey.x, self.pubkey.y, Fr::from(self.weight)],
+        )
     }
 
-    /// Reconstruct the root this witness implies (off-circuit; for tests).
+    /// Off-circuit root this witness implies (tests).
     pub fn implied_root(&self, cfg: &PoseidonConfig<Fr>) -> Fr {
         let mut node = self.leaf(cfg);
         for (sib, &is_right) in self.path.iter().zip(self.path_bits.iter()) {
             node = if is_right {
-                poseidon2(cfg, *sib, node)
+                poseidon_n(cfg, &[*sib, node])
             } else {
-                poseidon2(cfg, node, *sib)
+                poseidon_n(cfg, &[node, *sib])
             };
         }
         node
@@ -122,22 +151,23 @@ impl SignerV2 {
 
     fn padding(depth: usize) -> Self {
         Self {
-            pubkey_id: Fr::from(0u64),
+            pubkey: EdwardsAffine::default(),
             weight: 0,
             path: vec![Fr::from(0u64); depth],
             path_bits: vec![false; depth],
+            sig_r: EdwardsAffine::default(),
+            sig_s: JubScalar::from(0u64),
             present: false,
         }
     }
 }
 
-/// F1-redesign membership+weight circuit (WIP — see module docs).
+/// F1-redesign Option-B circuit (WIP — see module docs).
 #[derive(Clone)]
 pub struct VotingCircuitV2 {
     // ── Public inputs ──
-    /// Poseidon registration-tree root snapshot.
-    pub registration_root: Fr,
-    /// Total registered weight (threshold denominator base).
+    pub registration_root: Fr, // Poseidon registration-tree root snapshot
+    pub vote_message: Fr,      // outcome digest signers signed (≤254-bit)
     pub registration_vote_weight: u64,
     pub vote_threshold_num: u64,
     pub vote_threshold_den: u64,
@@ -149,8 +179,6 @@ pub struct VotingCircuitV2 {
 }
 
 impl VotingCircuitV2 {
-    /// Pad the signer set to the fixed `max_signers` shape so the QAP /
-    /// VK is independent of the actual signer count.
     pub fn padded_signers(&self) -> Vec<SignerV2> {
         let mut s = self.signers.clone();
         while s.len() < self.max_signers {
@@ -159,7 +187,6 @@ impl VotingCircuitV2 {
         s
     }
 
-    /// Sum of present signers' weights (off-circuit helper).
     pub fn signed_weight(&self) -> u64 {
         self.signers
             .iter()
@@ -172,58 +199,75 @@ impl VotingCircuitV2 {
 impl ConstraintSynthesizer<Fr> for VotingCircuitV2 {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
         let cfg = poseidon_config();
-        let params = CRHParametersVar::<Fr>::new_constant(cs.clone(), cfg)?;
 
         // Public inputs.
         let root_var = FpVar::<Fr>::new_input(cs.clone(), || Ok(self.registration_root))?;
+        let m_var = FpVar::<Fr>::new_input(cs.clone(), || Ok(self.vote_message))?;
         let total_weight_var =
             FpVar::<Fr>::new_input(cs.clone(), || Ok(Fr::from(self.registration_vote_weight)))?;
         let num_var = FpVar::<Fr>::new_input(cs.clone(), || Ok(Fr::from(self.vote_threshold_num)))?;
         let den_var = FpVar::<Fr>::new_input(cs.clone(), || Ok(Fr::from(self.vote_threshold_den)))?;
 
-        let signers = self.padded_signers();
+        // Jubjub base point (constant).
+        let g_var = EdwardsVar::new_constant(cs.clone(), Jub::generator())?;
 
-        // Accumulate verified weight.
+        let signers = self.padded_signers();
         let mut acc_weight = FpVar::<Fr>::zero();
 
         for s in &signers {
-            // present flag (Boolean).
             let present = Boolean::new_witness(cs.clone(), || Ok(s.present))?;
 
-            // leaf = Poseidon(pubkey_id, weight).
-            let pubkey_id = FpVar::<Fr>::new_witness(cs.clone(), || Ok(s.pubkey_id))?;
+            // Signer's Jubjub pubkey + weight.
+            let p_var = EdwardsVar::new_witness(cs.clone(), || Ok(Jub::from(s.pubkey)))?;
             let weight = FpVar::<Fr>::new_witness(cs.clone(), || Ok(Fr::from(s.weight)))?;
-            let leaf = TwoToOneCRHGadget::<Fr>::compress(&params, &pubkey_id, &weight)?;
 
-            // Walk the Poseidon Merkle path to a computed root.
+            // ── MEMBERSHIP (G2): leaf = Poseidon(P.x, P.y, weight) ──
+            let leaf = poseidon_n_var(
+                cs.clone(),
+                &cfg,
+                &[p_var.x.clone(), p_var.y.clone(), weight.clone()],
+            )?;
             let mut node = leaf;
             for level in 0..self.depth {
-                let sib =
-                    FpVar::<Fr>::new_witness(cs.clone(), || Ok(s.path[level]))?;
-                let is_right =
-                    Boolean::new_witness(cs.clone(), || Ok(s.path_bits[level]))?;
-                // left  = is_right ? sib  : node
-                // right = is_right ? node : sib
+                let sib = FpVar::<Fr>::new_witness(cs.clone(), || Ok(s.path[level]))?;
+                let is_right = Boolean::new_witness(cs.clone(), || Ok(s.path_bits[level]))?;
                 let left = is_right.select(&sib, &node)?;
                 let right = is_right.select(&node, &sib)?;
-                node = TwoToOneCRHGadget::<Fr>::compress(&params, &left, &right)?;
+                node = poseidon_n_var(cs.clone(), &cfg, &[left, right])?;
             }
-
-            // MEMBERSHIP (G2): for a PRESENT signer the reconstructed root
-            // MUST equal the public registration root. Absent/padded slots
-            // are exempt (their bogus path is ignored). `conditional_enforce_equal`
-            // adds the constraint `node == root` gated on `present`.
+            // present ⇒ reconstructed root == public root.
             node.conditional_enforce_equal(&root_var, &present)?;
 
-            // Accumulate present·weight.
+            // ── SIGNATURE: Schnorr over Jubjub, s·G == R + c·P ──
+            let r_var = EdwardsVar::new_witness(cs.clone(), || Ok(Jub::from(s.sig_r)))?;
+            let s_bits: Vec<Boolean<Fr>> = s
+                .sig_s
+                .into_bigint()
+                .to_bits_le()
+                .into_iter()
+                .map(|b| Boolean::new_witness(cs.clone(), || Ok(b)))
+                .collect::<Result<_, _>>()?;
+            // c = Poseidon(R.x, P.x, vote_message)
+            let c_var = poseidon_n_var(
+                cs.clone(),
+                &cfg,
+                &[r_var.x.clone(), p_var.x.clone(), m_var.clone()],
+            )?;
+            let c_bits = c_var.to_bits_le()?;
+            let s_g = g_var.scalar_mul_le(s_bits.iter())?;
+            let c_p = p_var.scalar_mul_le(c_bits.iter())?;
+            let rhs = &r_var + &c_p;
+            // present ⇒ s·G == R + c·P (valid signature on vote_message).
+            s_g.conditional_enforce_equal(&rhs, &present)?;
+
+            // ── WEIGHT (G1): accumulate present·weight ──
             let contribution = present.select(&weight, &FpVar::<Fr>::zero())?;
             acc_weight += contribution;
         }
 
-        // THRESHOLD (G1): acc_weight * den >= num * total_weight, encoded
-        // via a slack witness identity (acc*den - num*total == slack).
-        // NOTE (WIP): a bit-decomposition range proof on `slack` is still
-        // required for full soundness — see module docs.
+        // THRESHOLD (G1): acc_weight * den >= num * total_weight, via a slack
+        // identity. NOTE (WIP): a bit-decomposition range proof on `slack`
+        // is still required for full soundness (see module docs).
         let lhs = &acc_weight * &den_var;
         let rhs = &num_var * &total_weight_var;
         let slack_val = {
@@ -242,6 +286,30 @@ impl ConstraintSynthesizer<Fr> for VotingCircuitV2 {
     }
 }
 
+// ── Off-circuit signing (tests / future aggregator) ──────────────────────
+
+/// Generate a Jubjub keypair `(secret x, public P=x·G)`.
+pub fn keygen(x: JubScalar) -> EdwardsAffine {
+    use ark_ec::CurveGroup;
+    (Jub::generator() * x).into_affine()
+}
+
+/// Schnorr-sign `vote_message` with secret `x` and nonce `k`:
+/// `R=k·G`, `c=Poseidon(R.x, P.x, m)`, `s = k + c_inner·x`.
+pub fn schnorr_sign(
+    cfg: &PoseidonConfig<Fr>,
+    x: JubScalar,
+    k: JubScalar,
+    vote_message: Fr,
+) -> (EdwardsAffine, JubScalar) {
+    use ark_ec::CurveGroup;
+    let p = (Jub::generator() * x).into_affine();
+    let r = (Jub::generator() * k).into_affine();
+    let c = poseidon_n(cfg, &[r.x, p.x, vote_message]);
+    let s = k + challenge_to_inner(c) * x;
+    (r, s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,71 +320,55 @@ mod tests {
     use ark_std::rand::SeedableRng;
     use std::collections::BTreeMap;
 
-    /// Run a circuit's constraints on a fresh CS and report satisfiability —
-    /// the definitive unit-level test of the gadget logic.
     fn is_satisfied(c: VotingCircuitV2) -> bool {
         let cs = ConstraintSystem::<Fr>::new_ref();
         match c.generate_constraints(cs.clone()) {
             Ok(()) => cs.is_satisfied().unwrap_or(false),
-            Err(_) => false, // e.g. below-threshold short-circuit
+            Err(_) => false,
         }
     }
 
-    /// Tiny off-circuit Poseidon Merkle tree for building test witnesses.
+    /// Off-circuit Poseidon Merkle tree over the registration leaves.
     struct TestTree {
         cfg: PoseidonConfig<Fr>,
         depth: usize,
-        empty: Vec<Fr>, // empty subtree hash per level (0 = leaf)
+        empty: Vec<Fr>,
         leaves: BTreeMap<u64, Fr>,
     }
-
     impl TestTree {
         fn new(depth: usize) -> Self {
             let cfg = poseidon_config();
             let mut empty = vec![Fr::from(0u64)];
             for i in 0..depth {
-                let prev = empty[i];
-                empty.push(poseidon2(&cfg, prev, prev));
+                let p = empty[i];
+                empty.push(poseidon_n(&cfg, &[p, p]));
             }
-            Self {
-                cfg,
-                depth,
-                empty,
-                leaves: BTreeMap::new(),
-            }
+            Self { cfg, depth, empty, leaves: BTreeMap::new() }
         }
-
         fn insert(&mut self, index: u64, leaf: Fr) {
             self.leaves.insert(index, leaf);
         }
-
         fn node(&self, level: usize, idx: u64) -> Fr {
             if level == 0 {
                 return *self.leaves.get(&idx).unwrap_or(&self.empty[0]);
             }
             let span = 1u64 << level;
-            // Does any leaf fall under [idx*span, (idx+1)*span)?
             let lo = idx * span;
-            let hi = lo + span;
-            if self.leaves.range(lo..hi).next().is_none() {
+            if self.leaves.range(lo..lo + span).next().is_none() {
                 return self.empty[level];
             }
             let l = self.node(level - 1, idx * 2);
             let r = self.node(level - 1, idx * 2 + 1);
-            poseidon2(&self.cfg, l, r)
+            poseidon_n(&self.cfg, &[l, r])
         }
-
         fn root(&self) -> Fr {
             self.node(self.depth, 0)
         }
-
         fn proof(&self, mut index: u64) -> (Vec<Fr>, Vec<bool>) {
-            let mut path = Vec::with_capacity(self.depth);
-            let mut bits = Vec::with_capacity(self.depth);
+            let mut path = Vec::new();
+            let mut bits = Vec::new();
             for level in 0..self.depth {
-                let sibling_idx = index ^ 1;
-                path.push(self.node(level, sibling_idx));
-                // is_right == current node is the right child == index odd
+                path.push(self.node(level, index ^ 1));
                 bits.push(index & 1 == 1);
                 index >>= 1;
             }
@@ -324,42 +376,55 @@ mod tests {
         }
     }
 
-    fn build_signer(tree: &TestTree, index: u64, pubkey_id: Fr, weight: u64) -> SignerV2 {
-        let (path, path_bits) = tree.proof(index);
-        SignerV2 {
-            pubkey_id,
-            weight,
-            path,
-            path_bits,
-            present: true,
-        }
-    }
-
     fn rng() -> ark_std::rand::rngs::StdRng {
-        ark_std::rand::rngs::StdRng::seed_from_u64(0xF1_C0DE)
+        ark_std::rand::rngs::StdRng::seed_from_u64(0xF1_0B_C0DE)
     }
 
-    /// A small registration tree with two voters; a 2/3-quorum proof over
-    /// BOTH of them verifies, and the SAME setup REJECTS a forged signer
-    /// whose leaf is not in the tree.
-    fn setup_tree() -> (TestTree, SignerV2, SignerV2, u64) {
-        let depth = 8usize;
+    /// Build a registered, signing member at `index` with secret `x`,
+    /// nonce `k`, weight, signing `vote_message`. Inserts the leaf.
+    fn member(
+        tree: &mut TestTree,
+        index: u64,
+        x: JubScalar,
+        k: JubScalar,
+        weight: u64,
+        vote_message: Fr,
+    ) -> SignerV2 {
         let cfg = poseidon_config();
-        let mut tree = TestTree::new(depth);
-        let (pk_a, w_a) = (Fr::from(111u64), 1_000u64);
-        let (pk_b, w_b) = (Fr::from(222u64), 2_000u64);
-        let (idx_a, idx_b) = (5u64, 42u64);
-        tree.insert(idx_a, poseidon2(&cfg, pk_a, Fr::from(w_a)));
-        tree.insert(idx_b, poseidon2(&cfg, pk_b, Fr::from(w_b)));
-        let total = w_a + w_b;
-        let sa = build_signer(&tree, idx_a, pk_a, w_a);
-        let sb = build_signer(&tree, idx_b, pk_b, w_b);
-        (tree, sa, sb, total)
+        let p = keygen(x);
+        tree.insert(index, poseidon_n(&cfg, &[p.x, p.y, Fr::from(weight)]));
+        let (r, s) = schnorr_sign(&cfg, x, k, vote_message);
+        let (path, path_bits) = tree.proof(index);
+        SignerV2 { pubkey: p, weight, path, path_bits, sig_r: r, sig_s: s, present: true }
     }
 
-    fn circuit(tree: &TestTree, signers: Vec<SignerV2>, total: u64) -> VotingCircuitV2 {
+    fn setup() -> (TestTree, Fr, SignerV2, SignerV2, u64) {
+        let depth = 8usize;
+        let vote_message = Fr::from(0xABCDEFu64);
+        let mut tree = TestTree::new(depth);
+        // members must be built AFTER all inserts so their proofs reflect
+        // the final tree — so build, collect, then re-prove.
+        let cfg = poseidon_config();
+        let (xa, ka, wa, ia) = (JubScalar::from(7u64), JubScalar::from(11u64), 1_000u64, 5u64);
+        let (xb, kb, wb, ib) = (JubScalar::from(13u64), JubScalar::from(17u64), 2_000u64, 42u64);
+        let pa = keygen(xa);
+        let pb = keygen(xb);
+        tree.insert(ia, poseidon_n(&cfg, &[pa.x, pa.y, Fr::from(wa)]));
+        tree.insert(ib, poseidon_n(&cfg, &[pb.x, pb.y, Fr::from(wb)]));
+        let mk = |x, k, w, i: u64, p: EdwardsAffine| {
+            let (r, s) = schnorr_sign(&cfg, x, k, vote_message);
+            let (path, path_bits) = tree.proof(i);
+            SignerV2 { pubkey: p, weight: w, path, path_bits, sig_r: r, sig_s: s, present: true }
+        };
+        let sa = mk(xa, ka, wa, ia, pa);
+        let sb = mk(xb, kb, wb, ib, pb);
+        (tree, vote_message, sa, sb, wa + wb)
+    }
+
+    fn circuit(tree: &TestTree, m: Fr, signers: Vec<SignerV2>, total: u64) -> VotingCircuitV2 {
         VotingCircuitV2 {
             registration_root: tree.root(),
+            vote_message: m,
             registration_vote_weight: total,
             vote_threshold_num: 1,
             vote_threshold_den: 2,
@@ -369,20 +434,17 @@ mod tests {
         }
     }
 
-    /// WHAT: a proof whose signers are genuine tree members and whose
-    ///       verified weight meets quorum verifies.
-    /// WHY:  the membership+weight circuit must accept the honest case.
+    /// HONEST: two registered members who both signed the outcome satisfy
+    /// the circuit and the proof Groth16-verifies.
     #[test]
-    fn honest_membership_proof_verifies() {
-        let (tree, sa, sb, total) = setup_tree();
-        let c = circuit(&tree, vec![sa, sb], total);
+    fn honest_membership_and_signatures_verify() {
+        let (tree, m, sa, sb, total) = setup();
+        let c = circuit(&tree, m, vec![sa, sb], total);
+        assert!(is_satisfied(c.clone()), "honest witness must satisfy");
 
-        // Constraint-level: the honest witness satisfies the circuit.
-        assert!(is_satisfied(c.clone()), "honest witness must satisfy constraints");
-
-        // End-to-end Groth16: prove + verify.
         let public = vec![
             c.registration_root,
+            c.vote_message,
             Fr::from(c.registration_vote_weight),
             Fr::from(c.vote_threshold_num),
             Fr::from(c.vote_threshold_den),
@@ -390,47 +452,62 @@ mod tests {
         let mut r = rng();
         let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(c.clone(), &mut r).unwrap();
         let proof = Groth16::<Bls12_381>::prove(&pk, c, &mut r).unwrap();
-        assert!(
-            Groth16::<Bls12_381>::verify(&vk, &public, &proof).unwrap(),
-            "honest membership+quorum proof must verify"
-        );
+        assert!(Groth16::<Bls12_381>::verify(&vk, &public, &proof).unwrap());
     }
 
-    /// WHAT (load-bearing, closes F1's core): a signer who is NOT in the
-    ///       registration tree (forged leaf / bogus path) cannot produce a
-    ///       satisfying witness — `prove` fails.
-    /// WHY:  this is exactly the forgery `exploit_finalize_forgery_e2e.rs`
-    ///       demonstrates against the LIVE circuit; the redesigned circuit
-    ///       rejects it because membership is enforced in-circuit.
+    /// FORGERY (membership): a non-member Jubjub key — even with a VALID
+    /// self-signature — cannot satisfy the membership constraint.
     #[test]
-    fn forged_non_member_signer_is_rejected() {
-        let (tree, sa, _sb, _total) = setup_tree();
-        // Forge: an attacker key with a huge weight, NOT in the tree, using
-        // sa's (valid-shaped but wrong) path. Claim it alone meets quorum.
-        let mut forged = sa.clone();
-        forged.pubkey_id = Fr::from(999_999u64); // unregistered identity
-        forged.weight = 1_000_000; // fabricated weight
-        let c = circuit(&tree, vec![forged], 2_000);
-        assert!(
-            !is_satisfied(c),
-            "FORGERY: a non-member signer must NOT satisfy the constraints \
-             (membership enforced in-circuit). It did — F1 membership \
-             binding regressed."
-        );
+    fn forged_non_member_rejected() {
+        let (tree, m, _sa, _sb, _t) = setup();
+        let cfg = poseidon_config();
+        let (xz, kz) = (JubScalar::from(999u64), JubScalar::from(123u64));
+        let pz = keygen(xz);
+        let (rz, sz) = schnorr_sign(&cfg, xz, kz, m); // valid sig, but NOT registered
+        let (path, path_bits) = tree.proof(5); // borrow a member's path shape
+        let forged = SignerV2 {
+            pubkey: pz,
+            weight: 1_000_000,
+            path,
+            path_bits,
+            sig_r: rz,
+            sig_s: sz,
+            present: true,
+        };
+        let c = circuit(&tree, m, vec![forged], 2_000);
+        assert!(!is_satisfied(c), "non-member must fail membership");
     }
 
-    /// WHAT: tampering a real member's weight (claiming more than the leaf
-    ///       commits) breaks membership and is rejected.
+    /// FORGERY (signature): a registered member with an INVALID signature
+    /// (s tampered) cannot satisfy the signature constraint.
     #[test]
-    fn tampered_weight_is_rejected() {
-        let (tree, sa, _sb, _total) = setup_tree();
-        let mut tampered = sa.clone();
-        tampered.weight += 1; // leaf no longer matches the tree
-        let c = circuit(&tree, vec![tampered], 2_000);
-        assert!(
-            !is_satisfied(c),
-            "a signer claiming more weight than their leaf commits must be \
-             rejected by the in-circuit membership check"
-        );
+    fn bad_signature_rejected() {
+        let (tree, m, sa, _sb, _t) = setup();
+        let mut bad = sa.clone();
+        bad.sig_s += JubScalar::from(1u64); // break s·G == R + c·P
+        let c = circuit(&tree, m, vec![bad], 2_000);
+        assert!(!is_satisfied(c), "tampered signature must fail");
+    }
+
+    /// FORGERY (replay/wrong outcome): a member who signed a DIFFERENT
+    /// message cannot have it counted for `vote_message` (challenge
+    /// mismatch ⇒ signature check fails).
+    #[test]
+    fn wrong_message_rejected() {
+        let (tree, m, sa, _sb, _t) = setup();
+        // sa signed `m`; verify against a different outcome message.
+        let c = circuit(&tree, m + Fr::from(1u64), vec![sa], 2_000);
+        assert!(!is_satisfied(c), "signature over a different message must fail");
+    }
+
+    /// Weight tamper: claiming more weight than the registered leaf commits
+    /// breaks membership.
+    #[test]
+    fn tampered_weight_rejected() {
+        let (tree, m, sa, _sb, _t) = setup();
+        let mut bad = sa.clone();
+        bad.weight += 1;
+        let c = circuit(&tree, m, vec![bad], 2_000);
+        assert!(!is_satisfied(c), "weight tamper must fail membership");
     }
 }

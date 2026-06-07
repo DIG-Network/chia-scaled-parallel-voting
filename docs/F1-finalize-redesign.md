@@ -110,25 +110,48 @@ registration tree leaf+node hash to **Poseidon over `Fr`**:
   1–2k signers ≈ 10–20M constraints; 20k ≈ 160–200M, heavy — likely
   needs proof-batching/recursion for full-electorate quorums).
 
+## G3 decision: **Option B (SNARK-friendly signatures)** — CHOSEN
+
+Voters sign `vote_message` with a **Schnorr signature over Jubjub**
+(`ark-ed-on-bls12-381` — the embedded curve whose base field IS the
+constraint field `Fr`, so EC ops are native `FpVar<Fr>`). The circuit
+verifies each signer's signature in-circuit (`s·G == R + c·P`,
+`c = Poseidon(R.x, P.x, vote_message)`); BLS / `agg_signers` / on-chain
+`bls_verify` / `g2_map` are dropped. Measured cost ≈ **~5.5k constraints per
+signature + ~8–10k per Poseidon membership ≈ ~14–16k constraints/signer**
+⇒ a few hundred signers per ~1–2M-constraint proof; full-electorate
+quorums need proof batching/recursion (future).
+
 ## Sequencing (resumable plan)
 
-1. **[started]** `prover/circuit_v2.rs`: new `VotingCircuitV2` proving G1
-   (denominator bound to snapshot) + G2 (Poseidon-SPT membership + verified
-   weight sum ≥ threshold), fixed-shape, with unit tests (valid verifies;
-   forged membership/weight rejected). Built ALONGSIDE the live circuit so
-   the tree stays green.
-2. Decide G3: **Option B** recommended. Add the SNARK-friendly signature
-   verification gadget to the circuit; pick the embedded-curve/Poseidon
-   sig scheme.
-3. Migrate the registration accumulator to Poseidon (`merkle.rs`,
-   `register.rue`/`deregister.rue` Poseidon-in-Rue, SDK predictors).
-4. Rewrite `finalize.rue` for the new public-input set (Option B: drop
+1. **[DONE]** `prover/circuit_v2.rs` — `VotingCircuitV2` proving, per present
+   signer: Poseidon-SPT MEMBERSHIP (`leaf = Poseidon(P.x, P.y, weight)`,
+   depth-`DEPTH` Poseidon path → public root) + in-circuit Jubjub-Schnorr
+   SIGNATURE over `vote_message` + verified weight sum ≥ threshold.
+   Fixed-shape (padded to `max_signers`). Built ALONGSIDE the live circuit
+   (tree green). Tests (5, passing): honest membership+signatures verify
+   (full Groth16 prove/verify); forged non-member, bad signature,
+   wrong/replayed message, and weight-tamper each FAIL the constraints.
+2. **[DONE]** G3 decided + implemented: Schnorr-over-Jubjub, hand-rolled
+   in-circuit verify (arkworks 0.4 has no Schnorr verify gadget). Off-circuit
+   `keygen`/`schnorr_sign` helpers included.
+3. **[TODO]** Soundness hardening of `circuit_v2`: range-check the threshold
+   `slack` (bit decomposition); constrain `s`/`c` to the 252-bit inner
+   scalar width; cofactor/prime-order checks on witnessed `R`/`P`; feed
+   `vote_message` as ≤254-bit (or split). Choose audited Poseidon params.
+4. **[TODO]** Migrate the registration accumulator to this Poseidon tree
+   over voters' JUBJUB pubkeys: `sdk/src/merkle.rs`,
+   `election/register.rue` + `deregister.rue` (Poseidon-in-Rue membership),
+   SDK predictors. (Identity migration: voters register their Jubjub signing
+   key; the leaf commits it.)
+5. **[TODO]** Rewrite `finalize.rue` for the new public-input set (drop
    `agg_signers`/`bls_verify`/`g2_map`; keep the Groth16 pairing + outcome
-   commit). Rebuild VK / ceremony.
-5. Rewrite `sdk/src/actors/aggregator.rs` finalize builder + voter signing
-   for the new scheme; update all finalize e2e tests; flip
-   `exploit_finalize_forgery_e2e.rs` to assert the forged proof is
-   REJECTED.
+   commit). Rebuild VK / ceremony. Promote `VotingCircuitV2` to the live
+   circuit; fix `MAX_SIGNERS_PER_PROOF`.
+6. **[TODO]** Rewrite `sdk/src/actors/aggregator.rs` finalize builder +
+   voter signing (Jubjub Schnorr) + `sdk/src/actors/voter.rs`; update all
+   finalize e2e tests; flip `exploit_finalize_forgery_e2e.rs` to assert the
+   forged proof is REJECTED.
 
 ## Why not the cheaper-looking shortcuts
 

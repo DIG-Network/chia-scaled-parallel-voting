@@ -103,8 +103,12 @@ ark-ff                = { version = "0.4", default-features = false, features = 
 ark-ec                = { version = "0.4", default-features = false, features = ["std"] }
 ark-std               = { version = "0.4", default-features = false, features = ["std"] }
 ark-serialize         = { version = "0.4", default-features = false, features = ["std"] }
-ark-crypto-primitives = { version = "0.4", default-features = false, features = ["std", "crh", "r1cs"] }
+ark-crypto-primitives = { version = "0.4", default-features = false, features = ["std", "crh", "sponge", "r1cs"] }
 ark-snark             = { version = "0.4", default-features = false }
+# F1 redesign (Option B): Jubjub = embedded curve of BLS12-381 (its BASE
+# field IS BLS12-381 Fr), so in-circuit Schnorr verification over Jubjub is
+# native `FpVar<Fr>`. The `r1cs` feature exports `constraints::EdwardsVar`.
+ark-ed-on-bls12-381   = { version = "0.4", default-features = false, features = ["r1cs"] }
 
 # BLS aggregation (off-chain) — augmented signing matches on-chain bls_verify.
 blst = "0.3"
