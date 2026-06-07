@@ -137,9 +137,18 @@ fn main(
         message: deregister_sig_message,
     };
 
-    // Authorization announcement for Registration Coin release path.
-    let announce_deregister = CreateCoinAnnouncement {
-        message: deregister_announcement_msg(voter_pubkey),
+    // SEC-F4: authorize the Registration Coin's `release` action via
+    // CHIP-0025 SEND_MESSAGE (mode = SENDER_PUZZLE) rather than a
+    // forgeable coin announcement. The paired RECEIVE_MESSAGE in
+    // release.rue commits THIS singleton's puzzle hash as the message
+    // sender (re-derived from election_launcher_id), so only the genuine
+    // Election Singleton can authorize a collateral release. No
+    // receiver-side commitment (lower mode bits = 0): the message is
+    // uniquely keyed by `sha256("deregister" || voter_pubkey)`.
+    let send_deregister = SendMessage {
+        mode: SENDER_PUZZLE,
+        message: deregister_announcement_msg(voter_pubkey) as Bytes,
+        receiver: [],
     };
 
     let new_state = ElectionState {
@@ -160,7 +169,7 @@ fn main(
         },
         [
             agg_sig_deregister,
-            announce_deregister,
+            send_deregister,
         ],
     )
 }

@@ -4,7 +4,7 @@
 // Per CHIP rev 2026-05-02, release is gated by the Election
 // Singleton's `deregister` action — NOT by ballot finalization. The
 // voter pairs this spend with a singleton `deregister` spend in the
-// same bundle so this action can assert the deregister announcement.
+// same bundle so this action can verify the deregister authorization.
 //
 // Reads voter_pubkey and election_launcher_id from state (rather than
 // from a curry), so this action's puzzle hash is a deployment-wide
@@ -24,24 +24,52 @@
 // will continue to be aggregable for ballots opened during the
 // registration's active window.
 //
-// AssertCoinAnnouncement contract (CRITICAL):
-//   The on-chain `AssertCoinAnnouncement` opcode validates against
-//   the FULL announcement_id = sha256(announcer_coin_id || message).
-//   The singleton's coin_id is not knowable at curry time (changes
-//   per spend), so the spender supplies it via the
-//   `singleton_coin_id` solution parameter. The puzzle then computes
-//   the announcement_id locally. Consensus's AssertCoinAnnouncement
-//   validator only accepts spends paired with a real
-//   CreateCoinAnnouncement whose computed id matches — so a
-//   malicious voter cannot lie about singleton_coin_id.
+// SEC-F4 — binding to the GENUINE Election Singleton (CRITICAL):
+//   The previous design used `AssertCoinAnnouncement { id:
+//   sha256(singleton_coin_id || deregister_msg) }` with
+//   `singleton_coin_id` supplied in the SOLUTION. That is forgeable:
+//   `ASSERT_COIN_ANNOUNCEMENT` is satisfied by ANY co-spent coin that
+//   emits the message, and the attacker chooses `singleton_coin_id` to
+//   point at their own dummy coin — so collateral could be released
+//   WITHOUT the real singleton's `deregister` ever running.
+//
+//   This action now uses CHIP-0025 `RECEIVE_MESSAGE` committing the
+//   SENDER's PUZZLE HASH. We RE-DERIVE the genuine Election Singleton's
+//   puzzle hash from `election_launcher_id` (read from UNFORGEABLE
+//   state, never a solution atom) as
+//       curry(SINGLETON_TOP_LAYER, SingletonStruct(launcher_id), inner)
+//   and require the paired `SEND_MESSAGE` to come from a coin whose
+//   puzzle equals it. Only the genuine singleton lineage can land and
+//   SPEND a coin at that puzzle hash (the launcher_id coin is unique and
+//   already spent; `SINGLETON_TOP_LAYER` rejects any lineage proof that
+//   does not descend from it), so a forged announcer cannot satisfy this.
+//
+//   `singleton_inner_puzzle_hash` is solution-supplied, but that is safe:
+//   it only selects WHICH inner puzzle the committed singleton puzzle
+//   hash is built around. To actually pair the message, a real coin at
+//   curry(SINGLETON_TOP_LAYER, struct(launcher_id), that_inner) must be
+//   co-spent — and no such coin is spendable outside the genuine
+//   singleton's launcher lineage. RESIDUAL (documented in
+//   SECURITY_FINDINGS.md): a *clone* singleton sharing the same
+//   launcher_id is impossible (a launcher coin is spent exactly once),
+//   so there is no clone-singleton bypass.
 
 import super::common_types::*;
 import shared::*;
 
+// Canonical Chia singleton constants (chia-puzzles): the curried
+// singleton_top_layer_v1_1 mod hash and the singleton launcher puzzle
+// hash. Used to re-derive the Election Singleton's puzzle hash from its
+// launcher_id, matching `SingletonArgs::curry_tree_hash` in the SDK.
+inline const SINGLETON_TOP_LAYER_MOD_HASH: Bytes32 =
+    0x7faa3253bfddd1e0decb0906b2dc6247bbc4cf608f58345d173adb63e8b47c9f;
+inline const SINGLETON_LAUNCHER_PUZZLE_HASH: Bytes32 =
+    0xeff07522495060c066f66f32acc2a77e3a3e737aca8baea4d1a64ea4cdc13da9;
+
 fn main(
     Truth: RegistrationStateTruth,
     collateral_destination: Bytes32,
-    ...singleton_coin_id: Bytes32,
+    ...singleton_inner_puzzle_hash: Bytes32,
 ) -> (RegistrationStateTruth, List<Condition>) {
     inline let State = Truth.State;
 
@@ -61,8 +89,23 @@ fn main(
     let el_b: Bytes = State.election_launcher_id as Bytes;
     let dest_b: Bytes = collateral_destination as Bytes;
 
-    // Build the deregister announcement message the singleton's
-    // `deregister` action emits:
+    // SEC-F4: re-derive the genuine Election Singleton's puzzle hash from
+    // the UNFORGEABLE `election_launcher_id` in state plus the singleton's
+    // inner puzzle hash. This is exactly `SingletonArgs::curry_tree_hash(
+    // election_launcher_id, singleton_inner_puzzle_hash)`.
+    let singleton_struct = std::singleton::SingletonStruct {
+        mod_hash: SINGLETON_TOP_LAYER_MOD_HASH,
+        launcher_id: State.election_launcher_id,
+        launcher_puzzle_hash: SINGLETON_LAUNCHER_PUZZLE_HASH,
+    };
+    let singleton_struct_hash: Bytes32 = tree_hash(singleton_struct);
+    let singleton_puzzle_hash: Bytes32 = curry_tree_hash(
+        SINGLETON_TOP_LAYER_MOD_HASH,
+        [singleton_struct_hash, singleton_inner_puzzle_hash],
+    );
+
+    // The deregister authorization message the singleton's `deregister`
+    // action emits via SEND_MESSAGE:
     //   sha256("deregister" || voter_pubkey)
     // Inlined here rather than imported from election/shared to keep
     // registration_coin/ self-contained (no cross-coin imports).
@@ -70,15 +113,15 @@ fn main(
         "deregister" + pk_b
     );
 
-    // Compute the FULL announcement_id consensus expects:
-    //   announcement_id = sha256(announcer_coin_id || message)
-    let announcement_id: Bytes32 = sha256(
-        (singleton_coin_id as Bytes)
-        + (deregister_message as Bytes)
-    );
-
-    let assert_deregistered = AssertCoinAnnouncement {
-        id: announcement_id,
+    // CHIP-0025 RECEIVE_MESSAGE, mode = SENDER_PUZZLE (commit the
+    // sender's puzzle hash; no receiver-side commitment). Consensus pairs
+    // this only with a SEND_MESSAGE emitted by a coin whose puzzle hash
+    // equals `singleton_puzzle_hash` — i.e. the genuine Election
+    // Singleton spending its `deregister` action in the same bundle.
+    let receive_deregister = ReceiveMessage {
+        mode: SENDER_PUZZLE,
+        message: deregister_message as Bytes,
+        sender: [singleton_puzzle_hash as Bytes],
     };
 
     // Voter authorises the destination via AggSigMe. Message binds
@@ -105,6 +148,6 @@ fn main(
             Ephemeral_State: nil,
             State: new_state,
         },
-        [assert_deregistered, agg_sig_release, assert_my_amount],
+        [receive_deregister, agg_sig_release, assert_my_amount],
     )
 }

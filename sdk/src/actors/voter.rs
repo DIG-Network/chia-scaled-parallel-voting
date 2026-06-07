@@ -1751,8 +1751,6 @@ impl Voter {
                 hex::encode(on_chain_state.registration_merkle_root),
             )));
         }
-        let singleton_coin_id = singleton_coin.coin_id();
-
         // ── 2. Build the deregister action layer + solution ──────
         let mut ctx = SpendContext::new();
         let elect_finalizer = build_election_finalizer_full(&mut ctx, election_id)?;
@@ -1761,6 +1759,13 @@ impl Voter {
         let election_state_node = self.election_state_node(&mut ctx, &on_chain_state)?;
         let action_layer_node =
             build_action_layer_puzzle(&mut ctx, elect_finalizer, merkle_root, election_state_node)?;
+        // SEC-F4: release.rue re-derives the genuine Election Singleton's
+        // puzzle hash from election_launcher_id (unforgeable state) + this
+        // inner puzzle hash, and commits it as the CHIP-0025 message
+        // SENDER. It equals `SingletonArgs::curry_tree_hash(election_id,
+        // singleton_inner_ph)` = `singleton_coin.puzzle_hash`.
+        let singleton_inner_ph =
+            Bytes32::new(clvm_utils::tree_hash(&ctx, action_layer_node).to_bytes());
 
         // CURRY ORDER (per `puzzles/election/deregister.rue`):
         //   (TREE_DEPTH, EMPTY_LEAF_HASH, COLLATERAL_AMOUNT,
@@ -1862,12 +1867,16 @@ impl Voter {
             .await?;
         let voted_ballots_root = puzzles::voted_ballots_root_after_inserts(&cast_ballot_ids);
 
+        // SEC-F2: `locked_weight` is decremented by each cast's
+        // `voting_coin_amount` (mint_voting_coin.rue), so it always equals
+        // the registration coin's CURRENT CAT balance — use the on-chain
+        // coin amount, not the deployment-wide collateral floor.
         let predicted_reg_inner_ph = puzzles::registration_inner_hash_for_state(
             &self.keys.pubkey,
             election_id,
             cat_tail_hash,
             voted_ballots_root,
-            self.config.collateral_amount,
+            reg_record.coin.amount,
             None,
         );
         let predicted_reg_outer_ph = puzzles::cat_outer_for_inner_hash(
@@ -1909,7 +1918,8 @@ impl Voter {
             voter_pubkey: self.keys.pubkey,
             election_launcher_id: election_id,
             voted_ballots_root,
-            locked_weight: self.config.collateral_amount,
+            // SEC-F2: current CAT balance == current locked_weight (see above).
+            locked_weight: reg_record.coin.amount,
             release_destination: None,
         };
         let reg_state_node = self.registration_state_node(&mut ctx, &reg_state)?;
@@ -1926,8 +1936,8 @@ impl Voter {
         let release_program_node = load_action_puzzle(&mut ctx, puzzles::REGISTRATION_RELEASE_HEX)?;
 
         // Solution shape (per release.rue):
-        //   `(collateral_destination, ...singleton_coin_id)`
-        let release_solution_value = (destination, singleton_coin_id);
+        //   `(collateral_destination, ...singleton_inner_puzzle_hash)`
+        let release_solution_value = (destination, singleton_inner_ph);
         let release_solution = release_solution_value
             .to_clvm(&mut *ctx)
             .map_err(driver_err)?;
@@ -2214,12 +2224,15 @@ impl Voter {
                 let mut trial = inserted_so_far.clone();
                 trial.push(*candidate);
                 let trial_root = puzzles::voted_ballots_root_after_inserts(&trial);
+                // SEC-F2: `locked_weight` tracks the coin's CAT balance
+                // (decremented per cast), so reconstruct each lineage step's
+                // ph with that step's own amount, not the collateral floor.
                 let trial_inner_ph = puzzles::registration_inner_hash_for_state(
                     &self.keys.pubkey,
                     election_id,
                     cat_tail_hash,
                     trial_root,
-                    self.config.collateral_amount,
+                    current_coin.amount,
                     None,
                 );
                 let trial_outer_ph = puzzles::cat_outer_for_inner_hash(

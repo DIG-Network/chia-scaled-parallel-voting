@@ -1977,6 +1977,11 @@ fn apply_singleton_spend(
     // detect which one ran by trying both preimage shapes against
     // the candidate atoms found in the solution.
     let mut cca_messages: Vec<[u8; 32]> = Vec::new();
+    // SEC-F4: deregister now authorizes the Registration Coin's release
+    // via a CHIP-0025 SEND_MESSAGE (opcode 66) instead of a
+    // CreateCoinAnnouncement. Collect those 32-byte messages too so the
+    // deregister-detection below still recognises a deregister spend.
+    let mut send_messages: Vec<[u8; 32]> = Vec::new();
     let mut node = conds_root;
     while let Some((cond, rest)) = allocator.next(node) {
         node = rest;
@@ -1984,18 +1989,36 @@ fn apply_singleton_spend(
             continue;
         };
         let opcode_bytes = allocator.atom(opcode_node);
-        // CreateCoinAnnouncement = opcode 60.
-        if opcode_bytes.as_ref() != [60] {
-            continue;
-        }
-        let Some((msg_node, _)) = allocator.next(args_node) else {
-            continue;
-        };
-        let msg = allocator.atom(msg_node);
-        if msg.as_ref().len() == 32 {
-            let mut buf = [0u8; 32];
-            buf.copy_from_slice(msg.as_ref());
-            cca_messages.push(buf);
+        match opcode_bytes.as_ref() {
+            // CreateCoinAnnouncement = opcode 60: message is the 1st arg.
+            [60] => {
+                let Some((msg_node, _)) = allocator.next(args_node) else {
+                    continue;
+                };
+                let msg = allocator.atom(msg_node);
+                if msg.as_ref().len() == 32 {
+                    let mut buf = [0u8; 32];
+                    buf.copy_from_slice(msg.as_ref());
+                    cca_messages.push(buf);
+                }
+            }
+            // SendMessage = opcode 66: `(66 mode message ...receiver)`;
+            // the message is the 2nd arg (after the mode byte).
+            [66] => {
+                let Some((_mode_node, after_mode)) = allocator.next(args_node) else {
+                    continue;
+                };
+                let Some((msg_node, _)) = allocator.next(after_mode) else {
+                    continue;
+                };
+                let msg = allocator.atom(msg_node);
+                if msg.as_ref().len() == 32 {
+                    let mut buf = [0u8; 32];
+                    buf.copy_from_slice(msg.as_ref());
+                    send_messages.push(buf);
+                }
+            }
+            _ => continue,
         }
     }
 
@@ -2058,7 +2081,9 @@ fn apply_singleton_spend(
     // CCA counts as a register hint).
     for pk in &candidate_pubkeys {
         let msg = crate::puzzles::deregister_announcement_msg(pk);
-        if cca_messages.iter().any(|m| m == msg.as_ref()) {
+        if cca_messages.iter().any(|m| m == msg.as_ref())
+            || send_messages.iter().any(|m| m == msg.as_ref())
+        {
             // Found a deregister CCA. Wipe the SMT leaf, drop the
             // voter from the bookkeeping vector, and decrement
             // count/weight to mirror `deregister.rue`'s state

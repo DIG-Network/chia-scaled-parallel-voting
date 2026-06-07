@@ -316,40 +316,50 @@ mod tests {
         sk.public_key()
     }
 
-    /// WHAT: with a pre-release state and matching deregister args,
+    /// WHAT: with a pre-release state and a singleton inner puzzle hash,
     ///       the release action emits exactly THREE conditions:
-    ///       AssertCoinAnnouncement (the singleton's deregister
-    ///       announcement), AggSigMe (the voter's release
-    ///       authorisation), and AssertMyAmount (SEC-F2: the coin must
-    ///       hold exactly `locked_weight`).
+    ///       ReceiveMessage (SEC-F4: CHIP-0025, binds the genuine
+    ///       Election Singleton as the message SENDER), AggSigMe (the
+    ///       voter's release authorisation), and AssertMyAmount (SEC-F2:
+    ///       the coin must hold exactly `locked_weight`).
     /// HOW:  build a fresh registration state (release_destination =
-    ///       nil), supply destination + an arbitrary singleton coin
-    ///       id; run the release puzzle; assert two conditions of
-    ///       the expected kinds with byte-exact messages.
-    /// WHY:  these are the two conditions that bind the collateral
-    ///       release to (a) the singleton's deregister action having
-    ///       run in the same bundle, and (b) the voter authorising
-    ///       the destination. Drift in either message format would
-    ///       either lock the collateral forever (assertion mismatch)
-    ///       or let an attacker hijack the collateral (sig over wrong
-    ///       message).
+    ///       nil), supply destination + a singleton inner puzzle hash;
+    ///       run the release puzzle; assert each condition byte-exactly.
+    ///       The ReceiveMessage SENDER must equal
+    ///       `SingletonArgs::curry_tree_hash(election_id, inner_ph)` —
+    ///       this cross-checks the in-puzzle singleton re-derivation
+    ///       against the SDK's canonical singleton hashing.
+    /// WHY:  these conditions bind the collateral release to (a) the
+    ///       GENUINE singleton's deregister having run in the same bundle
+    ///       (SEC-F4: forgeable coin announcement replaced by a sender-
+    ///       puzzle-committed message), (b) the voter authorising the
+    ///       destination, and (c) the coin actually holding its staked
+    ///       weight. Drift in any would either lock the collateral or
+    ///       reopen a forgery.
     #[test]
-    fn release_emits_assert_announcement_and_aggsigme() {
+    fn release_emits_receive_message_and_aggsigme() {
+        use chia_puzzle_types::singleton::SingletonArgs;
+        use clvm_utils::TreeHash;
         use sha2::{Digest, Sha256};
+
+        // CHIP-0025 message mode (see rue std message_flags): commit the
+        // SENDER coin's puzzle hash, no receiver-side commitment.
+        const SENDER_PUZZLE: u8 = 0b010_000;
 
         let voter = deterministic_voter();
         let election_id = Bytes32::new([0xAB; 32]);
         let dest = Bytes32::new([0xCD; 32]);
         let voted_ballots_root = Bytes32::new([0x77; 32]);
 
-        // Pick an arbitrary singleton_coin_id for the test — the
-        // unit test only checks that the puzzle's emitted assertion
-        // id matches sha256(this || deregister_message).
-        let singleton_coin_id = Bytes32::new([0x42; 32]);
+        // SEC-F4: the singleton's INNER puzzle hash is solution-supplied;
+        // release re-derives the full singleton puzzle hash from it plus
+        // the election_launcher_id in state. Any value works for the unit
+        // test — we cross-check the re-derivation against SingletonArgs.
+        let singleton_inner_ph = Bytes32::new([0x42; 32]);
 
         let state = build_registration_state_pre_release(&voter, election_id, voted_ballots_root);
         let truth: RegistrationStateTruthClvm<()> = ((), state);
-        let solution: ReleaseSolution<()> = (truth, (dest, singleton_coin_id));
+        let solution: ReleaseSolution<()> = (truth, (dest, singleton_inner_ph));
 
         let mut runner = PuzzleRunner::from_hex(crate::puzzles::REGISTRATION_RELEASE_HEX).unwrap();
         let output = runner.run(&solution).expect("release should execute");
@@ -357,29 +367,29 @@ mod tests {
         // Output: (new_truth . conditions). new_truth's
         // release_destination is now `dest`, so its R is `Bytes32`.
         // Ephemeral remains `()` (release sets Ephemeral_State: nil).
+        // Extract with T = Bytes so ReceiveMessage's sender data is
+        // directly comparable.
         let (_new_truth, conds): (
             RegistrationStateTruthClvm<Bytes32>,
-            Vec<Condition<NodePtr>>,
+            Vec<Condition<Bytes>>,
         ) = runner.extract(output).expect("output parses");
         assert_eq!(
             conds.len(),
             3,
-            "release emits exactly 3 conditions (incl. SEC-F2 AssertMyAmount)"
+            "release emits exactly 3 conditions (ReceiveMessage + AggSigMe + AssertMyAmount)"
         );
 
-        // Recompute expected deregister announcement message
-        // (matches puzzles/registration_coin/release.rue):
-        //   sha256("deregister" || voter_pubkey).
+        // SEC-F4: expected message = sha256("deregister" || voter_pubkey).
         let mut h = Sha256::new();
         h.update(b"deregister");
         h.update(voter.to_bytes());
         let deregister_message: [u8; 32] = h.finalize().into();
-        // Compute the FULL announcement_id the puzzle emits:
-        //   sha256(singleton_coin_id || deregister_message).
-        let mut h = Sha256::new();
-        h.update(singleton_coin_id.as_ref());
-        h.update(deregister_message);
-        let expected_announce: [u8; 32] = h.finalize().into();
+
+        // Expected committed SENDER puzzle hash = the genuine Election
+        // Singleton's puzzle hash for `election_id` + this inner puzzle.
+        let inner_th = TreeHash::new(singleton_inner_ph.to_bytes());
+        let expected_singleton_ph: Bytes32 =
+            SingletonArgs::curry_tree_hash(election_id, inner_th).into();
 
         // Recompute expected release message (sha256("release" ||
         // election_id || voter_pubkey || destination)).
@@ -390,20 +400,30 @@ mod tests {
         h.update(dest.as_ref());
         let expected_release: [u8; 32] = h.finalize().into();
 
-        // The three conditions are AssertCoinAnnouncement + AggSigMe +
+        // The three conditions are ReceiveMessage (SEC-F4) + AggSigMe +
         // AssertMyAmount (SEC-F2).
-        let mut saw_assert = false;
+        let mut saw_receive = false;
         let mut saw_sig = false;
         let mut saw_amount = false;
         for c in &conds {
             match c {
-                Condition::AssertCoinAnnouncement(a) => {
+                Condition::ReceiveMessage(m) => {
+                    // mode = SENDER_PUZZLE (commit the message sender's
+                    // puzzle hash; no receiver-side commitment).
+                    assert_eq!(m.mode, SENDER_PUZZLE, "ReceiveMessage mode must be SENDER_PUZZLE");
                     assert_eq!(
-                        a.announcement_id.as_ref(),
-                        &expected_announce[..],
-                        "deregister announcement id mismatch"
+                        m.message.as_ref(),
+                        &deregister_message[..],
+                        "deregister message mismatch"
                     );
-                    saw_assert = true;
+                    assert_eq!(m.data.len(), 1, "sender data must be exactly [singleton_ph]");
+                    assert_eq!(
+                        m.data[0].as_ref(),
+                        expected_singleton_ph.as_ref(),
+                        "ReceiveMessage sender MUST equal SingletonArgs::curry_tree_hash(\
+                         election_id, inner_ph) — the genuine Election Singleton"
+                    );
+                    saw_receive = true;
                 }
                 Condition::AggSigMe(s) => {
                     assert_eq!(s.public_key, voter, "AggSigMe pubkey must be the voter");
@@ -428,8 +448,8 @@ mod tests {
             }
         }
         assert!(
-            saw_assert && saw_sig && saw_amount,
-            "expected AssertCoinAnnouncement, AggSigMe, and AssertMyAmount"
+            saw_receive && saw_sig && saw_amount,
+            "expected ReceiveMessage, AggSigMe, and AssertMyAmount"
         );
     }
 

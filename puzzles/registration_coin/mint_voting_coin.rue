@@ -127,11 +127,19 @@ fn main(
     // voter registered (== the SMT leaf weight the finalize circuit counts).
     // Without this, register only bound the weight to a forgeable
     // announcement, so a voter could claim a huge leaf weight while locking
-    // ~zero CAT. AssertMyAmount forces the coin to hold exactly
-    // `locked_weight` mojos when it casts a vote, so a forged-weight leaf
-    // can never mint a counted Voting Coin. The Voting Coin is minted at 0
-    // mojos (the SDK passes voting_coin_amount = 0), so the CAT principal
-    // stays == locked_weight across every ballot.
+    // ~zero CAT. AssertMyAmount forces the INPUT coin to hold exactly
+    // `locked_weight` mojos to cast a vote: a forged-weight registration
+    // (claimed weight W but backed by < W real CAT) can NEVER mint a
+    // counted Voting Coin, because at its FIRST cast the coin's real amount
+    // (< W) ≠ the registered `locked_weight` (W) and this assert fails.
+    //
+    // Casting peels `voting_coin_amount` mojos into the Voting Coin, so
+    // `locked_weight` is decremented in lock-step in `new_state` below to
+    // stay == the recreated Registration Coin's real CAT balance. This
+    // keeps AssertMyAmount satisfiable on every later spend (release / a
+    // further cast) WITHOUT weakening the first-cast gate: the gate that
+    // catches the forgery is the FIRST cast, where `locked_weight` is still
+    // the registered claim and the coin must hold it.
     let assert_my_amount = AssertMyAmount {
         amount: State.locked_weight,
     };
@@ -346,7 +354,9 @@ fn main(
         voter_pubkey: State.voter_pubkey,
         election_launcher_id: State.election_launcher_id,
         voted_ballots_root: new_voted_ballots_root,
-        locked_weight: State.locked_weight,
+        // SEC-F2: peel `voting_coin_amount` from the tracked weight so it
+        // stays equal to the recreated coin's real CAT balance.
+        locked_weight: State.locked_weight - voting_coin_amount,
         release_destination: nil,
     };
 

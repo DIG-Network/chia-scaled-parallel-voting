@@ -24,7 +24,7 @@ Every finding has a runnable proof-of-exploit or regression test under
 | F1 | **Critical** | Finalize forgery — circuit never binds the claimed signer weight to the registered set | **Open** (needs circuit rewrite) |
 | F2 | **Critical** | Register vote-weight forgery / fake CAT collateral | **Fixed** ✅ (numerator: forged weight unspendable via `AssertMyAmount(locked_weight)`); register-time denominator credit is a documented structural residual |
 | F3 | **Critical** | Ballot VK/snapshot substitution — ballot curry not tied to election `vk_hash` | **Open** (needs createBallot→ballot binding) |
-| F4 | **High** | Collateral release gated by a forgeable deregister announcement | **Open** (needs singleton-identity binding) |
+| F4 | **High** | Collateral release gated by a forgeable deregister announcement | **Fixed** ✅ (CHIP-0025 RECEIVE_MESSAGE binds the genuine Election Singleton's puzzle hash, re-derived from `election_launcher_id` in state) |
 | F5 | **High** | `vote_mode_lock` is unenforceable | **Open** (needs eve-derivation binding) |
 | F6 | **High** | `mint_voting_coin` had no close-height gate → vote after close | **Fixed** ✅ |
 | F7 | **High** | `int_to_8_bytes_be` aliasing → inflate weight / bypass close gate via `X + 2^64` | **Fixed** ✅ |
@@ -137,10 +137,20 @@ registration-coin spend now emits `AssertMyAmount { amount: locked_weight }`:
 Consensus enforces `ASSERT_MY_AMOUNT` byte-exactly, so a registration that
 claimed weight `W` but is backed by a coin holding `< W` can never mint a
 Voting Coin nor release collateral — **the forged weight is unspendable**.
-The SDK ripples `locked_weight` through `RegistrationState(Wire)`, all
-`puzzles.rs` predictors, the actual spend-state builder
-(`Voter::registration_state_node`), `voter.rs`, `aggregator.rs`, the CLI,
-and the WASM bindings; full `chip-voting-sdk` suite is green.
+The gate that catches the forgery is the **first cast**: there
+`locked_weight` is still the registered claim `W` and the coin must hold it.
+Because casting peels `voting_coin_amount` mojos into the Voting Coin,
+`mint_voting_coin.rue` **decrements `locked_weight` in lock-step**
+(`new_state.locked_weight = State.locked_weight - voting_coin_amount`) so it
+always equals the recreated Registration Coin's real CAT balance — keeping
+`AssertMyAmount` satisfiable on every later spend (release / a further cast)
+WITHOUT weakening the first-cast gate. The SDK ripples `locked_weight`
+through `RegistrationState(Wire)`, all `puzzles.rs` predictors, the actual
+spend-state builder (`Voter::registration_state_node`), the release / lineage
+walker (which reconstruct each step's `locked_weight` from that coin's
+on-chain amount), `aggregator.rs`, the CLI, and the WASM bindings; full
+`chip-voting-sdk` suite is green (except the pre-existing
+`chip_md_compliance_matrix_complete`, which needs a root `CHIP.md`).
 
 **Residual (DENOMINATOR — register-time credit — STRUCTURAL, documented).**
 The `register` action runs on the **Election Singleton** and does *not*
@@ -189,7 +199,7 @@ snapshot.
 
 ---
 
-## F4 — Collateral release via forgeable deregister announcement (HIGH, open)
+## F4 — Collateral release via forgeable deregister announcement (HIGH, FIXED ✅)
 
 **Where:** `puzzles/registration_coin/release.rue:44,60-73`,
 `puzzles/election/shared.rue::deregister_announcement_msg`,
@@ -207,17 +217,45 @@ registration set and keeping their finalize vote-weight. (`release` is
 gated by the voter's own `AggSigMe`, so it only affects their own coin —
 but it defeats the "collateral locked while registered" invariant.)
 
-**Remediation:** bind the authorization to the genuine Election
-Singleton. Either (a) require the real singleton's `deregister` to be
-co-spent and bind via CHIP-0025 `SEND_MESSAGE`/`RECEIVE_MESSAGE` with a
-sender commitment plus a launcher-lineage proof the registration coin
-verifies against `SingletonArgs::curry_tree_hash(ELECTION_LAUNCHER_ID,
-…)`; or (b) restructure so the registration coin is only spendable
-alongside a singleton whose unforgeable lineage identity it checks. Add
-`election_launcher_id` + the pre-state root to the message as
-defense-in-depth, but note domain separation alone does **not** close the
-forgery (the attacker includes the correct context in the dummy
-announcer).
+**Fix (CHIP-0025 sender-puzzle binding).** The forgeable
+`AssertCoinAnnouncement` (with a solution-supplied `singleton_coin_id`) is
+replaced by a CHIP-0025 `RECEIVE_MESSAGE` in `release.rue`, paired with a
+`SEND_MESSAGE` emitted by `deregister.rue` on the Election Singleton:
+
+- `release.rue` re-derives the genuine singleton's puzzle hash IN-PUZZLE
+  from `election_launcher_id` (read from UNFORGEABLE `RegistrationState`,
+  never a solution atom) as
+  `SingletonArgs::curry_tree_hash(election_launcher_id, inner_ph)` and
+  emits `RECEIVE_MESSAGE { mode: SENDER_PUZZLE, message:
+  sha256("deregister"||pk), sender: [singleton_ph] }`.
+- `deregister.rue` emits the paired `SEND_MESSAGE { mode: SENDER_PUZZLE,
+  message: sha256("deregister"||pk) }`.
+
+Consensus pairs the two only if the actual `SEND_MESSAGE`-emitting coin's
+puzzle hash equals the re-derived `singleton_ph`. A coin can only land and
+SPEND at `curry(SINGLETON_TOP_LAYER, struct(launcher_id), inner)` via the
+genuine singleton lineage (the launcher coin is unique and already spent;
+`SINGLETON_TOP_LAYER` rejects any lineage proof that does not descend from
+it), so a dummy/forged announcer can no longer authorize a release. The
+SDK `Voter::release_collateral` supplies `singleton_inner_puzzle_hash =
+tree_hash(election_action_layer)`; the `Aggregator` deregister detection
+now recognises the `SEND_MESSAGE` (opcode 66) as well as the legacy CCA.
+
+**Residual (documented):** `singleton_inner_puzzle_hash` is
+solution-supplied, but that only selects which inner puzzle the committed
+singleton hash is built around — no spendable coin exists at that hash
+outside the genuine launcher lineage. A *clone* singleton sharing the same
+`launcher_id` is impossible (a launcher coin is spent exactly once), so
+there is no clone-singleton bypass.
+
+**Tests:** `exploit_collateral_release_forgery_e2e.rs`
+(`release_binds_to_genuine_singleton_attacker_cannot_forge`) pins (1) no
+`AssertCoinAnnouncement` remains, (2) the committed sender equals
+`SingletonArgs::curry_tree_hash(election_id, inner_ph)`, (3) the sender
+changes with the in-state launcher id. The on-chain message pairing is
+exercised by `voter_release_collateral_e2e.rs`,
+`voter_release_after_cast_e2e.rs`, `aggregator_sync_after_deregister_e2e.rs`
+and `live_orchestration_e2e.rs`.
 
 ---
 
