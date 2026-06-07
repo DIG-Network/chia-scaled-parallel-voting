@@ -30,12 +30,17 @@
 // `finalize` then just verifies ONE Groth16 proof + commits the outcome —
 // constant cost regardless of voter count.
 //
+// SOUNDNESS HARDENING — DONE: the threshold `slack` is range-checked to
+// [0, 2^200) (so `(lhs-rhs)==slack` genuinely implies `lhs>=rhs` — a wrapped
+// negative difference is ~p and fails) and each signer `weight` is bounded
+// to 64 bits.
+//
 // REMAINING (multi-session, see design doc):
 //   * Migrate the on-chain registration accumulator (register/deregister +
 //     sdk/merkle.rs) to this Poseidon tree over the voters' Jubjub pubkeys.
-//   * Soundness hardening: range-check `slack` (threshold), constrain
-//     `s`/`c` to the inner-scalar bit-width (252) + cofactor/prime-order
-//     checks on witnessed points; feed `vote_message` as ≤254-bit or split.
+//   * Further hardening: constrain `s`/`c` to the inner-scalar bit-width
+//     (252) + cofactor/prime-order checks on witnessed `R`/`P`; feed
+//     `vote_message` as ≤254-bit or split; pin audited Poseidon params.
 //   * Wire into finalize.rue (new public-input set; drop VK BLS bits) +
 //     ceremony/VK + aggregator/voter signing + flip
 //     exploit_finalize_forgery_e2e to assert REJECTION.
@@ -104,6 +109,19 @@ fn poseidon_n_var(
         s.absorb(x)?;
     }
     Ok(s.squeeze_field_elements(1)?.pop().unwrap())
+}
+
+/// Enforce `0 <= v < 2^n` by bit-decomposition. `to_bits_le` constrains
+/// `bits == v` (little-endian, field width); forcing every bit at index
+/// `>= n` to zero bounds `v`. This is the primitive behind the threshold
+/// range proof (an Fr difference that "wrapped" to a negative integer is
+/// ~p ≈ 2^255 and fails this check).
+fn enforce_lt_pow2(v: &FpVar<Fr>, n: usize) -> Result<(), SynthesisError> {
+    let bits = v.to_bits_le()?;
+    for b in bits.iter().skip(n) {
+        b.enforce_equal(&Boolean::constant(false))?;
+    }
+    Ok(())
 }
 
 /// Reduce a base-field Poseidon challenge `c` into the Jubjub inner scalar
@@ -221,6 +239,11 @@ impl ConstraintSynthesizer<Fr> for VotingCircuitV2 {
             let p_var = EdwardsVar::new_witness(cs.clone(), || Ok(Jub::from(s.pubkey)))?;
             let weight = FpVar::<Fr>::new_witness(cs.clone(), || Ok(Fr::from(s.weight)))?;
 
+            // Weight is a u64 (defense-in-depth + keeps the threshold-sum
+            // bounded for the slack range proof below; membership also binds
+            // it to the registered leaf, which register.rue caps < 2^64).
+            enforce_lt_pow2(&weight, 64)?;
+
             // ── MEMBERSHIP (G2): leaf = Poseidon(P.x, P.y, weight) ──
             let leaf = poseidon_n_var(
                 cs.clone(),
@@ -280,6 +303,13 @@ impl ConstraintSynthesizer<Fr> for VotingCircuitV2 {
             Fr::from(lhs_v - rhs_v)
         };
         let slack = FpVar::<Fr>::new_witness(cs.clone(), || Ok(slack_val))?;
+        // SOUNDNESS (load-bearing): range-check slack to [0, 2^200) so
+        // `(lhs - rhs) == slack` genuinely implies `lhs >= rhs`. lhs/rhs are
+        // products of u64-bounded values summed over <= max_signers, so an
+        // honest non-negative difference is far below 2^200, while a wrapped
+        // negative difference is ~p (≈2^255) and fails this check. Without
+        // it, `slack` is a free Fr witness and the threshold is vacuous.
+        enforce_lt_pow2(&slack, 200)?;
         (lhs - rhs).enforce_equal(&slack)?;
 
         Ok(())
@@ -498,6 +528,17 @@ mod tests {
         // sa signed `m`; verify against a different outcome message.
         let c = circuit(&tree, m + Fr::from(1u64), vec![sa], 2_000);
         assert!(!is_satisfied(c), "signature over a different message must fail");
+    }
+
+    /// THRESHOLD: a signer set whose verified weight is below the quorum is
+    /// rejected (the slack range-check makes the inequality non-vacuous).
+    #[test]
+    fn below_threshold_rejected() {
+        let (tree, m, sa, _sb, _t) = setup();
+        // sa weight = 1000; require 1/2 quorum over a 10_000 total → needs
+        // signed >= 5000. 1000 < 5000 ⇒ must be rejected.
+        let c = circuit(&tree, m, vec![sa], 10_000);
+        assert!(!is_satisfied(c), "below-quorum signed weight must be rejected");
     }
 
     /// Weight tamper: claiming more weight than the registered leaf commits
