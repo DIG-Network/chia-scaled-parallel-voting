@@ -96,6 +96,10 @@
 //     `ArkVerifyingKey::chia_chunked_bytes`.
 
 pub mod circuit;
+// F1 redesign (WIP — docs/F1-finalize-redesign.md): in-circuit Poseidon-SPT
+// signer membership + weight binding, built alongside the live `circuit`
+// path. Not yet wired into finalization.
+pub mod circuit_v2;
 pub mod conversions;
 pub mod proof;
 
