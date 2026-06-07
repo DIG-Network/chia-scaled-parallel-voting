@@ -201,6 +201,19 @@ fn main(
     // proportionally more vote weight (bound into the leaf below).
     assert locked_cat_mojos >= COLLATERAL_AMOUNT;
 
+    // SECURITY (SEC-INT-ENCODING-ALIASING): `locked_cat_mojos` is a free
+    // solution Int. It is hashed below via `int_to_8_bytes_be`, which is
+    // only the low 8 bytes (i.e. `n mod 2^64`) — NOT injective. Without
+    // an upper bound an attacker could supply `X + 2^64`: the signed `>=`
+    // floor still passes (it sees the large positive value), the SMT leaf
+    // `sha256(pubkey || enc(X + 2^64))` and the `create_reg` announcement
+    // are byte-identical to the honest `X` leaf/announcement, yet
+    // `registration_vote_weight += X + 2^64` credits a wildly inflated
+    // weight. Reject anything outside [COLLATERAL_AMOUNT, 2^64) so the
+    // encoded weight is unambiguous.
+    let max_u64: Int = 0x010000000000000000 as Int;
+    assert locked_cat_mojos < max_u64;
+
     // Compute the new root with the weighted SMT leaf inserted at the
     // slot. Per the weighted-voting revision: occupied leaf =
     // sha256(pubkey || locked_cat_mojos_be8). Per-voter weight is

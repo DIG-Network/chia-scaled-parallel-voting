@@ -103,6 +103,16 @@ fn main(
     inline let State = Truth.State;
 
     // 1. Local height gate — ballot must still be open.
+    //
+    // SECURITY (SEC-INT-ENCODING-ALIASING): bound vote_close_height to
+    // [0, 2^64). It is hashed into the oracle preimage via
+    // `int_to_8_bytes_be` (low 8 bytes only); an unbounded `C + 2^64`
+    // would alias to the real ballot's `enc(C)` (oracle announcement
+    // still matches) while AssertBeforeHeightAbsolute(C + 2^64) accepts
+    // any block height — letting an edit land after the ballot closed.
+    let max_u64: Int = 0x010000000000000000 as Int;
+    assert vote_close_height >= 0;
+    assert vote_close_height < max_u64;
     let assert_before_close = AssertBeforeHeightAbsolute {
         height: vote_close_height,
     };

@@ -87,6 +87,23 @@ fn main(
     let computed_slot: Int = slot_from_pubkey(voter_pubkey);
     assert deregister_leaf_index == computed_slot;
 
+    // SECURITY (SEC-DEREGISTER-UNDERFLOW + floor parity with register):
+    // register.rue enforces `locked_cat_mojos >= COLLATERAL_AMOUNT`;
+    // deregister previously enforced no floor and no underflow guard, so
+    // an out-of-range / aliased `locked_cat_mojos` could over-decrement
+    // the running tally. The central `int_to_8_bytes_be` range guard now
+    // rejects `locked_cat_mojos` outside [0, 2^64) when `active_leaf` is
+    // computed below (closing the `X + 2^64` aliasing variant); these
+    // asserts add the collateral floor and a hard non-negative invariant
+    // on the post-decrement weight and count so a malformed deregister
+    // can never drive `registration_vote_weight` / `registration_count`
+    // negative.
+    let max_u64: Int = 0x010000000000000000 as Int;
+    assert locked_cat_mojos >= COLLATERAL_AMOUNT;
+    assert locked_cat_mojos < max_u64;
+    assert State.registration_vote_weight - locked_cat_mojos >= 0;
+    assert State.registration_count - 1 >= 0;
+
     // Membership proof: the slot currently holds the weighted SMT
     // leaf — sha256(pubkey || locked_cat_mojos_be8) — matching the
     // formula register.rue committed to at registration time. The

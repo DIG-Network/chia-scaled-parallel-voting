@@ -1,0 +1,291 @@
+# Security audit — Chia parallel-voting puzzles
+
+Adversarial audit of the non-ceremony puzzles (`puzzles/election/`,
+`puzzles/registration_coin/`, `puzzles/ballot_coin/`,
+`puzzles/voting_coin/`, `puzzles/action.rue`, `puzzles/merkle_utils.rue`,
+`puzzles/common_types.rue`) and the SDK that builds their spends. The
+ceremony lineage (`puzzles/ceremony_*`, `sdk/src/ceremony`) was
+explicitly out of scope.
+
+Threat model: an attacker hand-builds raw CLVM spend bundles. A finding
+is an **exploit** only if Chia consensus would *accept* a bundle that
+violates a protocol invariant (forge/redirect a vote, finalize an
+outcome with no real backing, fake/withdraw locked CAT collateral,
+double-vote, vote after close, replay). On-chain security must not
+depend on the SDK building honest spends.
+
+Every finding has a runnable proof-of-exploit or regression test under
+`sdk/tests/exploit_*.rs`. Run with `cargo test -p chip-voting-sdk`.
+
+## Status summary
+
+| # | Severity | Finding | Status |
+|---|----------|---------|--------|
+| F1 | **Critical** | Finalize forgery — circuit never binds the claimed signer weight to the registered set | **Open** (needs circuit rewrite) |
+| F2 | **Critical** | Register vote-weight forgery / fake CAT collateral | **Open** (needs reg-coin amount binding) |
+| F3 | **Critical** | Ballot VK/snapshot substitution — ballot curry not tied to election `vk_hash` | **Open** (needs createBallot→ballot binding) |
+| F4 | **High** | Collateral release gated by a forgeable deregister announcement | **Open** (needs singleton-identity binding) |
+| F5 | **High** | `vote_mode_lock` is unenforceable | **Open** (needs eve-derivation binding) |
+| F6 | **High** | `mint_voting_coin` had no close-height gate → vote after close | **Fixed** ✅ |
+| F7 | **High** | `int_to_8_bytes_be` aliasing → inflate weight / bypass close gate via `X + 2^64` | **Fixed** ✅ |
+| F8 | **Medium** | `deregister` had no collateral floor / underflow guard | **Fixed** ✅ |
+
+The three Fixed items are landed as additive on-chain `assert`s that do
+not change any solution shape (the SDK builders and all existing e2e
+tests are unaffected). The five Open items each require a structural
+redesign (a Groth16 circuit rewrite, a registration-coin amount-binding
+protocol, a createBallot→ballot cryptographic binding, or CHIP-0025
+message conditions) that cannot be landed safely as a localized patch;
+they are demonstrated with runnable exploits and specified below.
+
+> Note on the build toolchain: `puzzles/ballot_coin/finalize.rue` uses
+> the CHIP-0011 `g2_map` builtin, which the publicly-available
+> `rue-cli 0.8.4` does not provide (the committed hex was built with a
+> patched/forked `rue`). The Fixed patches were therefore intentionally
+> confined to the four puzzles that do **not** use `g2_map`
+> (`election/register.rue`, `election/deregister.rue`,
+> `registration_coin/mint_voting_coin.rue`, `voting_coin/update_vote.rue`)
+> so they could be recompiled and verified end-to-end. `rue-cli 0.8.4`
+> reproduces every unchanged puzzle's bytecode byte-for-byte, so the
+> recompile diff is exactly the four patched puzzles.
+
+---
+
+## F1 — Finalize forgery (CRITICAL, open)
+
+**Where:** `puzzles/ballot_coin/finalize.rue`, `sdk/src/prover/circuit.rs`
+(`generate_constraints`).
+**Test:** `sdk/tests/exploit_finalize_forgery_e2e.rs` (3 tests, passing).
+
+The Groth16 circuit's quorum gadget enforces
+`total_signer_weight * den >= num * registration_vote_weight`, but
+`total_signer_weight` is a **free prover-chosen witness**
+(`sum(self.signers[i].weight)`). The per-signer `pubkey`, `leaf_index`,
+and `merkle_proof` witnesses are **never constrained** — the circuit does
+not verify SPT membership, does not verify the leaf
+`sha256(pubkey || weight_be8)`, and does not relate the signer set to
+`agg_signers` (public input `s3`). On-chain `finalize.rue` only adds
+`bls_verify(agg_signers, agg_sig, vote_message)`, which proves "the
+holder of `agg_signers` signed `vote_message`" — not that `agg_signers`
+decomposes into registered voters carrying real weight.
+
+The circuit/`prover/mod.rs` comments assert these properties are
+"deferred to on-chain validation", but `finalize.rue` performs no such
+validation. The deferral lands nowhere.
+
+**Exploit:** anyone with the proving key (necessarily public —
+aggregation is permissionless; and SNARK soundness never depends on
+proving-key secrecy) picks `agg_signers` = their own key, builds a
+single fabricated `SignerWitness { weight: <whole electorate> }`,
+proves (threshold trivially satisfied), and self-signs `vote_message`.
+The proof verifies against the real VK and `finalize` accepts any
+outcome. The three tests show this works even when the attacker is not
+registered, even with zero registered voters, and with a claimed weight
+1000× the registered total.
+
+**Remediation:** move signer accounting into the circuit. For each
+signer, allocate `(pubkey, weight, merkle_path)` as witnesses and
+constrain in-circuit: (a) `sha256(pubkey || weight_be8)` is a leaf whose
+depth-32 Merkle path reconstructs `registration_merkle_root` (public
+input `s1`); (b) accumulate the verified weights into
+`total_signer_weight`; (c) bind `agg_signers` (`s3`) to the G1 sum of
+the verified signer pubkeys. This is the only place membership + weight
+can be enforced; no on-chain patch to `finalize.rue` can substitute for
+it because `agg_signers` is an opaque G1 sum on-chain.
+
+---
+
+## F2 — Register vote-weight forgery / fake CAT collateral (CRITICAL, open)
+
+**Where:** `puzzles/election/register.rue` (`locked_cat_mojos` is a
+solution field; the SMT leaf and `registration_vote_weight` increment
+use it; the only binding is `AssertCoinAnnouncement` over a `create_reg`
+message whose announcer `cat_parent_coin_id` is also solution-supplied).
+**Test:** `sdk/tests/exploit_register_weight_forgery_e2e.rs`.
+
+`register` credits the voter's solution-chosen `locked_cat_mojos` into
+the SMT leaf `sha256(pubkey || locked_cat_mojos_be8)` and into
+`ElectionState.registration_vote_weight`. Nothing verifies that a real
+CAT coin of that amount was created. The lone binding is an
+`AssertCoinAnnouncement` of `create_reg` (which embeds `reg_full_hash` +
+`locked_cat_mojos`), but consensus's `ASSERT_COIN_ANNOUNCEMENT` is
+satisfied by **any** co-spent coin that emits the message — it never
+inspects the announcer's puzzle, asset id, or amount. (The existing
+`voter_double_vote_e2e.rs` / `voter_release_collateral_e2e.rs` tests rely
+on exactly this: the "CAT parent" is a 1-mojo `(q . ((60 msg)))` dummy.)
+
+**Exploit:** the test registers `1_000_000_000` units of weight whose
+`create_reg` announcement is emitted by a plain 1-mojo **non-CAT** coin
+(zero governance CAT locked), and the bundle is accepted. The forged
+weight then flows into `REGISTRATION_VOTE_WEIGHT_SNAPSHOT` and the
+finalize threshold, so a single registration can dominate (or, by
+inflating the denominator, deny) any weighted quorum — for ~0 real CAT.
+This invalidates the README's "CAT-collateralized registration".
+
+**Remediation:** bind the registered weight to a real, currently-locked
+CAT coin. Carry `locked_weight` in `RegistrationState`; at every
+registration-coin spend (`mint_voting_coin`, `release`) assert the coin's
+real CAT amount equals `locked_weight` via `ASSERT_MY_AMOUNT`, and fund
+the Voting Coin's mojo from a separate input so the principal is not
+eroded. A coin that did not actually lock the claimed amount can then
+never cast a weighted vote nor release more than it holds. (Closing the
+residual `registration_vote_weight`-denominator inflation additionally
+requires `register` to verify the created coin's amount, e.g. via a
+one-shot confirm spend of the new registration coin in the same bundle.)
+
+---
+
+## F3 — Ballot VK / snapshot substitution (CRITICAL, open)
+
+**Where:** `puzzles/ballot_coin/finalize.rue` (curries VK, IC,
+`REGISTRATION_MERKLE_ROOT_SNAPSHOT`, `REGISTRATION_VOTE_WEIGHT_SNAPSHOT`),
+`puzzles/election/create_ballot.rue` (mints only a launcher; the
+follow-up launch curries the ballot off-chain).
+
+Nothing on-chain ties a Ballot Coin's curried VK/IC or its registration
+snapshots to the election's `vk_hash` / real `ElectionState`.
+`create_ballot` is permissionless and emits only a launcher eve coin; the
+operator (or anyone, since the eve id is deterministic) curries the
+Ballot Coin at launch. An attacker can launch a ballot whose
+`ballot_launcher_id` traces to the real election but whose VK is one they
+hold the trapdoor for (or whose snapshots are fabricated), then finalize
+any outcome. Downstream consumers that trust `ballot_launcher_id` as
+"belonging to the election" are fooled.
+
+**Remediation:** have `create_ballot` derive and commit the canonical
+Ballot Coin puzzle hash — with VK/IC = the election's curried VK/IC and
+snapshots = the live `ElectionState.registration_merkle_root` /
+`registration_vote_weight` — into the eve-coin derivation (or a
+launcher memo the ballot's own puzzle re-asserts), so a ballot that
+traces to the election provably uses the election's VK and a real
+snapshot.
+
+---
+
+## F4 — Collateral release via forgeable deregister announcement (HIGH, open)
+
+**Where:** `puzzles/registration_coin/release.rue:44,60-73`,
+`puzzles/election/shared.rue::deregister_announcement_msg`,
+`puzzles/election/deregister.rue:124-126`.
+
+`release` asserts `AssertCoinAnnouncement{ id: sha256(singleton_coin_id ||
+sha256("deregister" || voter_pubkey)) }` where `singleton_coin_id` is a
+**solution** field and the message binds only the (public) voter pubkey —
+no election id, no merkle root, no singleton identity. As with F2, the
+assertion is satisfied by any attacker-controlled co-spent coin emitting
+that message. So a registered voter can run `release` (sending their CAT
+to themselves) **without** spending the Election Singleton's `deregister`
+at all — withdrawing their staked collateral while remaining in the
+registration set and keeping their finalize vote-weight. (`release` is
+gated by the voter's own `AggSigMe`, so it only affects their own coin —
+but it defeats the "collateral locked while registered" invariant.)
+
+**Remediation:** bind the authorization to the genuine Election
+Singleton. Either (a) require the real singleton's `deregister` to be
+co-spent and bind via CHIP-0025 `SEND_MESSAGE`/`RECEIVE_MESSAGE` with a
+sender commitment plus a launcher-lineage proof the registration coin
+verifies against `SingletonArgs::curry_tree_hash(ELECTION_LAUNCHER_ID,
+…)`; or (b) restructure so the registration coin is only spendable
+alongside a singleton whose unforgeable lineage identity it checks. Add
+`election_launcher_id` + the pre-state root to the message as
+defense-in-depth, but note domain separation alone does **not** close the
+forgery (the attacker includes the correct context in the dummy
+announcer).
+
+---
+
+## F5 — `vote_mode_lock` is unenforceable (HIGH, open)
+
+**Where:** `puzzles/election/create_ballot.rue` (`mode_lock_ok` gates the
+solution value `ballot_vote_options_root`), but the actual ballot's
+`VOTE_OPTIONS_ROOT` is curried freely at launch, off-chain.
+
+The election-level mode lock asserts a *throwaway* solution value rather
+than the value the launched ballot is actually curried with, so a
+mode-locked election can still have ballots created under any vote mode.
+
+**Remediation:** commit the ballot's real `VOTE_OPTIONS_ROOT` into the
+eve-coin derivation (or launcher memo the ballot's oracle re-asserts), so
+`create_ballot`'s lock check binds the value the ballot will actually
+use.
+
+---
+
+## F6 — `mint_voting_coin` had no close-height gate (HIGH, FIXED ✅)
+
+**Where:** `puzzles/registration_coin/mint_voting_coin.rue`.
+**Test:** `sdk/tests/exploit_vote_after_close_e2e.rs`.
+
+`update_vote` gated edits with `AssertBeforeHeightAbsolute(vote_close_height)`,
+but `mint_voting_coin` (the *first* vote on a ballot) had **no height
+check**. So in the window `[vote_close_height, finalize)` a brand-new
+vote could be minted and counted after the ballot closed.
+
+**Fix:** `mint_voting_coin` now emits
+`AssertBeforeHeightAbsolute { height: vote_close_height }`, mirroring
+`update_vote`. `vote_close_height` is pinned to the ballot's real curried
+value by the existing oracle `AssertCoinAnnouncement`, and F7's range
+guard prevents aliasing it past `2^64` to defeat the gate.
+
+---
+
+## F7 — `int_to_8_bytes_be` aliasing (HIGH, FIXED ✅)
+
+**Where:** `puzzles/common_types.rue::int_to_8_bytes_be` is the low 8
+bytes of `n` (`n mod 2^64`) and is **not injective**: `enc(n) ==
+enc(n + 2^64)`. Attacker-controlled solution values fed through it could
+alias a forged value onto a legitimate one's bytes.
+**Tests:** covered by `exploit_register_weight_forgery_e2e.rs` (range)
+and `exploit_vote_after_close_e2e.rs`.
+
+- `register`/`deregister`: supplying `locked_cat_mojos = X + 2^64`
+  produced the same SMT leaf and `create_reg` announcement as `X` (the
+  signed `>=` floor passes), while crediting/decrementing the tally by
+  `X + 2^64`.
+- `mint_voting_coin`/`update_vote`: supplying
+  `vote_close_height = C + 2^64` matched the real ballot's oracle
+  preimage (`enc(C)`) while making `AssertBeforeHeightAbsolute(C + 2^64)`
+  accept any block height.
+
+**Fix:** the four puzzles whose encoded value comes from
+attacker-controlled solution input now assert `0 <= value < 2^64` before
+use (`register.rue`, `deregister.rue`, `mint_voting_coin.rue`,
+`update_vote.rue`), making each encoding unambiguous. (The shared helper
+itself was left unchanged to avoid forcing a `finalize.rue` recompile;
+`finalize`'s own encodings are curried operator constants, not attacker
+inputs.)
+
+---
+
+## F8 — `deregister` collateral floor / underflow (MEDIUM, FIXED ✅)
+
+**Where:** `puzzles/election/deregister.rue`.
+**Test:** `sdk/tests/exploit_vote_after_close_e2e.rs` (deregister-guard
+case) and the existing deregister e2e.
+
+`deregister` took `locked_cat_mojos` as a free Int with no
+`>= COLLATERAL_AMOUNT` floor (unlike `register`) and no guard against
+`registration_vote_weight` / `registration_count` going negative.
+
+**Fix:** `deregister` now asserts the collateral floor, the F7 range
+bound, and `registration_vote_weight - locked_cat_mojos >= 0` and
+`registration_count - 1 >= 0` before storing the new state.
+
+---
+
+## Items reviewed and found NOT exploitable
+
+- **Action-layer / finalizer state injection** (`action.rue`,
+  `finalizer.rue`): the dispatcher verifies each selected action against
+  the curried `MERKLE_ROOT` and threads state through the action; a
+  malicious solution cannot inject an arbitrary recreated state or run an
+  action outside the root.
+- **Double-vote per ballot** (`mint_voting_coin` non-membership SPT
+  proof): once a ballot's slot is occupied the non-membership proof fails;
+  covered by `voter_double_vote_e2e.rs`.
+- **Redirecting another voter's collateral**: `release` requires the
+  voter's `AggSigMe` over the destination, so an attacker cannot redirect
+  someone else's CAT (F4 is the voter withdrawing their *own* stake
+  early).
+- **CAT mint/melt via the finalizer `my_amount`**: the CAT v2 outer
+  enforces amount conservation, so `my_amount` cannot inflate supply.

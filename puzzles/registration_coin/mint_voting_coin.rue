@@ -148,6 +148,32 @@ fn main(
         id: oracle_announcement_id,
     };
 
+    // ─── 1a. Local close-height gate (SEC-VOTE-AFTER-CLOSE) ──────────
+    //
+    // A brand-new vote MUST NOT be castable at or after the ballot's
+    // close height. Previously mint_voting_coin had NO height check at
+    // all (only update_vote did), so a Voting Coin could be minted — and
+    // counted by the aggregator — in the window [vote_close_height,
+    // finalize) while the Ballot Coin was past close but not yet
+    // finalized. We mirror update_vote.rue's gate here so the first-vote
+    // path fails closed exactly like the edit path.
+    //
+    // `vote_close_height` is the same value pinned to the ballot's real
+    // curried close height by the `assert_ballot_open` oracle assertion
+    // above (it appears in the oracle preimage), so the spender cannot
+    // lie about it — PROVIDED it is in canonical range. The oracle
+    // preimage hashes it via `int_to_8_bytes_be` (low 8 bytes only), so
+    // without a bound an attacker could pass `C + 2^64`: the announcement
+    // would still match the real ballot's `enc(C)` while
+    // AssertBeforeHeightAbsolute(C + 2^64) would accept ANY block height,
+    // defeating this gate. Reject out-of-range close heights.
+    let max_u64: Int = 0x010000000000000000 as Int;
+    assert vote_close_height >= 0;
+    assert vote_close_height < max_u64;
+    let assert_before_close = AssertBeforeHeightAbsolute {
+        height: vote_close_height,
+    };
+
     // ─── 1b. M5r-merkle-e gate (mirrors update_vote.rue M5r-merkle-a):
     //       when vote_options_root != 0x00…00 the ballot is
     //       Mode2Restricted, and vote_data MUST be a leaf of the
@@ -317,6 +343,7 @@ fn main(
         },
         [
             assert_ballot_open,
+            assert_before_close,
             mint_vc,
             agg_sig_vote,
             announce_vote,
