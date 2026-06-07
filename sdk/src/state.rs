@@ -213,6 +213,12 @@ pub struct RegistrationState {
     /// Initialised to `puzzles::empty_ballot_root()` at registration
     /// time and updated by the vote action.
     pub voted_ballots_root: Bytes32,
+    /// SEC-F2: CAT mojos the voter actually locked at register time
+    /// (== the registration SMT leaf weight finalize counts). The
+    /// registration-coin actions `AssertMyAmount(locked_weight)`, so the
+    /// coin must really hold this many CAT — a forged leaf weight cannot
+    /// cast a counted vote nor release more than was staked.
+    pub locked_weight: u64,
     /// Set by the `release` action. Until then, the CAT collateral
     /// stays locked. Once set, the next finalize on the registration
     /// coin sends the CAT to this destination.
@@ -228,11 +234,16 @@ impl RegistrationState {
     /// USAGE: passed to `Voter::register` (and to puzzle-hash
     ///        predictors like
     ///        `puzzles::fresh_registration_state_tree_hash`).
-    pub fn fresh(voter_pubkey: PublicKey, election_launcher_id: Bytes32) -> Self {
+    pub fn fresh(
+        voter_pubkey: PublicKey,
+        election_launcher_id: Bytes32,
+        locked_weight: u64,
+    ) -> Self {
         Self {
             voter_pubkey,
             election_launcher_id,
             voted_ballots_root: puzzles::empty_ballot_root(),
+            locked_weight,
             release_destination: None,
         }
     }
@@ -247,6 +258,7 @@ impl RegistrationState {
             &self.voter_pubkey,
             self.election_launcher_id,
             self.voted_ballots_root,
+            self.locked_weight,
             self.release_destination,
         )
     }
@@ -262,6 +274,7 @@ pub struct RegistrationStateWire {
     pub voter_pubkey_hex: String,
     pub election_launcher_id_hex: String,
     pub voted_ballots_root_hex: String,
+    pub locked_weight: u64,
     pub release_destination_hex: Option<String>,
 }
 
@@ -271,6 +284,7 @@ impl From<&RegistrationState> for RegistrationStateWire {
             voter_pubkey_hex: hex::encode(s.voter_pubkey.to_bytes()),
             election_launcher_id_hex: hex::encode(s.election_launcher_id),
             voted_ballots_root_hex: hex::encode(s.voted_ballots_root),
+            locked_weight: s.locked_weight,
             release_destination_hex: s.release_destination.map(hex::encode),
         }
     }
@@ -315,6 +329,7 @@ impl RegistrationStateWire {
             voter_pubkey,
             election_launcher_id: Bytes32::new(election_arr),
             voted_ballots_root: Bytes32::new(vbr_arr),
+            locked_weight: self.locked_weight,
             release_destination: release,
         })
     }
@@ -823,7 +838,7 @@ mod tests {
     ///       state to predict the coin's landing puzzle hash.
     #[test]
     fn registration_fresh_starts_with_empty_ballot_root_and_no_release() {
-        let s = RegistrationState::fresh(pk_at(0), Bytes32::new([0x11; 32]));
+        let s = RegistrationState::fresh(pk_at(0), Bytes32::new([0x11; 32]), 1_000);
         assert_eq!(s.voted_ballots_root, puzzles::empty_ballot_root());
         assert_eq!(s.release_destination, None);
     }
@@ -837,12 +852,13 @@ mod tests {
     ///       would silently desync.
     #[test]
     fn registration_state_tree_hash_matches_puzzles_helper() {
-        let s = RegistrationState::fresh(pk_at(0), Bytes32::new([0x11; 32]));
+        let s = RegistrationState::fresh(pk_at(0), Bytes32::new([0x11; 32]), 1_000);
         let via_method = s.clvm_tree_hash();
         let via_helper = puzzles::fresh_registration_state_tree_hash(
             &s.voter_pubkey,
             s.election_launcher_id,
             s.voted_ballots_root,
+            s.locked_weight,
             s.release_destination,
         );
         assert_eq!(via_method, via_helper);
@@ -856,7 +872,7 @@ mod tests {
     ///       lossy round-trip would corrupt persisted state.
     #[test]
     fn registration_state_wire_roundtrips() {
-        let s = RegistrationState::fresh(pk_at(0), Bytes32::new([0x11; 32]));
+        let s = RegistrationState::fresh(pk_at(0), Bytes32::new([0x11; 32]), 1_000);
         let wire: RegistrationStateWire = (&s).into();
         let parsed = wire.into_state().unwrap();
         assert_eq!(parsed, s);
@@ -873,7 +889,7 @@ mod tests {
     ///       a bug in the Some-branch.
     #[test]
     fn registration_state_wire_with_release_roundtrips() {
-        let mut s = RegistrationState::fresh(pk_at(0), Bytes32::new([0x11; 32]));
+        let mut s = RegistrationState::fresh(pk_at(0), Bytes32::new([0x11; 32]), 1_000);
         s.voted_ballots_root = Bytes32::new([0x42; 32]);
         s.release_destination = Some(Bytes32::new([0xCC; 32]));
 
@@ -890,7 +906,7 @@ mod tests {
     ///       native serde impls.
     #[test]
     fn registration_state_wire_json_roundtrip() {
-        let s = RegistrationState::fresh(pk_at(0), Bytes32::new([0x11; 32]));
+        let s = RegistrationState::fresh(pk_at(0), Bytes32::new([0x11; 32]), 1_000);
         let wire: RegistrationStateWire = (&s).into();
         let json = serde_json::to_string(&wire).unwrap();
         let back: RegistrationStateWire = serde_json::from_str(&json).unwrap();
@@ -910,6 +926,7 @@ mod tests {
             voter_pubkey_hex: "not-hex".into(),
             election_launcher_id_hex: "11".repeat(32),
             voted_ballots_root_hex: "00".repeat(32),
+            locked_weight: 0,
             release_destination_hex: None,
         };
         assert!(bad.into_state().is_err());
@@ -928,6 +945,7 @@ mod tests {
             voter_pubkey_hex: "11".repeat(16),
             election_launcher_id_hex: "11".repeat(32),
             voted_ballots_root_hex: "00".repeat(32),
+            locked_weight: 0,
             release_destination_hex: None,
         };
         assert!(bad.into_state().is_err());

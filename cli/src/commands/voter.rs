@@ -418,6 +418,7 @@ fn status(config_path: PathBuf, secret: VoterSecretArgs, ctx: &Context) -> Resul
         cat_tail_hash,
         &keys.pubkey,
         election_id,
+        config.collateral_amount,
     );
     let hint = chip_voting_sdk::puzzles::voter_hint(election_id, cat_tail_hash, &keys.pubkey);
     let slot = chip_voting_sdk::merkle::SparseMerkleTree::slot_for_pubkey(&keys.pubkey);

@@ -453,13 +453,14 @@ fn chip_registration_state_has_no_has_voted_or_vote_data() {
     use chip_voting_sdk::state::{RegistrationState, RegistrationStateWire};
 
     let voter_pk = common::test_voter(0x01).1;
-    let state = RegistrationState::fresh(voter_pk.clone(), Bytes32::new([0xAB; 32]));
+    let state = RegistrationState::fresh(voter_pk.clone(), Bytes32::new([0xAB; 32]), 1_000);
 
     // Exhaustive destructuring — compile-time enforces field set.
     let RegistrationState {
         voter_pubkey,
         election_launcher_id,
         voted_ballots_root,
+        locked_weight,
         release_destination,
     } = &state;
     assert_eq!(voter_pubkey, &voter_pk);
@@ -1385,13 +1386,14 @@ fn chip_registration_coin_state_field_set_matches_spec() {
     use chip_voting_sdk::state::{RegistrationState, RegistrationStateWire};
 
     let voter_pk = common::test_voter(0x07).1;
-    let state = RegistrationState::fresh(voter_pk.clone(), Bytes32::new([0xAB; 32]));
+    let state = RegistrationState::fresh(voter_pk.clone(), Bytes32::new([0xAB; 32]), 1_000);
 
     // Exhaustive destructuring — compile-time enforces field set.
     let RegistrationState {
         voter_pubkey,
         election_launcher_id,
         voted_ballots_root,
+        locked_weight,
         release_destination,
     } = &state;
     assert_eq!(voter_pubkey, &voter_pk);
@@ -1410,12 +1412,15 @@ fn chip_registration_coin_state_field_set_matches_spec() {
         keys,
         vec![
             "election_launcher_id_hex",
+            "locked_weight",
             "release_destination_hex",
             "voted_ballots_root_hex",
             "voter_pubkey_hex",
         ],
-        "CHIP.md §258: RegistrationStateWire fields MUST be exactly \
-         the four spec fields (under hex-rename)"
+        "CHIP.md §258 + SEC-F2: RegistrationStateWire fields MUST be exactly \
+         the four spec fields (under hex-rename) plus `locked_weight` — the \
+         SEC-F2 field that binds the coin's real CAT amount into state so \
+         every registration-coin spend can AssertMyAmount(locked_weight)"
     );
 }
 

@@ -779,11 +779,13 @@ pub async fn build_cat_registration_spend_for_wallet_js(
         &voter_pk,
         election_launcher_id,
         cat_tail_hash,
+        collateral_amount,
     );
     let reg_outer_ph = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
         cat_tail_hash,
         &voter_pk,
         election_launcher_id,
+        collateral_amount,
     );
     let mut h = Sha256::new();
     h.update(b"create_reg");
@@ -2329,9 +2331,10 @@ pub fn voter_hint_js(
 /// issuance lands at the right address before the register spend.
 ///
 /// Wraps `chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash`,
-/// which takes `(cat_tail_hash, &voter_pubkey, election_launcher_id)`
-/// — the canonical pre-CHIP-rev shape that survives unchanged in
-/// CHIP rev 2026-05-02.
+/// which takes `(cat_tail_hash, &voter_pubkey, election_launcher_id,
+/// locked_weight)`. SEC-F2: `locked_weight` is bound into the
+/// registration state, so the predicted hash is taken with the
+/// election's `collateral_amount` (the weight the coin must hold).
 #[wasm_bindgen(js_name = "freshRegistrationCoinPuzzleHash")]
 pub fn fresh_registration_coin_puzzle_hash_js(
     election_config_json: &str,
@@ -2353,7 +2356,12 @@ pub fn fresh_registration_coin_puzzle_hash_js(
         .election_launcher_id()
         .map_err(|e| JsError::new(&format!("election_launcher_id: {e:?}")))?;
     let ph =
-        chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(cat_tail, &pk, election_id);
+        chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
+            cat_tail,
+            &pk,
+            election_id,
+            cfg.collateral_amount,
+        );
     Ok(format!("0x{}", hex::encode(ph)))
 }
 

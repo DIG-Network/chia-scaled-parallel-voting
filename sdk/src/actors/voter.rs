@@ -355,6 +355,7 @@ impl Voter {
             cat_tail_hash,
             &self.keys.pubkey,
             election_id,
+            self.config.collateral_amount,
         ))
     }
 
@@ -739,6 +740,7 @@ impl Voter {
             cat_tail_hash,
             &self.keys.pubkey,
             election_id,
+            self.config.collateral_amount,
         );
         let reg_records = chain.coin_records_by_puzzle_hash(predicted_reg_ph).await?;
         let reg_record = reg_records
@@ -927,7 +929,7 @@ impl Voter {
             voter_hint,
         )?;
         let reg_merkle_root = puzzles::registration_actions_merkle_root(cat_tail_hash);
-        let reg_state = crate::state::RegistrationState::fresh(self.keys.pubkey, election_id);
+        let reg_state = crate::state::RegistrationState::fresh(self.keys.pubkey, election_id, self.config.collateral_amount);
         let reg_state_node = self.registration_state_node(&mut ctx, &reg_state)?;
         let reg_action_layer_node = build_action_layer_puzzle(
             &mut ctx,
@@ -1865,6 +1867,7 @@ impl Voter {
             election_id,
             cat_tail_hash,
             voted_ballots_root,
+            self.config.collateral_amount,
             None,
         );
         let predicted_reg_outer_ph = puzzles::cat_outer_for_inner_hash(
@@ -1906,6 +1909,7 @@ impl Voter {
             voter_pubkey: self.keys.pubkey,
             election_launcher_id: election_id,
             voted_ballots_root,
+            locked_weight: self.config.collateral_amount,
             release_destination: None,
         };
         let reg_state_node = self.registration_state_node(&mut ctx, &reg_state)?;
@@ -2030,12 +2034,18 @@ impl Voter {
         state: &crate::state::RegistrationState,
     ) -> VotingResult<clvmr::NodePtr> {
         let pk_bytes = chia_protocol::Bytes::new(state.voter_pubkey.to_bytes().to_vec());
+        // SEC-F2: on-chain `RegistrationState` carries `locked_weight`
+        // between `voted_ballots_root` and `release_destination`:
+        //   (pk . (el . (vbr . (locked_weight . release_destination))))
+        // This MUST match `puzzles::registration_inner_hash_for_state`
+        // and the `register.rue` finalizer's recreated state, or the
+        // built spend's puzzle hash diverges from the on-chain coin.
         match state.release_destination {
             None => (
                 pk_bytes,
                 (
                     state.election_launcher_id,
-                    (state.voted_ballots_root, ()),
+                    (state.voted_ballots_root, (state.locked_weight, ())),
                 ),
             )
                 .to_clvm(&mut **ctx)
@@ -2044,7 +2054,10 @@ impl Voter {
                 pk_bytes,
                 (
                     state.election_launcher_id,
-                    (state.voted_ballots_root, dest),
+                    (
+                        state.voted_ballots_root,
+                        (state.locked_weight, dest),
+                    ),
                 ),
             )
                 .to_clvm(&mut **ctx)
@@ -2100,6 +2113,7 @@ impl Voter {
             cat_tail_hash,
             &self.keys.pubkey,
             election_id,
+            self.config.collateral_amount,
         );
 
         // Cap the walk at a reasonable depth — voters realistically
@@ -2205,6 +2219,7 @@ impl Voter {
                     election_id,
                     cat_tail_hash,
                     trial_root,
+                    self.config.collateral_amount,
                     None,
                 );
                 let trial_outer_ph = puzzles::cat_outer_for_inner_hash(

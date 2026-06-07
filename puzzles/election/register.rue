@@ -95,6 +95,10 @@ fn fresh_registration_coin_puzzle_hash(
     voter_pubkey: PublicKey,
     election_launcher_id: Bytes32,
     empty_ballot_root: Bytes32,
+    // SEC-F2: bound into the registration coin's initial state so the
+    // coin's puzzle hash commits to the weight, and every later spend can
+    // `AssertMyAmount(locked_weight)`.
+    locked_weight: Int,
 ) -> Bytes32 {
     // Per-voter hint baked into the finalizer's curry — gives off-chain
     // indexers a stable lookup key for this voter's registration coin
@@ -114,6 +118,7 @@ fn fresh_registration_coin_puzzle_hash(
         voter_pubkey: voter_pubkey,
         election_launcher_id: election_launcher_id,
         voted_ballots_root: empty_ballot_root,
+        locked_weight: locked_weight,
         release_destination: nil,
     };
 
@@ -236,6 +241,7 @@ fn main(
         new_voter_pubkey,
         ELECTION_LAUNCHER_ID,
         EMPTY_BALLOT_ROOT,
+        locked_cat_mojos,
     );
 
     // The CAT parent must emit this exact CreateCoinAnnouncement,

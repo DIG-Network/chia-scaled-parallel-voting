@@ -38,6 +38,17 @@ export struct RegistrationState {
     voter_pubkey: PublicKey,
     election_launcher_id: Bytes32,
     voted_ballots_root: Bytes32,
+    // SEC-F2 (vote-weight / fake-collateral binding): the CAT mojos this
+    // voter actually locked at register time, == the weight committed in
+    // their registration SMT leaf `sha256(pubkey || locked_weight_be8)`.
+    // Carried in state so every Registration-Coin spend can prove, via
+    // `AssertMyAmount(locked_weight)`, that the coin REALLY holds that
+    // many CAT — so a leaf weight (which finalize counts) can never exceed
+    // the collateral the voter genuinely staked. The Voting-Coin mint
+    // draws 0 mojos (see mint_voting_coin.rue) so the principal stays
+    // == locked_weight for the whole lineage and the invariant holds
+    // across every ballot the voter participates in.
+    locked_weight: Int,
     ...release_destination: Bytes32 | nil,
 }
 

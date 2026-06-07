@@ -48,6 +48,15 @@ fn main(
     // Cannot release twice.
     assert State.release_destination is nil;
 
+    // SEC-F2: the release branch of the finalizer pays out the coin's real
+    // CAT amount. Asserting the coin holds exactly `locked_weight` keeps
+    // the released collateral equal to what the voter genuinely staked and
+    // consistent with their SMT leaf weight, so a forged-weight
+    // registration cannot release more than it actually locked.
+    let assert_my_amount = AssertMyAmount {
+        amount: State.locked_weight,
+    };
+
     let pk_b: Bytes = State.voter_pubkey as Bytes;
     let el_b: Bytes = State.election_launcher_id as Bytes;
     let dest_b: Bytes = collateral_destination as Bytes;
@@ -87,6 +96,7 @@ fn main(
         voter_pubkey: State.voter_pubkey,
         election_launcher_id: State.election_launcher_id,
         voted_ballots_root: State.voted_ballots_root,
+        locked_weight: State.locked_weight,
         release_destination: collateral_destination,
     };
 
@@ -95,6 +105,6 @@ fn main(
             Ephemeral_State: nil,
             State: new_state,
         },
-        [assert_deregistered, agg_sig_release],
+        [assert_deregistered, agg_sig_release, assert_my_amount],
     )
 }

@@ -123,6 +123,19 @@ fn main(
     // Cannot mint after release has been authorised.
     assert State.release_destination is nil;
 
+    // SEC-F2: prove this Registration Coin REALLY holds the weight the
+    // voter registered (== the SMT leaf weight the finalize circuit counts).
+    // Without this, register only bound the weight to a forgeable
+    // announcement, so a voter could claim a huge leaf weight while locking
+    // ~zero CAT. AssertMyAmount forces the coin to hold exactly
+    // `locked_weight` mojos when it casts a vote, so a forged-weight leaf
+    // can never mint a counted Voting Coin. The Voting Coin is minted at 0
+    // mojos (the SDK passes voting_coin_amount = 0), so the CAT principal
+    // stays == locked_weight across every ballot.
+    let assert_my_amount = AssertMyAmount {
+        amount: State.locked_weight,
+    };
+
     // ─── 1. Assert Ballot Coin oracle open announcement ─────────────
     //
     // The Ballot Coin's `oracle` action emits, when finalized==false
@@ -333,6 +346,7 @@ fn main(
         voter_pubkey: State.voter_pubkey,
         election_launcher_id: State.election_launcher_id,
         voted_ballots_root: new_voted_ballots_root,
+        locked_weight: State.locked_weight,
         release_destination: nil,
     };
 
@@ -344,6 +358,7 @@ fn main(
         [
             assert_ballot_open,
             assert_before_close,
+            assert_my_amount,
             mint_vc,
             agg_sig_vote,
             announce_vote,

@@ -22,7 +22,7 @@ Every finding has a runnable proof-of-exploit or regression test under
 | # | Severity | Finding | Status |
 |---|----------|---------|--------|
 | F1 | **Critical** | Finalize forgery — circuit never binds the claimed signer weight to the registered set | **Open** (needs circuit rewrite) |
-| F2 | **Critical** | Register vote-weight forgery / fake CAT collateral | **Open** (needs reg-coin amount binding) |
+| F2 | **Critical** | Register vote-weight forgery / fake CAT collateral | **Fixed** ✅ (numerator: forged weight unspendable via `AssertMyAmount(locked_weight)`); register-time denominator credit is a documented structural residual |
 | F3 | **Critical** | Ballot VK/snapshot substitution — ballot curry not tied to election `vk_hash` | **Open** (needs createBallot→ballot binding) |
 | F4 | **High** | Collateral release gated by a forgeable deregister announcement | **Open** (needs singleton-identity binding) |
 | F5 | **High** | `vote_mode_lock` is unenforceable | **Open** (needs eve-derivation binding) |
@@ -95,43 +95,70 @@ it because `agg_signers` is an opaque G1 sum on-chain.
 
 ---
 
-## F2 — Register vote-weight forgery / fake CAT collateral (CRITICAL, open)
+## F2 — Register vote-weight forgery / fake CAT collateral (CRITICAL — numerator FIXED ✅; register-time denominator credit is a documented structural residual)
 
 **Where:** `puzzles/election/register.rue` (`locked_cat_mojos` is a
 solution field; the SMT leaf and `registration_vote_weight` increment
 use it; the only binding is `AssertCoinAnnouncement` over a `create_reg`
 message whose announcer `cat_parent_coin_id` is also solution-supplied).
-**Test:** `sdk/tests/exploit_register_weight_forgery_e2e.rs`.
+**Tests:** `sdk/tests/exploit_register_weight_forgery_e2e.rs` —
+`register_credits_forged_weight_with_no_real_collateral` pins the
+residual; `forged_weight_registration_coin_cannot_be_spent` pins the fix.
+Spend-time guard also pinned by
+`clvm_runner::tests::release_emits_assert_announcement_and_aggsigme`.
 
-`register` credits the voter's solution-chosen `locked_cat_mojos` into
-the SMT leaf `sha256(pubkey || locked_cat_mojos_be8)` and into
-`ElectionState.registration_vote_weight`. Nothing verifies that a real
-CAT coin of that amount was created. The lone binding is an
+**Original issue.** `register` credits the voter's solution-chosen
+`locked_cat_mojos` into the SMT leaf `sha256(pubkey || locked_cat_mojos_be8)`
+and into `ElectionState.registration_vote_weight`. Nothing verified that a
+real CAT coin of that amount was created. The lone binding is an
 `AssertCoinAnnouncement` of `create_reg` (which embeds `reg_full_hash` +
 `locked_cat_mojos`), but consensus's `ASSERT_COIN_ANNOUNCEMENT` is
 satisfied by **any** co-spent coin that emits the message — it never
-inspects the announcer's puzzle, asset id, or amount. (The existing
-`voter_double_vote_e2e.rs` / `voter_release_collateral_e2e.rs` tests rely
-on exactly this: the "CAT parent" is a 1-mojo `(q . ((60 msg)))` dummy.)
+inspects the announcer's puzzle, asset id, or amount. So a registration
+could claim `1_000_000_000` units while a 1-mojo `(q . ((60 msg)))` dummy
+emitted the announcement (zero governance CAT locked).
 
-**Exploit:** the test registers `1_000_000_000` units of weight whose
-`create_reg` announcement is emitted by a plain 1-mojo **non-CAT** coin
-(zero governance CAT locked), and the bundle is accepted. The forged
-weight then flows into `REGISTRATION_VOTE_WEIGHT_SNAPSHOT` and the
-finalize threshold, so a single registration can dominate (or, by
-inflating the denominator, deny) any weighted quorum — for ~0 real CAT.
-This invalidates the README's "CAT-collateralized registration".
+**Fix (NUMERATOR — the use of forged weight — CLOSED).**
+`RegistrationState` now carries `locked_weight`, bound into the coin's
+puzzle hash:
 
-**Remediation:** bind the registered weight to a real, currently-locked
-CAT coin. Carry `locked_weight` in `RegistrationState`; at every
-registration-coin spend (`mint_voting_coin`, `release`) assert the coin's
-real CAT amount equals `locked_weight` via `ASSERT_MY_AMOUNT`, and fund
-the Voting Coin's mojo from a separate input so the principal is not
-eroded. A coin that did not actually lock the claimed amount can then
-never cast a weighted vote nor release more than it holds. (Closing the
-residual `registration_vote_weight`-denominator inflation additionally
-requires `register` to verify the created coin's amount, e.g. via a
-one-shot confirm spend of the new registration coin in the same bundle.)
+```
+(pk . (el . (vbr . (locked_weight . release_destination))))
+```
+
+`register.rue` sets `locked_weight = locked_cat_mojos`, and **every**
+registration-coin spend now emits `AssertMyAmount { amount: locked_weight }`:
+
+- `mint_voting_coin.rue` — a Voting Coin can be minted only if the
+  registration coin actually holds `locked_weight`.
+- `release.rue` — collateral can be released only against a coin that
+  actually holds `locked_weight`.
+
+Consensus enforces `ASSERT_MY_AMOUNT` byte-exactly, so a registration that
+claimed weight `W` but is backed by a coin holding `< W` can never mint a
+Voting Coin nor release collateral — **the forged weight is unspendable**.
+The SDK ripples `locked_weight` through `RegistrationState(Wire)`, all
+`puzzles.rs` predictors, the actual spend-state builder
+(`Voter::registration_state_node`), `voter.rs`, `aggregator.rs`, the CLI,
+and the WASM bindings; full `chip-voting-sdk` suite is green.
+
+**Residual (DENOMINATOR — register-time credit — STRUCTURAL, documented).**
+The `register` action runs on the **Election Singleton** and does *not*
+consume the registration coin (a separate CAT issuance creates it in the
+same bundle). It therefore cannot `AssertMyAmount` on a coin it never
+spends, and binding the real CAT amount in O(1) on the singleton is
+structurally infeasible. So `register` still **credits the claimed weight
+into `ElectionState.registration_vote_weight`** even when no real CAT is
+locked. Impact of the residual is bounded to the **threshold denominator**:
+a forger can *inflate* `registration_vote_weight` (making a quorum *harder*
+to reach / a griefing/denial vector), but **cannot inflate the numerator**
+— forged weight never becomes a counted vote, because casting requires
+spending the registration coin through `mint_voting_coin`'s
+`AssertMyAmount`. Closing the residual would require `register` to verify
+the created coin's amount, e.g. a one-shot confirm spend of the new
+registration coin in the same bundle (a CHIP-level redesign of the
+register/issuance handshake), or moving registration-weight accounting to
+finalize time over only spendable (amount-bound) coins.
 
 ---
 

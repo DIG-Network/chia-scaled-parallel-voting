@@ -98,9 +98,9 @@ async fn aggregator_sync_after_deregister_wipes_voter() {
     let voter_keys = test_voter_keys(0x05u8);
     let voter_pk = voter_keys.pubkey;
     let reg_inner_ph =
-        puzzles::fresh_registration_inner_hash(&voter_pk, launcher_id, cat_tail_hash);
+        puzzles::fresh_registration_inner_hash(&voter_pk, launcher_id, cat_tail_hash, 1_000);
     let reg_outer_ph =
-        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id);
+        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id, 1_000);
 
     let mut ctx = SpendContext::new();
     let issuance_memos = ctx.hint(reg_outer_ph).expect("hint");

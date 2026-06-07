@@ -359,16 +359,16 @@ async fn build_two_voter_setup(
     let voter2_pk = voter2_keys.pubkey;
 
     let reg_inner_ph_1 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
-        &voter1_pk, launcher_id, cat_tail_hash,
+        &voter1_pk, launcher_id, cat_tail_hash, 1_000,
     );
     let reg_outer_ph_1 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash, &voter1_pk, launcher_id,
+        cat_tail_hash, &voter1_pk, launcher_id, 1_000,
     );
     let reg_inner_ph_2 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
-        &voter2_pk, launcher_id, cat_tail_hash,
+        &voter2_pk, launcher_id, cat_tail_hash, 1_000,
     );
     let reg_outer_ph_2 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash, &voter2_pk, launcher_id,
+        cat_tail_hash, &voter2_pk, launcher_id, 1_000,
     );
 
     let mut ctx = SpendContext::new();
@@ -561,7 +561,7 @@ async fn register_voter(
     let reg_outer_ph = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
         cat_tail_hash,
         &voter_pk,
-        launcher_id,
+        launcher_id, 1_000,
     );
 
     let create_reg_msg = compute_create_reg_msg(
@@ -721,22 +721,22 @@ async fn build_three_voter_setup(
     let voter3_pk = voter3_keys.pubkey;
 
     let reg_outer_ph_1 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash, &voter1_pk, launcher_id,
+        cat_tail_hash, &voter1_pk, launcher_id, 1_000,
     );
     let reg_outer_ph_2 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash, &voter2_pk, launcher_id,
+        cat_tail_hash, &voter2_pk, launcher_id, 1_000,
     );
     let reg_outer_ph_3 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash, &voter3_pk, launcher_id,
+        cat_tail_hash, &voter3_pk, launcher_id, 1_000,
     );
     let reg_inner_ph_1 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
-        &voter1_pk, launcher_id, cat_tail_hash,
+        &voter1_pk, launcher_id, cat_tail_hash, 1_000,
     );
     let reg_inner_ph_2 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
-        &voter2_pk, launcher_id, cat_tail_hash,
+        &voter2_pk, launcher_id, cat_tail_hash, 1_000,
     );
     let reg_inner_ph_3 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
-        &voter3_pk, launcher_id, cat_tail_hash,
+        &voter3_pk, launcher_id, cat_tail_hash, 1_000,
     );
 
     let mut ctx = SpendContext::new();

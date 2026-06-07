@@ -2492,7 +2492,7 @@ pub async fn extract_votes<C: ChainReader>(
     let mut out: Vec<VoteRecord> = Vec::new();
     for pk in &voter_set.voters {
         let hint = puzzles::voter_hint(election_id, cat_tail_hash, pk);
-        let fresh_ph = puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, pk, election_id);
+        let fresh_ph = puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, pk, election_id, config.collateral_amount);
         let records = chain.coin_records_by_hint(hint).await?;
         // Find the latest UNSPENT coin whose puzzle hash differs
         // from the fresh-registration puzzle hash. If there's only

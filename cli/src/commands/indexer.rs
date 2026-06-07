@@ -204,6 +204,7 @@ async fn puzzle_hashes(
             cat_tail_hash,
             &pk,
             launcher_id,
+            config.collateral_amount,
         );
         let hint = chip_voting_sdk::puzzles::voter_hint(launcher_id, cat_tail_hash, &pk);
         value["voter"] = serde_json::json!({

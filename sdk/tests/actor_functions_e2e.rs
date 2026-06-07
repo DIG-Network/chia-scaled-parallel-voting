@@ -203,7 +203,7 @@ fn voter_registration_coin_puzzle_hash_is_deterministic() {
     let expected = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
         cat_tail_hash,
         &voter.keys.pubkey,
-        election_id,
+        election_id, 1_000,
     );
     assert_eq!(ph1, expected);
 }

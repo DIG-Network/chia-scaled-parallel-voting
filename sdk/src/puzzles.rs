@@ -686,23 +686,43 @@ pub fn voted_ballots_root_after_inserts(ballot_launcher_ids: &[Bytes32]) -> Byte
 ///        `voted_ballots_root = empty_ballot_root()` and
 ///        `release_destination = None`. Callers predicting a coin
 ///        post-release pass `Some(destination)`.
+/// Tree hash of a `u64` as a canonical CLVM int atom (minimal big-endian,
+/// sign-extended so the MSB stays clear) — matches how Rue hashes an `Int`
+/// field. Used for `RegistrationState.locked_weight` (SEC-F2).
+pub fn uint_atom_hash(n: u64) -> Bytes32 {
+    if n == 0 {
+        return hash_atom(&[]);
+    }
+    let bytes = n.to_be_bytes();
+    let first = bytes.iter().position(|&b| b != 0).unwrap_or(8);
+    let mut payload = bytes[first..].to_vec();
+    if !payload.is_empty() && payload[0] & 0x80 != 0 {
+        payload.insert(0, 0);
+    }
+    hash_atom(&payload)
+}
+
 pub fn fresh_registration_state_tree_hash(
     voter_pubkey: &PublicKey,
     election_launcher_id: Bytes32,
     voted_ballots_root: Bytes32,
+    locked_weight: u64,
     release_destination: Option<Bytes32>,
 ) -> Bytes32 {
     let pk_hash = hash_atom(&voter_pubkey.to_bytes());
     let el_hash = hash_atom_b32(&election_launcher_id);
     let vbr_hash = hash_atom_b32(&voted_ballots_root);
+    let lw_hash = uint_atom_hash(locked_weight);
     let rd_hash = match release_destination {
         Some(dest) => hash_atom_b32(&dest),
         None => hash_atom(&[]), // None → nil → empty atom
     };
 
-    // Rest-arg shape — last field is paired directly:
-    //   (pk . (el . (vbr . rd)))
-    let pair = hash_pair(vbr_hash, rd_hash);
+    // SEC-F2 layout — `locked_weight` is a regular Int field BEFORE the
+    // rest-arg `release_destination`:
+    //   (pk . (el . (vbr . (locked_weight . rd))))
+    let pair = hash_pair(lw_hash, rd_hash);
+    let pair = hash_pair(vbr_hash, pair);
     let pair = hash_pair(el_hash, pair);
     hash_pair(pk_hash, pair)
 }
@@ -722,6 +742,7 @@ pub fn registration_inner_hash_for_state(
     election_launcher_id: Bytes32,
     cat_tail_hash: Bytes32,
     voted_ballots_root: Bytes32,
+    locked_weight: u64,
     release_destination: Option<Bytes32>,
 ) -> Bytes32 {
     let action_layer_mod_hash = PuzzleHashes::action_layer();
@@ -733,6 +754,7 @@ pub fn registration_inner_hash_for_state(
         voter_pubkey,
         election_launcher_id,
         voted_ballots_root,
+        locked_weight,
         release_destination,
     );
 
@@ -782,12 +804,14 @@ pub fn fresh_registration_inner_hash(
     voter_pubkey: &PublicKey,
     election_launcher_id: Bytes32,
     cat_tail_hash: Bytes32,
+    locked_weight: u64,
 ) -> Bytes32 {
     registration_inner_hash_for_state(
         voter_pubkey,
         election_launcher_id,
         cat_tail_hash,
         empty_ballot_root(),
+        locked_weight,
         None,
     )
 }
@@ -807,8 +831,10 @@ pub fn fresh_registration_coin_puzzle_hash(
     cat_tail_hash: Bytes32,
     voter_pubkey: &PublicKey,
     election_launcher_id: Bytes32,
+    locked_weight: u64,
 ) -> Bytes32 {
-    let inner = fresh_registration_inner_hash(voter_pubkey, election_launcher_id, cat_tail_hash);
+    let inner =
+        fresh_registration_inner_hash(voter_pubkey, election_launcher_id, cat_tail_hash, locked_weight);
     let inner_th = TreeHash::new(inner.to_bytes());
     let curried = CatArgs::curry_tree_hash(cat_tail_hash, inner_th);
     Bytes32::new(curried.to_bytes())
@@ -1959,12 +1985,12 @@ mod tests {
         let election_id = b32(0x11);
         let tail_hash = b32(0x22);
 
-        let inner = fresh_registration_inner_hash(&pk, election_id, tail_hash);
+        let inner = fresh_registration_inner_hash(&pk, election_id, tail_hash, 1_000);
         let inner_th = TreeHash::new(inner.to_bytes());
         let expected = Bytes32::new(CatArgs::curry_tree_hash(tail_hash, inner_th).to_bytes());
 
         assert_eq!(
-            fresh_registration_coin_puzzle_hash(tail_hash, &pk, election_id),
+            fresh_registration_coin_puzzle_hash(tail_hash, &pk, election_id, 1_000),
             expected,
         );
     }
@@ -1984,8 +2010,8 @@ mod tests {
         assert_ne!(pk1, pk2, "test setup: pubkeys must differ");
         let tail = b32(0x22);
         assert_ne!(
-            fresh_registration_inner_hash(&pk1, election_id, tail),
-            fresh_registration_inner_hash(&pk2, election_id, tail),
+            fresh_registration_inner_hash(&pk1, election_id, tail, 1_000),
+            fresh_registration_inner_hash(&pk2, election_id, tail, 1_000),
         );
     }
 
@@ -1995,8 +2021,8 @@ mod tests {
         let pk = test_pubkey();
         let tail = b32(0x22);
         assert_ne!(
-            fresh_registration_inner_hash(&pk, b32(0x11), tail),
-            fresh_registration_inner_hash(&pk, b32(0x22), tail),
+            fresh_registration_inner_hash(&pk, b32(0x11), tail, 1_000),
+            fresh_registration_inner_hash(&pk, b32(0x22), tail, 1_000),
         );
     }
 
@@ -2273,12 +2299,13 @@ mod tests {
         let election_id = b32(0xEE);
         let cat_tail = b32(0x77);
 
-        let fresh = fresh_registration_inner_hash(&pk, election_id, cat_tail);
+        let fresh = fresh_registration_inner_hash(&pk, election_id, cat_tail, 1_000);
         let general = registration_inner_hash_for_state(
             &pk,
             election_id,
             cat_tail,
             empty_ballot_root(),
+            1_000,
             None,
         );
 
@@ -2304,13 +2331,13 @@ mod tests {
         let cat_tail = b32(0x77);
 
         let fresh = registration_inner_hash_for_state(
-            &pk, election_id, cat_tail, empty_ballot_root(), None,
+            &pk, election_id, cat_tail, empty_ballot_root(), 1_000, None,
         );
         let with_vbr = registration_inner_hash_for_state(
-            &pk, election_id, cat_tail, b32(0xCC), None,
+            &pk, election_id, cat_tail, b32(0xCC), 1_000, None,
         );
         let with_dest = registration_inner_hash_for_state(
-            &pk, election_id, cat_tail, empty_ballot_root(), Some(b32(0xDD)),
+            &pk, election_id, cat_tail, empty_ballot_root(), 1_000, Some(b32(0xDD)),
         );
 
         assert_ne!(
@@ -2363,10 +2390,10 @@ mod tests {
         let cat_tail = b32(0x77);
 
         let inner = registration_inner_hash_for_state(
-            &pk, election_id, cat_tail, empty_ballot_root(), None,
+            &pk, election_id, cat_tail, empty_ballot_root(), 1_000, None,
         );
         let outer = cat_outer_for_inner_hash(cat_tail, inner);
-        let fresh_full = fresh_registration_coin_puzzle_hash(cat_tail, &pk, election_id);
+        let fresh_full = fresh_registration_coin_puzzle_hash(cat_tail, &pk, election_id, 1_000);
 
         assert_eq!(
             outer, fresh_full,

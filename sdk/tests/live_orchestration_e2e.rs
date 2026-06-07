@@ -114,16 +114,16 @@ async fn chip_live_orchestration_simulator_full_flow() {
 
     // ── 3a. Issue both voters' Registration CATs in one bundle ──
     let reg_inner_ph_1 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
-        &voter1_pk, launcher_id, cat_tail_hash,
+        &voter1_pk, launcher_id, cat_tail_hash, 1_000,
     );
     let reg_outer_ph_1 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash, &voter1_pk, launcher_id,
+        cat_tail_hash, &voter1_pk, launcher_id, 1_000,
     );
     let reg_inner_ph_2 = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
-        &voter2_pk, launcher_id, cat_tail_hash,
+        &voter2_pk, launcher_id, cat_tail_hash, 1_000,
     );
     let reg_outer_ph_2 = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
-        cat_tail_hash, &voter2_pk, launcher_id,
+        cat_tail_hash, &voter2_pk, launcher_id, 1_000,
     );
 
     let mut ctx = SpendContext::new();
@@ -526,7 +526,7 @@ async fn register_voter(
     let reg_outer_ph = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
         cat_tail_hash,
         &voter_pk,
-        launcher_id,
+        launcher_id, 1_000,
     );
 
     let create_reg_msg = compute_create_reg_msg(

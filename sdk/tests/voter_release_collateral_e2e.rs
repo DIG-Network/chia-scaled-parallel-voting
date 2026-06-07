@@ -118,9 +118,9 @@ async fn voter_release_collateral_against_simulator_full_flow() {
     let voter_keys = test_voter_keys(0x03u8);
     let voter_pk = voter_keys.pubkey;
     let reg_inner_ph =
-        puzzles::fresh_registration_inner_hash(&voter_pk, launcher_id, cat_tail_hash);
+        puzzles::fresh_registration_inner_hash(&voter_pk, launcher_id, cat_tail_hash, 1_000);
     let reg_outer_ph =
-        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id);
+        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id, 1_000);
 
     // ── 4. Mint a real CAT Registration Coin ─────────────────
     //

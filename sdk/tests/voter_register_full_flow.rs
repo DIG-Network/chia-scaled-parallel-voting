@@ -113,7 +113,7 @@ async fn voter_register_against_simulator_full_flow() {
         slot
     );
     let reg_outer_ph =
-        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id);
+        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id, 1_000);
     let create_reg_msg =
         compute_create_reg_msg(launcher_id, &voter_pk, reg_outer_ph, collateral_amount);
 

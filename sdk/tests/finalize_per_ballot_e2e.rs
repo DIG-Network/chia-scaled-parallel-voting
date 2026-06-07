@@ -97,12 +97,12 @@ async fn finalize_per_ballot_full_simulator_flow() {
     let reg_inner_ph = chip_voting_sdk::puzzles::fresh_registration_inner_hash(
         &voter_pk,
         launcher_id,
-        cat_tail_hash,
+        cat_tail_hash, 1_000,
     );
     let reg_outer_ph = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(
         cat_tail_hash,
         &voter_pk,
-        launcher_id,
+        launcher_id, 1_000,
     );
 
     let mut ctx = SpendContext::new();

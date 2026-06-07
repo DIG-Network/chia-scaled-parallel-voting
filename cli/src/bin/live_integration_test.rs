@@ -853,9 +853,19 @@ fn build_cat_collateral_spend(
     // into `CatArgs::curry_tree_hash(asset_id, ph)`, so passing the
     // INNER hash here lands at the correct CAT-wrapped puzzle hash.
     let reg_inner_ph =
-        puzzles::fresh_registration_inner_hash(voter_pk, election_launcher_id, cat_tail_hash);
+        puzzles::fresh_registration_inner_hash(
+            voter_pk,
+            election_launcher_id,
+            cat_tail_hash,
+            collateral_amount,
+        );
     let reg_outer_ph =
-        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, voter_pk, election_launcher_id);
+        puzzles::fresh_registration_coin_puzzle_hash(
+            cat_tail_hash,
+            voter_pk,
+            election_launcher_id,
+            collateral_amount,
+        );
     info!(
         reg_inner = %hex::encode(reg_inner_ph),
         reg_outer = %hex::encode(reg_outer_ph),
@@ -2127,6 +2137,7 @@ async fn phase_register_voter(
         cat_tail_hash,
         &voter_keys.pubkey,
         election_launcher_id,
+        args.collateral_amount,
     );
     let cat_input_parent_id: Bytes32 = cat_collateral.parent_spend.coin.coin_id().into();
     let reg_coin = Coin::new(cat_input_parent_id, reg_outer_ph, args.collateral_amount);

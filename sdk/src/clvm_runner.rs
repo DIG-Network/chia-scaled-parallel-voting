@@ -289,7 +289,13 @@ mod tests {
 
     use chia_bls::PublicKey;
 
-    type RegistrationStateClvm<R> = (Bytes, (Bytes32, (Bytes32, R)));
+    // SEC-F2: state now carries `locked_weight` between `voted_ballots_root`
+    // and `release_destination`:
+    //   (pk . (el . (vbr . (locked_weight . release_destination))))
+    type RegistrationStateClvm<R> = (Bytes, (Bytes32, (Bytes32, (u64, R))));
+    /// Locked weight used by the release unit tests (matches the honest
+    /// minimum collateral; the value the coin must actually hold).
+    const TEST_LOCKED_WEIGHT: u64 = 1_000;
     type RegistrationStateTruthClvm<R> = ((), RegistrationStateClvm<R>);
     type ReleaseSolution<R> = (RegistrationStateTruthClvm<R>, (Bytes32, Bytes32));
 
@@ -299,7 +305,10 @@ mod tests {
         voted_ballots_root: Bytes32,
     ) -> RegistrationStateClvm<()> {
         let pk_bytes = Bytes::new(voter_pk.to_bytes().to_vec());
-        (pk_bytes, (election_id, (voted_ballots_root, ())))
+        (
+            pk_bytes,
+            (election_id, (voted_ballots_root, (TEST_LOCKED_WEIGHT, ()))),
+        )
     }
 
     fn deterministic_voter() -> PublicKey {
@@ -308,10 +317,11 @@ mod tests {
     }
 
     /// WHAT: with a pre-release state and matching deregister args,
-    ///       the release action emits exactly TWO conditions:
+    ///       the release action emits exactly THREE conditions:
     ///       AssertCoinAnnouncement (the singleton's deregister
-    ///       announcement) and AggSigMe (the voter's release
-    ///       authorisation).
+    ///       announcement), AggSigMe (the voter's release
+    ///       authorisation), and AssertMyAmount (SEC-F2: the coin must
+    ///       hold exactly `locked_weight`).
     /// HOW:  build a fresh registration state (release_destination =
     ///       nil), supply destination + an arbitrary singleton coin
     ///       id; run the release puzzle; assert two conditions of
@@ -351,7 +361,11 @@ mod tests {
             RegistrationStateTruthClvm<Bytes32>,
             Vec<Condition<NodePtr>>,
         ) = runner.extract(output).expect("output parses");
-        assert_eq!(conds.len(), 2, "release emits exactly 2 conditions");
+        assert_eq!(
+            conds.len(),
+            3,
+            "release emits exactly 3 conditions (incl. SEC-F2 AssertMyAmount)"
+        );
 
         // Recompute expected deregister announcement message
         // (matches puzzles/registration_coin/release.rue):
@@ -376,9 +390,11 @@ mod tests {
         h.update(dest.as_ref());
         let expected_release: [u8; 32] = h.finalize().into();
 
-        // The two conditions are AssertCoinAnnouncement + AggSigMe.
+        // The three conditions are AssertCoinAnnouncement + AggSigMe +
+        // AssertMyAmount (SEC-F2).
         let mut saw_assert = false;
         let mut saw_sig = false;
+        let mut saw_amount = false;
         for c in &conds {
             match c {
                 Condition::AssertCoinAnnouncement(a) => {
@@ -398,12 +414,22 @@ mod tests {
                     );
                     saw_sig = true;
                 }
+                Condition::AssertMyAmount(a) => {
+                    // SEC-F2: the released coin must hold exactly the weight
+                    // it claimed to lock, so a forged-weight registration
+                    // cannot release more collateral than it staked.
+                    assert_eq!(
+                        a.amount, TEST_LOCKED_WEIGHT,
+                        "AssertMyAmount must equal locked_weight"
+                    );
+                    saw_amount = true;
+                }
                 other => panic!("unexpected condition: {other:?}"),
             }
         }
         assert!(
-            saw_assert && saw_sig,
-            "expected both AssertCoinAnnouncement and AggSigMe"
+            saw_assert && saw_sig && saw_amount,
+            "expected AssertCoinAnnouncement, AggSigMe, and AssertMyAmount"
         );
     }
 
@@ -426,7 +452,10 @@ mod tests {
             pk_bytes,
             (
                 election_id,
-                (voted_ballots_root, Bytes32::new([0x99; 32])),
+                (
+                    voted_ballots_root,
+                    (TEST_LOCKED_WEIGHT, Bytes32::new([0x99; 32])),
+                ),
             ),
         );
         let truth: RegistrationStateTruthClvm<Bytes32> = ((), post_release_state);

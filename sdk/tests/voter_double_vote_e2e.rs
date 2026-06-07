@@ -99,9 +99,9 @@ async fn voter_double_vote_for_same_ballot_rejected() {
     let voter_keys = test_voter_keys(0x03u8);
     let voter_pk = voter_keys.pubkey;
     let reg_inner_ph =
-        puzzles::fresh_registration_inner_hash(&voter_pk, launcher_id, cat_tail_hash);
+        puzzles::fresh_registration_inner_hash(&voter_pk, launcher_id, cat_tail_hash, 1_000);
     let reg_outer_ph =
-        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id);
+        puzzles::fresh_registration_coin_puzzle_hash(cat_tail_hash, &voter_pk, launcher_id, 1_000);
 
     // ── 4. Mint Registration Coin via Cat::issue_with_coin ──
     let mut ctx = SpendContext::new();
