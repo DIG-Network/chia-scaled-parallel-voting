@@ -666,12 +666,24 @@ export default dynamic(
 
       if (!address) {
         return (
-          <main className="max-w-3xl mx-auto px-4 py-12">
-            <div className="card-elev text-center">
+          <main className="mx-auto max-w-3xl px-4 py-12 sm:px-6 lg:px-8">
+            <Link
+              href="/"
+              className="text-sm text-[var(--color-muted)] transition-colors hover:text-[var(--color-foreground)]"
+            >
+              ← Back
+            </Link>
+            <div className="card-elev mt-5 flex flex-col items-center gap-3 text-center">
+              <div
+                aria-hidden
+                className="grid h-12 w-12 place-items-center rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent)]/10 text-xl text-[var(--color-accent)]"
+              >
+                ◈
+              </div>
               <h2 className="text-lg font-semibold">Connect your wallet</h2>
-              <p className="text-[var(--color-muted)] mt-2">
-                Deploying an election spends 1 mojo XCH (the launcher coin) +
-                tx fees. Connect Sage Wallet to continue.
+              <p className="max-w-md text-sm leading-relaxed text-[var(--color-muted-strong)]">
+                Deploying an election spends 1 mojo XCH (the launcher coin) plus
+                tx fees. Connect Sage Wallet — top right — to continue.
               </p>
             </div>
           </main>
@@ -687,13 +699,17 @@ export default dynamic(
               titleId="deploy-await-title"
             />
           )}
-          <main className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-            <Link href="/" className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)]">
-              ← back
+          <main className="fade-up mx-auto max-w-3xl px-4 py-10 sm:px-6 lg:px-8">
+            <Link
+              href="/"
+              className="inline-flex items-center gap-1 text-sm text-[var(--color-muted)] transition-colors hover:text-[var(--color-foreground)]"
+            >
+              ← Back
             </Link>
-          <header className="mt-4 mb-8">
-            <h1 className="text-3xl font-bold">New election</h1>
-            <p className="text-[var(--color-muted)] mt-2">
+          <header className="mb-8 mt-5">
+            <p className="eyebrow mb-2">Deploy</p>
+            <h1 className="text-3xl font-medium tracking-tight">New election</h1>
+            <p className="mt-2 max-w-2xl text-sm leading-relaxed text-[var(--color-muted-strong)]">
               Deploy a new Election Singleton on Chia. Only the parameters
               below are configurable; the trusted setup runs in your browser.
             </p>
@@ -753,12 +769,12 @@ export default dynamic(
                 style={{ wordBreak: "break-all", fontSize: "0.75em" }}
               />
               {vkHex.trim().length > 0 ? (
-                <p className="text-xs mt-1" style={{ color: "#1a7f1a" }}>
+                <p className="mt-1 text-xs text-[var(--color-success)]">
                   ✓ {vkHex.trim().length / 2} bytes — will deploy with this VK
                   {vkHex.trim().length === 1152 ? " (canonical Groth16 layout ✓)" : ""}
                 </p>
               ) : (
-                <p className="text-xs text-[var(--color-muted)] mt-1">
+                <p className="mt-1 text-xs text-[var(--color-muted)]">
                   No VK supplied — deploy will run the in-browser
                   single-participant trusted setup (TEST MODE).
                 </p>
@@ -784,26 +800,26 @@ export default dynamic(
                 disabled={busy}
               />
               {ceremonyIdHex.trim().length === 0 ? (
-                <p className="text-xs text-[var(--color-muted)] mt-1">
+                <p className="mt-1 text-xs text-[var(--color-muted)]">
                   No ceremony selected — deploy will use the legacy
                   unlinked path.
                 </p>
               ) : voucher.kind === "looking" ? (
-                <p className="text-xs mt-1" style={{ color: "#666" }}>
+                <p className="mt-1 text-xs text-[var(--color-muted)]">
                   Discovering voucher coin on chain…
                 </p>
               ) : voucher.kind === "found" ? (
-                <p className="text-xs mt-1" style={{ color: "#1a7f1a" }}>
+                <p className="mt-1 text-xs text-[var(--color-success)]">
                   ✓ Linked to ceremony{" "}
                   {voucher.launcherIdHex.slice(0, 18)}… (max_voters={" "}
                   {voucher.maxVoters}, vk_hash={voucher.vkHashHex.slice(0, 18)}…)
                 </p>
               ) : voucher.kind === "not_found" ? (
-                <p className="text-xs mt-1" style={{ color: "#b00020" }}>
+                <p className="mt-1 text-xs text-[var(--color-danger)]">
                   ✗ {voucher.reason}
                 </p>
               ) : voucher.kind === "error" ? (
-                <p className="text-xs mt-1" style={{ color: "#b00020" }}>
+                <p className="mt-1 text-xs text-[var(--color-danger)]">
                   ✗ Voucher discovery failed: {voucher.message}
                 </p>
               ) : null}
@@ -813,40 +829,37 @@ export default dynamic(
               label="Lock vote mode for all ballots?"
               hint="Default 'No lock' lets each ballot pick its own mode. Pick 'Free' to force every ballot of this election into Mode1Free (any 32-byte vote_data). Pick 'Restricted' to force every ballot into a fixed sorted-options merkle root — the dApp will sha256 each label and merkle-root them."
             >
-              <div className="flex gap-3 text-sm">
-                <label className="flex items-center gap-1">
-                  <input
-                    type="radio"
-                    name="voteModeLock"
-                    value="none"
-                    checked={voteModeLockChoice === "none"}
-                    onChange={() => setVoteModeLockChoice("none")}
-                    disabled={busy}
-                  />
-                  No lock (default)
-                </label>
-                <label className="flex items-center gap-1">
-                  <input
-                    type="radio"
-                    name="voteModeLock"
-                    value="free"
-                    checked={voteModeLockChoice === "free"}
-                    onChange={() => setVoteModeLockChoice("free")}
-                    disabled={busy}
-                  />
-                  Free
-                </label>
-                <label className="flex items-center gap-1">
-                  <input
-                    type="radio"
-                    name="voteModeLock"
-                    value="restricted"
-                    checked={voteModeLockChoice === "restricted"}
-                    onChange={() => setVoteModeLockChoice("restricted")}
-                    disabled={busy}
-                  />
-                  Restricted
-                </label>
+              <div className="flex flex-wrap gap-2 text-sm">
+                {(
+                  [
+                    ["none", "No lock (default)"],
+                    ["free", "Free"],
+                    ["restricted", "Restricted"],
+                  ] as const
+                ).map(([value, text]) => {
+                  const selected = voteModeLockChoice === value;
+                  return (
+                    <label
+                      key={value}
+                      className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 transition-colors ${
+                        selected
+                          ? "border-[var(--color-accent)]/55 bg-[var(--color-accent)]/[0.08] text-[var(--color-foreground)]"
+                          : "border-[var(--color-border)] text-[var(--color-muted-strong)] hover:border-[var(--color-border-strong)]"
+                      } ${busy ? "cursor-not-allowed opacity-60" : ""}`}
+                    >
+                      <input
+                        type="radio"
+                        name="voteModeLock"
+                        value={value}
+                        checked={selected}
+                        onChange={() => setVoteModeLockChoice(value)}
+                        disabled={busy}
+                        className="accent-[var(--color-accent)]"
+                      />
+                      {text}
+                    </label>
+                  );
+                })}
               </div>
               {voteModeLockChoice === "restricted" ? (
                 <textarea
@@ -859,26 +872,26 @@ export default dynamic(
                 />
               ) : null}
               {voteModeLockChoice === "none" ? (
-                <p className="text-xs text-[var(--color-muted)] mt-1">
+                <p className="mt-1 text-xs text-[var(--color-muted)]">
                   Per-ballot mode — each ballot picks Free or Restricted at
                   mint time.
                 </p>
               ) : voteModeLock.kind === "computing" ? (
-                <p className="text-xs mt-1" style={{ color: "#666" }}>
+                <p className="mt-1 text-xs text-[var(--color-muted)]">
                   Hashing labels…
                 </p>
               ) : voteModeLock.kind === "ready" && voteModeLockChoice === "free" ? (
-                <p className="text-xs mt-1" style={{ color: "#1a7f1a" }}>
+                <p className="mt-1 text-xs text-[var(--color-success)]">
                   ✓ Locked to Mode1Free — every ballot of this election
                   must use vote_options_root = 0x00…00
                 </p>
               ) : voteModeLock.kind === "ready" ? (
-                <p className="text-xs mt-1" style={{ color: "#1a7f1a" }}>
+                <p className="mt-1 text-xs text-[var(--color-success)]">
                   ✓ Locked to Mode2Restricted ({voteModeLock.labels.length}{" "}
                   options): root={voteModeLock.voteModeLockHex.slice(0, 18)}…
                 </p>
               ) : voteModeLock.kind === "error" ? (
-                <p className="text-xs mt-1" style={{ color: "#b00020" }}>
+                <p className="mt-1 text-xs text-[var(--color-danger)]">
                   ✗ {voteModeLock.message}
                 </p>
               ) : null}
@@ -903,8 +916,18 @@ export default dynamic(
                       ? "Deploy election with pasted VK"
                       : "Deploy election (TEST MODE — single-participant setup)"}
             </button>
-            <div className="text-xs text-[var(--color-muted)] text-center">
-              Status: {status}
+            <div
+              role="status"
+              aria-live="polite"
+              className={`text-center text-xs ${
+                status.startsWith("Error")
+                  ? "text-[var(--color-danger)]"
+                  : busy
+                    ? "text-[var(--color-accent)]"
+                    : "text-[var(--color-muted)]"
+              }`}
+            >
+              <span className="text-[var(--color-muted)]">Status:</span> {status}
             </div>
           </form>
 
@@ -924,7 +947,14 @@ export default dynamic(
       );
     };
   },
-  { ssr: false, loading: () => <div className="card animate-pulse h-96 m-8" /> }
+  {
+    ssr: false,
+    loading: () => (
+      <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6 lg:px-8">
+        <div className="skeleton h-[28rem]" />
+      </div>
+    ),
+  }
 );
 
 function Field({
@@ -938,9 +968,11 @@ function Field({
 }) {
   return (
     <div>
-      <label className="block text-sm font-medium mb-1">{label}</label>
+      <label className="mb-1.5 block text-sm font-medium">{label}</label>
       {children}
-      <p className="text-xs text-[var(--color-muted)] mt-1">{hint}</p>
+      <p className="mt-1.5 text-xs leading-relaxed text-[var(--color-muted)]">
+        {hint}
+      </p>
     </div>
   );
 }

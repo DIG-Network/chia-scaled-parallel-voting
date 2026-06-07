@@ -105,45 +105,55 @@ export default dynamic(
       if (!address) return null;
 
       return (
-        <div className="card grid gap-4">
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <div className="text-xs uppercase tracking-wide text-[var(--color-muted)]">
-                XCH balance
-              </div>
-              <div className="text-2xl font-semibold mono">
-                {loading ? "…" : xch === null ? "—" : formatXch(xch)}
-              </div>
+        <div className="card-elev grid gap-5">
+          <div>
+            <div className="eyebrow mb-1.5">XCH balance</div>
+            <div className="mono text-3xl font-semibold tabular-nums">
+              {loading ? (
+                <span className="inline-block h-8 w-32 animate-pulse rounded bg-[var(--color-muted-bg)] align-middle" />
+              ) : xch === null ? (
+                <span className="text-[var(--color-muted)]">—</span>
+              ) : (
+                formatXch(xch)
+              )}
             </div>
           </div>
+          <div className="h-px bg-[var(--color-border)]" />
           <div>
-            <div className="text-xs uppercase tracking-wide text-[var(--color-muted)] mb-2">
-              CAT collateral (per saved election asset id)
+            <div className="eyebrow mb-2.5">
+              CAT collateral · per saved election asset
             </div>
             {loading ? (
-              <div className="mono">…</div>
+              <div className="space-y-2">
+                <div className="h-7 w-40 animate-pulse rounded bg-[var(--color-muted-bg)]" />
+                <div className="h-7 w-32 animate-pulse rounded bg-[var(--color-muted-bg)]" />
+              </div>
             ) : cats.length === 0 ? (
-              <p className="text-sm text-[var(--color-muted)]">
-                Save an election locally (deploy or import its config), then balances
-                for that CAT tail appear here. Each election picks its own asset at
-                deploy time — there is no single default token.
+              <p className="text-sm leading-relaxed text-[var(--color-muted-strong)]">
+                Save an election locally (deploy or import its config), then
+                balances for that CAT tail appear here. Each election picks its
+                own asset at deploy time — there is no single default token.
               </p>
             ) : (
               <ul className="space-y-3">
                 {cats.map(({ tail, mojos }) => (
-                  <li key={tail} className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                    <span className="text-2xl font-semibold mono">
+                  <li
+                    key={tail}
+                    className="flex flex-wrap items-baseline gap-x-3 gap-y-1"
+                  >
+                    <span className="mono text-2xl font-semibold tabular-nums">
                       {formatCat(mojos)}
                     </span>
-                    <span className="text-xs mono text-[var(--color-muted)]">
+                    <span className="mono text-xs text-[var(--color-muted)]">
                       0x{tail.slice(0, 8)}…{tail.slice(-6)}
                     </span>
                     <Link
                       href={dexieCatAssetUrl(`0x${tail}`)}
                       target="_blank"
-                      className="text-xs hover:underline text-[var(--color-accent)]"
+                      rel="noreferrer"
+                      className="text-xs text-[var(--color-accent)] hover:underline"
                     >
-                      View on Dexie
+                      View on Dexie ↗
                     </Link>
                   </li>
                 ))}
@@ -154,5 +164,5 @@ export default dynamic(
       );
     };
   },
-  { ssr: false, loading: () => <div className="card animate-pulse h-24" /> }
+  { ssr: false, loading: () => <div className="skeleton h-28" /> }
 );

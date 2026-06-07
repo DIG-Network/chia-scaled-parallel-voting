@@ -222,18 +222,24 @@ const CreateCeremonyInner = dynamic(
 
       if (!address) {
         return (
-          <main className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          <main className="mx-auto max-w-3xl px-4 py-10 sm:px-6 lg:px-8">
             <Link
               href="/"
-              className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)]"
+              className="text-sm text-[var(--color-muted)] transition-colors hover:text-[var(--color-foreground)]"
             >
-              ← back
+              ← Back
             </Link>
-            <div className="card-elev p-6 mt-4">
+            <div className="card-elev mt-5 flex flex-col items-center gap-3 text-center">
+              <div
+                aria-hidden
+                className="grid h-12 w-12 place-items-center rounded-full border border-[var(--color-accent)]/40 bg-[var(--color-accent)]/10 text-xl text-[var(--color-accent)]"
+              >
+                ◈
+              </div>
               <h2 className="text-lg font-semibold">Connect your wallet</h2>
-              <p className="text-[var(--color-muted)] mt-2">
-                Deploying a ceremony spends 1 mojo XCH (the launcher) +
-                tx fees. Connect Sage Wallet to continue.
+              <p className="max-w-md text-sm leading-relaxed text-[var(--color-muted-strong)]">
+                Deploying a ceremony spends 1 mojo XCH (the launcher) plus tx
+                fees. Connect Sage Wallet — top right — to continue.
               </p>
             </div>
             <Footer />
@@ -250,20 +256,29 @@ const CreateCeremonyInner = dynamic(
               titleId="ceremony-deploy-await-title"
             />
           )}
-          <main className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          <main className="fade-up mx-auto max-w-3xl px-4 py-10 sm:px-6 lg:px-8">
             <Link
               href="/"
-              className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)]"
+              className="inline-flex items-center gap-1 text-sm text-[var(--color-muted)] transition-colors hover:text-[var(--color-foreground)]"
             >
-              ← back
+              ← Back
             </Link>
-            <header className="mt-4 mb-8">
-              <h1 className="text-3xl font-bold">New ceremony</h1>
-              <p className="text-[var(--color-muted)] mt-2">
-                Deploy a new on-chain Groth16 trusted-setup ceremony.
-                Anyone can contribute during the time window. Once the
-                threshold is met, /ceremony will surface a derived VK
-                ready to paste into <Link href="/create" className="text-[var(--color-accent)]">New Election</Link>.
+            <header className="mb-8 mt-5">
+              <p className="eyebrow mb-2">Deploy</p>
+              <h1 className="text-3xl font-medium tracking-tight">
+                New ceremony
+              </h1>
+              <p className="mt-2 max-w-2xl text-sm leading-relaxed text-[var(--color-muted-strong)]">
+                Deploy a new on-chain Groth16 trusted-setup ceremony. Anyone can
+                contribute during the time window. Once the threshold is met,
+                /ceremony will surface a derived VK ready to paste into{" "}
+                <Link
+                  href="/create"
+                  className="text-[var(--color-accent)] hover:underline"
+                >
+                  New Election
+                </Link>
+                .
               </p>
             </header>
 
@@ -399,10 +414,7 @@ const CreateCeremonyInner = dynamic(
                   </button>
                 </div>
                 {vkSeedHex.length > 0 && !/^[0-9a-fA-F]{64}$/.test(vkSeedHex) ? (
-                  <p
-                    className="text-xs mt-1"
-                    style={{ color: "#b35900" }}
-                  >
+                  <p className="mt-1 text-xs text-[var(--color-warning)]">
                     vk_seed must be exactly 64 hex chars (got {vkSeedHex.length}).
                   </p>
                 ) : null}
@@ -426,8 +438,19 @@ const CreateCeremonyInner = dynamic(
               >
                 {busy ? status : "Deploy ceremony"}
               </button>
-              <div className="text-xs text-[var(--color-muted)] text-center">
-                Status: {status}
+              <div
+                role="status"
+                aria-live="polite"
+                className={`text-center text-xs ${
+                  status.startsWith("Failed")
+                    ? "text-[var(--color-danger)]"
+                    : busy
+                      ? "text-[var(--color-accent)]"
+                      : "text-[var(--color-muted)]"
+                }`}
+              >
+                <span className="text-[var(--color-muted)]">Status:</span>{" "}
+                {status}
               </div>
             </form>
 
@@ -439,7 +462,11 @@ const CreateCeremonyInner = dynamic(
   },
   {
     ssr: false,
-    loading: () => <div className="card animate-pulse h-96 m-8" />,
+    loading: () => (
+      <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6 lg:px-8">
+        <div className="skeleton h-[32rem]" />
+      </div>
+    ),
   }
 );
 
@@ -454,16 +481,24 @@ function Field({
 }) {
   return (
     <div>
-      <label className="block text-sm font-medium mb-1">{label}</label>
+      <label className="mb-1.5 block text-sm font-medium">{label}</label>
       {children}
-      <p className="text-xs text-[var(--color-muted)] mt-1">{hint}</p>
+      <p className="mt-1.5 text-xs leading-relaxed text-[var(--color-muted)]">
+        {hint}
+      </p>
     </div>
   );
 }
 
 export default function CreateCeremonyPage() {
   return (
-    <Suspense fallback={<div className="card animate-pulse h-96 m-8" />}>
+    <Suspense
+      fallback={
+        <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6 lg:px-8">
+          <div className="skeleton h-[32rem]" />
+        </div>
+      }
+    >
       <CreateCeremonyInner />
     </Suspense>
   );

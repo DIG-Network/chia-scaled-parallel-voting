@@ -542,15 +542,17 @@ const CeremonyPageInner = dynamic(
 
       if (!launcherId) {
         return (
-          <main className="container">
-            <h1>Ceremony</h1>
-            <p>
-              No ceremony selected. Pass <code>?id=&lt;launcher_hex&gt;</code> in
-              the URL.
-            </p>
-            <p>
-              <Link href="/create">← Back to Create</Link>
-            </p>
+          <main className="container py-10">
+            <div className="card-elev space-y-3">
+              <h1 className="text-2xl font-semibold">Ceremony</h1>
+              <p className="text-sm text-[var(--color-muted-strong)]">
+                No ceremony selected. Pass{" "}
+                <code className="mono">?id=&lt;launcher_hex&gt;</code> in the URL.
+              </p>
+              <Link href="/create" className="btn-secondary text-sm">
+                ← Back to Create
+              </Link>
+            </div>
             <Footer />
           </main>
         );
@@ -558,17 +560,23 @@ const CeremonyPageInner = dynamic(
 
       if (bootstrapMissing && !bootstrap) {
         return (
-          <main className="container">
-            <h1>Ceremony</h1>
-            <p>
-              No bootstrap found in this browser session for ceremony{" "}
-              <code>{truncHex(`0x${launcherId}`)}</code>.
-            </p>
-            <p>
-              Cross-browser bootstrap recovery (chain-walk of the ceremony
-              singleton's launcher memo) lands in Phase 5 — until then, deploy
-              the ceremony from this browser via <Link href="/create">/create</Link>.
-            </p>
+          <main className="container py-10">
+            <div className="card-elev space-y-3">
+              <h1 className="text-2xl font-semibold">Ceremony</h1>
+              <p className="text-sm text-[var(--color-muted-strong)]">
+                No bootstrap found in this browser session for ceremony{" "}
+                <code className="mono">{truncHex(`0x${launcherId}`)}</code>.
+              </p>
+              <p className="text-sm leading-relaxed text-[var(--color-muted)]">
+                Cross-browser bootstrap recovery (chain-walk of the ceremony
+                singleton's launcher memo) lands in Phase 5 — until then, deploy
+                the ceremony from this browser via{" "}
+                <Link href="/create" className="text-[var(--color-accent)] hover:underline">
+                  /create
+                </Link>
+                .
+              </p>
+            </div>
             <Footer />
           </main>
         );
@@ -576,9 +584,13 @@ const CeremonyPageInner = dynamic(
 
       if (!bootstrap) {
         return (
-          <main className="container">
-            <h1>Ceremony</h1>
-            <p>Loading…</p>
+          <main className="container py-10">
+            <p className="eyebrow mb-2">Trusted setup</p>
+            <h1 className="text-3xl font-medium tracking-tight">Ceremony</h1>
+            <div className="mt-8 space-y-3">
+              <div className="skeleton h-48" />
+              <div className="skeleton h-32" />
+            </div>
           </main>
         );
       }
@@ -587,18 +599,19 @@ const CeremonyPageInner = dynamic(
         contributions.length >= bootstrap.minParticipants;
 
       return (
-        <main className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <main className="fade-up mx-auto max-w-3xl px-4 py-10 sm:px-6 lg:px-8">
           <Link
             href="/ceremonies"
-            className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)]"
+            className="inline-flex items-center gap-1 text-sm text-[var(--color-muted)] transition-colors hover:text-[var(--color-foreground)]"
           >
-            ← all ceremonies
+            ← All ceremonies
           </Link>
-          <header className="mt-4 mb-6">
-            <h1 className="text-3xl font-bold">
+          <header className="mb-6 mt-5">
+            <p className="eyebrow mb-2">Trusted setup</p>
+            <h1 className="text-3xl font-medium tracking-tight">
               {bootstrap.label || "Ceremony"}
             </h1>
-            <p className="text-sm text-[var(--color-muted)] mt-1 mono">
+            <p className="mono mt-1.5 text-sm text-[var(--color-muted)]">
               {truncHex(`0x${launcherId}`)}
             </p>
           </header>
@@ -611,14 +624,13 @@ const CeremonyPageInner = dynamic(
               <dd>
                 {status ? (
                   <span
-                    style={{
-                      color:
-                        status.kind === "open"
-                          ? "#1a7f1a"
-                          : status.kind === "pre-open"
-                            ? "#888"
-                            : "#b35900",
-                    }}
+                    className={
+                      status.kind === "open"
+                        ? "text-[var(--color-success)]"
+                        : status.kind === "pre-open"
+                          ? "text-[var(--color-muted)]"
+                          : "text-[var(--color-warning)]"
+                    }
                   >
                     {formatStatus(status)}
                   </span>
@@ -638,9 +650,9 @@ const CeremonyPageInner = dynamic(
               <dd>
                 {contributions.length} / {bootstrap.minParticipants}{" "}
                 {thresholdMet ? (
-                  <span style={{ color: "#1a7f1a" }}>✓ met</span>
+                  <span className="text-[var(--color-success)]">✓ met</span>
                 ) : (
-                  <span style={{ color: "#888" }}>
+                  <span className="text-[var(--color-muted)]">
                     (need {bootstrap.minParticipants - contributions.length}{" "}
                     more)
                   </span>
@@ -673,8 +685,8 @@ const CeremonyPageInner = dynamic(
                 {singletonTip == null
                   ? "—"
                   : singletonTip.state.finalized
-                    ? <span style={{ color: "#1a7f1a" }}>✓ true</span>
-                    : <span style={{ color: "#888" }}>false (pre-finalize)</span>}
+                    ? <span className="text-[var(--color-success)]">✓ true</span>
+                    : <span className="text-[var(--color-muted)]">false (pre-finalize)</span>}
               </dd>
               <dt className="text-[var(--color-muted)]">state.vk_hash</dt>
               <dd>
@@ -692,12 +704,12 @@ const CeremonyPageInner = dynamic(
               </dd>
             </dl>
             {singletonTipError ? (
-              <p className="text-xs mt-3" style={{ color: "red" }}>
+              <p className="mt-3 text-xs text-[var(--color-danger)]">
                 Singleton tip walk error: {singletonTipError}
               </p>
             ) : null}
             {contributionsError ? (
-              <p className="text-xs mt-3" style={{ color: "red" }}>
+              <p className="mt-3 text-xs text-[var(--color-danger)]">
                 Chain-walk error: {contributionsError}
               </p>
             ) : null}
@@ -764,66 +776,52 @@ const CeremonyPageInner = dynamic(
 
           {submitting && submitStatus ? (
             <div
-              style={{
-                marginTop: "1rem",
-                padding: "0.75rem",
-                border: "1px solid var(--color-border)",
-                borderRadius: "0.25rem",
-                background: "#fafafa",
-                color: "#222",
-              }}
+              className="mt-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-sunken)] p-3"
+              aria-live="polite"
             >
-              <h3 className="text-base font-semibold">Submitting contribution…</h3>
-              <p className="text-sm mt-1">{submitStatus}</p>
-              <p className="text-xs text-[var(--color-muted)] mt-2">
-                Two-signer flow: Sage signs the funder coin (AGG_SIG_ME)
-                and a fresh local participant key signs the
-                AGG_SIG_UNSAFE on the contribution_hash. The two G2
-                sigs are aggregated before broadcast.
+              <h3 className="flex items-center gap-2 text-base font-semibold">
+                <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-[var(--color-accent)] border-t-transparent" />
+                Submitting contribution…
+              </h3>
+              <p className="mt-1 text-sm text-[var(--color-accent)]">
+                {submitStatus}
+              </p>
+              <p className="mt-2 text-xs leading-relaxed text-[var(--color-muted)]">
+                Two-signer flow: Sage signs the funder coin (AGG_SIG_ME) and a
+                fresh local participant key signs the AGG_SIG_UNSAFE on the
+                contribution_hash. The two G2 sigs are aggregated before
+                broadcast.
               </p>
             </div>
           ) : null}
 
           {submitError ? (
             <div
-              style={{
-                marginTop: "1rem",
-                padding: "0.75rem",
-                border: "1px solid #c33",
-                borderRadius: "0.25rem",
-                background: "#fff5f5",
-                color: "#900",
-              }}
+              className="mt-4 rounded-lg border border-[var(--color-danger)]/40 bg-[var(--color-danger)]/[0.1] p-3"
+              role="alert"
             >
-              <h3 className="text-base font-semibold">Contribution failed</h3>
-              <p className="text-sm mt-1" style={{ wordBreak: "break-all" }}>
+              <h3 className="text-base font-semibold text-[var(--color-danger)]">
+                Contribution failed
+              </h3>
+              <p className="mt-1 break-all text-sm text-[var(--color-muted-strong)]">
                 {submitError}
               </p>
             </div>
           ) : null}
 
           {submittedMarker ? (
-            <div
-              style={{
-                marginTop: "1rem",
-                padding: "0.75rem",
-                border: "1px solid #1a7f1a",
-                borderRadius: "0.25rem",
-                background: "#e6f7e6",
-                color: "#0a3d0a",
-              }}
-            >
-              <h3 className="text-base font-semibold">
+            <div className="mt-4 rounded-lg border border-[var(--color-success)]/40 bg-[var(--color-success)]/[0.1] p-3">
+              <h3 className="text-base font-semibold text-[var(--color-success)]">
                 ✓ Contribution submitted
               </h3>
-              <p className="text-sm mt-1">
+              <p className="mt-1 text-sm">
                 Marker coin id:{" "}
                 <code className="mono">{truncHex(submittedMarker)}</code>
               </p>
-              <p className="text-xs mt-2">
-                The on-chain coin index below will refresh on its next
-                30s poll. Once the threshold is reached this page
-                will surface the derived VK.
+              <p className="mt-2 text-xs leading-relaxed text-[var(--color-muted)]">
+                The on-chain coin index below will refresh on its next 30s poll.
+                Once the threshold is reached this page will surface the derived
+                VK.
               </p>
             </div>
           ) : null}
@@ -831,21 +829,20 @@ const CeremonyPageInner = dynamic(
 
           {/* === VK ready card (only when threshold met) === */}
           {contributions.length >= bootstrap.minParticipants ? (
-            <section
-              className="card-elev p-4 mb-4"
-              style={{ background: "#e6f7e6", color: "#0a3d0a" }}
-            >
-              <h2 className="text-lg font-semibold mb-2">
-                ✓ Verification key ready
+            <section className="mb-4 rounded-2xl border border-[var(--color-success)]/35 bg-[var(--color-success)]/[0.08] p-5 shadow-[var(--shadow)]">
+              <h2 className="mb-1 flex items-center gap-2 text-lg font-semibold text-[var(--color-success)]">
+                <span aria-hidden>✓</span> Verification key ready
               </h2>
-              <p>
+              <p className="text-sm leading-relaxed text-[var(--color-muted-strong)]">
                 Threshold met ({contributions.length}/
-                {bootstrap.minParticipants}). The Groth16 VK derived
-                from these on-chain contributions:
+                {bootstrap.minParticipants}). The Groth16 VK derived from these
+                on-chain contributions:
               </p>
               {derivedVkHex ? (
                 <>
                   <pre
+                    role="button"
+                    tabIndex={0}
                     onClick={async () => {
                       try {
                         await navigator.clipboard.writeText(derivedVkHex);
@@ -859,44 +856,36 @@ const CeremonyPageInner = dynamic(
                       }
                     }}
                     title="Click to copy"
-                    style={{
-                      cursor: "pointer",
-                      whiteSpace: "pre-wrap",
-                      wordBreak: "break-all",
-                      background: "#fff",
-                      color: "#000",
-                      padding: "0.5rem",
-                      border: "1px solid #ccc",
-                      fontSize: "0.75em",
-                      maxHeight: "10rem",
-                      overflow: "auto",
-                    }}
+                    className="mono mt-3 max-h-40 cursor-pointer overflow-auto whitespace-pre-wrap break-all rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-sunken)] p-3 text-xs"
                   >
                     {derivedVkHex}
                   </pre>
                   <div
-                    style={{
-                      fontSize: "0.85em",
-                      color: copyFeedback === "copied!" ? "#1a7f1a" : "#888",
-                      marginTop: "0.25rem",
-                    }}
+                    aria-live="polite"
+                    className={`mt-1.5 text-xs ${
+                      copyFeedback === "copied!"
+                        ? "text-[var(--color-success)]"
+                        : "text-[var(--color-muted)]"
+                    }`}
                   >
-                    {copyFeedback ?? "Click the box above to copy. Paste into /create's Verification key field."}
+                    {copyFeedback ??
+                      "Click the box above to copy. Paste into /create's Verification key field."}
                   </div>
                   <Link
                     href={`/create?vkHex=${derivedVkHex}&ceremonyId=0x${launcherId}`}
-                    className="btn-primary inline-block"
-                    style={{ marginTop: "0.5rem" }}
+                    className="btn-primary mt-3"
                   >
                     Use this VK to launch an election →
                   </Link>
                 </>
               ) : vkDeriveError ? (
-                <div style={{ color: "red" }}>
+                <div className="mt-3 text-sm text-[var(--color-danger)]">
                   Error deriving VK: {vkDeriveError}
                 </div>
               ) : (
-                <div>Deriving VK…</div>
+                <div className="mt-3 text-sm text-[var(--color-muted)]">
+                  Deriving VK…
+                </div>
               )}
             </section>
           ) : null}
@@ -913,46 +902,44 @@ const CeremonyPageInner = dynamic(
                 ceremony's launcher id. Each is a child of the
                 singleton's recreate spend at amount=2.
               </p>
-              <table
-                style={{
-                  marginTop: "0.5rem",
-                  width: "100%",
-                  fontSize: "0.85em",
-                  borderCollapse: "collapse",
-                }}
-              >
-                <thead>
-                  <tr style={{ textAlign: "left", borderBottom: "1px solid #ddd" }}>
-                    <th style={{ padding: "0.25rem" }}>#</th>
-                    <th>participant_pubkey</th>
-                    <th>contribution_hash</th>
-                    <th>entropy_hex</th>
-                    <th>marker coin_id</th>
-                    <th>block</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {contributions.map((c, i) => {
-                    const entropyHex = c.entropyHex ?? "";
-                    const entropyDisplay = entropyHex
-                      ? truncHex(entropyHex)
-                      : "—";
-                    return (
-                      <tr key={c.coinIdHex} style={{ borderBottom: "1px solid #eee" }}>
-                        <td style={{ padding: "0.25rem" }}>
-                          {i + 1}
-                          {i === 0 ? " (gen)" : ""}
-                        </td>
-                        <td><code>{truncHex(c.participantPkHex)}</code></td>
-                        <td><code>{truncHex(c.contributionHashHex)}</code></td>
-                        <td><code>{entropyDisplay}</code></td>
-                        <td><code>{truncHex(c.coinIdHex)}</code></td>
-                        <td>{c.blockHeight}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+              <div className="mt-2 overflow-x-auto">
+                <table className="w-full border-collapse text-left text-[0.85em]">
+                  <thead>
+                    <tr className="border-b border-[var(--color-border-strong)] text-xs uppercase tracking-wide text-[var(--color-muted)]">
+                      <th className="py-1.5 pr-3 font-medium">#</th>
+                      <th className="pr-3 font-medium">participant_pubkey</th>
+                      <th className="pr-3 font-medium">contribution_hash</th>
+                      <th className="pr-3 font-medium">entropy_hex</th>
+                      <th className="pr-3 font-medium">marker coin_id</th>
+                      <th className="font-medium">block</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {contributions.map((c, i) => {
+                      const entropyHex = c.entropyHex ?? "";
+                      const entropyDisplay = entropyHex
+                        ? truncHex(entropyHex)
+                        : "—";
+                      return (
+                        <tr
+                          key={c.coinIdHex}
+                          className="border-b border-[var(--color-border)]"
+                        >
+                          <td className="py-1.5 pr-3 text-[var(--color-muted)]">
+                            {i + 1}
+                            {i === 0 ? " (gen)" : ""}
+                          </td>
+                          <td className="pr-3"><code className="mono">{truncHex(c.participantPkHex)}</code></td>
+                          <td className="pr-3"><code className="mono">{truncHex(c.contributionHashHex)}</code></td>
+                          <td className="pr-3"><code className="mono">{entropyDisplay}</code></td>
+                          <td className="pr-3"><code className="mono">{truncHex(c.coinIdHex)}</code></td>
+                          <td className="mono">{c.blockHeight}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
               <p className="text-xs text-[var(--color-muted)] mt-3">
                 Each row is a marker CeremonyCoin minted by the
                 singleton's contribute action (amount=2). The
@@ -971,9 +958,13 @@ const CeremonyPageInner = dynamic(
   {
     ssr: false,
     loading: () => (
-      <main className="container">
-        <h1>Ceremony</h1>
-        <p>Loading…</p>
+      <main className="container py-10">
+        <p className="eyebrow mb-2">Trusted setup</p>
+        <h1 className="text-3xl font-medium tracking-tight">Ceremony</h1>
+        <div className="mt-8 space-y-3">
+          <div className="skeleton h-48" />
+          <div className="skeleton h-32" />
+        </div>
       </main>
     ),
   }
@@ -993,9 +984,13 @@ export default function CeremonyPage() {
   return (
     <Suspense
       fallback={
-        <main className="container">
-          <h1>Ceremony</h1>
-          <p>Loading…</p>
+        <main className="container py-10">
+          <p className="eyebrow mb-2">Trusted setup</p>
+          <h1 className="text-3xl font-medium tracking-tight">Ceremony</h1>
+          <div className="mt-8 space-y-3">
+            <div className="skeleton h-48" />
+            <div className="skeleton h-32" />
+          </div>
         </main>
       }
     >

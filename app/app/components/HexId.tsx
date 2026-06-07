@@ -43,6 +43,7 @@ export function HexId({
     );
   }
   const display = hex.startsWith("0x") ? hex : `0x${hex}`;
+  const successColor = "var(--color-success)";
   const onCopy = async () => {
     try {
       await navigator.clipboard.writeText(display);
@@ -66,31 +67,30 @@ export function HexId({
         }
       }}
       className={`mono ${className ?? ""}`}
-      title={copied ? "copied!" : "Click to copy"}
+      title={copied ? "Copied!" : "Click to copy"}
       style={{
         cursor: "pointer",
         wordBreak: "break-all",
         userSelect: "all",
-        // Subtle hover affordance — underline on hover/focus signals
-        // the click target without being noisy in the resting state.
-        textDecoration: copied ? "none" : undefined,
-        color: copied ? "#1a7f1a" : undefined,
+        transition: "color var(--dur-fast) var(--ease-out)",
+        color: copied ? successColor : undefined,
       }}
     >
       {prefix ? <span style={{ color: "var(--color-muted)" }}>{prefix}</span> : null}
       {display}
-      {copied ? (
-        <span
-          aria-live="polite"
-          style={{
-            marginLeft: "0.5em",
-            fontSize: "0.75em",
-            color: "#1a7f1a",
-          }}
-        >
-          copied!
-        </span>
-      ) : null}
+      <span
+        aria-live="polite"
+        style={{
+          marginLeft: "0.5em",
+          fontSize: "0.75em",
+          fontWeight: 600,
+          color: successColor,
+          opacity: copied ? 1 : 0,
+          transition: "opacity var(--dur-fast) var(--ease-out)",
+        }}
+      >
+        {copied ? "copied ✓" : ""}
+      </span>
     </span>
   );
 }

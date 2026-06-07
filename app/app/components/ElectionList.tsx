@@ -23,10 +23,15 @@ export default function ElectionList() {
 
   if (list.length === 0) {
     return (
-      <div className="card text-[var(--color-muted)]">
-        <p>No elections in your local list yet.</p>
-        <p className="mt-2">
-          <Link href="/create" className="text-[var(--color-accent)] hover:underline">
+      <div className="card border-dashed text-[var(--color-muted-strong)]">
+        <p className="font-medium text-[var(--color-foreground)]">
+          No elections yet
+        </p>
+        <p className="mt-1.5 text-sm">
+          <Link
+            href="/create"
+            className="text-[var(--color-accent)] hover:underline"
+          >
             Create a new election
           </Link>{" "}
           or paste a launcher_id below to import an existing one.
@@ -42,34 +47,43 @@ export default function ElectionList() {
         const participated = address
           ? (e.registeredPubkeysHex ?? []).length > 0
           : false;
+        const href = `/election/?id=${e.launcherIdHex.replace(/^0x/, "")}`;
         return (
-          <Link
+          <div
             key={e.launcherIdHex}
-            href={`/election/?id=${e.launcherIdHex.replace(/^0x/, "")}`}
-            className="block card hover:border-[var(--color-accent)] transition-colors"
-            onClick={() => writeElectionBootstrap(bootstrapFromStored(e))}
+            className="card card-interactive relative"
           >
+            {/* Full-card click target; the remove button sits above it
+                with its own z-index so the anchor isn't nested in a
+                button (valid HTML + keyboard-reachable controls). */}
+            <Link
+              href={href}
+              onClick={() => writeElectionBootstrap(bootstrapFromStored(e))}
+              className="absolute inset-0 rounded-[inherit]"
+              aria-label={`Open election ${e.label}`}
+            />
             <div className="flex items-start justify-between gap-4">
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <h3 className="font-semibold text-lg truncate">{e.label}</h3>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="truncate text-lg font-semibold">{e.label}</h3>
                   {participated && (
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-[var(--color-accent)]/15 text-[var(--color-accent)]">
-                      Registered
-                    </span>
+                    <span className="badge badge-accent">Registered</span>
                   )}
                 </div>
-                <div className="mono text-xs text-[var(--color-muted)] mt-1">
+                <div className="mono mt-1 text-xs text-[var(--color-muted)]">
                   {truncHex(e.launcherIdHex, 10, 8)}
                 </div>
-                <div className="grid grid-cols-3 gap-2 mt-3 text-sm">
+                <div className="mt-4 grid grid-cols-3 gap-2 text-sm">
                   <div>
-                    <div className="text-xs text-[var(--color-muted)]">Collateral</div>
-                    <div className="mono">
+                    <div className="text-xs uppercase tracking-wide text-[var(--color-muted)]">
+                      Collateral
+                    </div>
+                    <div className="mono mt-0.5">
                       {formatCat(cfg.collateral_amount)}
-                      <span className="text-[var(--color-muted)] text-xs ml-1">
+                      <span className="ml-1 text-xs text-[var(--color-muted)]">
                         {truncHex(
-                          "0x" + normalizeHex32(String(cfg.cat_tail_hash_hex ?? "")),
+                          "0x" +
+                            normalizeHex32(String(cfg.cat_tail_hash_hex ?? "")),
                           4,
                           4
                         )}
@@ -77,28 +91,42 @@ export default function ElectionList() {
                     </div>
                   </div>
                   <div>
-                    <div className="text-xs text-[var(--color-muted)]">Reg. fee</div>
-                    <div className="mono">{formatXch(cfg.registration_fee)} XCH</div>
+                    <div className="text-xs uppercase tracking-wide text-[var(--color-muted)]">
+                      Reg. fee
+                    </div>
+                    <div className="mono mt-0.5">
+                      {formatXch(cfg.registration_fee)} XCH
+                    </div>
                   </div>
                   <div>
-                    <div className="text-xs text-[var(--color-muted)]">Window</div>
-                    <div className="mono">{cfg.election_length_blocks} blocks</div>
+                    <div className="text-xs uppercase tracking-wide text-[var(--color-muted)]">
+                      Window
+                    </div>
+                    <div className="mono mt-0.5">
+                      {cfg.election_length_blocks} blocks
+                    </div>
                   </div>
                 </div>
               </div>
               <button
-                onClick={(ev) => {
-                  ev.preventDefault();
-                  ev.stopPropagation();
-                  handleRemove(e.launcherIdHex);
-                }}
-                className="text-[var(--color-muted)] hover:text-[var(--color-danger)] text-xl"
+                onClick={() => handleRemove(e.launcherIdHex)}
+                className="relative z-10 -mr-1 -mt-1 grid h-8 w-8 shrink-0 place-items-center rounded-md text-[var(--color-muted)] transition-colors hover:bg-[var(--color-danger)]/10 hover:text-[var(--color-danger)]"
+                aria-label={`Remove ${e.label} from your local list`}
                 title="Remove from local list"
               >
-                ×
+                <svg
+                  className="h-4 w-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                  aria-hidden
+                >
+                  <path strokeLinecap="round" d="M6 6l12 12M6 18L18 6" />
+                </svg>
               </button>
             </div>
-          </Link>
+          </div>
         );
       })}
     </div>

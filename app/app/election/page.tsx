@@ -2056,8 +2056,12 @@ const ElectionPageInner = dynamic(
 
       if (chainStatus === "checking") {
         return (
-          <main className="max-w-4xl mx-auto px-4 py-8">
-            <div className="card animate-pulse h-48" />
+          <main className="mx-auto max-w-4xl px-4 py-8 sm:px-6 lg:px-8">
+            <div className="space-y-4">
+              <div className="skeleton h-9 w-2/3" />
+              <div className="skeleton h-40" />
+              <div className="skeleton h-32" />
+            </div>
           </main>
         );
       }
@@ -2911,7 +2915,7 @@ const ElectionPageInner = dynamic(
                       if (lockHex == null) return null;
                       if (lockHex === NO_LOCK) {
                         return (
-                          <p className="text-xs mb-3" style={{ color: "#666" }}>
+                          <p className="mb-3 text-xs text-[var(--color-muted)]">
                             Election vote mode: <strong>no lock</strong> —
                             this ballot's choices set its own merkle root.
                           </p>
@@ -2919,7 +2923,7 @@ const ElectionPageInner = dynamic(
                       }
                       if (lockHex === FREE_LOCK) {
                         return (
-                          <p className="text-xs mb-3" style={{ color: "#1a7f1a" }}>
+                          <p className="mb-3 text-xs text-[var(--color-success)]">
                             ✓ Election locked to <strong>Mode1Free</strong> —
                             any 32-byte vote_data accepted; the choices
                             below are advisory (vote_options_root forced
@@ -2928,19 +2932,19 @@ const ElectionPageInner = dynamic(
                         );
                       }
                       return (
-                        <div className="text-xs mb-3" style={{ color: "#1a7f1a" }}>
+                        <div className="mb-3 text-xs text-[var(--color-success)]">
                           ✓ Election locked to <strong>Mode2Restricted</strong>
                           {" "}(root=0x{lockHex.slice(0, 16)}…). Voter choices
                           must hash to this exact root.
                           {lockedRestrictedLabels && lockedRestrictedLabels.length > 0 ? (
-                            <p className="mt-1" style={{ color: "#666" }}>
+                            <p className="mt-1 text-[var(--color-muted)]">
                               Locked options:{" "}
                               <code className="mono">
                                 {lockedRestrictedLabels.join(", ")}
                               </code>
                             </p>
                           ) : (
-                            <p className="mt-1" style={{ color: "#b00020" }}>
+                            <p className="mt-1 text-[var(--color-danger)]">
                               ⚠ No labels in localStorage for this root —
                               ask the operator who deployed for the canonical
                               comma-separated label list.
@@ -3168,7 +3172,18 @@ const ElectionPageInner = dynamic(
       );
     };
   },
-  { ssr: false, loading: () => <div className="card animate-pulse h-96 m-8" /> }
+  {
+    ssr: false,
+    loading: () => (
+      <div className="mx-auto max-w-4xl px-4 py-8 sm:px-6 lg:px-8">
+        <div className="space-y-4">
+          <div className="skeleton h-9 w-2/3" />
+          <div className="skeleton h-40" />
+          <div className="skeleton h-32" />
+        </div>
+      </div>
+    ),
+  }
 );
 
 /**
@@ -3185,7 +3200,15 @@ const ElectionPageInner = dynamic(
 export default function ElectionPageRoute() {
   return (
     <Suspense
-      fallback={<div className="card animate-pulse h-96 m-8" />}
+      fallback={
+        <div className="mx-auto max-w-4xl px-4 py-8 sm:px-6 lg:px-8">
+          <div className="space-y-4">
+            <div className="skeleton h-9 w-2/3" />
+            <div className="skeleton h-40" />
+            <div className="skeleton h-32" />
+          </div>
+        </div>
+      }
     >
       <ElectionPageInner />
     </Suspense>

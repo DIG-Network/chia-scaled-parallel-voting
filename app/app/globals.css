@@ -1,29 +1,154 @@
 @import "tailwindcss";
 
+/* ════════════════════════════════════════════════════════════════════
+   CHIP Voting — design tokens
+   ────────────────────────────────────────────────────────────────────
+   A single source of truth for the visual language. Every page consumes
+   these via the `.card`, `.btn-*`, `.input`, `.badge-*` primitives below
+   and the `--color-*` Tailwind theme bridge (`@theme inline`).
+
+   Aesthetic: "civic terminal" — a refined, technical governance
+   interface. Editorial serif display (Fraunces) over a neutral
+   interface sans (IBM Plex Sans), with a ledger monospace (IBM Plex
+   Mono) for every hex / numeric value. Deep blue-black canvas, a single
+   signal-green accent, and disciplined semantic status colors tuned for
+   WCAG AA on the dark surface.
+   ════════════════════════════════════════════════════════════════════ */
+
 :root {
-  --background: #0b0e16;
-  --foreground: #e6e8ee;
-  --card: #141926;
-  --card-elevated: #1a2030;
-  --border: #232a3b;
-  --accent: #4ade80;       /* emerald-400 */
-  --accent-hover: #22c55e; /* emerald-500 */
-  --muted: #6b7280;        /* gray-500 */
-  --danger: #f87171;       /* red-400 */
+  color-scheme: dark;
+
+  /* — Surfaces — */
+  --background: #0a0d15;
+  --bg-grad-1: #0d1322;
+  --bg-grad-2: #0a0d15;
+  --foreground: #e8eaf2;
+  --card: #121826;
+  --card-elevated: #182032;
+  --surface-sunken: #0c111c;
+  --border: #232c40;
+  --border-strong: #303b54;
+
+  /* — Brand accent (signal green) — */
+  --accent: #34d399;        /* emerald-400, AA on dark surfaces */
+  --accent-hover: #10b981;  /* emerald-500 */
+  --accent-soft: rgba(52, 211, 153, 0.12);
+  --accent-contrast: #04150d; /* text on solid accent */
+
+  /* — Text tiers — */
+  --muted: #8b94a7;         /* AA (4.6:1) on --background */
+  --muted-strong: #aab2c4;
+  --faint: #5e6678; /* decorative only — never used for essential text */
+
+  /* — Semantic status (all AA on dark surfaces) — */
+  --success: #4ade80;
+  --success-soft: rgba(74, 222, 128, 0.12);
+  --warning: #fbbf24;
+  --warning-soft: rgba(251, 191, 36, 0.12);
+  --danger: #fb7185;        /* rose-400 */
+  --danger-soft: rgba(251, 113, 133, 0.12);
+  --info: #60a5fa;          /* sky-400 */
+  --info-soft: rgba(96, 165, 250, 0.12);
+
+  /* — Aliases for tokens referenced throughout the app that were never
+       defined (these previously rendered transparent / inert). Mapping
+       them here fixes real visual bugs without touching page logic. — */
+  --bg: var(--card);
+  --bg-elev: var(--card-elevated);
+  --muted-bg: rgba(255, 255, 255, 0.04);
+
+  /* — Radii — */
+  --radius-sm: 0.5rem;
+  --radius: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.25rem;
+
+  /* — Elevation — */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow: 0 4px 24px -8px rgba(0, 0, 0, 0.55);
+  --shadow-lg: 0 24px 60px -20px rgba(0, 0, 0, 0.7);
+  --ring: 0 0 0 2px var(--background), 0 0 0 4px var(--accent);
+
+  /* — Motion — */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 120ms;
+  --dur: 200ms;
+  --dur-slow: 380ms;
 }
 
+/* Warm-paper light theme for visitors whose OS prefers light. Keeps the
+   same hierarchy and contrast budget; the app's `dark:` variants are
+   authored against this. */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --background: #f6f5f0;
+    --bg-grad-1: #ffffff;
+    --bg-grad-2: #efeee8;
+    --foreground: #1a1e29;
+    --card: #ffffff;
+    --card-elevated: #ffffff;
+    --surface-sunken: #efeee7;
+    --border: #e0ddd2;
+    --border-strong: #cdc9bb;
+    --accent: #0f9d63;
+    --accent-hover: #0b7d4e;
+    --accent-soft: rgba(15, 157, 99, 0.1);
+    --accent-contrast: #ffffff;
+    --muted: #6a6f7d;
+    --muted-strong: #4c5160;
+    --success: #15803d;
+    --success-soft: rgba(21, 128, 61, 0.1);
+    --warning: #b45309;
+    --warning-soft: rgba(180, 83, 9, 0.1);
+    --danger: #be123c;
+    --danger-soft: rgba(190, 18, 60, 0.08);
+    --info: #1d4ed8;
+    --info-soft: rgba(29, 78, 216, 0.08);
+    --muted-bg: rgba(0, 0, 0, 0.04);
+    --shadow-sm: 0 1px 2px rgba(20, 25, 40, 0.08);
+    --shadow: 0 6px 24px -10px rgba(20, 25, 40, 0.16);
+    --shadow-lg: 0 24px 60px -22px rgba(20, 25, 40, 0.22);
+  }
+}
+
+/* Tailwind v4 theme bridge — exposes tokens as `bg-*`, `text-*`, etc.
+   utilities and to the existing `var(--color-*)` references in JSX. */
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
   --color-card-elevated: var(--card-elevated);
+  --color-surface-sunken: var(--surface-sunken);
   --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-accent: var(--accent);
   --color-accent-hover: var(--accent-hover);
   --color-muted: var(--muted);
+  --color-muted-strong: var(--muted-strong);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
   --color-danger: var(--danger);
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
-  --font-mono: ui-monospace, "JetBrains Mono", "Fira Code", monospace;
+  --color-info: var(--info);
+
+  /* Aliases consumed by existing JSX (previously undefined → fixed). */
+  --color-bg: var(--bg);
+  --color-bg-elev: var(--bg-elev);
+  --color-muted-bg: var(--muted-bg);
+
+  --font-display: var(--font-fraunces), "Fraunces", ui-serif, Georgia, serif;
+  --font-sans: var(--font-plex-sans), "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-plex-mono), "IBM Plex Mono", ui-monospace, "JetBrains Mono", monospace;
+}
+
+/* ── Base ─────────────────────────────────────────────────────────── */
+
+* {
+  border-color: var(--border);
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
 }
 
 html,
@@ -32,69 +157,383 @@ body {
   color: var(--foreground);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-/* Hex / id displays — always monospace, slightly de-emphasised */
+/* Atmospheric backdrop: a soft radial glow anchored top-center plus a
+   faint blueprint grid. Fixed so it doesn't scroll, and pointer-events
+   off so it never interferes. Replaces the flat single-color slab. */
+body {
+  position: relative;
+  min-height: 100vh;
+  background-image:
+    radial-gradient(
+      120% 80% at 50% -10%,
+      var(--bg-grad-1) 0%,
+      transparent 60%
+    ),
+    linear-gradient(var(--background), var(--background));
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size: 64px 64px;
+  -webkit-mask-image: radial-gradient(120% 70% at 50% 0%, black 0%, transparent 55%);
+  mask-image: radial-gradient(120% 70% at 50% 0%, black 0%, transparent 55%);
+  opacity: 0.5;
+}
+
+/* Keep app content above the backdrop layers. */
+body > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* Headings use the editorial display serif. */
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+h1 {
+  font-optical-sizing: auto;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+}
+
+/* ── Typography helpers ───────────────────────────────────────────── */
+
+.font-display {
+  font-family: var(--font-display);
+}
+
 .mono {
   font-family: var(--font-mono);
   font-size: 0.875rem;
+  font-feature-settings: "zero" 1;
 }
 
-/* Subtle "card" container used everywhere */
+/* Section eyebrow — small uppercase label above a heading. */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+/* ── Layout ───────────────────────────────────────────────────────── */
+
+/* `.container` is used by /ballot and /ceremony but Tailwind v4 ships no
+   `.container` utility by default — previously those pages had NO max
+   width or centering. Defined here. */
+.container {
+  width: 100%;
+  max-width: 64rem;
+  margin-inline: auto;
+  padding-inline: 1rem;
+}
+@media (min-width: 640px) {
+  .container {
+    padding-inline: 1.5rem;
+  }
+}
+@media (min-width: 1024px) {
+  .container {
+    padding-inline: 2rem;
+  }
+}
+
+/* ── Cards ────────────────────────────────────────────────────────── */
+
 .card {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
-  padding: 1rem;
+  border-radius: var(--radius);
+  padding: 1.25rem;
 }
 
 .card-elev {
   background: var(--card-elevated);
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
-  padding: 1.25rem;
+  border-radius: var(--radius-lg);
+  padding: 1.5rem;
+  box-shadow: var(--shadow);
 }
 
-/* Primary CTA */
+/* Interactive cards (links/buttons rendered as cards) get a tactile
+   hover lift + accent edge. Opt-in via `.card-interactive`. */
+.card-interactive {
+  transition:
+    border-color var(--dur) var(--ease-out),
+    transform var(--dur) var(--ease-out),
+    box-shadow var(--dur) var(--ease-out);
+}
+.card-interactive:hover {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  transform: translateY(-2px);
+  box-shadow: var(--shadow);
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────── */
+
+.btn-primary,
+.btn-secondary,
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  font-weight: 600;
+  font-size: 0.9375rem;
+  line-height: 1.2;
+  padding: 0.5625rem 1.1rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
 .btn-primary {
   background: var(--accent);
-  color: #07120c;
-  font-weight: 600;
-  padding: 0.5rem 1rem;
-  border-radius: 0.5rem;
-  transition: background 0.15s ease;
+  color: var(--accent-contrast);
 }
 .btn-primary:hover:not(:disabled) {
   background: var(--accent-hover);
 }
+.btn-primary:active:not(:disabled) {
+  transform: translateY(1px);
+}
 .btn-primary:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
 
 .btn-secondary {
-  background: transparent;
+  background: var(--card-elevated);
   color: var(--foreground);
-  border: 1px solid var(--border);
-  padding: 0.5rem 1rem;
-  border-radius: 0.5rem;
-  transition: background 0.15s ease;
+  border-color: var(--border-strong);
 }
 .btn-secondary:hover:not(:disabled) {
-  background: var(--card-elevated);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border-strong));
+  background: color-mix(in srgb, var(--accent) 6%, var(--card-elevated));
+}
+.btn-secondary:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.btn-secondary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
+.btn-ghost {
+  background: transparent;
+  color: var(--muted);
+  padding: 0.4rem 0.6rem;
+}
+.btn-ghost:hover:not(:disabled) {
+  color: var(--foreground);
+  background: var(--muted-bg);
+}
+
+/* ── Inputs ───────────────────────────────────────────────────────── */
+
 .input {
-  background: var(--background);
+  background: var(--surface-sunken);
   border: 1px solid var(--border);
   color: var(--foreground);
-  padding: 0.5rem 0.75rem;
-  border-radius: 0.5rem;
+  padding: 0.5625rem 0.75rem;
+  border-radius: var(--radius-sm);
   width: 100%;
   font-family: var(--font-sans);
+  font-size: 0.9375rem;
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+.input::placeholder {
+  color: var(--muted);
+  opacity: 0.7;
+}
+.input:hover:not(:focus):not(:disabled) {
+  border-color: var(--border-strong);
 }
 .input:focus {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
+  outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.input.mono {
+  font-family: var(--font-mono);
+}
+textarea.input {
+  line-height: 1.5;
+}
+
+/* ── Badges / status pills ────────────────────────────────────────── */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.badge-accent {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.badge-success {
+  color: var(--success);
+  background: var(--success-soft);
+  border-color: color-mix(in srgb, var(--success) 35%, transparent);
+}
+.badge-warning {
+  color: var(--warning);
+  background: var(--warning-soft);
+  border-color: color-mix(in srgb, var(--warning) 35%, transparent);
+}
+.badge-danger {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+}
+.badge-info {
+  color: var(--info);
+  background: var(--info-soft);
+  border-color: color-mix(in srgb, var(--info) 35%, transparent);
+}
+.badge-muted {
+  color: var(--muted-strong);
+  background: var(--muted-bg);
+  border-color: var(--border);
+}
+
+/* ── Inline status text (token-driven; replaces hardcoded hex like
+   #1a7f1a / #b00020 / #b35900 / #666 sprinkled across pages). ─────── */
+
+.text-success {
+  color: var(--success);
+}
+.text-warning {
+  color: var(--warning);
+}
+.text-danger {
+  color: var(--danger);
+}
+.text-info {
+  color: var(--info);
+}
+
+/* ── Skeleton loading ─────────────────────────────────────────────── */
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--muted-bg),
+    transparent
+  );
+  animation: skeleton-sweep 1.4s var(--ease-out) infinite;
+}
+@keyframes skeleton-sweep {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* ── Entrance motion ──────────────────────────────────────────────── */
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.fade-up {
+  animation: fade-up var(--dur-slow) var(--ease-out) both;
+}
+
+/* ── Global focus-visible (keyboard accessibility) ────────────────── */
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+  border-radius: var(--radius-sm);
+}
+/* Solid-accent buttons need a contrasting ring against their own fill. */
+.btn-primary:focus-visible {
+  box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--foreground);
+}
+
+/* Links default styling for prose contexts. */
+a {
+  text-underline-offset: 2px;
+}
+
+/* ── Reduced motion ───────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── Scrollbar polish (webkit) ────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  border: 2px solid var(--background);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
 }

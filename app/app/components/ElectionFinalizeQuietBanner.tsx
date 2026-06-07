@@ -42,7 +42,7 @@ export function ElectionFinalizeQuietBanner({
 
   return (
     <section
-      className="rounded-xl border border-[var(--color-border)] bg-[var(--color-accent)]/10 px-4 py-3 text-sm"
+      className="rounded-xl border border-[var(--color-info)]/30 bg-[var(--color-info)]/[0.08] px-4 py-3 text-sm"
       aria-live="polite"
     >
       <div className="font-medium text-[var(--color-foreground)]">
@@ -77,7 +77,7 @@ export function ElectionFinalizeQuietBanner({
           quietCountdown.blocksRemaining <= 0 && (
             <>
               Quiet period elapsed —{" "}
-              <span className="font-semibold text-green-700 dark:text-green-400">
+              <span className="font-semibold text-[var(--color-success)]">
                 finalize time-lock satisfied
               </span>
               <span className="text-[var(--color-muted)]">

@@ -37,8 +37,18 @@ export default function WalletConnector() {
     try {
       await navigator.clipboard.writeText(qrUri);
       setIsCopied(true);
-      toast.success("Link copied!");
-      setTimeout(() => setIsCopied(false), 1000);
+      toast.success("Link copied");
+      setTimeout(() => setIsCopied(false), 1200);
+    } catch {
+      toast.error("Failed to copy");
+    }
+  };
+
+  const handleCopyAddress = async () => {
+    if (!address) return;
+    try {
+      await navigator.clipboard.writeText(address);
+      toast.success("Address copied");
     } catch {
       toast.error("Failed to copy");
     }
@@ -47,17 +57,31 @@ export default function WalletConnector() {
   return (
     <>
       {!isInitialized || !address ? (
-        <button onClick={handleConnect} className="btn-primary">
-          Connect Wallet
+        <button
+          onClick={handleConnect}
+          className="btn-primary text-sm"
+          disabled={!isInitialized}
+        >
+          {isInitialized ? "Connect Wallet" : "Starting…"}
         </button>
       ) : (
-        <div className="flex items-center gap-3">
-          <span className="mono text-[var(--color-muted)]">
-            {truncHex(address, 7, 4)}
-          </span>
+        <div className="flex items-center gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] py-1 pl-1 pr-1">
+          <button
+            onClick={handleCopyAddress}
+            title="Copy full address"
+            className="flex items-center gap-2 rounded-md px-2 py-1 text-sm transition-colors hover:bg-[var(--color-muted-bg)]"
+          >
+            <span
+              aria-hidden
+              className="h-2 w-2 rounded-full bg-[var(--color-success)]"
+            />
+            <span className="mono text-[var(--color-muted-strong)]">
+              {truncHex(address, 7, 4)}
+            </span>
+          </button>
           <button
             onClick={() => walletConnect.disconnectWallet()}
-            className="btn-secondary text-sm"
+            className="btn-ghost px-2 py-1 text-xs"
             title="Disconnect wallet"
           >
             Disconnect
@@ -73,25 +97,30 @@ export default function WalletConnector() {
         <div className="flex flex-col items-center gap-4">
           {qrUri ? (
             <>
-              <div className="bg-white p-4 rounded-lg">
-                <QRCodeSVG value={qrUri} size={256} />
+              <div className="rounded-xl bg-white p-4 shadow-sm">
+                <QRCodeSVG value={qrUri} size={236} />
               </div>
               <button
                 onClick={handleCopyLink}
-                className={`btn-secondary text-sm ${
-                  isCopied ? "text-[var(--color-accent)]" : ""
-                }`}
+                className="btn-secondary text-sm"
               >
-                {isCopied ? "Copied!" : "Copy Link"}
+                {isCopied ? "Copied ✓" : "Copy connection link"}
               </button>
-              <p className="text-sm text-center text-[var(--color-muted)] mt-1">
-                Scan in Sage Wallet, or copy the link and paste it
+              <p className="mt-1 text-center text-sm leading-relaxed text-[var(--color-muted-strong)]">
+                Scan this code in Sage Wallet, or copy the link and paste it
                 into the WalletConnect dialog.
               </p>
             </>
           ) : (
-            <div className="flex items-center justify-center p-4">
-              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[var(--color-accent)]" />
+            <div
+              className="flex flex-col items-center gap-3 p-6"
+              aria-busy
+              aria-live="polite"
+            >
+              <div className="h-9 w-9 animate-spin rounded-full border-2 border-[var(--color-accent)] border-t-transparent" />
+              <p className="text-sm text-[var(--color-muted)]">
+                Preparing a secure connection…
+              </p>
             </div>
           )}
         </div>
@@ -105,6 +134,8 @@ export default function WalletConnector() {
             background: "var(--color-card-elevated)",
             color: "var(--color-foreground)",
             border: "1px solid var(--color-border)",
+            borderRadius: "0.75rem",
+            fontSize: "0.875rem",
           },
         }}
       />

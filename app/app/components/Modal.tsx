@@ -46,26 +46,44 @@ export default function Modal({
     setMounted(true);
   }, []);
 
+  // Close on Escape + lock body scroll while open.
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [isOpen, onClose]);
+
   if (!mounted || !isOpen) return null;
 
   const overlay = (
     <div
       className="fixed inset-0 z-[1000] overflow-y-auto bg-black/60 backdrop-blur-sm"
       onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
     >
       <div className="flex min-h-full items-center justify-center p-4">
         <div
-          className="relative card-elev max-w-md w-full mx-4"
+          className="relative card-elev mx-4 w-full max-w-md fade-up"
           // Stop propagation so clicks INSIDE the card don't dismiss
           // the modal — only clicks on the dimmed backdrop should.
           onClick={(e) => e.stopPropagation()}
         >
-          <div className="flex items-center justify-between pb-4 mb-4 border-b border-[var(--color-border)]">
+          <div className="mb-4 flex items-center justify-between border-b border-[var(--color-border)] pb-4">
             <h3 className="text-lg font-semibold">{title}</h3>
             <button
               onClick={onClose}
-              className="text-[var(--color-muted)] hover:text-[var(--color-foreground)]"
-              aria-label="Close"
+              className="btn-ghost -mr-1 p-1.5"
+              aria-label="Close dialog"
             >
               <svg
                 className="h-6 w-6"

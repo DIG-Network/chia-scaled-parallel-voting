@@ -2253,8 +2253,12 @@ export default function BallotPage() {
   return (
     <Suspense
       fallback={
-        <div className="container py-8 text-[var(--color-muted)]">
-          Loading…
+        <div className="container py-8">
+          <div className="space-y-4">
+            <div className="skeleton h-9 w-1/2" />
+            <div className="skeleton h-32" />
+            <div className="skeleton h-24" />
+          </div>
         </div>
       }
     >
