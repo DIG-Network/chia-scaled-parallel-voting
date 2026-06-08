@@ -502,8 +502,255 @@ fn sha256_concat(a: &[u8], b: &[u8]) -> Bytes32 {
 }
 
 // ============================================================================
+// PoseidonSmt — SNARK-friendly registration accumulator (F1 step 4)
+// ============================================================================
+//
+// Off-chain mirror of the Poseidon-over-Fr registration tree the F1 redesign
+// uses: leaf = Poseidon `hash_leaf(jubjub_px, jubjub_py, weight)`, node =
+// Poseidon `hash2(left, right)`, depth `TREE_DEPTH`. This is the SAME tree the
+// in-circuit membership proof (`prover::circuit_v2`) and the on-chain
+// `puzzles/poseidon.rue` verify against — `poseidon_perm` is the shared
+// primitive, so a proof produced here verifies in the circuit (pinned by
+// `poseidon_smt_proof_verifies_in_circuit`).
+//
+// Identity: a voter is keyed by their JUBJUB signing key (the key the circuit
+// checks the Schnorr signature for). The slot is derived from that key. The
+// root serialises as the 32-byte big-endian form of the Fr root (field
+// elements are < P < 2^255 so this is canonical and matches the integer the
+// circuit consumes as a public input).
+//
+// Built ALONGSIDE the live SHA256 `SparseMerkleTree`; wiring it into
+// register/deregister + the aggregator is the atomic on-chain migration that
+// follows (see docs/F1-finalize-redesign.md step 4).
+
+use crate::prover::poseidon_perm::{cfg as poseidon_cfg, hash2, hash_leaf};
+use ark_bls12_381::Fr;
+use ark_ed_on_bls12_381::EdwardsAffine as JubAffine;
+use ark_ff::{BigInteger, PrimeField};
+use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
+
+/// Serialise an Fr as a 32-byte big-endian array (zero-padded).
+pub fn fr_to_be32(f: Fr) -> [u8; 32] {
+    let v = f.into_bigint().to_bytes_be();
+    let mut out = [0u8; 32];
+    out[32 - v.len()..].copy_from_slice(&v);
+    out
+}
+
+/// Poseidon membership proof: `TREE_DEPTH` sibling field elements (leaf→root)
+/// plus the direction bits (true ⇒ this node is the right child).
+pub struct PoseidonProof {
+    pub siblings: Vec<Fr>,
+    pub bits: Vec<bool>,
+}
+
+/// Sparse Poseidon Merkle tree over Jubjub-keyed registration leaves.
+pub struct PoseidonSmt {
+    cfg: PoseidonConfig<Fr>,
+    depth: usize,
+    /// `empties[i]` = root of an all-empty subtree of height `i`
+    /// (`empties[0]` = empty leaf = 0).
+    empties: Vec<Fr>,
+    /// slot → leaf hash.
+    leaves: BTreeMap<u32, Fr>,
+}
+
+impl PoseidonSmt {
+    pub fn new() -> Self {
+        Self::with_depth(TREE_DEPTH as usize)
+    }
+
+    pub fn with_depth(depth: usize) -> Self {
+        let cfg = poseidon_cfg();
+        let mut empties = vec![Fr::from(0u64)];
+        for i in 0..depth {
+            let p = empties[i];
+            empties.push(hash2(&cfg, p, p));
+        }
+        Self {
+            cfg,
+            depth,
+            empties,
+            leaves: BTreeMap::new(),
+        }
+    }
+
+    /// Canonical slot for a Jubjub key: first 4 bytes of
+    /// `sha256(px_be32 || py_be32)`, big-endian — masked to `depth` bits.
+    pub fn slot_for_jubjub(px: Fr, py: Fr) -> u32 {
+        let mut h = Sha256::new();
+        h.update(fr_to_be32(px));
+        h.update(fr_to_be32(py));
+        let d = h.finalize();
+        u32::from_be_bytes([d[0], d[1], d[2], d[3]])
+    }
+
+    fn slot_masked(&self, px: Fr, py: Fr) -> u32 {
+        let raw = Self::slot_for_jubjub(px, py);
+        if self.depth >= 32 {
+            raw
+        } else {
+            raw & ((1u32 << self.depth) - 1)
+        }
+    }
+
+    /// The registration leaf for a Jubjub key + weight.
+    pub fn leaf_hash(&self, px: Fr, py: Fr, weight: u64) -> Fr {
+        hash_leaf(&self.cfg, px, py, weight)
+    }
+
+    pub fn insert(&mut self, pubkey: JubAffine, weight: u64) {
+        let slot = self.slot_masked(pubkey.x, pubkey.y);
+        let leaf = self.leaf_hash(pubkey.x, pubkey.y, weight);
+        self.leaves.insert(slot, leaf);
+    }
+
+    /// Hash of the subtree spanning slots `[lo, hi)` at remaining `level`
+    /// (caller guarantees `hi - lo == 2^level`). u64 bounds avoid u32
+    /// overflow at the top level (lo=0, hi=2^32). Mirrors the SHA256
+    /// `SparseMerkleTree::subtree_hash`.
+    fn subtree_hash(&self, lo: u64, hi: u64, level: usize) -> Fr {
+        if level == 0 {
+            return *self.leaves.get(&(lo as u32)).unwrap_or(&self.empties[0]);
+        }
+        if !self.range_has_any(lo, hi) {
+            return self.empties[level];
+        }
+        let mid = lo + ((hi - lo) >> 1);
+        let l = self.subtree_hash(lo, mid, level - 1);
+        let r = self.subtree_hash(mid, hi, level - 1);
+        hash2(&self.cfg, l, r)
+    }
+
+    fn range_has_any(&self, lo: u64, hi: u64) -> bool {
+        let lo32 = lo as u32;
+        if hi > u32::MAX as u64 {
+            self.leaves.range(lo32..).next().is_some()
+        } else {
+            let hi32 = hi as u32;
+            if hi32 <= lo32 {
+                return false;
+            }
+            self.leaves.range(lo32..hi32).next().is_some()
+        }
+    }
+
+    pub fn root(&self) -> Fr {
+        self.subtree_hash(0, 1u64 << self.depth, self.depth)
+    }
+
+    /// Root serialised for on-chain state / circuit public input.
+    pub fn root_be32(&self) -> [u8; 32] {
+        fr_to_be32(self.root())
+    }
+
+    /// Membership / emptiness proof for a slot: `depth` sibling hashes
+    /// (leaf→root) + direction bits (true ⇒ node is the right child).
+    pub fn prove(&self, index: u32) -> PoseidonProof {
+        let mut siblings = Vec::with_capacity(self.depth);
+        let mut bits = Vec::with_capacity(self.depth);
+        for level in 0..self.depth {
+            let sibling_parent = ((index as u64) >> level) ^ 1;
+            let span = 1u64 << level;
+            let sibling_lo = sibling_parent * span;
+            let sibling_hi = sibling_lo + span;
+            siblings.push(self.subtree_hash(sibling_lo, sibling_hi, level));
+            bits.push(((index as u64) >> level) & 1 == 1);
+        }
+        PoseidonProof { siblings, bits }
+    }
+
+    pub fn prove_jubjub(&self, px: Fr, py: Fr) -> PoseidonProof {
+        self.prove(self.slot_masked(px, py))
+    }
+}
+
+impl Default for PoseidonSmt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod poseidon_smt_tests {
+    use super::*;
+    use crate::prover::circuit_v2::{keygen, schnorr_sign, SignerV2, VotingCircuitV2};
+    use ark_ed_on_bls12_381::Fr as JubScalar;
+    use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
+
+    /// A single-leaf Poseidon tree's membership proof reconstructs the root.
+    #[test]
+    fn poseidon_smt_proof_reconstructs_root() {
+        let cfg = poseidon_cfg();
+        let mut tree = PoseidonSmt::with_depth(16);
+        let p = keygen(JubScalar::from(9u64));
+        tree.insert(p, 1_000);
+        let slot = {
+            let raw = PoseidonSmt::slot_for_jubjub(p.x, p.y);
+            raw & ((1u32 << 16) - 1)
+        };
+        let proof = tree.prove(slot);
+        // Reconstruct: leaf, then fold siblings per direction bits.
+        let mut node = tree.leaf_hash(p.x, p.y, 1_000);
+        for (sib, &is_right) in proof.siblings.iter().zip(proof.bits.iter()) {
+            node = if is_right {
+                hash2(&cfg, *sib, node)
+            } else {
+                hash2(&cfg, node, *sib)
+            };
+        }
+        assert_eq!(node, tree.root(), "proof must reconstruct the root");
+    }
+
+    /// LOAD-BEARING: a PoseidonSmt membership proof satisfies the in-circuit
+    /// membership constraint of `circuit_v2` — i.e. the off-chain accumulator
+    /// and the Groth16 circuit agree on the SAME tree. (Combined with the Rue
+    /// parity test, all three layers share one accumulator.)
+    #[test]
+    fn poseidon_smt_proof_verifies_in_circuit() {
+        let depth = 20usize;
+        let cfg = poseidon_cfg();
+        let mut tree = PoseidonSmt::with_depth(depth);
+        let x = JubScalar::from(42u64);
+        let p = keygen(x);
+        let weight = 1_000u64;
+        tree.insert(p, weight);
+        let proof = tree.prove_jubjub(p.x, p.y);
+        let root = tree.root();
+
+        let vote_message = Fr::from(0xABCDEFu64);
+        let (r, s) = schnorr_sign(&cfg, x, JubScalar::from(7u64), vote_message);
+        let signer = SignerV2 {
+            pubkey: p,
+            weight,
+            path: proof.siblings,
+            path_bits: proof.bits,
+            sig_r: r,
+            sig_s: s,
+            present: true,
+        };
+        let circuit = VotingCircuitV2 {
+            registration_root: root,
+            vote_message,
+            registration_vote_weight: weight,
+            vote_threshold_num: 1,
+            vote_threshold_den: 2,
+            depth,
+            max_signers: 1,
+            signers: vec![signer],
+        };
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        circuit.generate_constraints(cs.clone()).unwrap();
+        assert!(
+            cs.is_satisfied().unwrap(),
+            "PoseidonSmt proof must satisfy circuit_v2 membership"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
