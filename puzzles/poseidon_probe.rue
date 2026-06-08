@@ -1,0 +1,24 @@
+// puzzles/poseidon_probe.rue
+// Test-only entry point exposing the Poseidon library hashes so a Rust test
+// (sdk/tests/poseidon_rue_parity_e2e.rs) can run them via run_program and
+// assert byte-for-byte parity with sdk/src/prover/poseidon_perm.rs. NOT used
+// in production puzzles.
+//
+// Solution: (sel, a, b, c) where `sel` selects which hash to compute:
+//   0 => hash2(a, b)
+//   1 => hash_leaf(a, b, c)
+//   2 => hash_node(a, b)
+
+import poseidon::*;
+
+fn main(sel: Int, a: Int, b: Int, c: Int) -> Int {
+    if sel == 0 {
+        hash2(a, b)
+    } else {
+        if sel == 1 {
+            hash_leaf(a, b, c)
+        } else {
+            hash_node(a, b)
+        }
+    }
+}

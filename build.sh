@@ -16,6 +16,7 @@ LIBRARIES=(
     "puzzles/common_types.rue"
     "puzzles/finalizer.rue"
     "puzzles/merkle_utils.rue"
+    "puzzles/poseidon.rue"
     "puzzles/election/shared.rue"
     "puzzles/registration_coin/shared.rue"
     "puzzles/ballot_coin/shared.rue"
