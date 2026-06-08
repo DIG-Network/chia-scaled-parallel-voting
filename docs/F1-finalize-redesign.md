@@ -139,11 +139,25 @@ quorums need proof batching/recursion (future).
    `slack` (bit decomposition); constrain `s`/`c` to the 252-bit inner
    scalar width; cofactor/prime-order checks on witnessed `R`/`P`; feed
    `vote_message` as ≤254-bit (or split). Choose audited Poseidon params.
-4. **[TODO]** Migrate the registration accumulator to this Poseidon tree
-   over voters' JUBJUB pubkeys: `sdk/src/merkle.rs`,
+4. **[IN PROGRESS]** Migrate the registration accumulator to this Poseidon
+   tree over voters' JUBJUB pubkeys: `sdk/src/merkle.rs`,
    `election/register.rue` + `deregister.rue` (Poseidon-in-Rue membership),
    SDK predictors. (Identity migration: voters register their Jubjub signing
    key; the leaf commits it.)
+   - **[DONE] CLVM cost benchmark** (`sdk/tests/poseidon_clvm_cost_bench.rs`):
+     a single 32-byte modular multiply `(a*b)%P` costs **4 494**; a width-3
+     Poseidon permutation (≈909 modmul) ≈ **4.1M**; a depth-32 register
+     membership (≈33 permutations) ≈ **135M** = **1.23 % of the 11e9 block
+     cost cap**. **VERDICT: FEASIBLE** with large headroom — Poseidon-in-Rue
+     is viable; the design-doc dual-commitment fallback is NOT needed. (This
+     is a lower bound — modadds/round-loop/ARK-indexing add more — but even
+     3–4× stays <5 % of the cap, and registers are infrequent O(1) spends.)
+   - **[TODO]** Implement the width-3 Poseidon permutation in Rue (S-box x^5,
+     MDS, ARK over Fr) with parameters matching `circuit_v2::poseidon_config`
+     byte-for-byte; switch `circuit_v2` from the generic sponge to the same
+     fixed-arity compression so the in-circuit, off-circuit (`merkle.rs`),
+     and on-chain (Rue) hashes are identical; wire into register/deregister
+     membership + emptiness; update SDK predictors.
 5. **[TODO]** Rewrite `finalize.rue` for the new public-input set (drop
    `agg_signers`/`bls_verify`/`g2_map`; keep the Groth16 pairing + outcome
    commit). Rebuild VK / ceremony. Promote `VotingCircuitV2` to the live
