@@ -51,11 +51,15 @@ they are demonstrated with runnable exploits and specified below.
 
 ---
 
-## F1 — Finalize forgery (CRITICAL, open)
+## F1 — Finalize forgery (CRITICAL — forgery CLOSED in-circuit + on-chain pairing; live-finalize promotion on branch `security/f1-accumulator-wip`)
 
-**Where:** `puzzles/ballot_coin/finalize.rue`, `sdk/src/prover/circuit.rs`
-(`generate_constraints`).
-**Test:** `sdk/tests/exploit_finalize_forgery_e2e.rs` (3 tests, passing).
+**Where:** `puzzles/ballot_coin/finalize.rue`, `sdk/src/prover/circuit_v2.rs`.
+**Test:** `sdk/tests/exploit_finalize_forgery_e2e.rs` — now a CLOSURE guard:
+all 3 forgeries (unregistered signer, zero voters, weight > registered) are
+REJECTED by `VotingCircuitV2`'s in-circuit constraints, and an honest
+registered+signing member verifies. On-chain pairing pinned by
+`sdk/tests/finalize_v2_groth16_e2e.rs` (valid v2 proof verifies through the
+Rue verifier; tampered proof / public input rejected).
 
 The Groth16 circuit's quorum gadget enforces
 `total_signer_weight * den >= num * registration_vote_weight`, but
@@ -109,17 +113,33 @@ O(1) (verify one Groth16 proof). No on-chain per-signer work.
   tree. CLVM cost benchmarked at ~135M/register = 1.23 % of the block cap
   (`poseidon_clvm_cost_bench`) ⇒ on-chain Poseidon is FEASIBLE; the
   dual-commitment fallback is not needed.
-- **REMAINING (open):** the *atomic* on-chain wiring — switch
-  `register.rue`/`deregister.rue` to the Poseidon leaf (over the voter's
-  Jubjub key) + Poseidon membership, the aggregator to `PoseidonSmt`, add
-  the Jubjub key to `VoterKeys`, ripple the `Fr`↔`Bytes32` root
-  representation through `ElectionState`/predictors, and update the e2e
-  tests (one unit — diverging off/on-chain trees break every finalize).
-  Then step 5 (rewrite `finalize.rue` for the new public-input set, rebuild
-  the VK, promote `VotingCircuitV2`) and step 6 (aggregator finalize
-  builder + voter Jubjub signing, flip `exploit_finalize_forgery_e2e` to
-  REJECTION). The forgery is CLOSED in-circuit (circuit_v2 tests); these
-  steps PROMOTE that circuit to the live consensus path.
+- **Steps 4–6 LANDED on `security/f1-accumulator-wip`:**
+  - **Accumulator migrated.** `register.rue`/`deregister.rue` use the
+    Poseidon leaf `hash_leaf(jub_x, jub_y, weight)` over the voter's Jubjub
+    key + Poseidon membership; `merkle.rs::PoseidonSmt`, `VoterKeys` Jubjub
+    key, and the `Fr`↔`Bytes32` root representation are wired through the
+    aggregator/deployer/indexer/voter. The aggregator's sync recovers the
+    on-curve Jubjub coords from register/deregister solutions (validated by
+    `aggregator_sync_after_deregister_e2e`, passing).
+  - **`finalize.rue` rewritten + recompiled** for `VotingCircuitV2`: ONE
+    Groth16 pairing over 5 raw-field public inputs `[root, vote_message mod
+    r, weight, num, den]`; `agg_signers`/`bls_verify`/`g2_map` dropped.
+    `PUBLIC_INPUT_COUNT` 8→5; VK is 624 bytes / 6 IC. Ceremony backend +
+    aggregator finalize builder produce/consume the v2 proof.
+  - **`exploit_finalize_forgery_e2e` flipped to REJECTION (green)** — the
+    direct closure guard (above). `cargo test -p chip-voting-sdk --lib` =
+    226 passing; 12 register/vote/release/deregister e2e files migrated to
+    `PoseidonSmt` and passing.
+- **REMAINING (test-harness + go-live, NOT a soundness gap):** 3
+  finalize-proving e2e binaries (`finalize_one_third_threshold_e2e`,
+  `finalize_per_ballot_e2e`, `live_orchestration_e2e`) still build the
+  legacy circuit and deploy with `config::MAX_SIGNERS = 20_000`. Promoting
+  them to circuit_v2 requires a SMALL `max_signers` deploy variant: Option
+  B verifies every signer IN-circuit, so a 20 000-signer setup is
+  computationally infeasible — the practical signer cap per finalize is a
+  documented **go-live scaling** item (recursion / batching), independent
+  of the forgery soundness, which is already closed. Then merge
+  `security/f1-accumulator-wip` → `security/puzzle-attack-hardening`.
 
 ---
 
