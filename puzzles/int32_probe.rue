@@ -1,0 +1,7 @@
+// puzzles/int32_probe.rue — test fixture: exposes int_to_32_bytes_be for the
+// parity test sdk/tests/int32_be_parity_e2e.rs (SEC-F1 encoding helper).
+import common_types::*;
+
+fn main(n: Int) -> Bytes {
+    int_to_32_bytes_be(n)
+}

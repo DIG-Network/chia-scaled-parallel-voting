@@ -24,3 +24,16 @@ export inline fn int_to_8_bytes_be(n: Int) -> Bytes {
     let padded_bytes: Bytes = (n + sentinel) as Bytes;
     substr(padded_bytes, 1, 9)
 }
+
+// SEC-F1: fixed 32-byte big-endian encoding of a field element `n` in
+// [0, 2^256). Used for the Poseidon registration root + Jubjub pubkey
+// coordinates so the on-chain register/deregister hashing matches
+// sdk/src/prover/poseidon_perm.rs / merkle.rs::PoseidonSmt (32-byte BE).
+// Same sentinel-add trick: (n + 2^256) is a 33-byte value
+// 0x01 || <32-byte BE of n>; drop the leading 0x01.
+export inline fn int_to_32_bytes_be(n: Int) -> Bytes {
+    let sentinel: Int =
+        0x010000000000000000000000000000000000000000000000000000000000000000 as Int;
+    let padded_bytes: Bytes = (n + sentinel) as Bytes;
+    substr(padded_bytes, 1, 33)
+}
