@@ -1410,6 +1410,9 @@ impl Voter {
                 params.vote_threshold_den,
                 params.registration_merkle_root_snapshot,
                 params.registration_vote_weight_snapshot,
+                // SEC-F3+F5: MUST match launch_ballot's 11-arg finalize curry.
+                self.config.vk_hash(),
+                params.vote_options_root,
             ),
         }
         .to_clvm(&mut *ctx)
