@@ -53,31 +53,37 @@
 
 import super::common_types::*;
 import super::registration_coin::shared::*;
+import super::poseidon::*;
 import shared::*;
 
-inline fn slot_from_pubkey(pubkey: PublicKey) -> Int {
-    let pk_hash_b: Bytes = sha256(pubkey as Bytes) as Bytes;
-    let prefix: Bytes = substr(pk_hash_b, 0, 4);
+// SEC-F1: the registration SPT is now a Poseidon-over-Jubjub tree (so the
+// finalize circuit can prove membership cheaply). The slot is derived from
+// the voter's JUBJUB pubkey coordinates (32-byte BE), matching
+// `merkle.rs::PoseidonSmt::slot_for_jubjub`.
+inline fn slot_from_jubjub(jub_x: Bytes32, jub_y: Bytes32) -> Int {
+    let h: Bytes = sha256((jub_x as Bytes) + (jub_y as Bytes)) as Bytes;
+    let prefix: Bytes = substr(h, 0, 4);
     let unsigned_bytes: Bytes = 0x00 as Bytes + prefix;
     unsigned_bytes as Int
 }
 
+// SEC-F1: Poseidon Merkle root over Int field elements (node = hash2),
+// matching merkle.rs::PoseidonSmt + the in-circuit membership. Siblings are
+// passed as Bytes32 (32-byte BE of Fr) and interpreted as Int.
 fn compute_root(
-    node: Bytes32,
+    node: Int,
     index: Int,
     remaining: HashCons,
     depth_remaining: Int,
-) -> Bytes32 {
+) -> Int {
     if depth_remaining == 0 {
         node
     } else {
-        let sibling: Bytes32 = remaining.head;
-        let node_b: Bytes = node as Bytes;
-        let sibling_b: Bytes = sibling as Bytes;
-        let parent: Bytes32 = if index % 2 == 0 {
-            sha256(node_b + sibling_b)
+        let sibling: Int = remaining.head as Int;
+        let parent: Int = if index % 2 == 0 {
+            hash2(node, sibling)
         } else {
-            sha256(sibling_b + node_b)
+            hash2(sibling, node)
         };
         compute_root(parent, index / 2, remaining.tail, depth_remaining - 1)
     }
@@ -184,6 +190,11 @@ fn main(
     Truth: ElectionStateTruth,
     // ── Solution ────────────────────────────────────────────────────
     new_voter_pubkey: PublicKey,
+    // SEC-F1: the voter's Jubjub pubkey coordinates (32-byte BE). The SMT
+    // leaf commits these (not the BLS key); the finalize circuit verifies a
+    // Jubjub Schnorr signature by this key. BLS stays the auth/reg-coin key.
+    jub_x: Bytes32,
+    jub_y: Bytes32,
     register_leaf_index: Int,
     register_siblings: HashCons,
     locked_cat_mojos: Int,
@@ -191,15 +202,15 @@ fn main(
 ) -> (ElectionStateTruth, List<Condition>) {
     inline let State = Truth.State;
 
-    // Slot integrity: index MUST be the canonical slot for this pubkey.
-    let computed_slot: Int = slot_from_pubkey(new_voter_pubkey);
+    // Slot integrity: index MUST be the canonical slot for this Jubjub key.
+    let computed_slot: Int = slot_from_jubjub(jub_x, jub_y);
     assert register_leaf_index == computed_slot;
 
-    // Verify the slot is currently empty against the current root.
-    let pre_root: Bytes32 = compute_root(
-        EMPTY_LEAF_HASH, register_leaf_index, register_siblings, TREE_DEPTH,
+    // Verify the slot is currently empty against the current (Poseidon) root.
+    let pre_root: Int = compute_root(
+        EMPTY_LEAF_HASH as Int, register_leaf_index, register_siblings, TREE_DEPTH,
     );
-    assert pre_root == State.registration_merkle_root;
+    assert pre_root == (State.registration_merkle_root as Int);
 
     // Weighted-voting floor: voters MUST lock at least the curried
     // COLLATERAL_AMOUNT minimum. Locking more than the minimum gives
@@ -226,10 +237,16 @@ fn main(
     // real contribution to `signed_weight` from the same merkle proof
     // the on-chain action verifies.
     let pk_b: Bytes = new_voter_pubkey as Bytes;
-    let active_leaf: Bytes32 = sha256(pk_b + int_to_8_bytes_be(locked_cat_mojos));
-    let new_root: Bytes32 = compute_root(
+    // SEC-F1: weighted Poseidon leaf over the Jubjub pubkey + weight,
+    // matching merkle.rs::PoseidonSmt::leaf_hash and the in-circuit leaf.
+    let active_leaf: Int = hash_leaf(jub_x as Int, jub_y as Int, locked_cat_mojos);
+    let new_root_int: Int = compute_root(
         active_leaf, register_leaf_index, register_siblings, TREE_DEPTH,
     );
+    // `int_to_32_bytes_be` always returns 32 bytes; narrow Bytes -> Bytes32.
+    let new_root_b: Bytes = int_to_32_bytes_be(new_root_int);
+    assert new_root_b is Bytes32;
+    let new_root: Bytes32 = new_root_b;
 
     // Compute the expected CAT-wrapped Registration Coin puzzle hash.
     let reg_full_hash: Bytes32 = fresh_registration_coin_puzzle_hash(
@@ -269,9 +286,10 @@ fn main(
         message: registration_message,
     };
 
-    // Indexer / aggregator announcement. Includes `locked_cat_mojos`
-    // so off-chain walkers can recover each voter's per-leaf weight
-    // without re-parsing the action solution.
+    // Indexer / aggregator announcement. Includes `locked_cat_mojos` (the
+    // per-leaf weight) and the Jubjub coordinates so off-chain walkers can
+    // rebuild the Poseidon SPT (leaf = hash_leaf(jub_x, jub_y, weight)) from
+    // chain alone.
     let announce_register = CreateCoinAnnouncement {
         message: sha256(
             "registered"
@@ -279,6 +297,8 @@ fn main(
             + int_to_8_bytes_be(State.registration_count + 1)
             + pk_b
             + int_to_8_bytes_be(locked_cat_mojos)
+            + (jub_x as Bytes)
+            + (jub_y as Bytes)
         ),
     };
 
