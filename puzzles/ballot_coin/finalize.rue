@@ -80,6 +80,16 @@ struct Scalars {
     s5: PublicKey,    // Fr(den) raw 32-byte BE
 }
 
+// SEC-F3: canonical Chia singleton constants (chia-puzzles), identical to
+// registration_coin/release.rue. Used to re-derive the genuine Election
+// Singleton's puzzle hash from its launcher_id, matching
+// `SingletonArgs::curry_tree_hash` in the SDK — the UNFORGEABLE sender of the
+// ballot-binding message.
+inline const SINGLETON_TOP_LAYER_MOD_HASH: Bytes32 =
+    0x7faa3253bfddd1e0decb0906b2dc6247bbc4cf608f58345d173adb63e8b47c9f;
+inline const SINGLETON_LAUNCHER_PUZZLE_HASH: Bytes32 =
+    0xeff07522495060c066f66f32acc2a77e3a3e737aca8baea4d1a64ea4cdc13da9;
+
 fn main(
     // ── Curried (action-specific config) ────────────────────────────
     VK: VK,
@@ -91,10 +101,23 @@ fn main(
     VOTE_THRESHOLD_DEN: Int,
     REGISTRATION_MERKLE_ROOT_SNAPSHOT: Bytes32,
     REGISTRATION_VOTE_WEIGHT_SNAPSHOT: Int,
+    // SEC-F3: the election's committed VK hash (= sha256 of the chia-chunked
+    // VK bytes = ElectionState.vk_hash). Bound below to the curried VK/IC and,
+    // via the ballot-binding message, to the genuine election's state.vk_hash.
+    ELECTION_VK_HASH: Bytes32,
+    // SEC-F5: the ballot's REAL vote-options root (also curried into the
+    // ballot's oracle action). Bound to the election's vote_mode_lock via the
+    // ballot-binding message.
+    VOTE_OPTIONS_ROOT: Bytes32,
     Truth: BallotStateTruth,
     // ── Solution ────────────────────────────────────────────────────
     proof: Proof,
     vote_outcome_data: Bytes32,
+    // SEC-F3: the genuine Election Singleton's inner puzzle hash, used to
+    // re-derive its full puzzle hash. Solution-supplied (safe: no spendable
+    // coin exists at the re-derived hash outside the genuine launcher lineage
+    // — same argument as release.rue/F4).
+    election_inner_puzzle_hash: Bytes32,
     ...scalars: Scalars,
 ) -> (BallotStateTruth, List<Condition>) {
     inline let State = Truth.State;
@@ -165,6 +188,63 @@ fn main(
         -proof.c,   VK.delta,
     );
 
+    // ── SEC-F3 + SEC-F5: ballot-binding to the genuine election ──────
+    //
+    // (1) Bind the curried VK/IC bytes to ELECTION_VK_HASH. The chia-chunked
+    // VK layout is `alpha || beta || gamma || delta || ic0..ic5`, so hashing
+    // the curried fields in that exact order reproduces
+    // `sha256(chia_chunked_bytes) = ElectionState.vk_hash`. This forces the
+    // curried VK to be the one ELECTION_VK_HASH names — an attacker who curries
+    // a self-chosen (trapdoored) VK cannot also pass this assert with the
+    // election's real vk_hash.
+    let vk_ic_bytes: Bytes =
+        (VK.alpha as Bytes) + (VK.beta as Bytes) + (VK.gamma as Bytes) + (VK.delta as Bytes)
+        + (IC.ic0 as Bytes) + (IC.ic1 as Bytes) + (IC.ic2 as Bytes)
+        + (IC.ic3 as Bytes) + (IC.ic4 as Bytes) + (IC.ic5 as Bytes);
+    assert sha256(vk_ic_bytes) == (ELECTION_VK_HASH as Bytes);
+
+    // (2) Re-derive the genuine Election Singleton's puzzle hash from the
+    // UNFORGEABLE curried `ELECTION_LAUNCHER_ID` + the solution-supplied inner
+    // puzzle hash — `SingletonArgs::curry_tree_hash(election_launcher_id,
+    // inner_ph)`. Same primitive as release.rue's F4 fix.
+    let singleton_struct = std::singleton::SingletonStruct {
+        mod_hash: SINGLETON_TOP_LAYER_MOD_HASH,
+        launcher_id: ELECTION_LAUNCHER_ID,
+        launcher_puzzle_hash: SINGLETON_LAUNCHER_PUZZLE_HASH,
+    };
+    let singleton_struct_hash: Bytes32 = tree_hash(singleton_struct);
+    let genuine_election_ph: Bytes32 = curry_tree_hash(
+        SINGLETON_TOP_LAYER_MOD_HASH,
+        [singleton_struct_hash, election_inner_puzzle_hash],
+    );
+
+    // (3) Reconstruct the canonical ballot-binding tuple from THIS ballot's
+    // curried args. MUST be byte-identical to election/attest_ballot.rue.
+    let binding_msg: Bytes32 = sha256(
+        "ballot_binding"
+        + (ELECTION_LAUNCHER_ID as Bytes)
+        + (BALLOT_LAUNCHER_ID as Bytes)
+        + (ELECTION_VK_HASH as Bytes)
+        + (REGISTRATION_MERKLE_ROOT_SNAPSHOT as Bytes)
+        + int_to_8_bytes_be(REGISTRATION_VOTE_WEIGHT_SNAPSHOT)
+        + int_to_8_bytes_be(VOTE_THRESHOLD_NUM)
+        + int_to_8_bytes_be(VOTE_THRESHOLD_DEN)
+        + (VOTE_OPTIONS_ROOT as Bytes)
+    );
+
+    // (4) CHIP-0025 RECEIVE_MESSAGE, mode = SENDER_PUZZLE. Consensus pairs this
+    // ONLY with a SEND_MESSAGE emitted by a coin whose puzzle hash equals
+    // `genuine_election_ph` — i.e. the live Election Singleton running its
+    // `attest_ballot` action in the SAME bundle, which only emits this exact
+    // `binding_msg` if its own state.vk_hash / registration snapshot /
+    // vote_mode_lock match. So finalize cannot complete for a substituted VK,
+    // a fabricated snapshot, or a mode-lock-violating options root.
+    let receive_binding = ReceiveMessage {
+        mode: SENDER_PUZZLE,
+        message: binding_msg as Bytes,
+        sender: [genuine_election_ph as Bytes],
+    };
+
     // Proof-binding commitment. There is no signer-set aggregate to publish
     // (the quorum is proven in-circuit), so we commit the canonical
     // vote_message digest. Downstream consumers get a stable 32-byte
@@ -196,6 +276,7 @@ fn main(
         [
             assert_closed,
             announce_finalize,
+            receive_binding,
         ],
     )
 }

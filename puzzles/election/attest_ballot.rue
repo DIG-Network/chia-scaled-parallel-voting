@@ -1,0 +1,106 @@
+// election/attest_ballot.rue
+// AttestBallot action for the Election Singleton (SEC-F3 + SEC-F5).
+//
+// READ-ONLY action: it does NOT mutate ElectionState. Its sole purpose is to
+// emit a CHIP-0025 SEND_MESSAGE carrying the canonical "ballot binding" tuple
+// computed from the election's OWN unforgeable state (vk_hash, the live
+// registration root/weight, vote_mode_lock) plus the per-ballot parameters the
+// caller asserts. A Ballot Coin's `finalize` action co-spent in the SAME bundle
+// emits the paired RECEIVE_MESSAGE (sender = the genuine Election Singleton's
+// re-derived puzzle hash) reconstructing the identical tuple from its OWN
+// curried args. Consensus pairs the two only if the bytes are identical.
+//
+// WHY THIS CLOSES F3 (ballot VK / snapshot substitution) + F5 (vote_mode_lock
+// unenforceable): the Ballot Coin's curried VK/IC, registration snapshots,
+// thresholds, and VOTE_OPTIONS_ROOT are all transitively committed in the
+// ballot's puzzle hash, but NOTHING previously tied them to the real election.
+// An attacker could launch a ballot tracing to the election but curried with a
+// VK they hold the trapdoor for, fabricated snapshots, or a vote-options root
+// violating the election's mode lock, then finalize any outcome. Now finalize
+// cannot complete unless the genuine Election Singleton attests the SAME tuple:
+//   * vk_hash comes from the election's immutable state (an attacker's
+//     self-chosen VK hashes to a different value → no pairing);
+//   * the snapshot must equal the election's authoritative registration state
+//     (a fabricated root/weight makes this action RAISE → no message);
+//   * vote_options_root must satisfy the election's vote_mode_lock (a locked
+//     election rejects any other options root → no message).
+//
+// CHIP-0025 messages pair ONLY within one spend bundle (there is no persistent
+// cross-block message in Chia), which is exactly why this fires at finalize
+// (co-spending the live singleton) rather than at create_ballot time.
+
+import super::common_types::*;
+import shared::*;
+
+fn main(
+    // ── Curried (deploy constants, same kind create_ballot gets) ─────
+    ELECTION_LAUNCHER_ID: Bytes32,
+    NO_VOTE_MODE_LOCK: Bytes32,
+    Truth: ElectionStateTruth,
+    // ── Solution (per-ballot fields the caller asserts) ──────────────
+    ballot_launcher_id: Bytes32,
+    registration_merkle_root_snapshot: Bytes32,
+    registration_vote_weight_snapshot: Int,
+    vote_threshold_num: Int,
+    vote_threshold_den: Int,
+    ...vote_options_root: Bytes32,
+) -> (ElectionStateTruth, List<Condition>) {
+    inline let State = Truth.State;
+
+    // SEC-F5: vote_mode_lock enforcement against the ballot's REAL
+    // (curried) vote_options_root. When the election was deployed
+    // mode-locked, the ballot's options root MUST equal the lock; an
+    // unlocked election (sentinel) accepts any root.
+    let lock_ok: Bool = if State.vote_mode_lock == NO_VOTE_MODE_LOCK {
+        true
+    } else {
+        State.vote_mode_lock == vote_options_root
+    };
+    assert lock_ok;
+
+    // SEC-F3 snapshot predicate (MVP): the registration snapshot the ballot
+    // was launched with MUST equal the election's authoritative registration
+    // state. This rejects fabricated snapshots. (A stronger
+    // "was-real-at-launch" form requires a registration-root history
+    // accumulator — see docs/F3-F5-binding-design.md; the snapshot is already
+    // immutably curried into the ballot, so this equality blocks fabrication.)
+    assert registration_merkle_root_snapshot == State.registration_merkle_root;
+    assert registration_vote_weight_snapshot == State.registration_vote_weight;
+
+    // Range guards so a `>= 2^64` alias cannot collide two distinct tuples
+    // under `int_to_8_bytes_be` (mirrors deregister.rue's guard).
+    let max_u64: Int = 0x010000000000000000 as Int;
+    assert registration_vote_weight_snapshot < max_u64;
+    assert vote_threshold_num < max_u64;
+    assert vote_threshold_den < max_u64;
+    assert registration_vote_weight_snapshot >= 0;
+    assert vote_threshold_num >= 0;
+    assert vote_threshold_den >= 0;
+
+    // Canonical binding tuple — MUST match ballot_coin/finalize.rue byte-for-byte.
+    let binding_msg: Bytes32 = sha256(
+        "ballot_binding"
+        + (ELECTION_LAUNCHER_ID as Bytes)
+        + (ballot_launcher_id as Bytes)
+        + (State.vk_hash as Bytes)
+        + (registration_merkle_root_snapshot as Bytes)
+        + int_to_8_bytes_be(registration_vote_weight_snapshot)
+        + int_to_8_bytes_be(vote_threshold_num)
+        + int_to_8_bytes_be(vote_threshold_den)
+        + (vote_options_root as Bytes)
+    );
+
+    // CHIP-0025 SEND_MESSAGE, mode = SENDER_PUZZLE (commit THIS coin's puzzle
+    // hash as sender; no receiver-side commitment). The paired RECEIVE_MESSAGE
+    // in ballot_coin/finalize.rue commits this singleton's re-derived puzzle
+    // hash as the sender, so only the genuine Election Singleton can attest.
+    let send_binding = SendMessage {
+        mode: SENDER_PUZZLE,
+        message: binding_msg as Bytes,
+        receiver: [],
+    };
+
+    // State UNCHANGED (read-only action; the finalizer recreates the singleton
+    // at amount 1 with this same state).
+    (Truth, [send_binding])
+}
