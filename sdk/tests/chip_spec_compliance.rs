@@ -288,22 +288,26 @@ fn chip_vote_message_preimage_canonical_order() {
 /// which runs `puzzles/ballot_coin/finalize.rue` with a 768-byte VK and a
 /// real `bls_verify` over the 8-scalar IC linear combination.
 #[test]
-fn chip_circuit_public_input_count_is_six() {
+fn chip_circuit_public_input_count_is_five() {
     use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
+    // SEC-F1 (Option B): finalize verifies VotingCircuitV2, which has FIVE
+    // public inputs (registration_root, vote_message, registration_vote_weight,
+    // vote_threshold_num, vote_threshold_den) — the old 8-scalar layout
+    // (agg_signers / threshold_pack / per-hash scalars) is gone.
     assert_eq!(
-        PUBLIC_INPUT_COUNT, 8,
-        "CHIP.md §148-150 (CHIP-rev): 8 public-input scalars pinned for this revision"
+        PUBLIC_INPUT_COUNT, 5,
+        "SEC-F1: VotingCircuitV2 has 5 public inputs (no agg_signers / threshold-pack scalars)"
     );
 }
 
-/// CHIP.md §163 (positive): VK byte length = 336 + 9 * 48 = 768 bytes.
+/// SEC-F1: VK byte length = 336 + (5 + 1) * 48 = 624 bytes (6 IC points).
 #[test]
-fn chip_circuit_vk_length_is_672() {
+fn chip_circuit_vk_length_is_624() {
     use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
     let expected = 336 + (PUBLIC_INPUT_COUNT + 1) * 48;
     assert_eq!(
-        expected, 768,
-        "CHIP.md §163: VK byte length MUST equal 336 + (PUBLIC_INPUT_COUNT + 1) * 48 = 768"
+        expected, 624,
+        "SEC-F1: VK byte length MUST equal 336 + (PUBLIC_INPUT_COUNT + 1) * 48 = 624 (6 IC)"
     );
 }
 
@@ -336,17 +340,18 @@ fn chip_circuit_vk_length_rejects_wrong_size() {
 
     // The canonical length passes.
     let canonical_len = 336 + (PUBLIC_INPUT_COUNT + 1) * 48;
-    assert_eq!(canonical_len, 768);
+    assert_eq!(canonical_len, 624);
     assert!(
         make_config(canonical_len).validate().is_ok(),
-        "768-byte VK must validate"
+        "624-byte VK must validate"
     );
 
-    // Every non-canonical length is rejected.
-    for &bad in &[0, 1, 100, 335, 336, 384, 671, 673, 720, 1024] {
+    // Every non-canonical length is rejected (SEC-F1 fixes it at 624; the
+    // old 672/768 lengths are now also rejected).
+    for &bad in &[0, 1, 100, 335, 336, 384, 623, 625, 672, 768, 1024] {
         assert!(
             make_config(bad).validate().is_err(),
-            "VK length {} must be rejected (CHIP.md §159 fixes it at 672)",
+            "VK length {} must be rejected (SEC-F1 fixes it at 624)",
             bad
         );
     }
@@ -683,61 +688,42 @@ fn chip_election_action_set_is_register_create_ballot_deregister() {
 // SPT-EMPTY-LEAF (CHIP.md §90, §145)
 // ────────────────────────────────────────────────────────────────────
 
-/// CHIP.md §90, §145 (positive + negative): the empty-slot leaf
-/// constant `EMPTY_LEAF_HASH` MUST equal `sha256(0x00 × 48)`.
-///
-/// Quote: > `EMPTY_LEAF_HASH = sha256(0x00 × 48)`
+/// SEC-F1 (Poseidon-over-Jubjub accumulator): the empty-slot leaf constant
+/// `EMPTY_LEAF_HASH` MUST equal the canonical big-endian encoding of the
+/// Poseidon field-element ZERO — i.e. 32 zero bytes. The registration SPT
+/// is now a Poseidon tree over `Fr` (leaf = `hash_leaf(jub_x, jub_y, weight)`),
+/// whose empty leaf is `Fr::zero`, NOT the old `sha256(0x00 × 48)`.
 ///
 /// Verified by:
-///   1. Computing the spec preimage (48 zero bytes) directly, hashing
-///      it with sha256, and asserting equality with the SDK constant.
-///   2. Asserting INequality against several plausible "almost-correct"
-///      preimages: 32 zero bytes (a chia tree-leaf-shaped guess), 64
-///      zero bytes, the empty preimage, and `sha256("EMPTY_LEAF")`.
-///      Any of these would silently produce a different empty-subtree
-///      table and break empty-slot proofs across SDK + register.rue.
+///   1. Asserting equality with `[0u8; 32]` (Fr::zero, big-endian).
+///   2. Asserting INequality against the OLD `sha256(0x00 × 48)` constant
+///      and other plausible-but-wrong values — any of these would silently
+///      produce a different empty-subtree table and break empty-slot proofs
+///      across PoseidonSmt + register.rue + circuit_v2.
 #[test]
-fn chip_spt_empty_leaf_hash_is_sha256_of_48_zero_bytes() {
-    // Canonical: sha256(48 × 0x00).
-    let mut h = Sha256::new();
-    h.update([0u8; 48]);
-    let canonical: [u8; 32] = h.finalize().into();
+fn chip_spt_empty_leaf_hash_is_poseidon_fr_zero() {
+    // Canonical: Fr::zero big-endian = 32 zero bytes.
     assert_eq!(
-        EMPTY_LEAF_HASH, canonical,
-        "CHIP.md §90 / §145: EMPTY_LEAF_HASH MUST equal sha256(0x00 × 48)"
+        EMPTY_LEAF_HASH, [0u8; 32],
+        "SEC-F1: EMPTY_LEAF_HASH MUST equal the Poseidon Fr::zero leaf (32 zero bytes)"
     );
 
-    // Negatives: each plausible alternative MUST differ.
+    // Negative: the OLD sha256(48 zero bytes) value MUST NOT match anymore.
+    let mut h48 = Sha256::new();
+    h48.update([0u8; 48]);
+    let old_sha48: [u8; 32] = h48.finalize().into();
+    assert_ne!(
+        EMPTY_LEAF_HASH, old_sha48,
+        "SEC-F1: empty leaf is Fr::zero, NOT the legacy sha256(0x00 × 48)"
+    );
+
+    // Negative: sha256 of 32 zero bytes also differs.
     let mut h32 = Sha256::new();
     h32.update([0u8; 32]);
     let alt_32: [u8; 32] = h32.finalize().into();
     assert_ne!(
         EMPTY_LEAF_HASH, alt_32,
-        "CHIP.md §90: preimage is 48 zero bytes, NOT 32"
-    );
-
-    let mut h64 = Sha256::new();
-    h64.update([0u8; 64]);
-    let alt_64: [u8; 32] = h64.finalize().into();
-    assert_ne!(
-        EMPTY_LEAF_HASH, alt_64,
-        "CHIP.md §90: preimage is 48 zero bytes, NOT 64"
-    );
-
-    let mut h_empty = Sha256::new();
-    h_empty.update([] as [u8; 0]);
-    let alt_empty: [u8; 32] = h_empty.finalize().into();
-    assert_ne!(
-        EMPTY_LEAF_HASH, alt_empty,
-        "CHIP.md §90: preimage is 48 zero bytes, NOT empty"
-    );
-
-    let mut h_lit = Sha256::new();
-    h_lit.update(b"EMPTY_LEAF");
-    let alt_lit: [u8; 32] = h_lit.finalize().into();
-    assert_ne!(
-        EMPTY_LEAF_HASH, alt_lit,
-        "CHIP.md §90: preimage is 48 zero bytes, NOT a literal label"
+        "SEC-F1: empty leaf is Fr::zero (raw 32 zero bytes), NOT sha256(0x00 × 32)"
     );
 }
 
