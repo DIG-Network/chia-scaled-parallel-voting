@@ -125,6 +125,20 @@ fn main(
     // One-shot per ballot.
     assert State.finalized == false;
 
+    // SEC-F3 (placed early so it fails fast, before the expensive pairing):
+    // bind the curried VK/IC bytes to ELECTION_VK_HASH. The chia-chunked VK
+    // layout is `alpha || beta || gamma || delta || ic0..ic5`, so hashing the
+    // curried fields in that exact order reproduces
+    // `sha256(chia_chunked_bytes) = ElectionState.vk_hash`. This forces the
+    // curried VK to be the one ELECTION_VK_HASH names; combined with the
+    // ballot-binding message (which pairs ELECTION_VK_HASH to the genuine
+    // election's state.vk_hash), an attacker cannot substitute a trapdoored VK.
+    let vk_ic_bytes: Bytes =
+        (VK.alpha as Bytes) + (VK.beta as Bytes) + (VK.gamma as Bytes) + (VK.delta as Bytes)
+        + (IC.ic0 as Bytes) + (IC.ic1 as Bytes) + (IC.ic2 as Bytes)
+        + (IC.ic3 as Bytes) + (IC.ic4 as Bytes) + (IC.ic5 as Bytes);
+    assert sha256(vk_ic_bytes) == (ELECTION_VK_HASH as Bytes);
+
     // Time lock — ballot must have closed.
     let assert_closed = AssertHeightAbsolute {
         height: VOTE_CLOSE_HEIGHT,
@@ -189,20 +203,9 @@ fn main(
     );
 
     // ── SEC-F3 + SEC-F5: ballot-binding to the genuine election ──────
+    // (the VK/IC ↔ ELECTION_VK_HASH bind is asserted early, near the top, so
+    // it fails fast before the pairing.)
     //
-    // (1) Bind the curried VK/IC bytes to ELECTION_VK_HASH. The chia-chunked
-    // VK layout is `alpha || beta || gamma || delta || ic0..ic5`, so hashing
-    // the curried fields in that exact order reproduces
-    // `sha256(chia_chunked_bytes) = ElectionState.vk_hash`. This forces the
-    // curried VK to be the one ELECTION_VK_HASH names — an attacker who curries
-    // a self-chosen (trapdoored) VK cannot also pass this assert with the
-    // election's real vk_hash.
-    let vk_ic_bytes: Bytes =
-        (VK.alpha as Bytes) + (VK.beta as Bytes) + (VK.gamma as Bytes) + (VK.delta as Bytes)
-        + (IC.ic0 as Bytes) + (IC.ic1 as Bytes) + (IC.ic2 as Bytes)
-        + (IC.ic3 as Bytes) + (IC.ic4 as Bytes) + (IC.ic5 as Bytes);
-    assert sha256(vk_ic_bytes) == (ELECTION_VK_HASH as Bytes);
-
     // (2) Re-derive the genuine Election Singleton's puzzle hash from the
     // UNFORGEABLE curried `ELECTION_LAUNCHER_ID` + the solution-supplied inner
     // puzzle hash — `SingletonArgs::curry_tree_hash(election_launcher_id,
