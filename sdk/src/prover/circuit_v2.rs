@@ -30,17 +30,30 @@
 // `finalize` then just verifies ONE Groth16 proof + commits the outcome —
 // constant cost regardless of voter count.
 //
-// SOUNDNESS HARDENING — DONE: the threshold `slack` is range-checked to
-// [0, 2^200) (so `(lhs-rhs)==slack` genuinely implies `lhs>=rhs` — a wrapped
-// negative difference is ~p and fails) and each signer `weight` is bounded
-// to 64 bits.
+// SOUNDNESS HARDENING — DONE (load-bearing):
+//   * the threshold `slack` is range-checked to [0, 2^200) (so
+//     `(lhs-rhs)==slack` genuinely implies `lhs>=rhs` — a wrapped negative
+//     difference is ~p and fails) and each signer `weight` is bounded to 64
+//     bits;
+//   * the Schnorr scalar `s` is bound to the canonical 252-bit inner-scalar
+//     width (rejects an over-length `s + n·r` malleated witness).
 //
 // REMAINING (multi-session, see design doc):
 //   * Migrate the on-chain registration accumulator (register/deregister +
 //     sdk/merkle.rs) to this Poseidon tree over the voters' Jubjub pubkeys.
-//   * Further hardening: constrain `s`/`c` to the inner-scalar bit-width
-//     (252) + cofactor/prime-order checks on witnessed `R`/`P`; feed
-//     `vote_message` as ≤254-bit or split; pin audited Poseidon params.
+//   * Go-live hardening pass (requires careful cryptographic review — NOT
+//     load-bearing for the demonstrated forgeries, which membership +
+//     collateral + the tested signature/slack checks already close):
+//       - PRIME-ORDER subgroup checks on witnessed `P`/`R` via cofactor
+//         clearing (`P == [8]·Q`). A first cut was reverted: arkworks
+//         `EdwardsVar` witness/`scalar_mul_le` behaviour on small-order
+//         points made the naive check vacuous in unit tests; the correct
+//         gadget needs verification before shipping (a vacuous check is
+//         worse than none).
+//       - derive `vote_message` as ≤254-bit off-circuit (coupled to the
+//         step-6 aggregator) + add the matching in-circuit bound.
+//       - pin an audited Poseidon parameter set shared with `sdk/merkle.rs`
+//         + the on-chain verifier.
 //   * Wire into finalize.rue (new public-input set; drop VK BLS bits) +
 //     ceremony/VK + aggregator/voter signing + flip
 //     exploit_finalize_forgery_e2e to assert REJECTION.
@@ -123,6 +136,7 @@ fn enforce_lt_pow2(v: &FpVar<Fr>, n: usize) -> Result<(), SynthesisError> {
     }
     Ok(())
 }
+
 
 /// Reduce a base-field Poseidon challenge `c` into the Jubjub inner scalar
 /// field by integer value — matches the in-circuit interpretation where
@@ -270,6 +284,13 @@ impl ConstraintSynthesizer<Fr> for VotingCircuitV2 {
                 .into_iter()
                 .map(|b| Boolean::new_witness(cs.clone(), || Ok(b)))
                 .collect::<Result<_, _>>()?;
+            // SOUNDNESS: bind `s` to the canonical 252-bit inner-scalar width
+            // (Jubjub `r < 2^252`), so a malleated `s + n·r` over-length
+            // witness cannot be substituted. Honest `s < r` has zero high
+            // bits, so this is satisfied; padding signers have `s = 0`.
+            for b in s_bits.iter().skip(252) {
+                b.enforce_equal(&Boolean::constant(false))?;
+            }
             // c = Poseidon(R.x, P.x, vote_message)
             let c_var = poseidon_n_var(
                 cs.clone(),
@@ -551,4 +572,5 @@ mod tests {
         let c = circuit(&tree, m, vec![bad], 2_000);
         assert!(!is_satisfied(c), "weight tamper must fail membership");
     }
+
 }
