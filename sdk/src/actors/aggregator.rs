@@ -786,7 +786,10 @@ impl<C: ChainReader> Aggregator<C> {
             vote_threshold_num: params.vote_threshold_num,
             vote_threshold_den: params.vote_threshold_den,
             depth: crate::config::TREE_DEPTH as usize,
-            max_signers: witness.signers_v2.len().max(1),
+            // SEC-F1: the prover MUST use the SAME signer-slot count baked
+            // into the curried VK at ceremony time (circuit_v2 pads up to
+            // it). That shape parameter is the election's `max_signers`.
+            max_signers: self.config.max_signers.max(witness.signers_v2.len()),
             signers: witness.signers_v2.clone(),
         };
         let proof = circuit.prove(params.proving_key)?;

@@ -33,7 +33,7 @@ use chip_voting_sdk::actors::deployer::ElectionDeployer;
 use chip_voting_sdk::actors::voter::CastVoteParams;
 use chip_voting_sdk::ceremony::VerificationKey;
 use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
-use chip_voting_sdk::merkle::SparseMerkleTree;
+use chip_voting_sdk::merkle::PoseidonSmt;
 use chip_voting_sdk::{puzzles, DeployParams, NetworkType, Voter, VoterKeys};
 use clvm_traits::ToClvm;
 use clvm_utils::tree_hash;
@@ -121,7 +121,7 @@ async fn voter_cast_vote_two_voters_against_simulator_full_flow() {
         .expect("voter2 CAT child landed at reg_outer_ph_2");
 
     // ── 4. Register voter1, then voter2 ─────────────────────
-    let smt_pre_v1 = SparseMerkleTree::new();
+    let smt_pre_v1 = PoseidonSmt::new();
     register_voter(
         &mut sim,
         cat_tail_hash,
@@ -132,8 +132,8 @@ async fn voter_cast_vote_two_voters_against_simulator_full_flow() {
         smt_pre_v1,
     )
     .await;
-    let mut smt_post_v1 = SparseMerkleTree::new();
-    smt_post_v1.insert(&voter1_pk, config.collateral_amount).expect("smt insert v1");
+    let mut smt_post_v1 = PoseidonSmt::new();
+    smt_post_v1.insert(voter1_keys.jubjub_pubkey, config.collateral_amount);
     register_voter(
         &mut sim,
         cat_tail_hash,
@@ -146,8 +146,8 @@ async fn voter_cast_vote_two_voters_against_simulator_full_flow() {
     .await;
 
     let mut smt_post_v2 = smt_post_v1.clone();
-    smt_post_v2.insert(&voter2_pk, config.collateral_amount).expect("smt insert v2");
-    let registration_merkle_root_snapshot = smt_post_v2.root();
+    smt_post_v2.insert(voter2_keys.jubjub_pubkey, config.collateral_amount);
+    let registration_merkle_root_snapshot = Bytes32::new(smt_post_v2.root_be32());
     let registration_vote_weight_snapshot = 2 * collateral_amount;
 
     // ── 5. create_ballot + launch_ballot ────────────────────
@@ -317,7 +317,7 @@ async fn register_voter(
     config: &chip_voting_sdk::config::ElectionConfig,
     voter_keys: &VoterKeys,
     collateral_amount: u64,
-    smt_pre_register: SparseMerkleTree,
+    smt_pre_register: PoseidonSmt,
 ) {
     let voter_pk = voter_keys.pubkey;
     let reg_outer_ph = chip_voting_sdk::puzzles::fresh_registration_coin_puzzle_hash(

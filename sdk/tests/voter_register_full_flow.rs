@@ -26,7 +26,7 @@ use chia_sdk_types::conditions::Conditions;
 use chip_voting_sdk::actors::deployer::ElectionDeployer;
 use chip_voting_sdk::ceremony::VerificationKey;
 use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
-use chip_voting_sdk::merkle::SparseMerkleTree;
+use chip_voting_sdk::merkle::PoseidonSmt;
 use chip_voting_sdk::{puzzles, DeployParams, NetworkType, Voter, VoterKeys};
 use clvm_traits::ToClvm;
 use clvm_utils::tree_hash;
@@ -173,7 +173,7 @@ async fn voter_register_against_simulator_full_flow() {
     // Voter::register's signature must use the matching network
     // for `RequiredSignature::from_coin_spends` augmentation.
     let voter = Voter::new(config.clone(), voter_keys, NetworkType::Testnet11);
-    let smt = SparseMerkleTree::new();
+    let smt = PoseidonSmt::new();
 
     let chain = common::SharedSim::new(&mut sim);
     let bundle = voter

@@ -70,7 +70,7 @@ mod common;
 use chia_protocol::{Bytes32, Coin};
 use chia_sdk_test::Simulator;
 use chip_voting_sdk::actors::voter::VoterKeys;
-use chip_voting_sdk::merkle::SparseMerkleTree;
+use chip_voting_sdk::merkle::PoseidonSmt;
 use chip_voting_sdk::{Aggregator, ElectionDeployer, Indexer, Voter, VotingError};
 use chip_voting_sdk::NetworkType;
 
@@ -186,7 +186,7 @@ fn voter_slot_matches_smt_canonical_derivation() {
     let voter = build_voter_for_test();
     assert_eq!(
         voter.slot(),
-        SparseMerkleTree::slot_for_pubkey(&voter.keys.pubkey)
+        PoseidonSmt::slot_for_jubjub(voter.keys.jubjub_pubkey.x, voter.keys.jubjub_pubkey.y)
     );
 }
 
@@ -311,7 +311,7 @@ async fn aggregator_merkle_tree_accessor_returns_empty_smt_after_eve_sync() {
     let mut agg = Aggregator::new(config, chain, NetworkType::Mainnet);
     agg.sync().await.unwrap();
     let smt = agg.merkle_tree().unwrap();
-    assert_eq!(smt.root(), SparseMerkleTree::new().root());
+    assert_eq!(smt.root(), PoseidonSmt::new().root());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -425,7 +425,7 @@ async fn indexer_registration_merkle_root_returns_empty_root_after_eve_sync() {
     indexer.sync().await.unwrap();
     assert_eq!(
         indexer.registration_merkle_root().unwrap(),
-        SparseMerkleTree::new().root()
+        Bytes32::new(PoseidonSmt::new().root_be32())
     );
 }
 #[tokio::test(flavor = "current_thread")]
@@ -446,7 +446,7 @@ async fn indexer_merkle_tree_returns_empty_smt_after_eve_sync() {
     indexer.sync().await.unwrap();
     assert_eq!(
         indexer.merkle_tree().unwrap().root(),
-        SparseMerkleTree::new().root()
+        PoseidonSmt::new().root()
     );
 }
 

@@ -41,7 +41,7 @@ use chia_sdk_types::conditions::Conditions;
 use chip_voting_sdk::actors::deployer::ElectionDeployer;
 use chip_voting_sdk::ceremony::VerificationKey;
 use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
-use chip_voting_sdk::merkle::SparseMerkleTree;
+use chip_voting_sdk::merkle::PoseidonSmt;
 use chip_voting_sdk::{puzzles, DeployParams, NetworkType, Voter, VoterKeys};
 use clvm_traits::ToClvm;
 use clvm_utils::tree_hash;
@@ -198,7 +198,7 @@ async fn voter_release_collateral_against_simulator_full_flow() {
     drop(ctx);
 
     let voter = Voter::new(config.clone(), voter_keys, NetworkType::Testnet11);
-    let smt_pre_register = SparseMerkleTree::new();
+    let smt_pre_register = PoseidonSmt::new();
 
     let chain = common::SharedSim::new(&mut sim);
     let register_bundle = voter
@@ -214,10 +214,8 @@ async fn voter_release_collateral_against_simulator_full_flow() {
     // `Voter::release_collateral` validates that the supplied SMT
     // root matches the on-chain root, so we mirror that here by
     // inserting the voter's pubkey into a local SMT.
-    let mut smt_post_register = SparseMerkleTree::new();
-    smt_post_register
-        .insert(&voter_pk, config.collateral_amount)
-        .expect("local SMT insert must succeed (post-register state)");
+    let mut smt_post_register = PoseidonSmt::new();
+    smt_post_register.insert(voter.keys.jubjub_pubkey, config.collateral_amount);
 
 
     // ── 7. Run Voter::release_collateral ──────────────────────

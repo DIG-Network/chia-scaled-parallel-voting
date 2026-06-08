@@ -36,7 +36,7 @@ use chip_voting_sdk::actors::ballot::{
 use chip_voting_sdk::actors::deployer::ElectionDeployer;
 use chip_voting_sdk::ceremony::VerificationKey;
 use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
-use chip_voting_sdk::merkle::SparseMerkleTree;
+use chip_voting_sdk::merkle::PoseidonSmt;
 use chip_voting_sdk::actors::voter::CastVoteParams;
 use chip_voting_sdk::{puzzles, DeployParams, NetworkType, Voter, VoterKeys};
 use clvm_traits::ToClvm;
@@ -137,7 +137,7 @@ async fn voter_cast_vote_against_simulator_full_flow() {
     drop(ctx);
 
     let voter = Voter::new(config.clone(), voter_keys, NetworkType::Testnet11);
-    let smt_pre_register = SparseMerkleTree::new();
+    let smt_pre_register = PoseidonSmt::new();
     let chain = common::SharedSim::new(&mut sim);
     let register_bundle = voter
         .register(&smt_pre_register, cat_parent_spend, &chain, config.collateral_amount)
@@ -214,9 +214,9 @@ async fn voter_cast_vote_against_simulator_full_flow() {
     // match what `BallotIssuer::launch_ballot` actually used. After
     // the voter registered, weight = collateral_amount and root =
     // depth-32 SMT containing voter_pk. Mirror locally.
-    let mut smt_post_register = SparseMerkleTree::new();
-    smt_post_register.insert(&voter_pk, config.collateral_amount).expect("smt insert");
-    let registration_merkle_root_snapshot = smt_post_register.root();
+    let mut smt_post_register = PoseidonSmt::new();
+    smt_post_register.insert(voter.keys.jubjub_pubkey, config.collateral_amount);
+    let registration_merkle_root_snapshot = Bytes32::new(smt_post_register.root_be32());
     let registration_vote_weight_snapshot = collateral_amount; // exactly 1 voter post-register
 
     // ── 8. cast_vote ──────────────────────────────────────

@@ -41,7 +41,7 @@ use chip_voting_sdk::actors::deployer::ElectionDeployer;
 use chip_voting_sdk::actors::voter::CastVoteParams;
 use chip_voting_sdk::ceremony::VerificationKey;
 use chip_voting_sdk::config::PUBLIC_INPUT_COUNT;
-use chip_voting_sdk::merkle::SparseMerkleTree;
+use chip_voting_sdk::merkle::PoseidonSmt;
 use chip_voting_sdk::{puzzles, DeployParams, NetworkType, Voter, VoterKeys};
 use clvm_traits::ToClvm;
 use clvm_utils::tree_hash;
@@ -139,7 +139,7 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
     drop(ctx);
 
     let voter = Voter::new(config.clone(), voter_keys, NetworkType::Testnet11);
-    let smt_pre_register = SparseMerkleTree::new();
+    let smt_pre_register = PoseidonSmt::new();
 
     let chain = common::SharedSim::new(&mut sim);
     let register_bundle = voter
@@ -171,9 +171,9 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
     let vote_threshold_num: u64 = 1;
     let vote_threshold_den: u64 = 2;
     let registration_merkle_root_snapshot = {
-        let mut s = SparseMerkleTree::new();
-        s.insert(&voter_pk, config.collateral_amount).expect("smt insert");
-        s.root()
+        let mut s = PoseidonSmt::new();
+        s.insert(voter.keys.jubjub_pubkey, config.collateral_amount);
+        Bytes32::new(s.root_be32())
     };
     let registration_vote_weight_snapshot = collateral_amount;
 
@@ -259,8 +259,8 @@ async fn voter_release_collateral_after_cast_vote_full_flow() {
     let post_cast_reg_coin_id = post_cast_reg_coin.coin_id();
 
     // ── 6. release_collateral against the post-cast Registration Coin
-    let mut smt_post_register = SparseMerkleTree::new();
-    smt_post_register.insert(&voter_pk, config.collateral_amount).expect("smt insert");
+    let mut smt_post_register = PoseidonSmt::new();
+    smt_post_register.insert(voter.keys.jubjub_pubkey, config.collateral_amount);
 
     let destination = Bytes32::new([0xDD; 32]);
     let chain = common::SharedSim::new(&mut sim);
