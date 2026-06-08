@@ -200,6 +200,27 @@ impl VotingCircuitV2 {
             .map(|s| s.weight)
             .sum()
     }
+
+    /// The circuit's PUBLIC INPUTS as field elements, in the exact order
+    /// `generate_constraints` allocates them (`new_input`):
+    ///   [0] registration_root      (the Poseidon SPT root snapshot)
+    ///   [1] vote_message           (Fr; the outcome digest signers signed)
+    ///   [2] registration_vote_weight (Fr::from)
+    ///   [3] vote_threshold_num     (Fr::from)
+    ///   [4] vote_threshold_den     (Fr::from)
+    /// The on-chain `finalize_v2` verifier and the aggregator's proof
+    /// builder MUST use this exact ordering (IC1..IC5) — it replaces the
+    /// live circuit's 8-input layout (no `agg_signers`/threshold-pack
+    /// scalars; binding is fully in-circuit).
+    pub fn public_inputs(&self) -> Vec<Fr> {
+        vec![
+            self.registration_root,
+            self.vote_message,
+            Fr::from(self.registration_vote_weight),
+            Fr::from(self.vote_threshold_num),
+            Fr::from(self.vote_threshold_den),
+        ]
+    }
 }
 
 impl ConstraintSynthesizer<Fr> for VotingCircuitV2 {
@@ -459,13 +480,10 @@ mod tests {
         let c = circuit(&tree, m, vec![sa, sb], total);
         assert!(is_satisfied(c.clone()), "honest witness must satisfy");
 
-        let public = vec![
-            c.registration_root,
-            c.vote_message,
-            Fr::from(c.registration_vote_weight),
-            Fr::from(c.vote_threshold_num),
-            Fr::from(c.vote_threshold_den),
-        ];
+        // Use the canonical public-input layout the on-chain verifier will
+        // mirror — this also pins that `public_inputs()` matches the order
+        // `generate_constraints` allocates `new_input`s.
+        let public = c.public_inputs();
         let mut r = rng();
         let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(c.clone(), &mut r).unwrap();
         let proof = Groth16::<Bls12_381>::prove(&pk, c, &mut r).unwrap();
