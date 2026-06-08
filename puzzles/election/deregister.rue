@@ -37,31 +37,32 @@
 // collateral release; ballot finalize announcements are not.
 
 import super::common_types::*;
+import super::poseidon::*;
 import shared::*;
 
-inline fn slot_from_pubkey(pubkey: PublicKey) -> Int {
-    let pk_hash_b: Bytes = sha256(pubkey as Bytes) as Bytes;
-    let prefix: Bytes = substr(pk_hash_b, 0, 4);
+// SEC-F1: Poseidon-over-Jubjub registration SPT (matches register.rue +
+// merkle.rs::PoseidonSmt). Slot from the voter's Jubjub pubkey coords.
+inline fn slot_from_jubjub(jub_x: Bytes32, jub_y: Bytes32) -> Int {
+    let h: Bytes = sha256((jub_x as Bytes) + (jub_y as Bytes)) as Bytes;
+    let prefix: Bytes = substr(h, 0, 4);
     let unsigned_bytes: Bytes = 0x00 as Bytes + prefix;
     unsigned_bytes as Int
 }
 
 fn compute_root(
-    node: Bytes32,
+    node: Int,
     index: Int,
     remaining: HashCons,
     depth_remaining: Int,
-) -> Bytes32 {
+) -> Int {
     if depth_remaining == 0 {
         node
     } else {
-        let sibling: Bytes32 = remaining.head;
-        let node_b: Bytes = node as Bytes;
-        let sibling_b: Bytes = sibling as Bytes;
-        let parent: Bytes32 = if index % 2 == 0 {
-            sha256(node_b + sibling_b)
+        let sibling: Int = remaining.head as Int;
+        let parent: Int = if index % 2 == 0 {
+            hash2(node, sibling)
         } else {
-            sha256(sibling_b + node_b)
+            hash2(sibling, node)
         };
         compute_root(parent, index / 2, remaining.tail, depth_remaining - 1)
     }
@@ -76,15 +77,18 @@ fn main(
     Truth: ElectionStateTruth,
     // ── Solution ────────────────────────────────────────────────────
     voter_pubkey: PublicKey,
+    // SEC-F1: the voter's Jubjub pubkey coords — the SMT leaf commits these.
+    jub_x: Bytes32,
+    jub_y: Bytes32,
     deregister_leaf_index: Int,
     locked_cat_mojos: Int,
     ...deregister_siblings: HashCons,
 ) -> (ElectionStateTruth, List<Condition>) {
     inline let State = Truth.State;
 
-    // Slot integrity: index MUST be the canonical slot for this pubkey
+    // Slot integrity: index MUST be the canonical slot for this Jubjub key
     // (matches register.rue's invariant).
-    let computed_slot: Int = slot_from_pubkey(voter_pubkey);
+    let computed_slot: Int = slot_from_jubjub(jub_x, jub_y);
     assert deregister_leaf_index == computed_slot;
 
     // SECURITY (SEC-DEREGISTER-UNDERFLOW + floor parity with register):
@@ -112,16 +116,23 @@ fn main(
     // leaf hash and the proof fails. This is what keeps the
     // recovered amount honest — no separate signature required.
     let pk_b: Bytes = voter_pubkey as Bytes;
-    let active_leaf: Bytes32 = sha256(pk_b + int_to_8_bytes_be(locked_cat_mojos));
-    let pre_root: Bytes32 = compute_root(
+    // SEC-F1: Poseidon leaf over the Jubjub pubkey + weight (matches
+    // register.rue + PoseidonSmt). The proof still verifies only for the
+    // exact `locked_cat_mojos` the voter registered with.
+    let active_leaf: Int = hash_leaf(jub_x as Int, jub_y as Int, locked_cat_mojos);
+    let pre_root: Int = compute_root(
         active_leaf, deregister_leaf_index, deregister_siblings, TREE_DEPTH,
     );
-    assert pre_root == State.registration_merkle_root;
+    assert pre_root == (State.registration_merkle_root as Int);
 
-    // New root with the voter's leaf wiped to EMPTY_LEAF_HASH.
-    let new_root: Bytes32 = compute_root(
-        EMPTY_LEAF_HASH, deregister_leaf_index, deregister_siblings, TREE_DEPTH,
+    // New root with the voter's leaf wiped to EMPTY_LEAF_HASH (Poseidon
+    // empty leaf). `int_to_32_bytes_be` always yields 32 bytes.
+    let new_root_int: Int = compute_root(
+        EMPTY_LEAF_HASH as Int, deregister_leaf_index, deregister_siblings, TREE_DEPTH,
     );
+    let new_root_b: Bytes = int_to_32_bytes_be(new_root_int);
+    assert new_root_b is Bytes32;
+    let new_root: Bytes32 = new_root_b;
 
     // Voter's signature authorizing their own deregistration. Bound to
     // the election launcher so a sig from one election cannot replay on
