@@ -162,22 +162,53 @@ quorums need proof batching/recursion (future).
        * on-chain `puzzles/poseidon.rue` — test
          `poseidon_rue_parity_e2e::rue_poseidon_matches_rust_reference` pins
          Rue == reference byte-for-byte.
-   - **[TODO]** Migrate the OFF-CHAIN tree `sdk/src/merkle.rs` from the
-     SHA256 SPT to this Poseidon tree (leaf `hash_leaf`, node `hash2`).
-   - **[TODO]** Identity migration + on-chain membership: voters register a
-     Jubjub signing key; `register.rue`/`deregister.rue` compute the leaf as
-     `hash_leaf(jub_px, jub_py, weight)` and verify membership/emptiness with
-     `puzzles/poseidon.rue`'s `hash2` (replacing the SHA256 `compute_root`).
-     Ripple the Jubjub identity through `VoterKeys`, `RegistrationState`, the
-     SDK predictors, and the aggregator's tree reconstruction.
-5. **[TODO]** Rewrite `finalize.rue` for the new public-input set (drop
-   `agg_signers`/`bls_verify`/`g2_map`; keep the Groth16 pairing + outcome
-   commit). Rebuild VK / ceremony. Promote `VotingCircuitV2` to the live
-   circuit; fix `MAX_SIGNERS_PER_PROOF`.
-6. **[TODO]** Rewrite `sdk/src/actors/aggregator.rs` finalize builder +
-   voter signing (Jubjub Schnorr) + `sdk/src/actors/voter.rs`; update all
-   finalize e2e tests; flip `exploit_finalize_forgery_e2e.rs` to assert the
-   forged proof is REJECTED.
+   - **[DONE]** OFF-CHAIN tree `sdk/src/merkle.rs::PoseidonSmt` (leaf
+     `hash_leaf`, node `hash2`, depth `TREE_DEPTH`, root as 32-byte BE),
+     keyed by Jubjub pubkey; tests `poseidon_smt_proof_reconstructs_root` +
+     `poseidon_smt_proof_verifies_in_circuit`.
+   - **[DONE]** On-chain encoding helper `common_types::int_to_32_bytes_be`
+     (32-byte BE of an Fr) — parity-tested vs `fr_to_bytes32_be`
+     (`int32_be_parity_e2e`).
+   - **[DONE]** Voter identity: `VoterKeys` carries a deterministic Jubjub
+     key + `jubjub_schnorr_sign` (tested).
+   - **[TODO — ATOMIC unit; not green-incremental]** On-chain accumulator
+     wiring. All of the following change together (off-chain↔on-chain trees
+     must agree, else every register/finalize e2e breaks):
+       * `register.rue`: `import super::poseidon::*`; `compute_root` over
+         `Int` using `hash2` (not sha256); `active_leaf = hash_leaf(jub_x as
+         Int, jub_y as Int, locked_cat_mojos)`; `slot_from_jubjub(jub_x,
+         jub_y) = sha256(int_to_32(jub_x) || int_to_32(jub_y))[0..4]`; add
+         `jub_x, jub_y: Bytes32` to the solution; compare/store the root via
+         `as Int` / `int_to_32_bytes_be`. The reg-coin ph + `create_reg`
+         announcement + AggSigMe stay BLS-keyed (auth unchanged); only the
+         SMT leaf becomes Jubjub-Poseidon.
+       * `deregister.rue`: same `compute_root`/leaf/slot + jub coords.
+       * `config`: `EMPTY_LEAF_HASH` = Poseidon empty leaf (0x00..00); the
+         deployer's initial `ElectionState.registration_merkle_root` =
+         `PoseidonSmt::new().root_be32()`.
+       * `aggregator.rs` `apply_singleton_spend`: build `PoseidonSmt` from
+         register/deregister spends; recover `(jub_x, jub_y, lock)` (add the
+         jub coords to the `registered` announcement preimage).
+       * `voter.rs` register/deregister builders: pass `jubjub_pubkey`
+         coords + the Poseidon siblings + the jubjub-derived slot.
+       * tests building SMTs manually: `SparseMerkleTree` → `PoseidonSmt`,
+         `insert(&bls_pk, w)` → `insert(jub_pubkey, w)`.
+     The OLD (forgeable) finalize keeps working through this (it ignores
+     membership; binds `s1 = sha256(root)` regardless of the root's hash),
+     so this unit lands GREEN before step 5.
+5. **[TODO]** Rewrite `finalize.rue` for circuit_v2's 5-input set — fold in
+   `finalize_v2_probe.rue`'s pairing (DONE + validated on-chain by
+   `finalize_v2_groth16_e2e`) + the scalar→snapshot bindings (s1=root,
+   s2=vote_message, s3=Fr(weight), s4=Fr(num), s5=Fr(den)); drop
+   `agg_signers`/`bls_verify`/`g2_map`. Rebuild the deployment VK to
+   circuit_v2's (`ArkVerifyingKey::chia_chunked_bytes`, 624 bytes / 6 ICs);
+   `PUBLIC_INPUT_COUNT` 8→5. Promote `VotingCircuitV2` live; fix
+   `MAX_SIGNERS_PER_PROOF`.
+6. **[TODO]** Rewrite `aggregator.rs` finalize builder to produce a
+   circuit_v2 proof from `PoseidonSmt` membership + per-voter
+   `jubjub_schnorr_sign` (DONE) over `vote_message`; update finalize e2e
+   tests; flip `exploit_finalize_forgery_e2e.rs` (+ the on-chain variant) to
+   assert the forged proof is REJECTED.
 
 ## Why not the cheaper-looking shortcuts
 
