@@ -605,6 +605,19 @@ impl PoseidonSmt {
         self.leaves.insert(slot, leaf);
     }
 
+    /// Wipe a voter's leaf back to empty (the on-chain `deregister` action's
+    /// SPT update). Returns whether a leaf was present. Idempotent.
+    pub fn remove(&mut self, pubkey: JubAffine) -> bool {
+        let slot = self.slot_masked(pubkey.x, pubkey.y);
+        self.leaves.remove(&slot).is_some()
+    }
+
+    /// True iff this Jubjub key currently occupies its slot.
+    pub fn contains(&self, pubkey: JubAffine) -> bool {
+        let slot = self.slot_masked(pubkey.x, pubkey.y);
+        self.leaves.contains_key(&slot)
+    }
+
     /// Hash of the subtree spanning slots `[lo, hi)` at remaining `level`
     /// (caller guarantees `hi - lo == 2^level`). u64 bounds avoid u32
     /// overflow at the top level (lo=0, hi=2^32). Mirrors the SHA256
@@ -704,6 +717,22 @@ mod poseidon_smt_tests {
             };
         }
         assert_eq!(node, tree.root(), "proof must reconstruct the root");
+    }
+
+    /// `remove` wipes a leaf so the root returns to the empty-tree root
+    /// (the on-chain `deregister` SPT update).
+    #[test]
+    fn poseidon_smt_remove_restores_empty_root() {
+        let mut tree = PoseidonSmt::with_depth(16);
+        let empty_root = tree.root();
+        let p = keygen(JubScalar::from(123u64));
+        tree.insert(p, 1_000);
+        assert!(tree.contains(p));
+        assert_ne!(tree.root(), empty_root, "insert must change the root");
+        assert!(tree.remove(p), "remove returns true when present");
+        assert!(!tree.contains(p));
+        assert_eq!(tree.root(), empty_root, "remove must restore the empty root");
+        assert!(!tree.remove(p), "remove is idempotent (false when absent)");
     }
 
     /// LOAD-BEARING: a PoseidonSmt membership proof satisfies the in-circuit
