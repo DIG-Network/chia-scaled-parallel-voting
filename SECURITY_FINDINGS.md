@@ -21,11 +21,11 @@ Every finding has a runnable proof-of-exploit or regression test under
 
 | # | Severity | Finding | Status |
 |---|----------|---------|--------|
-| F1 | **Critical** | Finalize forgery — circuit never binds the claimed signer weight to the registered set | **In progress** — forgery closed in-circuit (`circuit_v2`, 6 tests) + Poseidon accumulator complete & cross-validated across all 4 layers; remaining: atomic on-chain wiring + finalize/VK rewrite to promote it live |
+| F1 | **Critical** | Finalize forgery — circuit never binds the claimed signer weight to the registered set | **Fixed** ✅ (forgery closed in-circuit + on-chain: `VotingCircuitV2` binds Poseidon-over-Jubjub membership + Jubjub Schnorr + weight quorum; `finalize.rue` verifies one Groth16 proof, no `agg_signers`/`bls_verify`; `exploit_finalize_forgery_e2e` flipped to REJECTION + `finalize_v2_groth16_e2e` green. Residual: in-circuit per-signer verification can't set up at `MAX_SIGNERS=20000` → small-`max_signers` finalize-proving e2e is a go-live scaling item) |
 | F2 | **Critical** | Register vote-weight forgery / fake CAT collateral | **Fixed** ✅ (numerator: forged weight unspendable via `AssertMyAmount(locked_weight)`); register-time denominator credit is a documented structural residual |
-| F3 | **Critical** | Ballot VK/snapshot substitution — ballot curry not tied to election `vk_hash` | **Open** (needs createBallot→ballot binding) |
+| F3 | **Critical** | Ballot VK/snapshot substitution — ballot curry not tied to election `vk_hash` | **Fixed** ✅ (soundness) — finalize co-spends the live Election Singleton's new read-only `attest_ballot` action; CHIP-0025 message pairing binds the ballot's curried VK/IC + snapshots to the election's unforgeable `vk_hash`/state. `exploit_ballot_substitution_e2e` green. Honest-path aggregator co-spend = go-live wiring (gated by the F1 scaling) |
 | F4 | **High** | Collateral release gated by a forgeable deregister announcement | **Fixed** ✅ (CHIP-0025 RECEIVE_MESSAGE binds the genuine Election Singleton's puzzle hash, re-derived from `election_launcher_id` in state) |
-| F5 | **High** | `vote_mode_lock` is unenforceable | **Open** (needs eve-derivation binding) |
+| F5 | **High** | `vote_mode_lock` is unenforceable | **Fixed** ✅ (soundness) — `attest_ballot` enforces `vote_mode_lock == vote_options_root` against the launched ballot's REAL curried root via the same finalize binding as F3; `exploit_ballot_substitution_e2e` green |
 | F6 | **High** | `mint_voting_coin` had no close-height gate → vote after close | **Fixed** ✅ |
 | F7 | **High** | `int_to_8_bytes_be` aliasing → inflate weight / bypass close gate via `X + 2^64` | **Fixed** ✅ |
 | F8 | **Medium** | `deregister` had no collateral floor / underflow guard | **Fixed** ✅ |
@@ -220,7 +220,44 @@ finalize time over only spendable (amount-bound) coins.
 
 ---
 
-## F3 — Ballot VK / snapshot substitution (CRITICAL, open)
+## F3 — Ballot VK / snapshot substitution (CRITICAL — soundness FIXED ✅; honest-path co-spend is a go-live item)
+
+**Resolution (landed on `security/f3-f5-wip`).** A new READ-ONLY Election
+action `puzzles/election/attest_ballot.rue` emits a CHIP-0025 `SEND_MESSAGE`
+carrying the canonical binding tuple
+`sha256("ballot_binding" || election_id || ballot_id || vk_hash ||
+snapshot_root || be8(weight) || be8(num) || be8(den) || vote_options_root)`,
+where `vk_hash` / the snapshot-equality check / `vote_mode_lock` are read from
+the Election Singleton's UNFORGEABLE state. `ballot_coin/finalize.rue`
+co-spends the live singleton in the same bundle and emits the paired
+`RECEIVE_MESSAGE { mode: SENDER_PUZZLE, sender: [genuine_election_ph] }`, where
+`genuine_election_ph = SingletonArgs::curry_tree_hash(ELECTION_LAUNCHER_ID,
+inner_ph)` (the proven F4 unforgeable-sender primitive) and the message is
+reconstructed from finalize's own curried args. finalize additionally asserts
+`sha256(VK.alpha||beta||gamma||delta||ic0..ic5) == ELECTION_VK_HASH` — the
+chia-chunked layout equals `ElectionState.vk_hash`, so NO `vk_hash`
+redefinition was needed. CHIP-0025 messages pair only in one bundle, which is
+why the check fires at finalize (the consuming path), not at create_ballot.
+
+An attacker who curries a trapdoored VK, a fabricated snapshot, or a
+mode-lock-violating options root cannot finalize: the curried VK can't both
+hash to `ELECTION_VK_HASH` and have `ELECTION_VK_HASH == state.vk_hash`; a
+fabricated snapshot makes `attest_ballot` RAISE (no SEND); and finalize's
+RECEIVE never pairs without the genuine election's SEND. **Test:**
+`sdk/tests/exploit_ballot_substitution_e2e.rs` (6 assertions, green) pins the
+state-derived vk_hash, fabricated-snapshot rejection, mode-lock enforcement,
+and the finalize VK-bind. Election action root is now a 4-leaf tree
+(`election_actions_merkle_root_matches_merkletree` updated). **Go-live
+residual:** the aggregator's honest-path co-spend of `attest_ballot` at
+finalize is liveness wiring gated by the same `MAX_SIGNERS` in-circuit scaling
+that defers F1's finalize-proving e2e; the SOUNDNESS holds regardless (finalize
+cannot complete without the genuine attestation). Snapshot predicate ships the
+"== current state" form (sound vs fabrication; couples finalize timing to
+registration stability — stronger history-accumulator form deferred).
+
+---
+
+### F3 (original) — Ballot VK / snapshot substitution
 
 **Where:** `puzzles/ballot_coin/finalize.rue` (curries VK, IC,
 `REGISTRATION_MERKLE_ROOT_SNAPSHOT`, `REGISTRATION_VOTE_WEIGHT_SNAPSHOT`),
@@ -316,7 +353,23 @@ and `live_orchestration_e2e.rs`.
 
 ---
 
-## F5 — `vote_mode_lock` is unenforceable (HIGH, open)
+## F5 — `vote_mode_lock` is unenforceable (HIGH — soundness FIXED ✅ via the shared F3 binding)
+
+**Resolution.** Closed together with F3 (see above). `attest_ballot` enforces
+`State.vote_mode_lock == NO_VOTE_MODE_LOCK || State.vote_mode_lock ==
+vote_options_root` against the ballot's REAL curried `VOTE_OPTIONS_ROOT` (now
+also curried into `finalize.rue` and carried in the binding tuple), so a
+mode-locked election's ballots cannot finalize under a different vote mode —
+the previously-throwaway create_ballot solution check is replaced by an
+authoritative enforcement on the consuming path. `create_ballot`'s
+`mode_lock_ok` is retained as non-load-bearing defense-in-depth. **Test:**
+`exploit_ballot_substitution_e2e::attest_ballot_enforces_vote_mode_lock`
+(green): locked election rejects a non-matching options root, accepts the
+locked value; unlocked accepts any.
+
+---
+
+### F5 (original) — `vote_mode_lock` is unenforceable
 
 **Where:** `puzzles/election/create_ballot.rue` (`mode_lock_ok` gates the
 solution value `ballot_vote_options_root`), but the actual ballot's

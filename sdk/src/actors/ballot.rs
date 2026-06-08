@@ -601,7 +601,11 @@ impl BallotIssuer {
         //   (VK, IC, BALLOT_LAUNCHER_ID, ELECTION_LAUNCHER_ID,
         //    VOTE_CLOSE_HEIGHT, VOTE_THRESHOLD_NUM,
         //    VOTE_THRESHOLD_DEN, REGISTRATION_MERKLE_ROOT_SNAPSHOT,
-        //    REGISTRATION_VOTE_WEIGHT_SNAPSHOT)
+        //    REGISTRATION_VOTE_WEIGHT_SNAPSHOT, ELECTION_VK_HASH,
+        //    VOTE_OPTIONS_ROOT)
+        // SEC-F3+F5: ELECTION_VK_HASH (= the deployment's committed vk_hash)
+        // and VOTE_OPTIONS_ROOT are curried so the ballot's finalize can bind
+        // them to the genuine election via the attest_ballot message.
         let finalize_program_node =
             load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_FINALIZE_HEX)?;
         let finalize_curried = CurriedProgram {
@@ -616,6 +620,8 @@ impl BallotIssuer {
                 params.vote_threshold_den,
                 registration_merkle_root_snapshot,
                 registration_vote_weight_snapshot,
+                self.config.vk_hash(),
+                params.vote_options_root,
             ),
         }
         .to_clvm(&mut *ctx)
