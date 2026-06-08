@@ -152,12 +152,24 @@ quorums need proof batching/recursion (future).
      is viable; the design-doc dual-commitment fallback is NOT needed. (This
      is a lower bound — modadds/round-loop/ARK-indexing add more — but even
      3–4× stays <5 % of the cap, and registers are infrequent O(1) spends.)
-   - **[TODO]** Implement the width-3 Poseidon permutation in Rue (S-box x^5,
-     MDS, ARK over Fr) with parameters matching `circuit_v2::poseidon_config`
-     byte-for-byte; switch `circuit_v2` from the generic sponge to the same
-     fixed-arity compression so the in-circuit, off-circuit (`merkle.rs`),
-     and on-chain (Rue) hashes are identical; wire into register/deregister
-     membership + emptiness; update SDK predictors.
+   - **[DONE]** Shared Poseidon primitive across ALL THREE layers, each
+     cross-validated:
+       * off-circuit reference `sdk/src/prover/poseidon_perm.rs` (explicit
+         width-3 permutation; `hash2`/`hash3`/`hash_leaf`/`hash_node`);
+       * in-circuit gadgets in the same module (`permute_var` etc.) — test
+         `gadget_matches_reference` pins gadget == reference; `circuit_v2`
+         switched off the generic sponge onto them (all 6 circuit tests pass);
+       * on-chain `puzzles/poseidon.rue` — test
+         `poseidon_rue_parity_e2e::rue_poseidon_matches_rust_reference` pins
+         Rue == reference byte-for-byte.
+   - **[TODO]** Migrate the OFF-CHAIN tree `sdk/src/merkle.rs` from the
+     SHA256 SPT to this Poseidon tree (leaf `hash_leaf`, node `hash2`).
+   - **[TODO]** Identity migration + on-chain membership: voters register a
+     Jubjub signing key; `register.rue`/`deregister.rue` compute the leaf as
+     `hash_leaf(jub_px, jub_py, weight)` and verify membership/emptiness with
+     `puzzles/poseidon.rue`'s `hash2` (replacing the SHA256 `compute_root`).
+     Ripple the Jubjub identity through `VoterKeys`, `RegistrationState`, the
+     SDK predictors, and the aggregator's tree reconstruction.
 5. **[TODO]** Rewrite `finalize.rue` for the new public-input set (drop
    `agg_signers`/`bls_verify`/`g2_map`; keep the Groth16 pairing + outcome
    commit). Rebuild VK / ceremony. Promote `VotingCircuitV2` to the live
