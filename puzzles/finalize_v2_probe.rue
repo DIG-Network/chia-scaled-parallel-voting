@@ -1,0 +1,59 @@
+// puzzles/finalize_v2_probe.rue
+// SEC-F1 step 5 PROBE: on-chain Groth16 verification of VotingCircuitV2.
+//
+// circuit_v2 (the Option-B finalize circuit) has FIVE public inputs and binds
+// membership + Jubjub-Schnorr signatures + the weight threshold ENTIRELY
+// in-circuit, so finalize needs only the Groth16 pairing check — NO
+// `agg_signers` / `bls_verify` / `g2_map` (those are dropped). This probe
+// isolates and validates exactly that pairing for circuit_v2's 5-input layout
+// (IC0 + IC1·s1 + … + IC5·s5), so the eventual `ballot_coin/finalize.rue`
+// rewrite can adopt it with confidence. Cross-checked byte-for-byte against a
+// real arkworks proof/VK by `sdk/tests/finalize_v2_groth16_e2e.rs`.
+//
+// Public-input order MUST match `VotingCircuitV2::public_inputs()`:
+//   s1 = registration_root, s2 = vote_message, s3 = Fr(weight),
+//   s4 = Fr(num), s5 = Fr(den).
+//
+// Solution is a flat proper list (no curry): VK (alpha,beta,gamma,delta),
+// IC0..IC5, proof (a,b,c), then the five scalars. Returns `true` on a valid
+// proof; `bls_pairing_identity` RAISES (spend rejected) on an invalid one.
+
+fn main(
+    alpha: PublicKey,
+    beta: Signature,
+    gamma: Signature,
+    delta: Signature,
+    ic0: PublicKey,
+    ic1: PublicKey,
+    ic2: PublicKey,
+    ic3: PublicKey,
+    ic4: PublicKey,
+    ic5: PublicKey,
+    a: PublicKey,
+    b: Signature,
+    c: PublicKey,
+    s1: PublicKey,
+    s2: PublicKey,
+    s3: PublicKey,
+    s4: PublicKey,
+    s5: PublicKey,
+) -> Bool {
+    // vk_input = IC0 + Σ ICi · si  (Groth16 prepared input commitment).
+    let vk_input: PublicKey = ic0
+        + ic1 * s1
+        + ic2 * s2
+        + ic3 * s3
+        + ic4 * s4
+        + ic5 * s5;
+
+    // Groth16 pairing identity:
+    //   e(A,B) · e(-alpha,beta) · e(-vk_input,gamma) · e(-C,delta) == 1
+    bls_pairing_identity(
+        a,         b,
+        -alpha,    beta,
+        -vk_input, gamma,
+        -c,        delta,
+    );
+
+    true
+}
