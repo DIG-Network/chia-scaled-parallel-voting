@@ -101,6 +101,10 @@ pub mod circuit;
 // path. Not yet wired into finalization.
 pub mod circuit_v2;
 pub mod conversions;
+// F1 step 4: explicit width-3 Poseidon permutation shared by the in-circuit
+// gadget, the off-circuit accumulator (merkle.rs), and the on-chain Rue
+// register/deregister membership.
+pub mod poseidon_perm;
 pub mod proof;
 
 pub use circuit::VotingCircuit;
