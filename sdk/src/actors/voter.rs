@@ -116,6 +116,35 @@ impl VoterKeys {
     pub fn sign_unsafe(&self, message: &[u8]) -> Signature {
         chia_bls::sign_raw(&self.secret, message)
     }
+
+    /// SEC-F1 (step 6 building block): produce a Jubjub Schnorr signature
+    /// over `vote_message` (an Fr field element) with this voter's Jubjub
+    /// key — the signature the finalize circuit (`prover::circuit_v2`)
+    /// verifies in-circuit. The nonce `k` is derived DETERMINISTICALLY from
+    /// the secret + message (RFC6979/EdDSA-style) so two signatures over the
+    /// same message never reuse `k` with a different message (which would
+    /// leak the key), and signing needs no RNG.
+    ///
+    /// Returns `(R, s)` with `R = k·G`, `s = k + challenge_to_inner(c)·x`,
+    /// `c = Poseidon(R.x, P.x, vote_message)` — exactly what `SignerV2`
+    /// carries into the circuit.
+    pub fn jubjub_schnorr_sign(
+        &self,
+        vote_message: ark_bls12_381::Fr,
+    ) -> (ark_ed_on_bls12_381::EdwardsAffine, ark_ed_on_bls12_381::Fr) {
+        use ark_ed_on_bls12_381::Fr as JubScalar;
+        use ark_ff::{BigInteger, PrimeField};
+        use sha2::Digest;
+        let cfg = crate::prover::circuit_v2::poseidon_config();
+        // Deterministic nonce k = H("CHIP/jubjub-nonce/v1" || x_le || m_le).
+        let mut h = sha2::Sha256::new();
+        h.update(b"CHIP/jubjub-nonce/v1");
+        h.update(self.jubjub_secret.into_bigint().to_bytes_le());
+        h.update(vote_message.into_bigint().to_bytes_le());
+        let seed: [u8; 32] = h.finalize().into();
+        let k = JubScalar::from_le_bytes_mod_order(&seed);
+        crate::prover::circuit_v2::schnorr_sign(&cfg, self.jubjub_secret, k, vote_message)
+    }
 }
 
 /// STRUCT: Voter
@@ -2654,6 +2683,36 @@ mod tests {
     use chia_puzzle_types::DeriveSynthetic;
     use hex_literal::hex;
     use sha2::{Digest, Sha256};
+
+    /// SEC-F1: `VoterKeys::jubjub_schnorr_sign` produces a signature that
+    /// satisfies the Schnorr verification equation the finalize circuit
+    /// checks: `s·G == R + challenge_to_inner(c)·P`,
+    /// `c = Poseidon(R.x, P.x, vote_message)`.
+    #[test]
+    fn jubjub_schnorr_sign_produces_valid_signature() {
+        use crate::prover::circuit_v2::{challenge_to_inner, poseidon_config};
+        use crate::prover::poseidon_perm::hash3;
+        use ark_bls12_381::Fr;
+        use ark_ec::{CurveGroup, Group};
+        use ark_ed_on_bls12_381::EdwardsProjective as Jub;
+        use chia_bls::SecretKey;
+
+        let keys = VoterKeys::new(SecretKey::from_seed(&[3u8; 32]));
+        let vote_message = Fr::from(0xDEAD_BEEFu64);
+        let (r, s) = keys.jubjub_schnorr_sign(vote_message);
+        let p = keys.jubjub_pubkey;
+
+        let cfg = poseidon_config();
+        let c = hash3(&cfg, r.x, p.x, vote_message);
+        let c_inner = challenge_to_inner(c);
+        let lhs = (Jub::generator() * s).into_affine();
+        let rhs = (Jub::from(r) + Jub::from(p) * c_inner).into_affine();
+        assert_eq!(lhs, rhs, "Schnorr signature must verify: s·G == R + c·P");
+
+        // Determinism: same message ⇒ same signature (no RNG).
+        let (r2, s2) = keys.jubjub_schnorr_sign(vote_message);
+        assert_eq!((r, s), (r2, s2), "signing must be deterministic");
+    }
 
     fn test_voter_pk() -> PublicKey {
         let root = Sk::from_bytes(&hex!(
