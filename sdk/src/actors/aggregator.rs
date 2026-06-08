@@ -2990,6 +2990,7 @@ mod tests {
     use crate::ceremony::VerificationKey;
     use crate::chain::SharedSimulator;
     use crate::config::PUBLIC_INPUT_COUNT;
+    use ark_ed_on_bls12_381::Fr as JubScalar;
     use chia_sdk_test::Simulator;
 
     fn dummy_deploy_params() -> DeployParams {
@@ -3255,10 +3256,11 @@ mod tests {
             .map(|(sk, pk)| VoteRecord {
                 voter_pubkey: *pk,
                 vote_data: vote_outcome,
-                vote_signature_hex: sign_canonical(sk, canonical_msg),
+                vote_signature_hex: String::new(),
                 registration_coin_id: Bytes32::default(),
                 ballot_launcher_id: Bytes32::default(),
                 voting_coin_id: Bytes32::default(),
+                jubjub_vote: Some(test_jubjub_vote(sk, vote_message_to_fr(canonical_msg))),
             })
             .collect();
 
@@ -3266,11 +3268,12 @@ mod tests {
         let res = agg
             .build_finalize(vote_outcome, &votes, Bytes32::default(), &pk)
             .await;
-        // The prover's VK doesn't match the deploy's zero-VK so
-        // the action-layer's curried hash mismatches the merkle
-        // root → spend assembly fails. This is EXPECTED for the
-        // zero-VK deploy and confirms the flow reaches assembly.
-        assert!(matches!(res, Err(VotingError::Other(_))));
+        // SEC-F1: build_finalize now builds a circuit_v2 proof; with the
+        // legacy zero/old-circuit stub proving key the flow cannot produce
+        // a matching proof + the action-layer curried hash mismatches the
+        // zero-VK deploy. Either way assembly fails — we only assert the
+        // flow reaches an error rather than panicking.
+        assert!(res.is_err());
     }
 
     /// WHAT: the strict-majority threshold `2 * k > n` correctly
@@ -3303,6 +3306,48 @@ mod tests {
         let sk = chia_bls::SecretKey::from_seed(&seed);
         let pk = sk.public_key();
         (sk, pk)
+    }
+
+    /// SEC-F1: derive a voter's Jubjub signing keypair from their BLS
+    /// secret, mirroring `VoterKeys::new`'s `CHIP/jubjub-signing-key/v1`
+    /// scheme. Returns `(secret, pubkey)`. The PoseidonSmt is keyed by the
+    /// Jubjub pubkey, and circuit_v2 verifies a Schnorr signature under it.
+    fn test_jubjub(sk: &chia_bls::SecretKey) -> (JubScalar, JubAffine) {
+        use ark_ec::{CurveGroup, Group};
+        use ark_ed_on_bls12_381::EdwardsProjective as Jub;
+        use ark_ff::PrimeField;
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(b"CHIP/jubjub-signing-key/v1");
+        h.update(sk.to_bytes());
+        let seed: [u8; 32] = h.finalize().into();
+        let s = JubScalar::from_le_bytes_mod_order(&seed);
+        let p = (Jub::generator() * s).into_affine();
+        (s, p)
+    }
+
+    /// SEC-F1: build a `JubjubVoteWitness` (the in-circuit Schnorr signature)
+    /// for `sk` over `vote_message_fr`.
+    fn test_jubjub_vote(
+        sk: &chia_bls::SecretKey,
+        vote_message_fr: ark_bls12_381::Fr,
+    ) -> crate::state::JubjubVoteWitness {
+        let (jsec, jpub) = test_jubjub(sk);
+        let cfg = crate::prover::circuit_v2::poseidon_config();
+        let (sig_r, sig_s) = crate::prover::circuit_v2::schnorr_sign(
+            &cfg,
+            jsec,
+            JubScalar::from(7u64),
+            vote_message_fr,
+        );
+        crate::state::JubjubVoteWitness { pubkey: jpub, sig_r, sig_s }
+    }
+
+    /// Reduce a canonical (Bytes32) vote message into `Fr` the way the
+    /// aggregator + finalize.rue do.
+    fn vote_message_to_fr(m: Bytes32) -> ark_bls12_381::Fr {
+        use ark_ff::PrimeField;
+        ark_bls12_381::Fr::from_be_bytes_mod_order(m.as_ref())
     }
 
     /// Sign `message` with `sk` using UNAUGMENTED BLS
@@ -3354,15 +3399,17 @@ mod tests {
         // `collateral_amount` (uniform). Tests covering non-uniform
         // weighted voting should construct their own helper.
         let uniform_lock = agg.config.collateral_amount;
-        for (_, pk) in &voters {
+        for (sk, pk) in &voters {
             agg.voter_set.as_mut().unwrap().voters.push(*pk);
-            // Also insert into the SPT so prove() returns realistic
-            // sibling paths that match registration_merkle_root.
-            agg.smt.as_mut().unwrap().insert(pk, uniform_lock).unwrap();
+            // SEC-F1: insert the voter's JUBJUB pubkey into the Poseidon SPT
+            // (the tree is Jubjub-keyed) so prove_jubjub() returns realistic
+            // sibling paths matching registration_merkle_root.
+            agg.smt.as_mut().unwrap().insert(test_jubjub(sk).1, uniform_lock);
         }
+        let root = Bytes32::new(agg.smt.as_ref().unwrap().root_be32());
         agg.voter_set.as_mut().unwrap().registration_count = n_voters as u64;
-        agg.voter_set.as_mut().unwrap().registration_merkle_root = agg.smt.as_ref().unwrap().root();
-        agg.state.as_mut().unwrap().registration_merkle_root = agg.smt.as_ref().unwrap().root();
+        agg.voter_set.as_mut().unwrap().registration_merkle_root = root;
+        agg.state.as_mut().unwrap().registration_merkle_root = root;
         agg.state.as_mut().unwrap().registration_count = n_voters as u64;
         (agg, voters)
     }
@@ -3383,14 +3430,15 @@ mod tests {
         agg.sync().await.unwrap();
         let voters: Vec<_> = (0..locks.len() as u32).map(test_voter).collect();
         let mut total_weight: u64 = 0;
-        for ((_, pk), lock) in voters.iter().zip(locks.iter()) {
+        for ((sk, pk), lock) in voters.iter().zip(locks.iter()) {
             agg.voter_set.as_mut().unwrap().voters.push(*pk);
-            agg.smt.as_mut().unwrap().insert(pk, *lock).unwrap();
+            agg.smt.as_mut().unwrap().insert(test_jubjub(sk).1, *lock);
             total_weight = total_weight.checked_add(*lock).expect("test lock overflow");
         }
+        let root = Bytes32::new(agg.smt.as_ref().unwrap().root_be32());
         agg.voter_set.as_mut().unwrap().registration_count = locks.len() as u64;
-        agg.voter_set.as_mut().unwrap().registration_merkle_root = agg.smt.as_ref().unwrap().root();
-        agg.state.as_mut().unwrap().registration_merkle_root = agg.smt.as_ref().unwrap().root();
+        agg.voter_set.as_mut().unwrap().registration_merkle_root = root;
+        agg.state.as_mut().unwrap().registration_merkle_root = root;
         agg.state.as_mut().unwrap().registration_count = locks.len() as u64;
         agg.state.as_mut().unwrap().registration_vote_weight = total_weight;
         (agg, voters)
@@ -3417,13 +3465,15 @@ mod tests {
         let election_id = agg.config.election_launcher_id().unwrap();
         let canonical_msg =
             canonical_vote_message(vote_outcome, placeholder_ballot_id(), election_id);
+        let vote_message_fr = vote_message_to_fr(canonical_msg);
         let mk_vote = |sk: &chia_bls::SecretKey, pk: &PublicKey| VoteRecord {
             voter_pubkey: *pk,
             vote_data: vote_outcome,
-            vote_signature_hex: sign_canonical(sk, canonical_msg),
+            vote_signature_hex: String::new(),
             registration_coin_id: Bytes32::default(),
             ballot_launcher_id: Bytes32::default(),
             voting_coin_id: Bytes32::default(),
+            jubjub_vote: Some(test_jubjub_vote(sk, vote_message_fr)),
         };
 
         let total_weight = 6_000u64;
@@ -3463,262 +3513,6 @@ mod tests {
         }
     }
 
-    /// WHAT: the aggregated BLS signature in the witness satisfies
-    ///       the PoP-style single-pair pairing identity
-    ///       `e(agg_signers, H(vote_message)) ==
-    ///        e(G1_GENERATOR, agg_signature)` — exactly what the
-    ///       on-chain `bls_pairing_identity` opcode in
-    ///       `puzzles/election/finalize.rue` checks.
-    /// HOW:  same setup as the previous test; after extracting the
-    ///       witness, hash `vote_message` to G2 via the default
-    ///       (AUG_) DST, and call `chia_bls::aggregate_pairing`
-    ///       with the two `(G1, G2)` pairs the on-chain identity
-    ///       expects (`agg_signers`, `H(msg)`) and (`-G1::generator`,
-    ///       `agg_sig`). Assert it returns true.
-    /// WHY:  Voters in this CHIP sign with `sign_unsafe`
-    ///       (UNAUGMENTED) so per-voter sigs sum to
-    ///       `sk_agg · H(msg)` and the textbook PoP-style identity
-    ///       holds. This pre-check is what guarantees the prover
-    ///       will succeed; failure here means the prover can never
-    ///       construct a valid proof.
-    ///
-    ///       Per-pair augmented `chia_bls::aggregate_verify` would
-    ///       NOT work here, because that helper internally
-    ///       augments each (pk, msg) pair with `pk || msg` —
-    ///       matching only `chia_bls::sign` (augmented), not the
-    ///       `sign_raw` voters use.
-    #[tokio::test(flavor = "current_thread")]
-    async fn prepare_finalize_witness_aggregated_signature_pop_pairing_verifies() {
-        let (config, mut sim) = deploy_into_sim();
-        let chain = SharedSimulator::new(&mut sim);
-        let (agg, voters) = populated_aggregator(config.clone(), chain, 3).await;
-
-        let vote_outcome = Bytes32::new([0xAB; 32]);
-        let election_id = config.election_launcher_id().unwrap();
-        let canonical_msg =
-            canonical_vote_message(vote_outcome, placeholder_ballot_id(), election_id);
-
-        let votes: Vec<_> = voters[..2]
-            .iter()
-            .map(|(sk, pk)| VoteRecord {
-                voter_pubkey: *pk,
-                vote_data: vote_outcome,
-                vote_signature_hex: sign_canonical(sk, canonical_msg),
-                registration_coin_id: Bytes32::default(),
-                ballot_launcher_id: Bytes32::default(),
-                voting_coin_id: Bytes32::default(),
-            })
-            .collect();
-        let w = agg
-            .prepare_finalize_witness(vote_outcome, placeholder_ballot_id(), &votes)
-            .expect("witness preparation succeeds");
-
-        // PoP-style single-pair pairing identity:
-        //   e(agg_signers, H(vote_message)) *
-        //     e(-G1_GENERATOR, agg_signature) == identity
-        let h_vote_message = chia_bls::hash_to_g2(w.vote_message.as_ref());
-        let neg_g1 = -PublicKey::generator();
-        assert!(
-            chia_bls::aggregate_pairing([
-                (&w.agg_signers, &h_vote_message),
-                (&neg_g1, &w.agg_signature),
-            ]),
-            "aggregated signature must satisfy the PoP-style pairing identity \
-             that mirrors the on-chain `bls_pairing_identity` check",
-        );
-    }
-
-    /// WHAT: every per-signer Merkle proof in the witness verifies
-    ///       against the witness's `registration_merkle_root` with
-    ///       the signer's `active_leaf_hash`.
-    /// HOW:  build the witness as in previous tests; for each
-    ///       (signer_pk, proof), compute the slot + active leaf hash,
-    ///       call `merkle::verify_proof`, assert true.
-    /// WHY:  these proofs ARE the Groth16 circuit's private witness;
-    ///       on-chain failure is silent and expensive. Pre-checking
-    ///       them off-chain is essential for cost safety.
-    #[tokio::test(flavor = "current_thread")]
-    async fn prepare_finalize_witness_merkle_proofs_verify() {
-        use crate::merkle::verify_proof;
-
-        let (config, mut sim) = deploy_into_sim();
-        let chain = SharedSimulator::new(&mut sim);
-        let (agg, voters) = populated_aggregator(config.clone(), chain, 4).await;
-
-        let vote_outcome = Bytes32::new([0x99; 32]);
-        let election_id = config.election_launcher_id().unwrap();
-        let canonical_msg =
-            canonical_vote_message(vote_outcome, placeholder_ballot_id(), election_id);
-        let votes: Vec<_> = voters[..3]
-            .iter()
-            .map(|(sk, pk)| VoteRecord {
-                voter_pubkey: *pk,
-                vote_data: vote_outcome,
-                vote_signature_hex: sign_canonical(sk, canonical_msg),
-                registration_coin_id: Bytes32::default(),
-                ballot_launcher_id: Bytes32::default(),
-                voting_coin_id: Bytes32::default(),
-            })
-            .collect();
-        let w = agg
-            .prepare_finalize_witness(vote_outcome, placeholder_ballot_id(), &votes)
-            .unwrap();
-
-        for (i, pk) in w.signer_pubkeys.iter().enumerate() {
-            let slot = SparseMerkleTree::slot_for_pubkey(pk);
-            // populated_aggregator registers every voter with the
-            // uniform `config.collateral_amount`, so the leaf encoding
-            // uses that value here. Tests covering non-uniform amounts
-            // should look up the per-voter amount from
-            // `agg.merkle_tree()?.locked_amount(pk)`.
-            let leaf = SparseMerkleTree::active_leaf_hash(pk, config.collateral_amount);
-            assert!(
-                verify_proof(leaf, slot, &w.merkle_proofs[i], w.registration_merkle_root),
-                "merkle proof for signer #{i} must verify",
-            );
-        }
-    }
-
-    /// WHAT: `prepare_finalize_witness` rejects a vote whose
-    ///       signature isn't a parsable 96-byte BLS G2 point.
-    /// HOW:  populated aggregator + supply a valid voter pubkey but
-    ///       a signature_hex that's the right length but not a valid
-    ///       G2 encoding ("ff" * 96). Expect InvalidSignature.
-    /// WHY:  malformed signatures should surface as a typed,
-    ///       distinguishable error so callers can branch on it
-    ///       (e.g., UI: "voter X's signature is corrupt — please
-    ///       re-sign") rather than a generic parse error.
-    #[tokio::test(flavor = "current_thread")]
-    async fn prepare_finalize_witness_rejects_malformed_signature() {
-        let (config, mut sim) = deploy_into_sim();
-        let chain = SharedSimulator::new(&mut sim);
-        let (agg, voters) = populated_aggregator(config, chain, 3).await;
-
-        let votes: Vec<_> = voters[..2]
-            .iter()
-            .map(|(_, pk)| VoteRecord {
-                voter_pubkey: *pk,
-                vote_data: Bytes32::default(),
-                // 96 bytes of 0xFF is not a valid BLS G2 point.
-                vote_signature_hex: "ff".repeat(96),
-                registration_coin_id: Bytes32::default(),
-                ballot_launcher_id: Bytes32::default(),
-                voting_coin_id: Bytes32::default(),
-            })
-            .collect();
-
-        let res = agg.prepare_finalize_witness(Bytes32::default(), placeholder_ballot_id(), &votes);
-        assert!(matches!(res, Err(VotingError::InvalidSignature)));
-    }
-
-    /// WHAT: `prepare_finalize_witness` rejects a witness where
-    ///       the supplied vote_signature was generated for the
-    ///       WRONG message (replay-protection / scheme mismatch).
-    /// HOW:  populated_aggregator(3) → for each of 2 voters, sign
-    ///       the WRONG message (a different vote_outcome) → assemble
-    ///       VoteRecords with these stale signatures → call
-    ///       prepare_finalize_witness with the CURRENT vote_outcome.
-    ///       The aggregate-verify pre-check should fail with
-    ///       InvalidSignature.
-    /// WHY:  aggregate verification is the gate that ensures a
-    ///       prover doesn't waste cycles building a Groth16 proof
-    ///       that can never validate on-chain. Failing fast here
-    ///       saves both prover compute and the on-chain bundle fee.
-    #[tokio::test(flavor = "current_thread")]
-    async fn prepare_finalize_witness_rejects_signatures_over_wrong_message() {
-        let (config, mut sim) = deploy_into_sim();
-        let chain = SharedSimulator::new(&mut sim);
-        let (agg, voters) = populated_aggregator(config.clone(), chain, 3).await;
-
-        let real_outcome = Bytes32::new([0xAA; 32]);
-        let wrong_outcome = Bytes32::new([0xBB; 32]);
-        let election_id = config.election_launcher_id().unwrap();
-        // Voters mistakenly sign the wrong outcome.
-        let wrong_msg = canonical_vote_message(wrong_outcome, placeholder_ballot_id(), election_id);
-
-        let votes: Vec<_> = voters[..2]
-            .iter()
-            .map(|(sk, pk)| VoteRecord {
-                voter_pubkey: *pk,
-                vote_data: real_outcome,
-                vote_signature_hex: sign_canonical(sk, wrong_msg),
-                registration_coin_id: Bytes32::default(),
-                ballot_launcher_id: Bytes32::default(),
-                voting_coin_id: Bytes32::default(),
-            })
-            .collect();
-        // We pass the REAL outcome to prepare_finalize_witness, but
-        // the signatures are over the WRONG message. aggregate_verify
-        // catches this.
-        let res = agg.prepare_finalize_witness(real_outcome, placeholder_ballot_id(), &votes);
-        assert!(matches!(res, Err(VotingError::InvalidSignature)));
-    }
-
-    /// WHAT: `prepare_finalize_witness` rejects a vote whose
-    ///       signature_hex isn't valid hex.
-    /// HOW:  populated aggregator + signature_hex = "not-hex".
-    ///       Expect InvalidSignature (NOT a generic Other).
-    /// WHY:  same rationale as the malformed-G2 test — surface
-    ///       parse errors as typed errors.
-    #[tokio::test(flavor = "current_thread")]
-    async fn prepare_finalize_witness_rejects_bad_hex_signature() {
-        let (config, mut sim) = deploy_into_sim();
-        let chain = SharedSimulator::new(&mut sim);
-        let (agg, voters) = populated_aggregator(config, chain, 3).await;
-
-        let votes: Vec<_> = voters[..2]
-            .iter()
-            .map(|(_, pk)| VoteRecord {
-                voter_pubkey: *pk,
-                vote_data: Bytes32::default(),
-                vote_signature_hex: "not-hex".into(),
-                registration_coin_id: Bytes32::default(),
-                ballot_launcher_id: Bytes32::default(),
-                voting_coin_id: Bytes32::default(),
-            })
-            .collect();
-
-        let res = agg.prepare_finalize_witness(Bytes32::default(), placeholder_ballot_id(), &votes);
-        assert!(matches!(res, Err(VotingError::InvalidSignature)));
-    }
-
-    /// WHAT: `aggregate_pubkeys([])` returns the BLS G1 identity
-    ///       (zero) element.
-    /// HOW:  call with empty slice, compare to `PublicKey::default()`.
-    /// WHY:  G1 sum over an empty set must be the identity (so any
-    ///       single-element sum equals that element). Pinned so a
-    ///       refactor doesn't accidentally panic on empty input.
-    #[test]
-    fn aggregate_pubkeys_empty_is_identity() {
-        let agg = aggregate_pubkeys(&[]);
-        assert_eq!(agg, PublicKey::default());
-    }
-
-    /// WHAT: `aggregate_pubkeys([pk])` equals `pk` (single-element
-    ///       sum is the identity element).
-    /// HOW:  pick a deterministic test pubkey, call aggregate_pubkeys
-    ///       on a slice of one, compare to original.
-    /// WHY:  group identity element behaviour for G1 — pin it so
-    ///       any change in the upstream BLS arithmetic is caught.
-    #[test]
-    fn aggregate_pubkeys_singleton_is_identity_op() {
-        let (_, pk) = test_voter(0);
-        let agg = aggregate_pubkeys(std::slice::from_ref(&pk));
-        assert_eq!(agg, pk);
-    }
-
-    /// WHAT: `aggregate_pubkeys` is order-independent.
-    /// HOW:  build two distinct pubkeys, aggregate in both orders,
-    ///       assert equal sums.
-    /// WHY:  G1 addition is commutative; the SDK relies on this for
-    ///       invariance of the witness no matter the input order
-    ///       of votes.
-    #[test]
-    fn aggregate_pubkeys_is_commutative() {
-        let (_, p1) = test_voter(0);
-        let (_, p2) = test_voter(1);
-        assert_eq!(aggregate_pubkeys(&[p1, p2]), aggregate_pubkeys(&[p2, p1]));
-    }
     /// WHAT: post-CHIP rev 2026-05-02, `canonical_vote_message`
     ///       takes 3 inputs and equals
     ///       `sha256(outcome || ballot_launcher_id || election_id)`

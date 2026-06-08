@@ -626,6 +626,11 @@ impl PoseidonSmt {
         self.leaves.contains_key(&slot)
     }
 
+    /// True iff no leaves are registered (root is the all-empty root).
+    pub fn is_empty(&self) -> bool {
+        self.leaves.is_empty()
+    }
+
     /// The locked weight committed for this Jubjub key (the
     /// `SparseMerkleTree::locked_amount` analogue), or None if absent.
     pub fn locked_amount(&self, pubkey: JubAffine) -> Option<u64> {

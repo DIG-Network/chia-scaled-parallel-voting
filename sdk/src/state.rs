@@ -1075,6 +1075,9 @@ mod tests {
             registration_coin_id: Bytes32::new([0x99; 32]),
             ballot_launcher_id: Bytes32::new([0x77; 32]),
             voting_coin_id: Bytes32::new([0x88; 32]),
+            // SEC-F1: wire serialization ignores the in-memory Jubjub
+            // witness (debug-only JSON view), so None round-trips fine.
+            jubjub_vote: None,
         };
         let wire: VoteRecordWire = (&v).into();
         let json = serde_json::to_string(&wire).unwrap();

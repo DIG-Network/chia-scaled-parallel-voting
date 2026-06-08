@@ -82,11 +82,18 @@ pub trait MpcBackend: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct SimulatedBackend {
     pub tree_depth: usize,
+    /// SEC-F1: the `VotingCircuitV2` signer-slot count baked into the VK
+    /// shape. The aggregator MUST pad its signer set to this when proving
+    /// (circuit_v2 `padded_signers`), so it is a protocol parameter shared
+    /// by ceremony + finalize. Defaults to 1 for the simulated backend (the
+    /// VK byte length — 624 — is independent of this; only setup/proving
+    /// cost scales with it).
+    pub max_signers: usize,
 }
 
 impl Default for SimulatedBackend {
     fn default() -> Self {
-        Self { tree_depth: 32 }
+        Self { tree_depth: 32, max_signers: 1 }
     }
 }
 
@@ -94,7 +101,7 @@ impl SimulatedBackend {
     /// Construct with an explicit tree depth — typically
     /// `ceil(log2(ceremony_params.max_voters))`.
     pub fn with_tree_depth(tree_depth: usize) -> Self {
-        Self { tree_depth }
+        Self { tree_depth, max_signers: 1 }
     }
 }
 
@@ -195,13 +202,16 @@ impl MpcBackend for SimulatedBackend {
         rng_seed.copy_from_slice(&seed);
         let mut rng = ark_std::rand::rngs::StdRng::from_seed(rng_seed);
 
-        // Run the actual VotingCircuit setup to produce real,
-        // verification-correct (PK, VK) for our circuit shape. The
-        // tree_depth bound at SimulatedBackend construction (E2) is
-        // forwarded so the resulting circuit's R1CS shape matches
-        // the SPT depth the election singleton will curry.
-        let (ark_pk, ark_vk) =
-            crate::prover::circuit::generate_test_setup(self.tree_depth, &mut rng)?;
+        // SEC-F1: run the VotingCircuitV2 (Option-B) setup to produce real,
+        // verification-correct (PK, VK) — 5 public inputs / 6 IC points
+        // (624-byte chia-chunked VK). tree_depth + max_signers fix the R1CS
+        // shape the election singleton curries and the aggregator proves
+        // against.
+        let (ark_pk, ark_vk) = crate::prover::circuit_v2::generate_test_setup_v2(
+            self.tree_depth,
+            self.max_signers,
+            &mut rng,
+        )?;
 
         // Serialise both keys to opaque byte buffers for the
         // backend-agnostic ProvingKey / VerificationKey wrappers.
