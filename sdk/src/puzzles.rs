@@ -107,6 +107,16 @@ pub const ELECTION_DEREGISTER_HEX: &str =
 pub const ELECTION_DEREGISTER_HASH_HEX: &str =
     include_str!("../../puzzles/compiled/election/deregister.rue.hash");
 
+/// SEC-F3+F5: Election Singleton `attest_ballot` action — a READ-ONLY action
+/// (state unchanged) that emits a CHIP-0025 SEND_MESSAGE carrying the canonical
+/// ballot-binding tuple from the election's unforgeable state, paired in-bundle
+/// with the Ballot Coin's `finalize` RECEIVE_MESSAGE. Binds the ballot's curried
+/// VK/snapshots/vote-options-root to the genuine election.
+pub const ELECTION_ATTEST_BALLOT_HEX: &str =
+    include_str!("../../puzzles/compiled/election/attest_ballot.rue.hex");
+pub const ELECTION_ATTEST_BALLOT_HASH_HEX: &str =
+    include_str!("../../puzzles/compiled/election/attest_ballot.rue.hash");
+
 // ── Ballot Coin (per-ballot lane) ─────────────────────────────────────
 
 /// Ballot Coin custom finalizer — recreates the Ballot Coin singleton
@@ -299,6 +309,9 @@ impl PuzzleHashes {
     }
     pub fn election_deregister() -> Bytes32 {
         decode_hash(ELECTION_DEREGISTER_HASH_HEX)
+    }
+    pub fn election_attest_ballot() -> Bytes32 {
+        decode_hash(ELECTION_ATTEST_BALLOT_HASH_HEX)
     }
 
     // Ballot Coin
@@ -946,35 +959,37 @@ pub fn registration_action_root_leaves(cat_tail_hash: Bytes32) -> Vec<Bytes32> {
 }
 
 /// FN: election_actions_merkle_root
-/// WHAT: 3-leaf Merkle root over the Election Singleton's allowed
-///       actions: `register`, `create_ballot`, `deregister`. Each is
-///       already curried with election-wide constants by the caller
-///       (TREE_DEPTH, EMPTY_LEAF_HASH, CAT_TAIL_HASH, COLLATERAL_AMOUNT,
-///       EMPTY_BALLOT_ROOT, etc.).
+/// WHAT: 4-leaf Merkle root over the Election Singleton's allowed
+///       actions: `register`, `create_ballot`, `deregister`, and
+///       `attest_ballot` (SEC-F3+F5 — the read-only action that attests
+///       the ballot-binding tuple). Each leaf is already curried with
+///       election-wide constants by the caller.
 /// LEAF ORDER: sorted ascending — caller doesn't need to maintain a
 ///             specific declaration order.
-/// SHAPE: with 3 leaves the upstream
-///        `chia_sdk_types::MerkleTree::list_to_binary_tree` splits
-///        at midpoint = `(3+1) >> 1 = 2`, producing an unbalanced
-///        binary tree
+/// SHAPE: with 4 leaves the upstream
+///        `chia_sdk_types::MerkleTree::list_to_binary_tree` splits at
+///        midpoint = `(4+1) >> 1 = 2`, producing a BALANCED binary tree
 ///          root = sha256(0x02 ||
 ///                        sha256(0x02 || L0 || L1) ||
-///                        L2)
-///        which is exactly `hash_pair(hash_pair(L0,L1), L2)`. Pinned
-///        by `election_actions_merkle_root_matches_merkletree`.
+///                        sha256(0x02 || L2 || L3))
+///        = `hash_pair(hash_pair(L0,L1), hash_pair(L2,L3))`. Pinned by
+///        `election_actions_merkle_root_matches_merkletree`.
 pub fn election_actions_merkle_root(
     register_full_hash: Bytes32,
     create_ballot_full_hash: Bytes32,
     deregister_full_hash: Bytes32,
+    attest_ballot_full_hash: Bytes32,
 ) -> Bytes32 {
     let mut leaves = [
         hash_atom_b32(&register_full_hash),
         hash_atom_b32(&create_ballot_full_hash),
         hash_atom_b32(&deregister_full_hash),
+        hash_atom_b32(&attest_ballot_full_hash),
     ];
     leaves.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
     let pair01 = hash_pair(leaves[0], leaves[1]);
-    hash_pair(pair01, leaves[2])
+    let pair23 = hash_pair(leaves[2], leaves[3]);
+    hash_pair(pair01, pair23)
 }
 
 /// FN: ballot_actions_merkle_root
@@ -1929,17 +1944,21 @@ mod tests {
         let a = b32(0xA1);
         let b = b32(0xB2);
         let c = b32(0xC3);
+        let d = b32(0xD4);
 
-        let r1 = election_actions_merkle_root(a, b, c);
-        let r2 = election_actions_merkle_root(b, a, c);
-        let r3 = election_actions_merkle_root(c, b, a);
+        let r1 = election_actions_merkle_root(a, b, c, d);
+        let r2 = election_actions_merkle_root(b, a, d, c);
+        let r3 = election_actions_merkle_root(d, c, b, a);
         assert_eq!(r1, r2);
         assert_eq!(r2, r3);
     }
 
     /// WHAT: hand-rolled `election_actions_merkle_root` agrees byte-
     ///       for-byte with `chia_sdk_types::MerkleTree::new` on the
-    ///       SORTED leaf set (3-leaf shape: pair01 + L2).
+    ///       SORTED leaf set (SEC-F3+F5 4-leaf balanced shape:
+    ///       pair(pair(L0,L1), pair(L2,L3))). This is load-bearing: the
+    ///       aggregator builds action-inclusion proofs via the same
+    ///       `MerkleTree`, so the root must match or proofs fail on-chain.
     #[test]
     fn election_actions_merkle_root_matches_merkletree() {
         use chia_sdk_types::MerkleTree;
@@ -1947,12 +1966,13 @@ mod tests {
         let a = b32(0xA1);
         let b = b32(0xB2);
         let c = b32(0xC3);
+        let d = b32(0xD4);
 
-        let mut leaves = vec![a, b, c];
+        let mut leaves = vec![a, b, c, d];
         leaves.sort_by(|x, y| hash_atom_b32(x).as_ref().cmp(hash_atom_b32(y).as_ref()));
         let upstream_root = MerkleTree::new(&leaves).root();
 
-        let our_root = election_actions_merkle_root(a, b, c);
+        let our_root = election_actions_merkle_root(a, b, c, d);
         assert_eq!(our_root, upstream_root);
     }
 

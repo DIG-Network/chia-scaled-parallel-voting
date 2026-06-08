@@ -491,7 +491,13 @@ impl ElectionDeployer {
         let register_full = self.election_register_action_hash(launcher_id);
         let create_ballot_full = self.election_create_ballot_action_hash(launcher_id);
         let deregister_full = self.election_deregister_action_hash();
-        puzzles::election_actions_merkle_root(register_full, create_ballot_full, deregister_full)
+        let attest_ballot_full = self.election_attest_ballot_action_hash(launcher_id);
+        puzzles::election_actions_merkle_root(
+            register_full,
+            create_ballot_full,
+            deregister_full,
+            attest_ballot_full,
+        )
     }
 
     /// Tree hash of the genesis `ElectionState` cons tree.
@@ -585,6 +591,19 @@ impl ElectionDeployer {
                 puzzles::hash_atom_b32(&puzzles::registration_actions_merkle_root(
                     self.params.cat_tail_hash,
                 )),
+            ],
+        )
+    }
+
+    /// SEC-F3+F5: curried `attest_ballot` action hash. Curry order matches
+    /// `puzzles/election/attest_ballot.rue`: (ELECTION_LAUNCHER_ID,
+    /// NO_VOTE_MODE_LOCK).
+    fn election_attest_ballot_action_hash(&self, launcher_id: Bytes32) -> Bytes32 {
+        puzzles::curry_tree_hash(
+            PuzzleHashes::election_attest_ballot(),
+            &[
+                puzzles::hash_atom_b32(&launcher_id),
+                puzzles::hash_atom_b32(&crate::vote_mode::VOTE_MODE_LOCK_NONE),
             ],
         )
     }

@@ -2702,14 +2702,19 @@ pub fn compute_election_action_root_leaves(config: &ElectionConfig) -> Vec<Bytes
     let launcher_id = config.election_launcher_id().expect("config validated");
     let cat_tail_hash = config.cat_tail_hash().expect("config validated");
 
-    let [register_leaf, create_ballot_leaf, deregister_leaf] =
+    let [register_leaf, create_ballot_leaf, deregister_leaf, attest_ballot_leaf] =
         election_action_leaves(config, launcher_id, cat_tail_hash);
 
     // Match the in-tree sort `puzzles::election_actions_merkle_root`
     // applies (ascending by `hash_atom_b32` of the leaf). This makes
     // `MerkleTree::new(&leaves).proof(leaf)` produce a proof against
     // the same root.
-    let mut leaves = vec![register_leaf, create_ballot_leaf, deregister_leaf];
+    let mut leaves = vec![
+        register_leaf,
+        create_ballot_leaf,
+        deregister_leaf,
+        attest_ballot_leaf,
+    ];
     leaves.sort_by(|a, b| {
         puzzles::hash_atom_b32(a)
             .as_ref()
@@ -2875,11 +2880,11 @@ fn compute_election_actions_merkle_root(
     cat_tail_hash: Bytes32,
 ) -> Bytes32 {
     let leaves = election_action_leaves(config, launcher_id, cat_tail_hash);
-    // `leaves` is `[register_full, create_ballot_full, deregister_full]`
-    // in declaration order; `puzzles::election_actions_merkle_root`
-    // sorts internally before composing the root, so the order here
-    // is intentional and matches the deployer.
-    puzzles::election_actions_merkle_root(leaves[0], leaves[1], leaves[2])
+    // `leaves` is `[register_full, create_ballot_full, deregister_full,
+    // attest_ballot_full]` in declaration order;
+    // `puzzles::election_actions_merkle_root` sorts internally before
+    // composing the root, so the order here matches the deployer.
+    puzzles::election_actions_merkle_root(leaves[0], leaves[1], leaves[2], leaves[3])
 }
 
 /// FN: election_action_leaves (file-private)
@@ -2896,7 +2901,7 @@ fn election_action_leaves(
     config: &ElectionConfig,
     launcher_id: Bytes32,
     cat_tail_hash: Bytes32,
-) -> [Bytes32; 3] {
+) -> [Bytes32; 4] {
     use crate::puzzles::PuzzleHashes;
 
     // ── register ─────────────────────────────────────────────────
@@ -2951,7 +2956,18 @@ fn election_action_leaves(
         ],
     );
 
-    [register_full, create_ballot_full, deregister_full]
+    // ── attest_ballot (SEC-F3+F5) ────────────────────────────────
+    // CURRY ORDER (matches puzzles/election/attest_ballot.rue):
+    //   (ELECTION_LAUNCHER_ID, NO_VOTE_MODE_LOCK).
+    let attest_ballot_full = puzzles::curry_tree_hash(
+        PuzzleHashes::election_attest_ballot(),
+        &[
+            puzzles::hash_atom_b32(&launcher_id),
+            puzzles::hash_atom_b32(&crate::vote_mode::VOTE_MODE_LOCK_NONE),
+        ],
+    );
+
+    [register_full, create_ballot_full, deregister_full, attest_ballot_full]
 }
 
 /// CLVM canonical unsigned-integer atom encoding (mirror of
