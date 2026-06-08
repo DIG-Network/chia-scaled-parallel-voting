@@ -1389,6 +1389,9 @@ pub async fn build_announce_finalization_bundle<C: ChainReader>(
         &mut ctx,
         crate::puzzles::BALLOT_COIN_FINALIZE_HEX,
     )?;
+    // SEC-F3+F5: trailing ELECTION_VK_HASH + VOTE_OPTIONS_ROOT MUST match
+    // `launch_ballot` (and voter.rs cast_vote predictor) so the reconstructed
+    // ballot ph equals the on-chain one.
     let finalize_curried = CurriedProgram {
         program: finalize_program_node,
         args: clvm_curried_args!(
@@ -1401,6 +1404,12 @@ pub async fn build_announce_finalization_bundle<C: ChainReader>(
             params.vote_threshold_den,
             params.registration_merkle_root_snapshot,
             params.registration_vote_weight_snapshot,
+            config.vk_hash(),
+            // This reconstruction path (AnnounceFinalizationParams) carries no
+            // per-ballot options root; like its oracle curry below it assumes
+            // the Mode1Free default. Non-default ballots use the launch/voter
+            // path. (Pre-existing Mode1Free-only limitation of this builder.)
+            Bytes32::default(),
         ),
     }
     .to_clvm(&mut *ctx)

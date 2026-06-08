@@ -864,11 +864,15 @@ impl Voter {
             crate::actors::ballot::build_vk_ic_nodes(&mut ctx, &self.config)?;
 
         // finalize curry order MUST match
-        // `puzzles/ballot_coin/finalize.rue`:
+        // `puzzles/ballot_coin/finalize.rue` (SEC-F3+F5 added the trailing
+        // ELECTION_VK_HASH + VOTE_OPTIONS_ROOT):
         //   (VK, IC, BALLOT_LAUNCHER_ID, ELECTION_LAUNCHER_ID,
         //    VOTE_CLOSE_HEIGHT, VOTE_THRESHOLD_NUM, VOTE_THRESHOLD_DEN,
         //    REGISTRATION_MERKLE_ROOT_SNAPSHOT,
-        //    REGISTRATION_VOTE_WEIGHT_SNAPSHOT)
+        //    REGISTRATION_VOTE_WEIGHT_SNAPSHOT, ELECTION_VK_HASH,
+        //    VOTE_OPTIONS_ROOT)
+        // These MUST match `ballot.rs::launch_ballot` exactly or the
+        // predicted Ballot Coin puzzle hash won't equal the on-chain one.
         let finalize_program_node =
             load_action_puzzle(&mut ctx, puzzles::BALLOT_COIN_FINALIZE_HEX)?;
         let finalize_curried = CurriedProgram {
@@ -883,6 +887,8 @@ impl Voter {
                 params.vote_threshold_den,
                 params.registration_merkle_root_snapshot,
                 params.registration_vote_weight_snapshot,
+                self.config.vk_hash(),
+                params.vote_options_root,
             ),
         }
         .to_clvm(&mut *ctx)
