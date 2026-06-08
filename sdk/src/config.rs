@@ -96,25 +96,29 @@ pub const MAX_SIGNERS: usize = 20_000;
 /// CONST: PUBLIC_INPUT_COUNT
 /// WHAT: number of public inputs to the Groth16 circuit. Each input
 ///       contributes one IC point to the verification key.
-/// ORDER: registration_merkle_root, registration_vote_weight,
-///        agg_signers, vote_message, threshold_pack,
-///        ballot_launcher_id, vote_threshold_num, vote_threshold_den —
-///        must match `prover/circuit.rs::Scalars`. The 7th and 8th
-///        inputs (`vote_threshold_num` / `vote_threshold_den`) were
-///        added under the CHIP rev that promotes (num, den) from
-///        compile-time R1CS coefficients to first-class public inputs,
-///        so a single VK verifies any (num, den). threshold_pack stays
-///        at input #5 as belt-and-suspenders hash binding.
-pub const PUBLIC_INPUT_COUNT: usize = 8;
+/// ORDER (SEC-F1, VotingCircuitV2 — must match
+///        `prover/circuit_v2.rs::VotingCircuitV2::public_inputs()` and
+///        `puzzles/ballot_coin/finalize.rue`):
+///        [1] registration_root         (Poseidon SPT root snapshot)
+///        [2] vote_message              (sha256(outcome||ballot||election) mod r)
+///        [3] registration_vote_weight  (Fr::from u64)
+///        [4] vote_threshold_num        (Fr::from u64)
+///        [5] vote_threshold_den        (Fr::from u64)
+/// The Option-B redesign binds membership + Jubjub-Schnorr signatures +
+/// the weight quorum ENTIRELY in-circuit, so the old 8-input layout
+/// (`agg_signers` / `threshold_pack` / per-hash scalars) is gone — the
+/// VK now carries 6 IC points (PUBLIC_INPUT_COUNT + 1).
+pub const PUBLIC_INPUT_COUNT: usize = 5;
 
 /// CONST: EMPTY_LEAF_HASH
-/// WHAT: SHA256(0x00 ⨯ 48) — the canonical empty-leaf marker for the
-///       SPT. This is what `sha256(zero_pubkey)` would yield, so the
-///       Rue side and SDK side agree on what "no voter here" hashes to.
-/// USAGE: passed to the deployer as the curried `EMPTY_LEAF_HASH` arg
-///        of `puzzles/election/register.rue`.
-pub const EMPTY_LEAF_HASH: [u8; 32] =
-    hex_literal::hex!("17b0761f87b081d5cf10757ccc89f12be355c70e2e29df288b65b30710dcbcd1");
+/// WHAT: SEC-F1 — the Poseidon SPT empty leaf = `Fr::zero` = 32 zero bytes.
+///       (Before the Poseidon-over-Jubjub migration this was
+///       `SHA256(0x00 ⨯ 48)`.) `register.rue`/`deregister.rue` curry this as
+///       the empty-leaf for the Poseidon emptiness proof, and
+///       `merkle.rs::PoseidonSmt` uses `Fr::zero` at the leaf level.
+/// USAGE: passed to the deployer as the curried `EMPTY_LEAF_HASH` arg of
+///        `puzzles/election/register.rue` + `deregister.rue`.
+pub const EMPTY_LEAF_HASH: [u8; 32] = [0u8; 32];
 
 /// FN: cat_mod_hash
 /// WHAT: standard CAT v2 outer puzzle hash.
@@ -467,19 +471,15 @@ mod tests {
         assert_eq!(cat_mod_hash(), Bytes32::new(chia_puzzles::CAT_PUZZLE_HASH));
     }
 
-    /// WHAT: `EMPTY_LEAF_HASH` actually equals `sha256(0x00 ⨯ 48)`.
-    /// HOW:  recompute the sha256 inline and assert equality with
-    ///       the const.
-    /// WHY:  this is the single most safety-critical constant in the
-    ///       SDK — it's what the on-chain register action uses to
-    ///       check empty-slot proofs. A previous iteration shipped
-    ///       a wrong value here; this test catches that regression.
+    /// WHAT: SEC-F1 — `EMPTY_LEAF_HASH` is the Poseidon empty leaf
+    ///       (`Fr::zero` = 32 zero bytes).
+    /// WHY:  this is the single most safety-critical constant in the SDK —
+    ///       the on-chain Poseidon register/deregister actions curry it as
+    ///       the empty leaf for emptiness proofs, and it MUST equal
+    ///       `merkle.rs::PoseidonSmt`'s `empties[0]` (Fr::zero). The
+    ///       migration changed it from `sha256(0x00 ⨯ 48)`.
     #[test]
-    fn empty_leaf_hash_is_sha256_of_48_zero_bytes() {
-        use sha2::{Digest, Sha256};
-        let zero_pk = [0u8; 48];
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&Sha256::digest(zero_pk));
-        assert_eq!(arr, EMPTY_LEAF_HASH);
+    fn empty_leaf_hash_is_poseidon_fr_zero() {
+        assert_eq!(EMPTY_LEAF_HASH, [0u8; 32]);
     }
 }

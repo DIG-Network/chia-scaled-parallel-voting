@@ -31,7 +31,7 @@ use chia_protocol::Bytes32;
 use crate::chain::ChainReader;
 use crate::config::ElectionConfig;
 use crate::error::{VotingError, VotingResult};
-use crate::merkle::SparseMerkleTree;
+use crate::merkle::PoseidonSmt;
 use crate::state::{BallotCoinSnapshot, BallotState, ElectionState, VoteRecord, VoterSet};
 
 // Indexer delegates the chain-walk + memo-extraction logic to the
@@ -49,7 +49,7 @@ pub struct Indexer<C: ChainReader> {
     chain: C,
     state: Option<ElectionState>,
     voter_set: Option<VoterSet>,
-    smt: Option<SparseMerkleTree>,
+    smt: Option<PoseidonSmt>,
     /// Per-Ballot-Coin snapshots recovered from the most recent sync.
     /// Pending Phase 6 test infrastructure the aggregator returns an
     /// empty vec here; the field exists so callers can begin coding
@@ -287,7 +287,7 @@ impl<C: ChainReader> Indexer<C> {
     }
 
     /// Last-synced SPT.
-    pub fn merkle_tree(&self) -> VotingResult<&SparseMerkleTree> {
+    pub fn merkle_tree(&self) -> VotingResult<&PoseidonSmt> {
         self.smt.as_ref().ok_or(VotingError::NotDeployed)
     }
 }

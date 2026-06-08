@@ -382,10 +382,14 @@ impl Voter {
 
     /// FN: slot
     /// WHAT: this voter's canonical SPT slot.
-    /// FORMULA: `u32::from_be_bytes(sha256(pubkey)[0..4])` — see
-    ///          `SparseMerkleTree::slot_for_pubkey`.
+    /// FORMULA (SEC-F1): `sha256(jub_x_be32 || jub_y_be32)[0..4]` — see
+    ///          `PoseidonSmt::slot_for_jubjub`. The slot is keyed by the
+    ///          voter's Jubjub pubkey coords, matching register.rue.
     pub fn slot(&self) -> u32 {
-        crate::merkle::SparseMerkleTree::slot_for_pubkey(&self.keys.pubkey)
+        crate::merkle::PoseidonSmt::slot_for_jubjub(
+            self.keys.jubjub_pubkey.x,
+            self.keys.jubjub_pubkey.y,
+        )
     }
 
     /// FN: registration_coin_puzzle_hash
@@ -469,7 +473,7 @@ impl Voter {
     /// conditions Sage's chip0002_signCoinSpends covers in one pass).
     pub async fn register_build_coin_spends<C: ChainReader>(
         &self,
-        smt: &crate::merkle::SparseMerkleTree,
+        smt: &crate::merkle::PoseidonSmt,
         cat_parent_spend: CoinSpend,
         chain: &C,
         lock_amount: u64,
@@ -530,10 +534,12 @@ impl Voter {
             crate::actors::aggregator::election_actions_merkle_root_for_config(&self.config);
         // Inner puzzle MUST match what's curried into the singleton
         // on-chain (`on_chain_state` from the launcher lineage walk).
-        if on_chain_state.registration_merkle_root != smt.root() {
+        // SEC-F1: the Poseidon SPT root is the 32-byte BE of the Fr root.
+        let smt_root = Bytes32::new(smt.root_be32());
+        if on_chain_state.registration_merkle_root != smt_root {
             return Err(voting_other(format!(
                 "Voter::register: aggregator SMT root {} does not match on-chain {} — re-sync",
-                hex::encode(smt.root()),
+                hex::encode(smt_root),
                 hex::encode(on_chain_state.registration_merkle_root),
             )));
         }
@@ -568,17 +574,32 @@ impl Voter {
         .map_err(driver_err)?;
 
         // ── 4. Build the register action solution ───────────────
-        // Solution shape (per register.rue, weighted-voting rev):
-        //   (new_voter_pubkey, register_leaf_index, register_siblings,
-        //    locked_cat_mojos, ...cat_parent_coin_id)
+        // Solution shape (per register.rue, SEC-F1 Poseidon/Jubjub rev):
+        //   (new_voter_pubkey, jub_x, jub_y, register_leaf_index,
+        //    register_siblings, locked_cat_mojos, ...cat_parent_coin_id)
         //
-        // SLOT ENCODING: register.rue's `slot_from_pubkey` builds
-        //   `0x00 || sha256(pk)[0..4]` and casts to Int. We pass the
-        //   slot as the EXACT 5-byte sequence the puzzle constructs
-        //   so `==` always succeeds regardless of the slot's value.
+        // The BLS `new_voter_pubkey` stays first (register.rue still uses
+        // it for the `create_reg` announcement + AggSigMe). The voter's
+        // Jubjub pubkey coords follow — the SPT leaf and slot are keyed
+        // by them.
+        //
+        // SLOT ENCODING: register.rue's `slot_from_jubjub` builds
+        //   `0x00 || sha256(jub_x_be32 || jub_y_be32)[0..4]` and casts to
+        //   Int. We pass the slot as the EXACT 5-byte sequence the puzzle
+        //   constructs so `==` always succeeds.
         let slot = self.slot();
-        let siblings = smt.prove(slot);
+        let proof = smt.prove(slot);
+        // register.rue's `compute_root` walks siblings as `Int`s by index
+        // parity (not direction bits), so we pass only the sibling list as
+        // 32-byte BE Fr values; the bits are implicit in the slot index.
+        let siblings: Vec<Bytes32> = proof
+            .siblings
+            .iter()
+            .map(|f| Bytes32::new(crate::merkle::fr_to_be32(*f)))
+            .collect();
         let voter_pk_bytes = chia_protocol::Bytes::new(self.keys.pubkey.to_bytes().to_vec());
+        let jub_x = Bytes32::new(crate::merkle::fr_to_be32(self.keys.jubjub_pubkey.x));
+        let jub_y = Bytes32::new(crate::merkle::fr_to_be32(self.keys.jubjub_pubkey.y));
         let cat_parent_coin_id = cat_parent_spend.coin.coin_id();
         let slot_bytes = {
             let mut buf = Vec::with_capacity(5);
@@ -588,7 +609,10 @@ impl Voter {
         };
         let register_solution_value = (
             voter_pk_bytes,
-            (slot_bytes, (siblings, (lock_amount, cat_parent_coin_id))),
+            (
+                jub_x,
+                (jub_y, (slot_bytes, (siblings, (lock_amount, cat_parent_coin_id)))),
+            ),
         );
         let register_solution = register_solution_value
             .to_clvm(&mut *ctx)
@@ -663,7 +687,7 @@ impl Voter {
     /// [`Voter::register_build_coin_spends`].
     pub async fn register<C: ChainReader>(
         &self,
-        smt: &crate::merkle::SparseMerkleTree,
+        smt: &crate::merkle::PoseidonSmt,
         cat_parent_spend: CoinSpend,
         chain: &C,
         lock_amount: u64,
@@ -1759,7 +1783,7 @@ impl Voter {
     pub async fn release_collateral_build_coin_spends<C: ChainReader>(
         &self,
         chain: &C,
-        smt: &crate::merkle::SparseMerkleTree,
+        smt: &crate::merkle::PoseidonSmt,
         registration_coin_id: Bytes32,
         destination: Bytes32,
     ) -> VotingResult<Vec<CoinSpend>> {
@@ -1797,10 +1821,12 @@ impl Voter {
         // The voter MUST be in the on-chain SMT; this is what the
         // deregister action's membership proof asserts. Surface the
         // mismatch early instead of as an opaque CLVM raise.
-        if smt.root() != on_chain_state.registration_merkle_root {
+        // SEC-F1: the Poseidon SPT root is the 32-byte BE of the Fr root.
+        let smt_root = Bytes32::new(smt.root_be32());
+        if smt_root != on_chain_state.registration_merkle_root {
             return Err(voting_other(format!(
                 "Voter::release_collateral: SMT root {} doesn't match on-chain {} — re-sync",
-                hex::encode(smt.root()),
+                hex::encode(smt_root),
                 hex::encode(on_chain_state.registration_merkle_root),
             )));
         }
@@ -1839,33 +1865,43 @@ impl Voter {
         .to_clvm(&mut *ctx)
         .map_err(driver_err)?;
 
-        // Solution shape (per deregister.rue, weighted-voting rev):
-        //   `(voter_pubkey, deregister_leaf_index, locked_cat_mojos,
-        //     ...deregister_siblings)`
-        // with the same 5-byte `0x00 || sha256(pk)[0..4]` slot encoding
-        // register.rue uses (re-applied below to keep the two actions
-        // byte-identical on the slot atom).
+        // Solution shape (per deregister.rue, SEC-F1 Poseidon/Jubjub rev):
+        //   `(voter_pubkey, jub_x, jub_y, deregister_leaf_index,
+        //     locked_cat_mojos, ...deregister_siblings)`
+        // The BLS `voter_pubkey` stays first (deregister.rue uses it for
+        // the CHIP-0025 SEND_MESSAGE + AggSigMe). The Jubjub coords key
+        // the SPT leaf + slot. Same 5-byte `0x00 || sha256(...)[0..4]`
+        // slot encoding register.rue uses.
         //
         // `locked_cat_mojos` is recovered from the SMT — the membership
         // proof verifies only for the same value the voter registered
         // with, so we pass exactly what the SMT has on file.
         let slot = self.slot();
-        let siblings = smt.prove(slot);
-        let lock_amount = smt.locked_amount(&self.keys.pubkey).ok_or_else(|| {
+        let proof = smt.prove(slot);
+        let siblings: Vec<Bytes32> = proof
+            .siblings
+            .iter()
+            .map(|f| Bytes32::new(crate::merkle::fr_to_be32(*f)))
+            .collect();
+        let lock_amount = smt.locked_amount(self.keys.jubjub_pubkey).ok_or_else(|| {
             voting_other(
                 "Voter::release_collateral: SMT has no locked amount for this voter — \
                  was the SMT synced from chain?",
             )
         })?;
         let voter_pk_bytes = chia_protocol::Bytes::new(self.keys.pubkey.to_bytes().to_vec());
+        let jub_x = Bytes32::new(crate::merkle::fr_to_be32(self.keys.jubjub_pubkey.x));
+        let jub_y = Bytes32::new(crate::merkle::fr_to_be32(self.keys.jubjub_pubkey.y));
         let slot_bytes = {
             let mut buf = Vec::with_capacity(5);
             buf.push(0x00);
             buf.extend_from_slice(&slot.to_be_bytes());
             chia_protocol::Bytes::new(buf)
         };
-        let deregister_solution_value =
-            (voter_pk_bytes, (slot_bytes, (lock_amount, siblings)));
+        let deregister_solution_value = (
+            voter_pk_bytes,
+            (jub_x, (jub_y, (slot_bytes, (lock_amount, siblings)))),
+        );
         let deregister_solution = deregister_solution_value
             .to_clvm(&mut *ctx)
             .map_err(driver_err)?;
@@ -2067,7 +2103,7 @@ impl Voter {
     pub async fn release_collateral<C: ChainReader>(
         &self,
         chain: &C,
-        smt: &crate::merkle::SparseMerkleTree,
+        smt: &crate::merkle::PoseidonSmt,
         registration_coin_id: Bytes32,
         destination: Bytes32,
     ) -> VotingResult<SpendBundle> {

@@ -700,6 +700,21 @@ pub struct VotingCoinSnapshot {
 // VoteRecord / VoteRecordWire
 // ----------------------------------------------------------------------------
 
+/// STRUCT: JubjubVoteWitness
+/// PURPOSE (SEC-F1): a voter's SNARK-friendly Jubjub Schnorr signature over
+///          the canonical `vote_message` (reduced to `Fr`), plus their
+///          Jubjub pubkey. This is what `VotingCircuitV2` verifies
+///          in-circuit at finalize — the BLS signature still authorizes the
+///          on-chain vote spend, but the QUORUM proof is built from these.
+/// FIELDS: `pubkey = x·G`, `sig_r = k·G`, `sig_s = k + c·x`
+///         (`c = Poseidon(R.x, P.x, vote_message)`).
+#[derive(Debug, Clone, Copy)]
+pub struct JubjubVoteWitness {
+    pub pubkey: ark_ed_on_bls12_381::EdwardsAffine,
+    pub sig_r: ark_ed_on_bls12_381::EdwardsAffine,
+    pub sig_s: ark_ed_on_bls12_381::Fr,
+}
+
 /// STRUCT: VoteRecord
 /// PURPOSE: a single voter's tally entry, reconstructed off-chain by
 ///          the aggregator/indexer from a vote bundle's memos and
@@ -712,7 +727,8 @@ pub struct VoteRecord {
     pub vote_data: Bytes32,
     /// 96-byte BLS G2 signature over the canonical vote message
     /// (see `actors::voter::vote_message` /
-    /// `puzzles/voting_coin/shared.rue::vote_message`).
+    /// `puzzles/voting_coin/shared.rue::vote_message`). Authorizes the
+    /// on-chain vote spend (AggSigUnsafe).
     pub vote_signature_hex: String,
     /// Coin id of the Registration Coin whose vote action created
     /// the Voting Coin — useful for proof construction and audit.
@@ -725,6 +741,11 @@ pub struct VoteRecord {
     /// vote bundle — primary anchor when reconciling votes against
     /// observed on-chain spends.
     pub voting_coin_id: Bytes32,
+    /// SEC-F1: the voter's Jubjub Schnorr signature over the canonical
+    /// `vote_message`, used to build the `VotingCircuitV2` finalize proof.
+    /// `None` for records reconstructed before the signature is available
+    /// (the finalize witness builder treats those as non-signers).
+    pub jubjub_vote: Option<JubjubVoteWitness>,
 }
 
 /// STRUCT: VoteRecordWire

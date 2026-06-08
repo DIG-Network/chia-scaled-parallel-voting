@@ -1,32 +1,51 @@
 // ballot_coin/finalize.rue
 // Finalize action for the Ballot Coin.
 //
-// One-shot per ballot. Verifies a Groth16 proof + BLS aggregate
-// signature attesting that voters whose combined weight meets the
-// curried threshold signed the ballot's vote outcome, then transitions
-// the Ballot Coin's state to finalized=true with the committed
-// outcome. Does NOT spend the Election Singleton — the singleton's
-// lane is reserved for orchestration (register / createBallot /
-// deregister); this is the whole point of moving finalize onto the
-// Ballot Coin under CHIP rev 2026-05-02.
+// One-shot per ballot. Verifies a SINGLE Groth16 proof (VotingCircuitV2,
+// the Option-B finalize circuit) attesting — ENTIRELY in-circuit and at
+// O(1) on-chain cost — that registered voters whose combined weight meets
+// the curried quorum threshold SIGNED the ballot's vote outcome. It then
+// transitions the Ballot Coin's state to finalized=true with the committed
+// outcome. Does NOT spend the Election Singleton — the singleton's lane is
+// reserved for orchestration (register / createBallot / deregister); this
+// is the whole point of moving finalize onto the Ballot Coin under CHIP
+// rev 2026-05-02.
 //
-// Time lock: emits ASSERT_HEIGHT_ABSOLUTE(VOTE_CLOSE_HEIGHT) so the
-// ballot must have closed before finalize can run.
+// SEC-F1 (finalize forgery, closed): the previous design verified a BLS
+// AGGREGATE signature on-chain against a caller-supplied `agg_signers` G1
+// point. Because nothing bound `agg_signers` to the registered set, a
+// forger could pass a self-chosen keypair + matching aggregate and forge
+// any outcome (see exploit_finalize_forgery_e2e). The redesign moves ALL
+// binding in-circuit:
+//   * MEMBERSHIP: each signer's `Poseidon(pubkey.x, pubkey.y, weight)` leaf
+//     is proven to be in the registration tree whose root is a public input.
+//   * SIGNATURE: each signer's Jubjub Schnorr signature over `vote_message`
+//     is verified natively in-circuit (the embedded curve's base field IS
+//     the constraint field, so this is cheap — unlike in-circuit BLS12-381).
+//   * WEIGHT: the verified weights are summed and the quorum inequality
+//     `signed*den >= num*total` is enforced with a range-checked slack.
+// `finalize` therefore drops `agg_signers` / `bls_verify` / `g2_map`
+// entirely and verifies only the Groth16 pairing — a key whose holder did
+// not actually register AND sign THIS outcome can contribute nothing.
 //
-// Eight public inputs (ordering MUST match `circuit.rs` exactly):
-//   s1  ←  sha256(registration_merkle_root)             mod r
-//   s2  ←  sha256(registration_vote_weight_be8)         mod r
-//   s3  ←  sha256(agg_signers)                          mod r
-//   s4  ←  sha256(vote_message)                         mod r
-//   s5  ←  sha256(threshold_pack(num, den))             mod r   ← preserved on-chain threshold check (defense-in-depth)
-//   s6  ←  sha256(ballot_launcher_id)                   mod r   ← prevents cross-ballot replay
-//   s7  ←  Fr::from(num)                                (raw, 32-byte BE)
-//   s8  ←  Fr::from(den)                                (raw, 32-byte BE)
+// Time lock: emits ASSERT_HEIGHT_ABSOLUTE(VOTE_CLOSE_HEIGHT) so the ballot
+// must have closed before finalize can run.
+//
+// FIVE public inputs (ordering MUST match `VotingCircuitV2::public_inputs()`
+// and the proven `puzzles/finalize_v2_probe.rue` layout exactly):
+//   s1  ←  registration_root          (the Poseidon SPT root snapshot, raw Fr)
+//   s2  ←  vote_message               (sha256(outcome||ballot||election) mod r)
+//   s3  ←  Fr(registration_vote_weight_snapshot)
+//   s4  ←  Fr(vote_threshold_num)
+//   s5  ←  Fr(vote_threshold_den)
 //
 // State transitions:
 //   finalized    → true
 //   vote_outcome → vote_outcome_data
-//   agg_signers  → agg_signers (commitment to signer set)
+//   agg_signers  → sha256(vote_message)  (proof-binding commitment; there is
+//                  no signer-set aggregate to publish anymore — the quorum
+//                  is proven in-circuit. The field is retained so the
+//                  BallotState shape / downstream announcement is unchanged.)
 
 import super::common_types::*;
 import shared::*;
@@ -40,14 +59,11 @@ struct VK {
 
 struct IC {
     ic0: PublicKey,
-    ic1: PublicKey,    // multiplied by scalar(registration_merkle_root)
-    ic2: PublicKey,    // multiplied by scalar(registration_vote_weight)
-    ic3: PublicKey,    // multiplied by scalar(agg_signers)
-    ic4: PublicKey,    // multiplied by scalar(vote_message)
-    ic5: PublicKey,    // multiplied by scalar(threshold_pack)
-    ic6: PublicKey,    // multiplied by scalar(ballot_launcher_id)
-    ic7: PublicKey,    // multiplied by Fr::from(num)
-    ic8: PublicKey,    // multiplied by Fr::from(den)
+    ic1: PublicKey,    // multiplied by scalar(registration_root)
+    ic2: PublicKey,    // multiplied by scalar(vote_message)
+    ic3: PublicKey,    // multiplied by scalar(registration_vote_weight)
+    ic4: PublicKey,    // multiplied by scalar(vote_threshold_num)
+    ic5: PublicKey,    // multiplied by scalar(vote_threshold_den)
 }
 
 struct Proof {
@@ -57,20 +73,11 @@ struct Proof {
 }
 
 struct Scalars {
-    s1: PublicKey,    // sha256(registration_merkle_root) mod r
-    s2: PublicKey,    // sha256(registration_vote_weight_be8) mod r
-    s3: PublicKey,    // sha256(agg_signers) mod r
-    s4: PublicKey,    // sha256(vote_message) mod r
-    s5: PublicKey,    // sha256(threshold_pack) mod r
-    s6: PublicKey,    // sha256(ballot_launcher_id) mod r
-    s7: PublicKey,    // Fr::from(num) raw 32-byte BE
-    s8: PublicKey,    // Fr::from(den) raw 32-byte BE
-}
-
-/// Pack (num, den) into a 16-byte BE blob; both are u64 / 8-byte BE.
-/// Hash the pack to produce the canonical threshold_pack scalar input.
-inline fn threshold_pack_bytes(num: Int, den: Int) -> Bytes {
-    int_to_8_bytes_be(num) + int_to_8_bytes_be(den)
+    s1: PublicKey,    // registration_root (raw Fr, 32-byte BE)
+    s2: PublicKey,    // vote_message mod r
+    s3: PublicKey,    // Fr(registration_vote_weight) raw 32-byte BE
+    s4: PublicKey,    // Fr(num) raw 32-byte BE
+    s5: PublicKey,    // Fr(den) raw 32-byte BE
 }
 
 fn main(
@@ -88,8 +95,6 @@ fn main(
     // ── Solution ────────────────────────────────────────────────────
     proof: Proof,
     vote_outcome_data: Bytes32,
-    agg_signers: PublicKey,
-    agg_sig: Signature,
     ...scalars: Scalars,
 ) -> (BallotStateTruth, List<Condition>) {
     inline let State = Truth.State;
@@ -102,77 +107,57 @@ fn main(
         height: VOTE_CLOSE_HEIGHT,
     };
 
-    // Vote message binds outcome to ballot identity AND election
-    // identity. Order MUST match circuit.rs and voting_coin/shared.rue
-    // `vote_message`.
+    // Vote message binds outcome to ballot identity AND election identity.
+    // Order MUST match circuit_v2's `vote_message` input and the
+    // aggregator's off-chain derivation (Fr::from_be_bytes_mod_order of the
+    // same preimage). A signature over this message can't be replayed onto
+    // a different ballot or election.
     let outcome_b: Bytes = vote_outcome_data as Bytes;
     let ballot_b: Bytes = BALLOT_LAUNCHER_ID as Bytes;
     let election_b: Bytes = ELECTION_LAUNCHER_ID as Bytes;
-    let vote_message: Bytes32 = sha256(outcome_b + ballot_b + election_b);
 
-    // Threshold pack — packs (num, den) so the circuit binds the exact
-    // quorum threshold the deployment curried. Forces the on-chain
-    // curried threshold to match the circuit's threshold input
-    // (defense in depth on top of the circuit's internal threshold
-    // constraint).
-    let threshold_pack_b: Bytes = threshold_pack_bytes(
-        VOTE_THRESHOLD_NUM, VOTE_THRESHOLD_DEN,
-    );
-
-    // BLS12-381 subgroup order r. See deleted election/finalize.rue
-    // history for the full WHY-mod-r rationale (CLVM op_mod vs op_modpow,
-    // signed-vs-unsigned scalar interpretation, mempool-mode disable
-    // flags). The same considerations apply unchanged here.
+    // BLS12-381 subgroup order r (the Groth16 scalar field). The public
+    // inputs are field elements mod r; we bind each supplied scalar to its
+    // canonical derivation so a forger cannot pass a proof for a DIFFERENT
+    // public-input vector than the one this ballot's curried config + the
+    // committed outcome imply.
     let r: Bytes = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
     let zero_pad: Bytes = 0x00;
+    let r_int: Int = r as Int;
 
-    // Scalar verification — bind each scalar to sha256(input) mod r.
-    let vmr_b: Bytes = REGISTRATION_MERKLE_ROOT_SNAPSHOT as Bytes;
-    assert ((zero_pad + sha256(vmr_b)) as Int % (r as Int)) as Bytes
-        == (scalars.s1 as Bytes);
+    // s1 = registration_root. The snapshot is the 32-byte BE of the Poseidon
+    // Fr root, which is already a canonical field element (< r), so the
+    // public-input scalar equals the snapshot by integer value.
+    assert ((scalars.s1 as Bytes) as Int) == (REGISTRATION_MERKLE_ROOT_SNAPSHOT as Int);
 
-    assert (
-        (zero_pad + sha256(int_to_8_bytes_be(REGISTRATION_VOTE_WEIGHT_SNAPSHOT))) as Int
-        % (r as Int)
-    ) as Bytes == (scalars.s2 as Bytes);
+    // s2 = vote_message reduced mod r. `0x00 ||` keeps the 256-bit sha256
+    // digest a positive Int before the modular reduction.
+    let vote_message_int: Int =
+        (zero_pad + sha256(outcome_b + ballot_b + election_b)) as Int % r_int;
+    assert ((scalars.s2 as Bytes) as Int) == vote_message_int;
 
-    let agg_b: Bytes = agg_signers as Bytes;
-    assert ((zero_pad + sha256(agg_b)) as Int % (r as Int)) as Bytes
-        == (scalars.s3 as Bytes);
+    // s3 = Fr(registration_vote_weight). For a u64 < r this is just the
+    // integer value; compare numerically so the SDK's 32-byte zero-padded
+    // encoding (`fr_to_bytes32_be`) and the canonical int agree.
+    assert ((scalars.s3 as Bytes) as Int) == REGISTRATION_VOTE_WEIGHT_SNAPSHOT;
 
-    let vm_b: Bytes = vote_message as Bytes;
-    assert ((zero_pad + sha256(vm_b)) as Int % (r as Int)) as Bytes
-        == (scalars.s4 as Bytes);
+    // s4 / s5 = Fr(num) / Fr(den).
+    assert ((scalars.s4 as Bytes) as Int) == VOTE_THRESHOLD_NUM;
+    assert ((scalars.s5 as Bytes) as Int) == VOTE_THRESHOLD_DEN;
 
-    assert ((zero_pad + sha256(threshold_pack_b)) as Int % (r as Int)) as Bytes
-        == (scalars.s5 as Bytes);
-
-    assert ((zero_pad + sha256(ballot_b)) as Int % (r as Int)) as Bytes
-        == (scalars.s6 as Bytes);
-
-    // s7 / s8: direct equality bindings to Fr::from(num) / Fr::from(den).
-    // The SDK side uses `fr_to_bytes32_be(Fr::from(n))` which, for u64
-    // values < r, is simply the 32-byte big-endian encoding (24 zero
-    // bytes followed by 8 BE bytes of n).
-    let zero_pad_24: Bytes =
-        0x000000000000000000000000000000000000000000000000;
-    assert (zero_pad_24 + int_to_8_bytes_be(VOTE_THRESHOLD_NUM))
-        == (scalars.s7 as Bytes);
-    assert (zero_pad_24 + int_to_8_bytes_be(VOTE_THRESHOLD_DEN))
-        == (scalars.s8 as Bytes);
-
-    // VK input: IC[0] + IC[1]*s1 + ... + IC[8]*s8.
+    // Groth16 prepared input commitment: IC0 + Σ ICi·si.
     let vk_input: PublicKey = IC.ic0
         + IC.ic1 * scalars.s1
         + IC.ic2 * scalars.s2
         + IC.ic3 * scalars.s3
         + IC.ic4 * scalars.s4
-        + IC.ic5 * scalars.s5
-        + IC.ic6 * scalars.s6
-        + IC.ic7 * scalars.s7
-        + IC.ic8 * scalars.s8;
+        + IC.ic5 * scalars.s5;
 
-    // Groth16 pairing identity.
+    // Groth16 pairing identity:
+    //   e(A,B) · e(-alpha,beta) · e(-vk_input,gamma) · e(-C,delta) == 1
+    // RAISES (spend rejected) on an invalid proof. This single check is the
+    // whole on-chain verification — membership / signatures / weight quorum
+    // are all bound inside the proof (see VotingCircuitV2).
     bls_pairing_identity(
         proof.a,    proof.b,
         -VK.alpha,  VK.beta,
@@ -180,23 +165,12 @@ fn main(
         -proof.c,   VK.delta,
     );
 
-    // BLS aggregate signature verification (PoP / unaugmented).
-    // Identical scheme to the deleted election/finalize.rue: voters
-    // sign sk_i · H(vote_message), aggregate is sum, verified via the
-    // single-pair pairing identity.
-    let G1_GENERATOR: PublicKey =
-        0x97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb;
-    let h_vote_message: Signature = g2_map(vote_message as Bytes);
-    bls_pairing_identity(
-        agg_signers,     h_vote_message,
-        -G1_GENERATOR,   agg_sig,
-    );
-
-    // BallotState.agg_signers is a 32-byte commitment to the signer
-    // set; the full G1 aggregate is 48 bytes, so we hash it once to
-    // collapse to Bytes32. The same hash is used in the finalization
-    // announcement so on-chain consumers see a stable identifier.
-    let agg_signers_commitment: Bytes32 = sha256(agg_b);
+    // Proof-binding commitment. There is no signer-set aggregate to publish
+    // (the quorum is proven in-circuit), so we commit the canonical
+    // vote_message digest. Downstream consumers get a stable 32-byte
+    // identifier; the BallotState shape is unchanged.
+    let vote_message_b: Bytes = sha256(outcome_b + ballot_b + election_b);
+    let agg_signers_commitment: Bytes32 = sha256(vote_message_b);
 
     // Finalization announcement — asserted by downstream outcome-gated
     // contracts and re-emittable via announce_finalization.

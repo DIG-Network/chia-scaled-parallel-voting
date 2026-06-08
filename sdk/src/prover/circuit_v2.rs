@@ -81,6 +81,13 @@ use ark_r1cs_std::groups::CurveVar;
 use ark_r1cs_std::ToBitsGadget;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 
+use crate::error::{VotingError, VotingResult};
+use crate::prover::circuit::{ArkProvingKey, ArkVerifyingKey};
+use crate::prover::proof::Groth16Proof;
+use ark_bls12_381::Bls12_381;
+use ark_groth16::Groth16;
+use ark_snark::SNARK;
+
 /// Canonical Poseidon parameters over BLS12-381 `Fr` (width 3, rate 2).
 /// The SAME config is used for the leaf hash, the Merkle node hash, and the
 /// Schnorr challenge. Production MUST pin an audited parameter set shared
@@ -346,6 +353,115 @@ pub fn schnorr_sign(
     let c = hash3(cfg, r.x, p.x, vote_message);
     let s = k + challenge_to_inner(c) * x;
     (r, s)
+}
+
+// ── Groth16 prove / verify / setup for circuit_v2 ────────────────────────
+
+impl VotingCircuitV2 {
+    /// FN: prove
+    /// WHAT: run the Groth16 prover for the v2 (Option-B) circuit; returns
+    ///       the chia-compressed wire proof. Mirrors `VotingCircuit::prove`.
+    /// PRE-CHECK: the in-circuit slack identity requires
+    ///       `signed_weight*den >= num*total`; we surface `BelowThreshold`
+    ///       here rather than emit a proof the verifier (or the circuit's
+    ///       own `Unsatisfiable`) would reject.
+    pub fn prove(&self, proving_key: &ArkProvingKey) -> VotingResult<Groth16Proof> {
+        let signed = self.signed_weight() as u128;
+        let lhs = signed * self.vote_threshold_den as u128;
+        let rhs = self.vote_threshold_num as u128 * self.registration_vote_weight as u128;
+        if lhs < rhs {
+            return Err(VotingError::BelowThreshold);
+        }
+        let mut rng = ark_std::rand::rngs::OsRng;
+        let proof = Groth16::<Bls12_381>::prove(&proving_key.0, self.clone(), &mut rng)
+            .map_err(|e| VotingError::ProvingError(format!("Groth16::prove (v2) failed: {e}")))?;
+        Groth16Proof::from_arkworks(&proof)
+    }
+
+    /// FN: verify_offchain
+    /// WHAT: off-chain Groth16 verification pre-flight. `public_inputs` is
+    ///       the raw `[Fr; 5]` from `public_inputs()` (NOT sha256 scalars —
+    ///       circuit_v2 binds field values directly), matching the on-chain
+    ///       `finalize.rue` scalar = `fr_to_bytes32_be(input_i)` layout.
+    pub fn verify_offchain(
+        verification_key: &ArkVerifyingKey,
+        proof: &Groth16Proof,
+        public_inputs: &[Fr],
+    ) -> VotingResult<bool> {
+        let proof = proof.to_arkworks()?;
+        let pvk = ark_groth16::prepare_verifying_key(&verification_key.0);
+        Groth16::<Bls12_381>::verify_with_processed_vk(&pvk, public_inputs, &proof)
+            .map_err(|e| VotingError::ProvingError(format!("verify (v2) failed: {e}")))
+    }
+}
+
+/// FN: generate_test_setup_v2
+/// WHAT: Groth16 trusted setup for the `VotingCircuitV2` shape. Produces
+///       `(ProvingKey, VerificationKey)` from a deterministic RNG.
+///
+/// **TEST-ONLY** — single-party setup, toxic waste not destroyed. Production
+/// setup MUST come from the MPC ceremony (which curries this same circuit
+/// shape). The VK has `PUBLIC_INPUT_COUNT + 1 = 6` IC points (624 bytes
+/// chia-chunked).
+///
+/// CIRCUIT SHAPE: arkworks evaluates the witness during setup, so the shape
+/// circuit must be SATISFIABLE — we build one genuinely-registered, signing
+/// member at index 0 of an otherwise-empty depth-`tree_depth` Poseidon tree
+/// (weight 1, threshold 1/2 over total 1 → `1*2 >= 1*1`). Only the
+/// constraint STRUCTURE (input count + R1CS shape) is captured into the VK;
+/// the concrete root/sig values are irrelevant to the resulting keys.
+pub fn generate_test_setup_v2<R: ark_std::rand::Rng + ark_std::rand::CryptoRng>(
+    tree_depth: usize,
+    max_signers: usize,
+    rng: &mut R,
+) -> VotingResult<(ArkProvingKey, ArkVerifyingKey)> {
+    use ark_ec::CurveGroup;
+    let cfg = poseidon_config();
+    let x = JubScalar::from(1u64);
+    let p = (Jub::generator() * x).into_affine();
+    let weight = 1u64;
+    let vote_message = Fr::from(1u64);
+    let (sig_r, sig_s) = schnorr_sign(&cfg, x, JubScalar::from(2u64), vote_message);
+
+    // Empty-subtree hashes for an all-empty tree (leaf = Fr::zero).
+    let mut empty = vec![Fr::from(0u64)];
+    for i in 0..tree_depth {
+        let e = empty[i];
+        empty.push(hash2(&cfg, e, e));
+    }
+    // Single leaf at index 0: siblings are the empty subtree hashes, all
+    // direction bits false (index 0 is the left child at every level).
+    let leaf = hash_leaf(&cfg, p.x, p.y, weight);
+    let path: Vec<Fr> = (0..tree_depth).map(|l| empty[l]).collect();
+    let path_bits = vec![false; tree_depth];
+    let mut node = leaf;
+    for sib in &path {
+        node = hash2(&cfg, node, *sib);
+    }
+    let root = node;
+
+    let signer = SignerV2 {
+        pubkey: p,
+        weight,
+        path,
+        path_bits,
+        sig_r,
+        sig_s,
+        present: true,
+    };
+    let shape = VotingCircuitV2 {
+        registration_root: root,
+        vote_message,
+        registration_vote_weight: 1,
+        vote_threshold_num: 1,
+        vote_threshold_den: 2,
+        depth: tree_depth,
+        max_signers,
+        signers: vec![signer],
+    };
+    let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(shape, rng)
+        .map_err(|e| VotingError::ProvingError(format!("v2 setup failed: {e}")))?;
+    Ok((ArkProvingKey(pk), ArkVerifyingKey(vk)))
 }
 
 #[cfg(test)]

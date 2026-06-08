@@ -545,6 +545,7 @@ pub struct PoseidonProof {
 }
 
 /// Sparse Poseidon Merkle tree over Jubjub-keyed registration leaves.
+#[derive(Clone, Debug)]
 pub struct PoseidonSmt {
     cfg: PoseidonConfig<Fr>,
     depth: usize,
@@ -553,6 +554,10 @@ pub struct PoseidonSmt {
     empties: Vec<Fr>,
     /// slot → leaf hash.
     leaves: BTreeMap<u32, Fr>,
+    /// slot → locked weight (the value committed in the leaf). Lets the
+    /// finalize builder recover each registered voter's weight (the SHA256
+    /// `SparseMerkleTree::locked_amount` analogue).
+    weights: BTreeMap<u32, u64>,
 }
 
 impl PoseidonSmt {
@@ -572,6 +577,7 @@ impl PoseidonSmt {
             depth,
             empties,
             leaves: BTreeMap::new(),
+            weights: BTreeMap::new(),
         }
     }
 
@@ -603,12 +609,14 @@ impl PoseidonSmt {
         let slot = self.slot_masked(pubkey.x, pubkey.y);
         let leaf = self.leaf_hash(pubkey.x, pubkey.y, weight);
         self.leaves.insert(slot, leaf);
+        self.weights.insert(slot, weight);
     }
 
     /// Wipe a voter's leaf back to empty (the on-chain `deregister` action's
     /// SPT update). Returns whether a leaf was present. Idempotent.
     pub fn remove(&mut self, pubkey: JubAffine) -> bool {
         let slot = self.slot_masked(pubkey.x, pubkey.y);
+        self.weights.remove(&slot);
         self.leaves.remove(&slot).is_some()
     }
 
@@ -616,6 +624,18 @@ impl PoseidonSmt {
     pub fn contains(&self, pubkey: JubAffine) -> bool {
         let slot = self.slot_masked(pubkey.x, pubkey.y);
         self.leaves.contains_key(&slot)
+    }
+
+    /// The locked weight committed for this Jubjub key (the
+    /// `SparseMerkleTree::locked_amount` analogue), or None if absent.
+    pub fn locked_amount(&self, pubkey: JubAffine) -> Option<u64> {
+        let slot = self.slot_masked(pubkey.x, pubkey.y);
+        self.weights.get(&slot).copied()
+    }
+
+    /// The locked weight at a given slot.
+    pub fn locked_amount_at_slot(&self, slot: u32) -> Option<u64> {
+        self.weights.get(&slot).copied()
     }
 
     /// Hash of the subtree spanning slots `[lo, hi)` at remaining `level`

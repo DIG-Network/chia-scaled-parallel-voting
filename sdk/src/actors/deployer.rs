@@ -457,7 +457,8 @@ impl ElectionDeployer {
         // `SparseMerkleTree::new().root()` (the full root) when
         // building the action layer state for the eve singleton
         // spend; the deployer must commit to the same value.
-        let empty_root = crate::merkle::SparseMerkleTree::new().root();
+        // SEC-F1: the empty registration root is the Poseidon SPT root.
+        let empty_root = Bytes32::new(crate::merkle::PoseidonSmt::new().root_be32());
         let state_hash = self.genesis_state_tree_hash(empty_root);
 
         // Curry args (matching `register.rue::fresh_registration_coin_puzzle_hash`):
@@ -1012,7 +1013,8 @@ mod tests {
         // We compare `ElectionState::genesis(...).clvm_tree_hash()`
         // against the same value built by encoding the genesis tuple
         // through clvm_traits::ToClvm and tree-hashing the result.
-        let empty_root = crate::merkle::SparseMerkleTree::new().root();
+        // SEC-F1: the empty registration root is the Poseidon SPT root.
+        let empty_root = Bytes32::new(crate::merkle::PoseidonSmt::new().root_be32());
         let cer = d.params.ceremony_launcher_id;
         let vk = d.params.vk_hash;
         let max_voters: u64 = d.params.max_signers as u64;

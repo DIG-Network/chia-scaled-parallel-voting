@@ -25,7 +25,7 @@
 // CACHE: state, voter_set, smt are populated by `sync()` and re-used
 //        by `build_finalize()` to avoid redundant chain walks.
 
-use chia_bls::{aggregate, PublicKey, SecretKey, Signature};
+use chia_bls::{PublicKey, SecretKey, Signature};
 use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use crate::config::NetworkType;
 
@@ -33,8 +33,9 @@ use crate::actors::deployer::sign_bundle_signature;
 use crate::chain::ChainReader;
 use crate::config::ElectionConfig;
 use crate::error::{anyhow_compat, VotingError, VotingResult};
-use crate::merkle::{MerkleProof, SparseMerkleTree};
-use crate::prover::Scalars;
+use crate::merkle::PoseidonSmt;
+use crate::prover::circuit_v2::{SignerV2, VotingCircuitV2};
+use ark_ed_on_bls12_381::EdwardsAffine as JubAffine;
 use crate::puzzles;
 use crate::state::{BallotCoinSnapshot, ElectionState, VoteRecord, VoterSet};
 
@@ -59,7 +60,7 @@ pub struct Aggregator<C: ChainReader> {
     chain: C,
     state: Option<ElectionState>,
     voter_set: Option<VoterSet>,
-    smt: Option<SparseMerkleTree>,
+    smt: Option<PoseidonSmt>,
     ballots: Option<Vec<BallotCoinSnapshot>>,
     /// Election launch height — required to predict the singleton's
     /// genesis state (4-field shape; `election_start_height` is the
@@ -185,7 +186,7 @@ impl<C: ChainReader> Aggregator<C> {
     }
     /// Last-synced SPT — needed for `prove(slot)` calls when assembling
     /// finalize witnesses.
-    pub fn merkle_tree(&self) -> VotingResult<&SparseMerkleTree> {
+    pub fn merkle_tree(&self) -> VotingResult<&PoseidonSmt> {
         self.smt.as_ref().ok_or(VotingError::NotDeployed)
     }
     /// Last-synced Ballot Coin snapshots (one per observed ballot).
@@ -447,6 +448,11 @@ pub async fn collect_votes_for_ballot_via_chain<C: ChainReader>(
             registration_coin_id,
             ballot_launcher_id,
             voting_coin_id: voting_coin.coin_id(),
+            // SEC-F1 TODO(step-6 on-chain plumbing): recover the voter's
+            // Jubjub Schnorr witness from the voting-coin memo. Until
+            // voting_coin carries it, on-chain-collected votes have no
+            // in-circuit signature and cannot be finalized via circuit_v2.
+            jubjub_vote: None,
         });
     }
     Ok(records)
@@ -579,16 +585,27 @@ impl<C: ChainReader> Aggregator<C> {
         // (the chain-canonical sum at snapshot time). u128 widening
         // here keeps the multiply overflow-safe for any realistic CAT
         // mojo amounts (each fits in u64 ≤ 2^64).
-        let signed_weight: u128 = votes
-            .iter()
-            .map(|v| {
-                smt.locked_amount(&v.voter_pubkey)
-                    .map(|a| a as u128)
-                    .ok_or(VotingError::NotRegistered)
-            })
-            .collect::<VotingResult<Vec<_>>>()?
-            .into_iter()
-            .sum();
+        // SEC-F1: build the per-signer circuit_v2 witnesses. Each signer's
+        // weight is read from the Poseidon SPT (keyed by their Jubjub pubkey,
+        // carried in the per-vote Jubjub witness); the Schnorr signature is
+        // verified IN-CIRCUIT at finalize. `signed_weight = Σ weights`.
+        let mut signers_v2: Vec<SignerV2> = Vec::with_capacity(votes.len());
+        let mut signed_weight: u128 = 0;
+        for v in votes {
+            let jv = v.jubjub_vote.ok_or(VotingError::InvalidSignature)?;
+            let weight = smt.locked_amount(jv.pubkey).ok_or(VotingError::NotRegistered)?;
+            signed_weight += weight as u128;
+            let mp = smt.prove_jubjub(jv.pubkey.x, jv.pubkey.y);
+            signers_v2.push(SignerV2 {
+                pubkey: jv.pubkey,
+                weight,
+                path: mp.siblings,
+                path_bits: mp.bits,
+                sig_r: jv.sig_r,
+                sig_s: jv.sig_s,
+                present: true,
+            });
+        }
         let total_weight = registration_vote_weight_snapshot as u128;
         let lhs = signed_weight.checked_mul(vote_threshold_den as u128).ok_or_else(|| {
             VotingError::Other(anyhow_compat::Error(
@@ -606,36 +623,13 @@ impl<C: ChainReader> Aggregator<C> {
             return Err(VotingError::BelowThreshold);
         }
 
-        // Pre-check 5 + parse: every vote signature must be a 96-byte
-        // BLS G2 point. Failure here is INVALID input — surface as
-        // InvalidSignature rather than a generic parse error.
-        let parsed_sigs: Vec<Signature> = votes
-            .iter()
-            .map(|v| {
-                let bytes = hex::decode(&v.vote_signature_hex)
-                    .map_err(|_| VotingError::InvalidSignature)?;
-                let arr: [u8; 96] = bytes
-                    .try_into()
-                    .map_err(|_| VotingError::InvalidSignature)?;
-                Signature::from_bytes(&arr).map_err(|_| VotingError::InvalidSignature)
-            })
-            .collect::<VotingResult<Vec<_>>>()?;
-
-        // BLS aggregation: G2 sum of signatures, G1 sum of pubkeys.
-        // `chia_bls::aggregate` runs in linear time per signature.
-        let agg_signature = aggregate(&parsed_sigs);
+        // SEC-F1: the BLS aggregate signature path is GONE. Voters no longer
+        // sign the canonical message with BLS for the aggregator to combine;
+        // instead each supplies a Jubjub Schnorr signature (in `jubjub_vote`)
+        // that `VotingCircuitV2` verifies in-circuit. We keep `signer_pks`
+        // for the returned witness (audit / dedup), but there is no on-chain
+        // `agg_signers` / `agg_sig` / BLS pairing pre-check anymore.
         let signer_pks: Vec<PublicKey> = votes.iter().map(|v| v.voter_pubkey).collect();
-        let agg_signers = aggregate_pubkeys(&signer_pks);
-
-        // Per-signer Merkle inclusion proof against the cached SPT.
-        // Slot derivation MUST mirror `slot_for_pubkey` so it agrees
-        // with the on-chain register action. Every signer is in the
-        // voter set (pre-check 2 above) so `prove(slot)` cannot
-        // legitimately produce an empty-leaf path.
-        let merkle_proofs: Vec<MerkleProof> = signer_pks
-            .iter()
-            .map(|pk| smt.prove(SparseMerkleTree::slot_for_pubkey(pk)))
-            .collect();
 
         // Canonical AGGREGATE vote message — `sha256(vote_outcome ||
         // election_launcher_id)`. Per `prover/mod.rs` this is the
@@ -658,68 +652,50 @@ impl<C: ChainReader> Aggregator<C> {
             .map_err(|e| VotingError::Other(anyhow_compat::Error(format!("config: {e}").into())))?;
         let vote_message = canonical_vote_message(vote_outcome, ballot_launcher_id, election_id);
 
-        // Pre-check 6: PoP-style BLS aggregate verify off-chain
-        // — mirrors the EXACT pairing identity the on-chain
-        // `bls_pairing_identity` opcode in
-        // `puzzles/election/finalize.rue` will run:
-        //
-        //   e(agg_signers, H(vote_message)) ==
-        //     e(G1_GENERATOR, agg_sig)
-        //
-        // i.e. equivalently
-        //
-        //   e(agg_signers, H(vote_message)) *
-        //     e(-G1_GENERATOR, agg_sig) == identity in GT
-        //
-        // This catches mismatches between supplied signatures and
-        // pubkeys BEFORE we run the (expensive) Groth16 prover,
-        // which would otherwise waste both prover time and the
-        // eventual bundle fee on-chain.
-        //
-        // WHY NOT `chia_bls::aggregate_verify`: that helper
-        // augments each (pk, msg) pair internally with `pk || msg`
-        // before hashing-to-G2, which only matches signatures
-        // produced via `chia_bls::sign` (augmented). Voters in
-        // this CHIP sign with `sign_unsafe` / `sign_raw`
-        // (UNAUGMENTED) so per-voter sigs sum cleanly to
-        // `sk_agg · H(msg)` and verify under the single-pair
-        // identity above. Pinned by
-        // `prepare_finalize_witness_aggregated_signature_pop_pairing_verifies`.
-        let h_vote_message = chia_bls::hash_to_g2(vote_message.as_ref());
-        let neg_g1_gen = -PublicKey::generator();
-        if !chia_bls::aggregate_pairing([
-            (&agg_signers, &h_vote_message),
-            (&neg_g1_gen, &agg_signature),
-        ]) {
-            return Err(VotingError::InvalidSignature);
-        }
-
-        // CHIP rev 2026-05-02: 6 public inputs. Threshold values
-        // are now plumbed via `prepare_finalize_witness_with_threshold`;
-        // the legacy no-threshold variant passes (0, 0) which is
-        // deterministic but won't match the real on-chain s5 unless
-        // the ballot was curried with that exact pair (i.e. mostly
-        // useful for off-chain skeleton tests).
-        let scalars = Scalars::compute(
-            voter_set.registration_merkle_root,
-            registration_vote_weight_snapshot,
-            &agg_signers,
-            vote_message,
-            vote_threshold_num,
-            vote_threshold_den,
-            ballot_launcher_id,
-        );
+        // SEC-F1: circuit_v2 has FIVE public inputs (no agg_signers /
+        // threshold-pack scalars; binding is fully in-circuit). They are the
+        // RAW field values — NOT sha256-then-mod-r scalars — in the order
+        // `VotingCircuitV2::public_inputs()` allocates them, and the on-chain
+        // `finalize.rue` scalar = `fr_to_bytes32_be(input_i)`:
+        //   [0] registration_root          (Poseidon SPT root snapshot, Fr)
+        //   [1] vote_message               (sha256(outcome||ballot||election) mod r)
+        //   [2] Fr(registration_vote_weight_snapshot)
+        //   [3] Fr(vote_threshold_num)
+        //   [4] Fr(vote_threshold_den)
+        let vote_message_fr = {
+            use ark_ff::PrimeField;
+            ark_bls12_381::Fr::from_be_bytes_mod_order(vote_message.as_ref())
+        };
+        let registration_root_fr = smt.root();
+        let public_fr: [ark_bls12_381::Fr; 5] = [
+            registration_root_fr,
+            vote_message_fr,
+            ark_bls12_381::Fr::from(registration_vote_weight_snapshot),
+            ark_bls12_381::Fr::from(vote_threshold_num),
+            ark_bls12_381::Fr::from(vote_threshold_den),
+        ];
+        let public_inputs: [Bytes32; 5] = [
+            Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&public_fr[0])),
+            Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&public_fr[1])),
+            Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&public_fr[2])),
+            Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&public_fr[3])),
+            Bytes32::new(crate::prover::conversions::fr_to_bytes32_be(&public_fr[4])),
+        ];
 
         Ok(FinalizeWitness {
             vote_outcome,
             ballot_launcher_id,
             vote_message,
-            agg_signers,
-            agg_signature,
-            merkle_proofs,
-            scalars,
+            vote_message_fr,
             registration_merkle_root: voter_set.registration_merkle_root,
+            registration_root_fr,
             registration_count: voter_set.registration_count,
+            registration_vote_weight: registration_vote_weight_snapshot,
+            vote_threshold_num,
+            vote_threshold_den,
+            public_inputs,
+            public_fr,
+            signers_v2,
             signer_pubkeys: signer_pks,
         })
     }
@@ -798,30 +774,20 @@ impl<C: ChainReader> Aggregator<C> {
             params.registration_vote_weight_snapshot,
         )?;
 
-        // Build the circuit + prove. Per-voter weight comes from the
-        // SMT leaf — `sha256(pk || locked_amount_be8)` — so the SDK
-        // and the on-chain register / deregister actions agree on
-        // what each voter contributes to `signed_weight`.
-        let smt = self.merkle_tree()?;
-        let mut signers: Vec<crate::prover::circuit::SignerWitness> = Vec::new();
-        for (pk, mp) in witness.signer_pubkeys.iter().zip(witness.merkle_proofs.iter()) {
-            let weight = smt.locked_amount(pk).ok_or(VotingError::NotRegistered)?;
-            signers.push(crate::prover::circuit::SignerWitness {
-                pubkey: *pk,
-                weight,
-                leaf_index: SparseMerkleTree::slot_for_pubkey(pk),
-                merkle_proof: mp.clone(),
-            });
-        }
-        let circuit = crate::prover::circuit::VotingCircuit {
-            registration_merkle_root: witness.registration_merkle_root,
+        // SEC-F1: build the circuit_v2 instance from the witness's per-signer
+        // Jubjub/Schnorr/Poseidon-membership data and run the Groth16 prover.
+        // Membership + signature + weight quorum are all bound IN-circuit, so
+        // a key whose holder did not register AND sign THIS outcome cannot
+        // contribute.
+        let circuit = VotingCircuitV2 {
+            registration_root: witness.registration_root_fr,
+            vote_message: witness.vote_message_fr,
             registration_vote_weight: params.registration_vote_weight_snapshot,
-            agg_signers: witness.agg_signers,
-            vote_message: witness.vote_message,
             vote_threshold_num: params.vote_threshold_num,
             vote_threshold_den: params.vote_threshold_den,
-            ballot_launcher_id: params.ballot_launcher_id,
-            signers,
+            depth: crate::config::TREE_DEPTH as usize,
+            max_signers: witness.signers_v2.len().max(1),
+            signers: witness.signers_v2.clone(),
         };
         let proof = circuit.prove(params.proving_key)?;
 
@@ -1033,60 +999,25 @@ impl<C: ChainReader> Aggregator<C> {
         // Proof: (a . (b . (c . ())))
         let proof_value = (proof_a, (proof_b, (proof_c, ())));
 
-        let agg_signers_bytes = Bytes::new(witness.agg_signers.to_bytes().to_vec());
-        let agg_sig_bytes = Bytes::new(witness.agg_signature.to_bytes().to_vec());
+        // SEC-F1: circuit_v2 finalize solution carries FIVE scalars (the raw
+        // 32-byte BE public inputs), NO agg_signers / agg_sig. finalize.rue
+        // compares each scalar NUMERICALLY (`(scalars.sN as Bytes) as Int`),
+        // so the 32-byte zero-padded `fr_to_bytes32_be` form reads as the
+        // same integer the off-chain prover committed via the IC vector.
+        let pi = &witness.public_inputs;
+        let s1 = chia_protocol::Bytes::new(pi[0].as_ref().to_vec());
+        let s2 = chia_protocol::Bytes::new(pi[1].as_ref().to_vec());
+        let s3 = chia_protocol::Bytes::new(pi[2].as_ref().to_vec());
+        let s4 = chia_protocol::Bytes::new(pi[3].as_ref().to_vec());
+        let s5 = chia_protocol::Bytes::new(pi[4].as_ref().to_vec());
+        // Scalars rest-arg: (s1 . (s2 . (s3 . (s4 . (s5 . ())))))
+        let scalars_value = (s1, (s2, (s3, (s4, (s5, ())))));
 
-        let s = &witness.scalars;
-        // Scalars: (s1 . (s2 . (s3 . (s4 . (s5 . (s6 . (s7 . (s8 . ()))))))))
-        //
-        // s1..s6: CLVM Int → Bytes canonical encoding strips leading
-        // zero bytes. The on-chain finalize.rue assertion
-        //   `((zero_pad + sha256(input_i)) as Int % r) as Bytes
-        //    == scalars.s_i as Bytes`
-        // canonicalises the LHS, so the RHS (the Scalars values we
-        // pass in the solution) MUST also be in canonical form to
-        // compare-equal. Bls12-381 Fr is always < 2^254, so the
-        // leading non-zero byte never has its high bit set →
-        // canonical = shortest-BE with no leading zeros.
-        //
-        // s7/s8: bound by direct byte equality
-        //   `(zero_pad_24 + int_to_8_bytes_be(num)) == scalars.s7 as Bytes`
-        // which is a literal 32-byte concatenation (24 zero bytes +
-        // 8 BE bytes) — NOT canonicalised. So we MUST pass the full
-        // 32-byte big-endian form here for the byte-equality to hold.
-        let s7_bytes = chia_protocol::Bytes::new(s.s7.as_ref().to_vec());
-        let s8_bytes = chia_protocol::Bytes::new(s.s8.as_ref().to_vec());
-        let scalars_value = (
-            canonical_int_bytes32(&s.s1),
-            (
-                canonical_int_bytes32(&s.s2),
-                (
-                    canonical_int_bytes32(&s.s3),
-                    (
-                        canonical_int_bytes32(&s.s4),
-                        (
-                            canonical_int_bytes32(&s.s5),
-                            (
-                                canonical_int_bytes32(&s.s6),
-                                (s7_bytes, (s8_bytes, ())),
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-        );
-
-        // Top-level finalize solution:
-        //   (proof . (vote_outcome . (agg_signers . (agg_sig . scalars))))
+        // Top-level finalize solution (per ballot_coin/finalize.rue):
+        //   (proof . (vote_outcome . (s1 . (s2 . (s3 . (s4 . (s5 . ())))))))
         let finalize_solution_value = (
             proof_value,
-            (
-                params.vote_outcome,
-                (
-                    agg_signers_bytes,
-                    (agg_sig_bytes, scalars_value),
-                ),
-            ),
+            (params.vote_outcome, scalars_value),
         );
         let finalize_solution = finalize_solution_value
             .to_clvm(&mut *ctx)
@@ -1136,16 +1067,14 @@ impl<C: ChainReader> Aggregator<C> {
                     "vote_threshold_den": params.vote_threshold_den,
                     "registration_merkle_root_snapshot": format!("0x{}", hex::encode(params.registration_merkle_root_snapshot)),
                     "registration_vote_weight_snapshot": params.registration_vote_weight_snapshot,
-                    "scalars": {
-                        "s1": format!("0x{}", hex::encode(witness.scalars.s1)),
-                        "s2": format!("0x{}", hex::encode(witness.scalars.s2)),
-                        "s3": format!("0x{}", hex::encode(witness.scalars.s3)),
-                        "s4": format!("0x{}", hex::encode(witness.scalars.s4)),
-                        "s5": format!("0x{}", hex::encode(witness.scalars.s5)),
-                        "s6": format!("0x{}", hex::encode(witness.scalars.s6)),
+                    "public_inputs": {
+                        "s1_registration_root": format!("0x{}", hex::encode(witness.public_inputs[0])),
+                        "s2_vote_message": format!("0x{}", hex::encode(witness.public_inputs[1])),
+                        "s3_vote_weight": format!("0x{}", hex::encode(witness.public_inputs[2])),
+                        "s4_num": format!("0x{}", hex::encode(witness.public_inputs[3])),
+                        "s5_den": format!("0x{}", hex::encode(witness.public_inputs[4])),
                     },
-                    "agg_signers": format!("0x{}", hex::encode(witness.agg_signers.to_bytes())),
-                    "agg_sig": format!("0x{}", hex::encode(witness.agg_signature.to_bytes())),
+                    "n_signers": witness.signers_v2.len(),
                     "coin_spends": coin_spends.iter().map(|cs| serde_json::json!({
                         "coin": {
                             "parent_coin_info": format!("0x{}", hex::encode(cs.coin.parent_coin_info)),
@@ -1276,33 +1205,44 @@ impl<C: ChainReader> Aggregator<C> {
 ///        and pass it to their own prover, bypassing
 ///        `Aggregator::build_finalize`.
 ///
-/// FIELD GROUPS:
-///   * Public inputs to the Groth16 verifier (also on-chain):
-///     `registration_merkle_root`, `registration_count`,
-///     `agg_signers`, `vote_message`.
-///   * Private witness (off-chain only): `merkle_proofs`,
-///     `signer_pubkeys`.
+/// FIELD GROUPS (SEC-F1, circuit_v2):
+///   * On-chain public inputs (5): `registration_root_fr`,
+///     `vote_message_fr`, `registration_vote_weight`,
+///     `vote_threshold_num`, `vote_threshold_den` — also encoded as
+///     `public_inputs` (32-byte BE) for the finalize solution.
+///   * Private witness (off-chain only): `signers_v2` (Jubjub pubkey +
+///     Poseidon membership proof + Schnorr signature per signer),
+///     `signer_pubkeys` (BLS, for audit/dedup).
 ///   * On-chain solution arguments to the `finalize` action:
-///     `vote_outcome`, `agg_signature`, `scalars`.
+///     `vote_outcome` + `public_inputs`. There is NO `agg_signers` /
+///     `agg_signature` anymore — the quorum is proven in-circuit.
 ///
-/// SERDE: not derived because of `PublicKey` / `Signature`. If you
-///        need a JSON view, hex-encode the BLS fields.
+/// SERDE: not derived (arkworks + chia_bls types). Hex-encode if needed.
 #[derive(Debug, Clone)]
 pub struct FinalizeWitness {
     pub vote_outcome: Bytes32,
-    /// Ballot Coin launcher id this witness was produced against —
-    /// included so downstream callers (Phase 5 prover, Phase 6 spend
-    /// builder) can derive the 6th public input
-    /// `vote_message(outcome, ballot, election)` without re-querying
-    /// the aggregator.
+    /// Ballot Coin launcher id this witness was produced against.
     pub ballot_launcher_id: Bytes32,
+    /// Canonical vote message digest `sha256(outcome||ballot||election)`.
     pub vote_message: Bytes32,
-    pub agg_signers: PublicKey,
-    pub agg_signature: Signature,
-    pub merkle_proofs: Vec<MerkleProof>,
-    pub scalars: Scalars,
+    /// `vote_message` reduced into `Fr` — the value voters Schnorr-sign and
+    /// circuit_v2 binds (matches finalize.rue's on-chain `mod r` derivation).
+    pub vote_message_fr: ark_bls12_381::Fr,
     pub registration_merkle_root: Bytes32,
+    /// The Poseidon registration-tree root as an `Fr` (circuit public input).
+    pub registration_root_fr: ark_bls12_381::Fr,
     pub registration_count: u64,
+    pub registration_vote_weight: u64,
+    pub vote_threshold_num: u64,
+    pub vote_threshold_den: u64,
+    /// The 5 circuit_v2 public inputs as 32-byte BE (the finalize solution
+    /// scalars, matching `finalize_v2_probe.rue`).
+    pub public_inputs: [Bytes32; 5],
+    /// The same 5 public inputs as `Fr` (off-chain verify pre-flight).
+    pub public_fr: [ark_bls12_381::Fr; 5],
+    /// Per-signer circuit_v2 witnesses (Jubjub pubkey + Poseidon proof +
+    /// Schnorr signature).
+    pub signers_v2: Vec<SignerV2>,
     pub signer_pubkeys: Vec<PublicKey>,
 }
 
@@ -1350,7 +1290,7 @@ pub fn canonical_vote_message(
 pub struct SyncSnapshot {
     pub state: ElectionState,
     pub voter_set: VoterSet,
-    pub smt: SparseMerkleTree,
+    pub smt: PoseidonSmt,
     /// Per-CHIP-rev-2026-05-02: every Ballot Coin minted so far. Each
     /// snapshot carries the ballot launcher id, its current
     /// `BallotState` (`finalized` / `vote_outcome` / `agg_signers`),
@@ -1411,8 +1351,8 @@ pub async fn sync_with_chain<C: ChainReader>(
         // CHIP.md §88-91 the occupied leaf is `sha256(pubkey)`; no
         // per-voter weight is encoded into the leaf, so the SMT
         // takes no extra parameters.
-        let smt = SparseMerkleTree::new();
-        let empty_root = smt.root();
+        let smt = PoseidonSmt::new();
+        let empty_root = Bytes32::new(smt.root_be32());
         let state = ElectionState::genesis_from_config(empty_root, election_start_height, config);
         let voter_set = VoterSet {
             registration_merkle_root: empty_root,
@@ -1465,9 +1405,9 @@ pub async fn sync_with_chain<C: ChainReader>(
     // Per CHIP.md §88-91 the occupied leaf is `sha256(pubkey)`,
     // so the SMT needs no extra parameters; per-voter weight is
     // tracked on the Election Singleton state instead.
-    let mut smt = SparseMerkleTree::new();
+    let mut smt = PoseidonSmt::new();
     let mut voters: Vec<chia_bls::PublicKey> = Vec::new();
-    let mut state = ElectionState::genesis_from_config(smt.root(), election_start_height, config);
+    let mut state = ElectionState::genesis_from_config(Bytes32::new(smt.root_be32()), election_start_height, config);
     // Ballot Coin snapshots emitted by the singleton's `create_ballot`
     // action. Phase 4.5 (indexer) walks each ballot's own lineage to
     // populate these fully; the aggregator only emits an entry when
@@ -1524,7 +1464,7 @@ pub async fn sync_with_chain<C: ChainReader>(
     }
 
     let voter_set = VoterSet {
-        registration_merkle_root: smt.root(),
+        registration_merkle_root: Bytes32::new(smt.root_be32()),
         registration_count: voters.len() as u64,
         voters,
     };
@@ -1559,7 +1499,7 @@ pub struct CurrentSingleton {
     /// fields so callers don't need a separate `sync_with_chain`
     /// invocation.
     pub voter_set: VoterSet,
-    pub smt: SparseMerkleTree,
+    pub smt: PoseidonSmt,
 }
 
 /// FN: find_current_singleton
@@ -1645,10 +1585,10 @@ pub async fn find_current_singleton<C: ChainReader>(
             parent_parent_coin_info: launcher_record.coin.parent_coin_info,
             parent_amount: launcher_record.coin.amount,
         });
-        let smt = SparseMerkleTree::new();
-        let state = ElectionState::genesis_from_config(smt.root(), election_start_height, config);
+        let smt = PoseidonSmt::new();
+        let state = ElectionState::genesis_from_config(Bytes32::new(smt.root_be32()), election_start_height, config);
         let voter_set = VoterSet {
-            registration_merkle_root: smt.root(),
+            registration_merkle_root: Bytes32::new(smt.root_be32()),
             registration_count: 0,
             voters: vec![],
         };
@@ -1677,9 +1617,9 @@ pub async fn find_current_singleton<C: ChainReader>(
         .find(|r| r.coin.amount % 2 == 1)
         .ok_or(VotingError::NotDeployed)?;
 
-    let mut smt = SparseMerkleTree::new();
+    let mut smt = PoseidonSmt::new();
     let mut voters: Vec<chia_bls::PublicKey> = Vec::new();
-    let mut state = ElectionState::genesis_from_config(smt.root(), election_start_height, config);
+    let mut state = ElectionState::genesis_from_config(Bytes32::new(smt.root_be32()), election_start_height, config);
     let mut ballots: Vec<BallotCoinSnapshot> = Vec::new();
 
     let mut current = eve_record;
@@ -1747,7 +1687,7 @@ pub async fn find_current_singleton<C: ChainReader>(
             };
 
             let voter_set = VoterSet {
-                registration_merkle_root: smt.root(),
+                registration_merkle_root: Bytes32::new(smt.root_be32()),
                 registration_count: voters.len() as u64,
                 voters,
             };
@@ -1924,7 +1864,7 @@ pub async fn wait_for_current_singleton<C: ChainReader>(
 fn apply_singleton_spend(
     puzzle: &chia_protocol::Program,
     solution: &chia_protocol::Program,
-    smt: &mut SparseMerkleTree,
+    smt: &mut PoseidonSmt,
     voters: &mut Vec<chia_bls::PublicKey>,
     state: &mut ElectionState,
     _ballots: &mut Vec<BallotCoinSnapshot>,
@@ -2060,7 +2000,6 @@ fn apply_singleton_spend(
     // each transition; the aggregator's voter set is recomputed on
     // every sync, so a misclassification here at most yields a
     // stale snapshot — never a forged one.
-    let _ = candidate_outcomes;
 
     // ── Deregister detection ─────────────────────────────────────
     //
@@ -2079,28 +2018,39 @@ fn apply_singleton_spend(
     // NOTE: deregister discrimination MUST run BEFORE the register
     // fallback, because the latter is intentionally permissive (any
     // CCA counts as a register hint).
+    // SEC-F1: the deregister announcement is keyed by the BLS pubkey, but
+    // the Poseidon SPT is keyed by the voter's Jubjub pubkey, so the wipe
+    // needs the Jubjub coords. deregister.rue carries them in the solution
+    // (after the BLS pubkey), so we recover the on-curve Jubjub point from
+    // the solution's 32-byte atoms — the genuine point is the one currently
+    // registered in the SPT.
+    let candidate_points = recover_jubjub_points(&candidate_outcomes, smt);
     for pk in &candidate_pubkeys {
         let msg = crate::puzzles::deregister_announcement_msg(pk);
         if cca_messages.iter().any(|m| m == msg.as_ref())
             || send_messages.iter().any(|m| m == msg.as_ref())
         {
-            // Found a deregister CCA. Wipe the SMT leaf, drop the
-            // voter from the bookkeeping vector, and decrement
-            // count/weight to mirror `deregister.rue`'s state
-            // transition:
+            // Found a deregister CCA. Wipe the SMT leaf (keyed by the
+            // recovered Jubjub point), drop the voter from the bookkeeping
+            // vector, and decrement count/weight to mirror
+            // `deregister.rue`'s state transition:
             //   `registration_count -= 1`
             //   `registration_vote_weight -= locked_cat_mojos` (the
             //       voter's REAL lock, recovered from the SMT before
             //       we wipe their leaf — weighted-voting rev)
             //   `registration_merkle_root = <SPT with leaf wiped>`
             // Idempotent against repeated syncs because `remove`
-            // returns false when the pk isn't currently in the SPT.
-            let recovered_lock = smt.locked_amount(pk);
-            let removed = smt.remove(pk);
+            // returns false when the point isn't currently in the SPT.
+            let jub = match candidate_points.first() {
+                Some(p) => *p,
+                None => return Ok(()),
+            };
+            let recovered_lock = smt.locked_amount(jub);
+            let removed = smt.remove(jub);
             if removed {
                 voters.retain(|v| v != pk);
                 state.registration_count = voters.len() as u64;
-                state.registration_merkle_root = smt.root();
+                state.registration_merkle_root = Bytes32::new(smt.root_be32());
                 let lock = recovered_lock.unwrap_or(collateral_amount);
                 state.registration_vote_weight = state
                     .registration_vote_weight
@@ -2110,93 +2060,144 @@ fn apply_singleton_spend(
         }
     }
 
-    // ── Register detection (weighted-voting rev) ─────────────────
+    // ── Register detection (SEC-F1 Poseidon/Jubjub rev) ──────────
     //
     // `register.rue` emits a CCA whose preimage is
     //   sha256("registered" || new_root || (count+1)_be8 ||
-    //          pk || lock_be8)
-    // — this binds the new SMT root, the new count, the registering
-    // pubkey, AND the voter's chosen lock amount into one hash. We
-    // recover (pk, lock_amount) by:
-    //   (a) collecting all 48-byte BLS-G1 atoms in the solution as
-    //       pubkey candidates,
-    //   (b) collecting all 0-8 byte atoms in the solution as
-    //       lock_amount candidates (the puzzle's `int_to_8_bytes_be`
-    //       expands an arbitrary CLVM int to 8 bytes, but the value
-    //       in the solution can be CLVM-canonical i.e. shorter),
-    //   (c) for each (pk, lock) pair: tentatively insert into the
-    //       SMT, compute the resulting root, hash the candidate
-    //       preimage, and check it matches a CCA message.
-    // This makes the chain walker reconstruct each voter's REAL
-    // locked amount instead of falling back to the curried minimum.
+    //          pk || lock_be8 || jub_x || jub_y)
+    // — this binds the new Poseidon SPT root, the new count, the BLS
+    // pubkey, the voter's chosen lock amount, AND the voter's Jubjub
+    // pubkey coords into one hash. We recover (pk, jub_point, lock) by:
+    //   (a) all 48-byte BLS-G1 atoms in the solution as pubkey candidates,
+    //   (b) all on-curve Jubjub points formed from the solution's 32-byte
+    //       atoms (jub_x, jub_y) as point candidates,
+    //   (c) all 0-8 byte atoms as lock_amount candidates,
+    //   (d) for each (pk, point, lock): tentatively insert the leaf into
+    //       the Poseidon SPT keyed by the point, compute the resulting
+    //       root, hash the candidate preimage, and check it matches a CCA.
+    // Only the genuine triple reproduces the announced root.
     if registered_count > 0 {
         let mut lock_candidates: Vec<u64> = Vec::new();
         collect_u64_atoms(&allocator, solution_node, &mut lock_candidates);
+        let point_candidates = oncurve_jubjub_points(&candidate_outcomes);
         let next_count = state.registration_count.saturating_add(1);
         let next_count_be = next_count.to_be_bytes();
-        let mut matched: Option<(chia_bls::PublicKey, u64)> = None;
+        let mut matched: Option<(chia_bls::PublicKey, JubAffine, u64)> = None;
         'search: for pk in &candidate_pubkeys {
             let pk_bytes = pk.to_bytes();
-            for lock in &lock_candidates {
-                if *lock < collateral_amount {
-                    // Below the curried minimum — register.rue would
-                    // have rejected the spend, so it cannot be the
-                    // real lock amount.
-                    continue;
-                }
-                let mut tentative = smt.clone();
-                if tentative.insert(pk, *lock).is_err() {
-                    continue;
-                }
-                let new_root = tentative.root();
-                let mut h = sha2::Sha256::new();
-                use sha2::Digest;
-                h.update(b"registered");
-                h.update(new_root.as_ref());
-                h.update(next_count_be);
-                h.update(pk_bytes);
-                h.update(lock.to_be_bytes());
-                let candidate_msg: [u8; 32] = h.finalize().into();
-                if cca_messages.iter().any(|m| m == &candidate_msg) {
-                    matched = Some((*pk, *lock));
-                    break 'search;
+            for point in &point_candidates {
+                let jub_x = crate::merkle::fr_to_be32(point.x);
+                let jub_y = crate::merkle::fr_to_be32(point.y);
+                for lock in &lock_candidates {
+                    if *lock < collateral_amount {
+                        // Below the curried minimum — register.rue would
+                        // have rejected the spend.
+                        continue;
+                    }
+                    let mut tentative = smt.clone();
+                    tentative.insert(*point, *lock);
+                    let new_root = tentative.root_be32();
+                    let mut h = sha2::Sha256::new();
+                    use sha2::Digest;
+                    h.update(b"registered");
+                    h.update(new_root);
+                    h.update(next_count_be);
+                    h.update(pk_bytes);
+                    h.update(lock.to_be_bytes());
+                    h.update(jub_x);
+                    h.update(jub_y);
+                    let candidate_msg: [u8; 32] = h.finalize().into();
+                    if cca_messages.iter().any(|m| m == &candidate_msg) {
+                        matched = Some((*pk, *point, *lock));
+                        break 'search;
+                    }
                 }
             }
         }
-        if let Some((pk, lock)) = matched {
-            if let Err(e) = smt.insert(&pk, lock) {
-                tracing::warn!(error = ?e, "apply_singleton_spend: SMT insert failed");
-            } else {
-                voters.push(pk);
-                state.registration_count = voters.len() as u64;
-                state.registration_merkle_root = smt.root();
-                state.registration_vote_weight =
-                    state.registration_vote_weight.saturating_add(lock);
-            }
-        } else if let Some(pk) = candidate_pubkeys.into_iter().next() {
-            // Defensive fallback: no (pk, lock) pair matched a CCA.
-            // Should not happen for spends produced by this SDK; the
-            // most likely trigger is a manually-crafted register
-            // bundle whose announcement preimage diverges from
-            // `register.rue`. Fall back to the curried minimum so
-            // sync makes forward progress instead of deadlocking,
-            // and warn loudly.
+        if let Some((pk, point, lock)) = matched {
+            smt.insert(point, lock);
+            voters.push(pk);
+            state.registration_count = voters.len() as u64;
+            state.registration_merkle_root = Bytes32::new(smt.root_be32());
+            state.registration_vote_weight =
+                state.registration_vote_weight.saturating_add(lock);
+        } else if let (Some(pk), Some(point)) =
+            (candidate_pubkeys.into_iter().next(), point_candidates.into_iter().next())
+        {
+            // Defensive fallback: no (pk, point, lock) triple matched a
+            // CCA. Should not happen for spends produced by this SDK; the
+            // most likely trigger is a manually-crafted register bundle
+            // whose announcement preimage diverges from `register.rue`.
+            // Fall back to the curried minimum so sync makes forward
+            // progress instead of deadlocking, and warn loudly.
             tracing::warn!(
                 pk = %hex::encode(pk.to_bytes()),
                 "apply_singleton_spend: register CCA detected but no \
-                 (pk, lock) pair matched — falling back to curried \
-                 collateral_amount minimum"
+                 (pk, point, lock) triple matched — falling back to \
+                 curried collateral_amount minimum"
             );
-            if smt.insert(&pk, collateral_amount).is_ok() {
+            {
+                smt.insert(point, collateral_amount);
                 voters.push(pk);
                 state.registration_count = voters.len() as u64;
-                state.registration_merkle_root = smt.root();
+                state.registration_merkle_root = Bytes32::new(smt.root_be32());
                 state.registration_vote_weight =
                     state.registration_vote_weight.saturating_add(collateral_amount);
             }
         }
     }
     Ok(())
+}
+
+/// FN: jubaffine_from_be32 (file-private, SEC-F1)
+/// WHAT: reconstruct a Jubjub affine point from the 32-byte BE encodings of
+///       its (x, y) coords (as produced by `merkle::fr_to_be32`), returning
+///       `None` unless the point is genuinely on the curve and in the
+///       prime-order subgroup. Used to recover a voter's registered Jubjub
+///       pubkey from a register / deregister action's solution atoms.
+fn jubaffine_from_be32(x: &[u8; 32], y: &[u8; 32]) -> Option<JubAffine> {
+    use ark_ff::PrimeField;
+    type Fq = ark_ed_on_bls12_381::Fq;
+    let px = Fq::from_be_bytes_mod_order(x);
+    let py = Fq::from_be_bytes_mod_order(y);
+    let p = JubAffine::new_unchecked(px, py);
+    if p.is_on_curve() && p.is_in_correct_subgroup_assuming_on_curve() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// FN: oncurve_jubjub_points (file-private, SEC-F1)
+/// WHAT: from a list of 32-byte atoms recovered from a solution, return
+///       every ORDERED (x, y) pair that forms a valid on-curve Jubjub
+///       point. The genuine `(jub_x, jub_y)` the voter supplied is among
+///       these; sibling-hash / coin-id atoms paired as (x, y) are
+///       overwhelmingly NOT on-curve and are filtered out. De-duplicated.
+fn oncurve_jubjub_points(atoms: &[[u8; 32]]) -> Vec<JubAffine> {
+    let mut out: Vec<JubAffine> = Vec::new();
+    for x in atoms {
+        for y in atoms {
+            if let Some(p) = jubaffine_from_be32(x, y) {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// FN: recover_jubjub_points (file-private, SEC-F1)
+/// WHAT: the subset of `oncurve_jubjub_points(atoms)` that is CURRENTLY
+///       registered in `smt`. For a deregister spend (whose announcement is
+///       keyed by the BLS pubkey, not the Jubjub key) this isolates the
+///       exact leaf to wipe.
+fn recover_jubjub_points(atoms: &[[u8; 32]], smt: &PoseidonSmt) -> Vec<JubAffine> {
+    oncurve_jubjub_points(atoms)
+        .into_iter()
+        .filter(|p| smt.contains(*p))
+        .collect()
 }
 
 /// FN: collect_u64_atoms (file-private)
@@ -2596,6 +2597,8 @@ pub async fn extract_votes<C: ChainReader>(
             // we emit zeroed identity so the field exists.
             ballot_launcher_id: Bytes32::default(),
             voting_coin_id: Bytes32::default(),
+            // SEC-F1: legacy walker carries no Jubjub witness.
+            jubjub_vote: None,
         });
     }
     Ok(out)
@@ -2721,7 +2724,7 @@ pub fn compute_eve_inner_puzzle_hash(
     config: &ElectionConfig,
     election_start_height: u64,
 ) -> Bytes32 {
-    let empty_root = crate::merkle::SparseMerkleTree::new().root();
+    let empty_root = Bytes32::new(crate::merkle::PoseidonSmt::new().root_be32());
     let genesis = ElectionState::genesis_from_config(empty_root, election_start_height, config);
     compute_election_inner_puzzle_hash_for_state(config, &genesis)
 }
@@ -2835,7 +2838,7 @@ pub fn compute_eve_singleton_puzzle_hash(
     // Step 3: genesis state tree hash via the source-of-truth helper.
     // V6: read the ceremony back-reference triple from the config so we
     // match what the deployer commits at launch.
-    let empty_root = crate::merkle::SparseMerkleTree::new().root();
+    let empty_root = Bytes32::new(crate::merkle::PoseidonSmt::new().root_be32());
     let state_hash = ElectionState::genesis(
         empty_root,
         election_start_height,
@@ -3061,7 +3064,7 @@ mod tests {
 
         let cached_state = agg.state().expect("state populated after sync");
         // Empty SPT root at depth 32 (NOT the leaf hash).
-        let empty_root = SparseMerkleTree::new().root();
+        let empty_root = Bytes32::new(PoseidonSmt::new().root_be32());
         assert_eq!(
             *cached_state,
             ElectionState::genesis(
