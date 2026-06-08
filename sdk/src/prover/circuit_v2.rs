@@ -64,10 +64,7 @@
 // against the live circuit.
 
 use ark_bls12_381::Fr;
-use ark_crypto_primitives::sponge::constraints::CryptographicSpongeVar;
-use ark_crypto_primitives::sponge::poseidon::constraints::PoseidonSpongeVar;
-use ark_crypto_primitives::sponge::poseidon::{find_poseidon_ark_and_mds, PoseidonConfig, PoseidonSponge};
-use ark_crypto_primitives::sponge::CryptographicSponge;
+use ark_crypto_primitives::sponge::poseidon::{find_poseidon_ark_and_mds, PoseidonConfig};
 use ark_ec::Group;
 use ark_ed_on_bls12_381::constraints::EdwardsVar;
 use ark_ed_on_bls12_381::{EdwardsAffine, EdwardsProjective as Jub, Fr as JubScalar};
@@ -77,6 +74,9 @@ use ark_r1cs_std::boolean::Boolean;
 use ark_r1cs_std::eq::EqGadget;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::fields::FieldVar;
+use crate::prover::poseidon_perm::{
+    hash2, hash2_var, hash3, hash3_var, hash_leaf, hash_leaf_var,
+};
 use ark_r1cs_std::groups::CurveVar;
 use ark_r1cs_std::ToBitsGadget;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
@@ -99,29 +99,6 @@ pub fn poseidon_config() -> PoseidonConfig<Fr> {
         0,
     );
     PoseidonConfig::<Fr>::new(full_rounds, partial_rounds, alpha, mds, ark, rate, capacity)
-}
-
-/// Off-circuit Poseidon over a list of field elements (absorb all, squeeze
-/// one) — MUST match the in-circuit `poseidon_n_var`.
-pub fn poseidon_n(cfg: &PoseidonConfig<Fr>, xs: &[Fr]) -> Fr {
-    let mut s = PoseidonSponge::<Fr>::new(cfg);
-    for x in xs {
-        s.absorb(x);
-    }
-    s.squeeze_field_elements(1)[0]
-}
-
-/// In-circuit counterpart of [`poseidon_n`].
-fn poseidon_n_var(
-    cs: ConstraintSystemRef<Fr>,
-    cfg: &PoseidonConfig<Fr>,
-    xs: &[FpVar<Fr>],
-) -> Result<FpVar<Fr>, SynthesisError> {
-    let mut s = PoseidonSpongeVar::<Fr>::new(cs, cfg);
-    for x in xs {
-        s.absorb(x)?;
-    }
-    Ok(s.squeeze_field_elements(1)?.pop().unwrap())
 }
 
 /// Enforce `0 <= v < 2^n` by bit-decomposition. `to_bits_le` constrains
@@ -162,10 +139,7 @@ pub struct SignerV2 {
 impl SignerV2 {
     /// Registration leaf = `Poseidon(P.x, P.y, weight)`.
     pub fn leaf(&self, cfg: &PoseidonConfig<Fr>) -> Fr {
-        poseidon_n(
-            cfg,
-            &[self.pubkey.x, self.pubkey.y, Fr::from(self.weight)],
-        )
+hash_leaf(cfg, self.pubkey.x, self.pubkey.y, self.weight)
     }
 
     /// Off-circuit root this witness implies (tests).
@@ -173,9 +147,9 @@ impl SignerV2 {
         let mut node = self.leaf(cfg);
         for (sib, &is_right) in self.path.iter().zip(self.path_bits.iter()) {
             node = if is_right {
-                poseidon_n(cfg, &[*sib, node])
+                hash2(cfg, *sib, node)
             } else {
-                poseidon_n(cfg, &[node, *sib])
+                hash2(cfg, node, *sib)
             };
         }
         node
@@ -259,18 +233,14 @@ impl ConstraintSynthesizer<Fr> for VotingCircuitV2 {
             enforce_lt_pow2(&weight, 64)?;
 
             // ── MEMBERSHIP (G2): leaf = Poseidon(P.x, P.y, weight) ──
-            let leaf = poseidon_n_var(
-                cs.clone(),
-                &cfg,
-                &[p_var.x.clone(), p_var.y.clone(), weight.clone()],
-            )?;
+            let leaf = hash_leaf_var(&cfg, &p_var.x, &p_var.y, &weight)?;
             let mut node = leaf;
             for level in 0..self.depth {
                 let sib = FpVar::<Fr>::new_witness(cs.clone(), || Ok(s.path[level]))?;
                 let is_right = Boolean::new_witness(cs.clone(), || Ok(s.path_bits[level]))?;
                 let left = is_right.select(&sib, &node)?;
                 let right = is_right.select(&node, &sib)?;
-                node = poseidon_n_var(cs.clone(), &cfg, &[left, right])?;
+                node = hash2_var(&cfg, &left, &right)?;
             }
             // present ⇒ reconstructed root == public root.
             node.conditional_enforce_equal(&root_var, &present)?;
@@ -292,11 +262,7 @@ impl ConstraintSynthesizer<Fr> for VotingCircuitV2 {
                 b.enforce_equal(&Boolean::constant(false))?;
             }
             // c = Poseidon(R.x, P.x, vote_message)
-            let c_var = poseidon_n_var(
-                cs.clone(),
-                &cfg,
-                &[r_var.x.clone(), p_var.x.clone(), m_var.clone()],
-            )?;
+            let c_var = hash3_var(&cfg, &r_var.x, &p_var.x, &m_var)?;
             let c_bits = c_var.to_bits_le()?;
             let s_g = g_var.scalar_mul_le(s_bits.iter())?;
             let c_p = p_var.scalar_mul_le(c_bits.iter())?;
@@ -356,7 +322,7 @@ pub fn schnorr_sign(
     use ark_ec::CurveGroup;
     let p = (Jub::generator() * x).into_affine();
     let r = (Jub::generator() * k).into_affine();
-    let c = poseidon_n(cfg, &[r.x, p.x, vote_message]);
+    let c = hash3(cfg, r.x, p.x, vote_message);
     let s = k + challenge_to_inner(c) * x;
     (r, s)
 }
@@ -392,7 +358,7 @@ mod tests {
             let mut empty = vec![Fr::from(0u64)];
             for i in 0..depth {
                 let p = empty[i];
-                empty.push(poseidon_n(&cfg, &[p, p]));
+                empty.push(hash2(&cfg, p, p));
             }
             Self { cfg, depth, empty, leaves: BTreeMap::new() }
         }
@@ -410,7 +376,7 @@ mod tests {
             }
             let l = self.node(level - 1, idx * 2);
             let r = self.node(level - 1, idx * 2 + 1);
-            poseidon_n(&self.cfg, &[l, r])
+            hash2(&self.cfg, l, r)
         }
         fn root(&self) -> Fr {
             self.node(self.depth, 0)
@@ -443,7 +409,7 @@ mod tests {
     ) -> SignerV2 {
         let cfg = poseidon_config();
         let p = keygen(x);
-        tree.insert(index, poseidon_n(&cfg, &[p.x, p.y, Fr::from(weight)]));
+        tree.insert(index, hash_leaf(&cfg, p.x, p.y, weight));
         let (r, s) = schnorr_sign(&cfg, x, k, vote_message);
         let (path, path_bits) = tree.proof(index);
         SignerV2 { pubkey: p, weight, path, path_bits, sig_r: r, sig_s: s, present: true }
@@ -460,8 +426,8 @@ mod tests {
         let (xb, kb, wb, ib) = (JubScalar::from(13u64), JubScalar::from(17u64), 2_000u64, 42u64);
         let pa = keygen(xa);
         let pb = keygen(xb);
-        tree.insert(ia, poseidon_n(&cfg, &[pa.x, pa.y, Fr::from(wa)]));
-        tree.insert(ib, poseidon_n(&cfg, &[pb.x, pb.y, Fr::from(wb)]));
+        tree.insert(ia, hash_leaf(&cfg, pa.x, pa.y, wa));
+        tree.insert(ib, hash_leaf(&cfg, pb.x, pb.y, wb));
         let mk = |x, k, w, i: u64, p: EdwardsAffine| {
             let (r, s) = schnorr_sign(&cfg, x, k, vote_message);
             let (path, path_bits) = tree.proof(i);

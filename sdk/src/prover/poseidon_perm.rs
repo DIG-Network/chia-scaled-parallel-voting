@@ -116,9 +116,124 @@ pub fn hash_node(cfg: &PoseidonConfig<Fr>, l: Fr, r: Fr) -> Fr {
     hash2(cfg, l, r)
 }
 
+/// 3-input hash (used for the Schnorr challenge): `hash2(hash2(a, b), c)`.
+/// Same composition as `hash_leaf` so the circuit only needs one primitive.
+pub fn hash3(cfg: &PoseidonConfig<Fr>, a: Fr, b: Fr, c: Fr) -> Fr {
+    hash2(cfg, hash2(cfg, a, b), c)
+}
+
 /// Convenience: the shared config.
 pub fn cfg() -> PoseidonConfig<Fr> {
     poseidon_config()
+}
+
+// ── In-circuit gadgets (match the off-circuit functions above) ────────────
+
+use ark_r1cs_std::fields::fp::FpVar;
+use ark_r1cs_std::fields::FieldVar;
+use ark_relations::r1cs::SynthesisError;
+
+#[inline]
+fn sbox_var(x: &FpVar<Fr>) -> Result<FpVar<Fr>, SynthesisError> {
+    let x2 = x.square()?;
+    let x4 = x2.square()?;
+    Ok(&x4 * x)
+}
+
+/// In-circuit width-3 Poseidon permutation — mirrors [`permute`] exactly
+/// (same ARK/MDS constants, same round order). All arithmetic is native
+/// `FpVar<Fr>` (the constraint field IS Fr), so this is cheap.
+pub fn permute_var(
+    cfg: &PoseidonConfig<Fr>,
+    state_in: [FpVar<Fr>; 3],
+) -> Result<[FpVar<Fr>; 3], SynthesisError> {
+    let rf = cfg.full_rounds;
+    let rp = cfg.partial_rounds;
+    let half = rf / 2;
+    let mut state = state_in;
+    let mut round = 0usize;
+
+    let apply_mds = |state: &[FpVar<Fr>; 3]| -> [FpVar<Fr>; 3] {
+        core::array::from_fn(|i| {
+            let mut acc = FpVar::<Fr>::Constant(cfg.mds[i][0]) * &state[0];
+            acc += FpVar::<Fr>::Constant(cfg.mds[i][1]) * &state[1];
+            acc += FpVar::<Fr>::Constant(cfg.mds[i][2]) * &state[2];
+            acc
+        })
+    };
+
+    // first half full rounds
+    for _ in 0..half {
+        for i in 0..3 {
+            state[i] = &state[i] + FpVar::<Fr>::Constant(cfg.ark[round][i]);
+        }
+        for s in state.iter_mut() {
+            *s = sbox_var(s)?;
+        }
+        state = apply_mds(&state);
+        round += 1;
+    }
+    // partial rounds (S-box on lane 0 only)
+    for _ in 0..rp {
+        for i in 0..3 {
+            state[i] = &state[i] + FpVar::<Fr>::Constant(cfg.ark[round][i]);
+        }
+        state[0] = sbox_var(&state[0])?;
+        state = apply_mds(&state);
+        round += 1;
+    }
+    // second half full rounds
+    for _ in 0..half {
+        for i in 0..3 {
+            state[i] = &state[i] + FpVar::<Fr>::Constant(cfg.ark[round][i]);
+        }
+        for s in state.iter_mut() {
+            *s = sbox_var(s)?;
+        }
+        state = apply_mds(&state);
+        round += 1;
+    }
+    debug_assert_eq!(round, rf + rp);
+    Ok(state)
+}
+
+/// In-circuit `hash2`.
+pub fn hash2_var(
+    cfg: &PoseidonConfig<Fr>,
+    l: &FpVar<Fr>,
+    r: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let out = permute_var(
+        cfg,
+        [
+            FpVar::<Fr>::Constant(Fr::from(DOMAIN_NODE)),
+            l.clone(),
+            r.clone(),
+        ],
+    )?;
+    Ok(out[0].clone())
+}
+
+/// In-circuit `hash3` = `hash2(hash2(a, b), c)`.
+pub fn hash3_var(
+    cfg: &PoseidonConfig<Fr>,
+    a: &FpVar<Fr>,
+    b: &FpVar<Fr>,
+    c: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let inner = hash2_var(cfg, a, b)?;
+    hash2_var(cfg, &inner, c)
+}
+
+/// In-circuit `hash_leaf` = `hash2(hash2(px, py), weight)`.
+pub fn hash_leaf_var(
+    cfg: &PoseidonConfig<Fr>,
+    px: &FpVar<Fr>,
+    py: &FpVar<Fr>,
+    weight: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let inner = hash2_var(cfg, px, py)?;
+    hash2_var(cfg, &inner, weight)
 }
 
 #[cfg(test)]
@@ -137,6 +252,47 @@ mod tests {
         // A different input gives a different output (sanity, not collision).
         let c = permute(&cfg, [Fr::from(1u64), Fr::from(2u64), Fr::from(4u64)]);
         assert_ne!(a, c);
+    }
+
+    /// The in-circuit gadget must equal the off-circuit reference (so the
+    /// circuit, merkle.rs, and Rue all agree).
+    #[test]
+    fn gadget_matches_reference() {
+        use ark_r1cs_std::alloc::AllocVar;
+        use ark_r1cs_std::eq::EqGadget;
+        use ark_relations::r1cs::ConstraintSystem;
+        let cfg = cfg();
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let l = FpVar::new_witness(cs.clone(), || Ok(Fr::from(5u64))).unwrap();
+        let r = FpVar::new_witness(cs.clone(), || Ok(Fr::from(7u64))).unwrap();
+        let w = FpVar::new_witness(cs.clone(), || Ok(Fr::from(1_000u64))).unwrap();
+
+        let h2 = hash2_var(&cfg, &l, &r).unwrap();
+        h2.enforce_equal(&FpVar::Constant(hash2(&cfg, Fr::from(5u64), Fr::from(7u64))))
+            .unwrap();
+
+        let leaf = hash_leaf_var(&cfg, &l, &r, &w).unwrap();
+        leaf.enforce_equal(&FpVar::Constant(hash_leaf(
+            &cfg,
+            Fr::from(5u64),
+            Fr::from(7u64),
+            1_000,
+        )))
+        .unwrap();
+
+        let h3 = hash3_var(&cfg, &l, &r, &w).unwrap();
+        h3.enforce_equal(&FpVar::Constant(hash3(
+            &cfg,
+            Fr::from(5u64),
+            Fr::from(7u64),
+            Fr::from(1_000u64),
+        )))
+        .unwrap();
+
+        assert!(
+            cs.is_satisfied().unwrap(),
+            "in-circuit Poseidon gadget must match the off-circuit reference"
+        );
     }
 
     #[test]
