@@ -21,7 +21,7 @@ Every finding has a runnable proof-of-exploit or regression test under
 
 | # | Severity | Finding | Status |
 |---|----------|---------|--------|
-| F1 | **Critical** | Finalize forgery — circuit never binds the claimed signer weight to the registered set | **Open** (needs circuit rewrite) |
+| F1 | **Critical** | Finalize forgery — circuit never binds the claimed signer weight to the registered set | **In progress** — forgery closed in-circuit (`circuit_v2`, 6 tests) + Poseidon accumulator complete & cross-validated across all 4 layers; remaining: atomic on-chain wiring + finalize/VK rewrite to promote it live |
 | F2 | **Critical** | Register vote-weight forgery / fake CAT collateral | **Fixed** ✅ (numerator: forged weight unspendable via `AssertMyAmount(locked_weight)`); register-time denominator credit is a documented structural residual |
 | F3 | **Critical** | Ballot VK/snapshot substitution — ballot curry not tied to election `vk_hash` | **Open** (needs createBallot→ballot binding) |
 | F4 | **High** | Collateral release gated by a forgeable deregister announcement | **Fixed** ✅ (CHIP-0025 RECEIVE_MESSAGE binds the genuine Election Singleton's puzzle hash, re-derived from `election_launcher_id` in state) |
@@ -83,15 +83,43 @@ outcome. The three tests show this works even when the attacker is not
 registered, even with zero registered voters, and with a claimed weight
 1000× the registered total.
 
-**Remediation:** move signer accounting into the circuit. For each
-signer, allocate `(pubkey, weight, merkle_path)` as witnesses and
-constrain in-circuit: (a) `sha256(pubkey || weight_be8)` is a leaf whose
-depth-32 Merkle path reconstructs `registration_merkle_root` (public
-input `s1`); (b) accumulate the verified weights into
-`total_signer_weight`; (c) bind `agg_signers` (`s3`) to the G1 sum of
-the verified signer pubkeys. This is the only place membership + weight
-can be enforced; no on-chain patch to `finalize.rue` can substitute for
-it because `agg_signers` is an opaque G1 sum on-chain.
+**Remediation:** move signer accounting into the circuit (Option B — see
+`docs/F1-finalize-redesign.md`). Each signer proves in-circuit: (a)
+Poseidon-SPT membership of `leaf = hash_leaf(jub_pubkey.x, jub_pubkey.y,
+weight)` under the snapshot root; (b) a Jubjub Schnorr signature on
+`vote_message` by that key; (c) verified weight ≥ quorum. BLS
+`agg_signers`/`bls_verify`/`g2_map` are dropped — the proof alone attests
+"≥threshold registered weight signed the outcome", and `finalize` stays
+O(1) (verify one Groth16 proof). No on-chain per-signer work.
+
+**Progress (in progress — branch `security/puzzle-attack-hardening`):**
+- **Steps 1–3 DONE.** `sdk/src/prover/circuit_v2.rs` proves per-signer
+  Poseidon membership + in-circuit Jubjub Schnorr + weight threshold; the
+  6 tests pin honest-verify + the 5 forgeries (non-member, bad sig, wrong
+  message, below threshold, weight tamper) each REJECTED. Hardening:
+  slack/weight range-checks + canonical `s`-width bound done; prime-order
+  P/R + `vote_message`≤254-bit + audited Poseidon params are a documented
+  go-live pass.
+- **Step 4 — Poseidon accumulator: primitive COMPLETE + cross-validated
+  across all layers.** Off-circuit reference (`prover/poseidon_perm.rs`),
+  in-circuit gadget (test `gadget_matches_reference`), on-chain
+  `puzzles/poseidon.rue` (test `poseidon_rue_parity_e2e`, byte-for-byte),
+  and the off-chain `merkle.rs::PoseidonSmt` (test
+  `poseidon_smt_proof_verifies_in_circuit`) all agree on ONE Poseidon
+  tree. CLVM cost benchmarked at ~135M/register = 1.23 % of the block cap
+  (`poseidon_clvm_cost_bench`) ⇒ on-chain Poseidon is FEASIBLE; the
+  dual-commitment fallback is not needed.
+- **REMAINING (open):** the *atomic* on-chain wiring — switch
+  `register.rue`/`deregister.rue` to the Poseidon leaf (over the voter's
+  Jubjub key) + Poseidon membership, the aggregator to `PoseidonSmt`, add
+  the Jubjub key to `VoterKeys`, ripple the `Fr`↔`Bytes32` root
+  representation through `ElectionState`/predictors, and update the e2e
+  tests (one unit — diverging off/on-chain trees break every finalize).
+  Then step 5 (rewrite `finalize.rue` for the new public-input set, rebuild
+  the VK, promote `VotingCircuitV2`) and step 6 (aggregator finalize
+  builder + voter Jubjub signing, flip `exploit_finalize_forgery_e2e` to
+  REJECTION). The forgery is CLOSED in-circuit (circuit_v2 tests); these
+  steps PROMOTE that circuit to the live consensus path.
 
 ---
 
