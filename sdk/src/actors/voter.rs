@@ -73,14 +73,38 @@ use crate::puzzles::{self, PuzzleHashes};
 pub struct VoterKeys {
     pub pubkey: PublicKey,
     pub secret: SecretKey,
+    /// SEC-F1: the voter's Jubjub signing key (secret scalar). This is the
+    /// SNARK-friendly key the finalize circuit (`prover::circuit_v2`) verifies
+    /// a Schnorr signature for, and whose `(x, y)` the Poseidon registration
+    /// leaf commits. Derived deterministically from the BLS secret.
+    pub jubjub_secret: ark_ed_on_bls12_381::Fr,
+    /// SEC-F1: Jubjub public key `P = jubjub_secret · G` (the leaf identity).
+    pub jubjub_pubkey: ark_ed_on_bls12_381::EdwardsAffine,
 }
 
 impl VoterKeys {
     /// FN: new
     /// WHAT: build VoterKeys from a raw secret. Pubkey computed lazily.
+    ///       The Jubjub signing key is derived deterministically from the
+    ///       BLS secret (SEC-F1) so a voter's identity is a single seed.
     pub fn new(secret: SecretKey) -> Self {
+        use ark_ec::{CurveGroup, Group};
+        use ark_ed_on_bls12_381::{EdwardsProjective as Jub, Fr as JubScalar};
+        use ark_ff::PrimeField;
+        use sha2::Digest;
         let pubkey = secret.public_key();
-        Self { pubkey, secret }
+        let mut h = sha2::Sha256::new();
+        h.update(b"CHIP/jubjub-signing-key/v1");
+        h.update(secret.to_bytes());
+        let seed: [u8; 32] = h.finalize().into();
+        let jubjub_secret = JubScalar::from_le_bytes_mod_order(&seed);
+        let jubjub_pubkey = (Jub::generator() * jubjub_secret).into_affine();
+        Self {
+            pubkey,
+            secret,
+            jubjub_secret,
+            jubjub_pubkey,
+        }
     }
 
     /// FN: sign_unsafe
