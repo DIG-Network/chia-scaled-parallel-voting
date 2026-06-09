@@ -795,6 +795,142 @@ impl<C: ChainReader> Aggregator<C> {
         };
         let proof = circuit.prove(params.proving_key)?;
 
+        // Off-chain verify pre-flight: confirm the proof verifies against the
+        // proving key's embedded VK + the SAME public inputs the on-chain
+        // finalize will reconstruct (`witness.public_fr`). Catches a
+        // circuit/public-input mismatch before paying the on-chain bundle fee
+        // (and surfaces it distinctly from an on-chain scalar-encoding bug).
+        {
+            let vk = crate::prover::circuit::ArkVerifyingKey(params.proving_key.0.vk.clone());
+            let ok = VotingCircuitV2::verify_offchain(&vk, &proof, &witness.public_fr)
+                .map_err(|e| anyhow_other(format!("finalize proof off-chain verify: {e}")))?;
+            if !ok {
+                return Err(anyhow_other(
+                    "finalize circuit_v2 proof FAILED off-chain verify against the proving \
+                     key's VK + public inputs — circuit/public-input mismatch (not an on-chain \
+                     encoding bug)"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // SEC-F1/F3 PRE-FLIGHT: replicate EACH on-chain finalize.rue assert
+        // off-chain so an opaque `clvm raise` in the per-coin dry-run is
+        // surfaced as a precise, labelled mismatch. Each branch mirrors the
+        // exact comparison in `puzzles/ballot_coin/finalize.rue`.
+        {
+            use sha2::{Digest, Sha256};
+            // u64 → canonical 32-byte BE (matches `fr_to_bytes32_be(Fr::from(n))`
+            // for n < r, which is how the SDK encodes s3/s4/s5).
+            let u64_be32 = |n: u64| -> [u8; 32] {
+                let mut out = [0u8; 32];
+                out[24..32].copy_from_slice(&n.to_be_bytes());
+                out
+            };
+            let election_id = self
+                .config
+                .election_launcher_id()
+                .map_err(|e| anyhow_other(format!("preflight election_id: {e}")))?;
+
+            // (1) VK-bind: sha256(verification_key_hex bytes) == config.vk_hash().
+            let vk_bytes = hex::decode(self.config.verification_key_hex.trim())
+                .map_err(|e| anyhow_other(format!("preflight vk hex: {e}")))?;
+            let computed_vk_hash = Bytes32::new(Sha256::digest(&vk_bytes).into());
+            let expected_vk_hash = self.config.vk_hash();
+            if computed_vk_hash != expected_vk_hash {
+                return Err(anyhow_other(format!(
+                    "PREFLIGHT VK-bind MISMATCH (finalize.rue would raise on \
+                     `sha256(vk_ic_bytes) == ELECTION_VK_HASH`): \
+                     sha256(verification_key_hex[{}B]) = 0x{} != config.vk_hash = 0x{}",
+                    vk_bytes.len(),
+                    hex::encode(computed_vk_hash),
+                    hex::encode(expected_vk_hash),
+                )));
+            }
+
+            // (1b) CRITICAL: the curried/on-chain VK (from config) MUST be the
+            // SAME verifying key the proof was generated against. Off-chain
+            // verify above uses the PROVING KEY's embedded VK; the on-chain
+            // `bls_pairing_identity` uses the CURRIED config VK. If they differ,
+            // off-chain passes but the on-chain pairing raises.
+            let pk_vk = crate::prover::circuit::ArkVerifyingKey(params.proving_key.0.vk.clone());
+            let pk_vk_bytes = pk_vk
+                .chia_chunked_bytes()
+                .map_err(|e| anyhow_other(format!("preflight pk vk chunked: {e}")))?;
+            if pk_vk_bytes != vk_bytes {
+                return Err(anyhow_other(format!(
+                    "PREFLIGHT proving-key VK != config.verification_key_hex: the proof \
+                     was generated against a DIFFERENT VK than the one curried on-chain. \
+                     proving_key VK = {}B (0x{}…), config VK = {}B (0x{}…)",
+                    pk_vk_bytes.len(),
+                    hex::encode(&pk_vk_bytes[..pk_vk_bytes.len().min(16)]),
+                    vk_bytes.len(),
+                    hex::encode(&vk_bytes[..vk_bytes.len().min(16)]),
+                )));
+            }
+
+            let pi = &witness.public_inputs;
+
+            // (2) s1 == REGISTRATION_MERKLE_ROOT_SNAPSHOT (both canonical 32-B BE).
+            if pi[0].as_ref() != params.registration_merkle_root_snapshot.as_ref() {
+                return Err(anyhow_other(format!(
+                    "PREFLIGHT s1 MISMATCH (registration_root): proof public input \
+                     0x{} != curried snapshot 0x{}",
+                    hex::encode(pi[0]),
+                    hex::encode(params.registration_merkle_root_snapshot),
+                )));
+            }
+            // (3) s2 == sha256(outcome||ballot||election) mod r. Use ark Fr to
+            // reduce mod r exactly as the SDK builds public_fr[1], then re-encode.
+            let mut h = Sha256::new();
+            h.update(params.vote_outcome.as_ref());
+            h.update(params.ballot_launcher_id.as_ref());
+            h.update(election_id.as_ref());
+            let digest: [u8; 32] = h.finalize().into();
+            use ark_ff::PrimeField as _;
+            let s2_expected = crate::prover::conversions::fr_to_bytes32_be(
+                &ark_bls12_381::Fr::from_be_bytes_mod_order(&digest),
+            );
+            if pi[1].as_ref() != s2_expected.as_slice() {
+                return Err(anyhow_other(format!(
+                    "PREFLIGHT s2 MISMATCH (vote_message): proof public input 0x{} != \
+                     sha256(outcome||ballot||election) mod r = 0x{}",
+                    hex::encode(pi[1]),
+                    hex::encode(s2_expected),
+                )));
+            }
+            // (4) s3 == registration_vote_weight_snapshot.
+            if pi[2].as_ref() != u64_be32(params.registration_vote_weight_snapshot) {
+                return Err(anyhow_other(format!(
+                    "PREFLIGHT s3 MISMATCH (vote_weight): proof public input 0x{} != \
+                     curried snapshot {} (0x{})",
+                    hex::encode(pi[2]),
+                    params.registration_vote_weight_snapshot,
+                    hex::encode(u64_be32(params.registration_vote_weight_snapshot)),
+                )));
+            }
+            // (5) s4 == vote_threshold_num.
+            if pi[3].as_ref() != u64_be32(params.vote_threshold_num) {
+                return Err(anyhow_other(format!(
+                    "PREFLIGHT s4 MISMATCH (threshold_num): proof public input 0x{} != \
+                     curried {} (0x{})",
+                    hex::encode(pi[3]),
+                    params.vote_threshold_num,
+                    hex::encode(u64_be32(params.vote_threshold_num)),
+                )));
+            }
+            // (6) s5 == vote_threshold_den.
+            if pi[4].as_ref() != u64_be32(params.vote_threshold_den) {
+                return Err(anyhow_other(format!(
+                    "PREFLIGHT s5 MISMATCH (threshold_den): proof public input 0x{} != \
+                     curried {} (0x{})",
+                    hex::encode(pi[4]),
+                    params.vote_threshold_den,
+                    hex::encode(u64_be32(params.vote_threshold_den)),
+                )));
+            }
+        }
+
         self.build_finalize_with_proof_for_ballot_inner(
             &params,
             witness,
@@ -1049,6 +1185,10 @@ impl<C: ChainReader> Aggregator<C> {
         // Ballot inner ph (state is fresh — pre-finalize).
         let ballot_finalizer_node =
             crate::action_spends::build_ballot_finalizer_full(&mut ctx, params.ballot_launcher_id)?;
+        // SEC-F1: BallotState = (finalized . (vote_outcome . agg_signers)).
+        // `finalized` MUST be nil (= Rue `false`), NOT Bytes32::default()
+        // (32 zero bytes) — finalize.rue asserts `State.finalized == false`,
+        // and a 32-byte zero atom != nil.
         let fresh_ballot_state_value: ((), (Bytes32, Bytes32)) =
             ((), (Bytes32::default(), Bytes32::default()));
         let ballot_state_node = fresh_ballot_state_value
@@ -2511,27 +2651,17 @@ pub async fn find_current_ballot_singleton_via_chain<C: ChainReader>(
     }
 }
 
-/// FN: canonical_int_bytes32 (file-private)
-/// WHAT: convert a `Bytes32` (interpreted as a non-negative big-endian
-///       integer) to its canonical CLVM Int encoding — the shortest
-///       big-endian representation, with no leading zero bytes.
-/// USAGE: encoding the Groth16 `Scalars` for the on-chain
-///        `finalize.rue` solution. The puzzle compares
-///        `((value as Int) % r) as Bytes == scalars.s_i as Bytes`;
-///        the LHS is the canonical encoding, so the RHS we pass
-///        must also be canonical or the equality fails for any
-///        scalar with leading-zero bytes.
-/// HIGH-BIT NOTE: BLS12-381 Fr is always `< r < 2^254`, so the
-///       canonical leading byte is at most `0x73`. The high bit is
-///       never set, so no leading-`0x00` sign pad is needed.
-fn canonical_int_bytes32(b: &Bytes32) -> chia_protocol::Bytes {
-    let raw: &[u8] = b.as_ref();
-    let mut start = 0;
-    while start < raw.len() && raw[start] == 0 {
-        start += 1;
-    }
-    chia_protocol::Bytes::new(raw[start..].to_vec())
-}
+// NOTE: a `canonical_int_bytes32` helper formerly lived here to strip leading
+// zero bytes off each finalize scalar so the on-chain CLVM byte-equality
+// (`scalars.s_i as Bytes == <canonical>`) would match. That approach was
+// abandoned: it was fragile (a stripped value whose new leading byte has the
+// high bit set needs a `0x00` sign pad — the helper's "high bit never set"
+// note conflated the 32-byte form's leading byte with the stripped form's) and
+// asymmetric (s1's curried RHS is a fixed 32-byte Bytes32, not canonical). The
+// real fix is in `puzzles/ballot_coin/finalize.rue`: each scalar bind now
+// compares by VALUE via `(lhs - rhs) == 0` (CLVM subtraction is numeric and
+// encoding-agnostic), so the SDK can send every scalar as a plain 32-byte BE
+// atom (`fr_to_bytes32_be`) and the binding holds regardless of byte width.
 
 /// FN: collect_signature_atoms (file-private)
 /// WHAT: walk a CLVM tree and collect every 96-byte atom (BLS G2

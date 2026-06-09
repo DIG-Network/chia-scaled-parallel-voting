@@ -162,25 +162,33 @@ fn main(
     let zero_pad: Bytes = 0x00;
     let r_int: Int = r as Int;
 
-    // s1 = registration_root. The snapshot is the 32-byte BE of the Poseidon
-    // Fr root, which is already a canonical field element (< r), so the
-    // public-input scalar equals the snapshot by integer value.
-    assert ((scalars.s1 as Bytes) as Int) == (REGISTRATION_MERKLE_ROOT_SNAPSHOT as Int);
+    // Each scalar bind is a NUMERIC equality. The SDK supplies every scalar as
+    // a fixed 32-byte big-endian atom (`fr_to_bytes32_be`), but the RHS values
+    // are CLVM-canonical (minimal) integers: REGISTRATION_VOTE_WEIGHT_SNAPSHOT /
+    // VOTE_THRESHOLD_NUM / VOTE_THRESHOLD_DEN are curried as small ints, and the
+    // s2 derivation `% r` returns canonical form. CLVM `=` (what `==` compiles
+    // to) is BYTE equality, so `0x000…07d0 == 0x07d0` is FALSE even though both
+    // mean 2000. We therefore compare by VALUE: `(lhs - rhs) == 0`. CLVM
+    // subtraction is numeric and returns canonical 0 (= nil) iff the integers
+    // are equal, regardless of either side's byte width or leading zeros. This
+    // is also the SOUND semantics — the pairing below consumes each scalar as a
+    // numeric G1 multiplier, so the binding must be on value, not encoding.
+
+    // s1 = registration_root (the Poseidon SPT root snapshot, raw Fr < r).
+    assert (((scalars.s1 as Bytes) as Int) - (REGISTRATION_MERKLE_ROOT_SNAPSHOT as Int)) == 0;
 
     // s2 = vote_message reduced mod r. `0x00 ||` keeps the 256-bit sha256
     // digest a positive Int before the modular reduction.
     let vote_message_int: Int =
         (zero_pad + sha256(outcome_b + ballot_b + election_b)) as Int % r_int;
-    assert ((scalars.s2 as Bytes) as Int) == vote_message_int;
+    assert (((scalars.s2 as Bytes) as Int) - vote_message_int) == 0;
 
-    // s3 = Fr(registration_vote_weight). For a u64 < r this is just the
-    // integer value; compare numerically so the SDK's 32-byte zero-padded
-    // encoding (`fr_to_bytes32_be`) and the canonical int agree.
-    assert ((scalars.s3 as Bytes) as Int) == REGISTRATION_VOTE_WEIGHT_SNAPSHOT;
+    // s3 = Fr(registration_vote_weight).
+    assert (((scalars.s3 as Bytes) as Int) - REGISTRATION_VOTE_WEIGHT_SNAPSHOT) == 0;
 
     // s4 / s5 = Fr(num) / Fr(den).
-    assert ((scalars.s4 as Bytes) as Int) == VOTE_THRESHOLD_NUM;
-    assert ((scalars.s5 as Bytes) as Int) == VOTE_THRESHOLD_DEN;
+    assert (((scalars.s4 as Bytes) as Int) - VOTE_THRESHOLD_NUM) == 0;
+    assert (((scalars.s5 as Bytes) as Int) - VOTE_THRESHOLD_DEN) == 0;
 
     // Groth16 prepared input commitment: IC0 + Σ ICi·si.
     let vk_input: PublicKey = IC.ic0

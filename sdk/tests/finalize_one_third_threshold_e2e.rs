@@ -47,9 +47,11 @@ use chip_voting_sdk::actors::voter::CastVoteParams;
 use chip_voting_sdk::ceremony::VerificationKey;
 use chip_voting_sdk::merkle::PoseidonSmt;
 use chip_voting_sdk::prover::circuit::generate_test_setup;
+use chip_voting_sdk::prover::circuit_v2::generate_test_setup_v2;
 use chip_voting_sdk::{
     Aggregator, DeployParams, NetworkType, Voter, VoterKeys, VotingError,
 };
+use sha2::{Digest, Sha256};
 use clvm_traits::ToClvm;
 use clvm_utils::tree_hash;
 
@@ -177,7 +179,6 @@ async fn finalize_one_third_pre_check_accepts_weighted_quorum() {
 /// `den_var`, computes `v1 = signed * den_var`, `v2 = num_var *
 /// total`, and asserts `v1 - v2 - slack == 0` — leaving the matrices
 /// shape-only and tying the witness to s7/s8 via direct equality.
-#[ignore = "SEC-F1: needs a small-max_signers circuit_v2 deploy variant; Option-B in-circuit signer verification can't set up at config::MAX_SIGNERS=20000 (go-live scaling). Forgery closure is pinned by exploit_finalize_forgery_e2e + finalize_v2_groth16_e2e."]
 #[tokio::test(flavor = "current_thread")]
 async fn finalize_one_third_full_flow_e2e() {
     let (mut sim, config, proving_key, voter1_keys, voter1_pk, registration_coin_1_id,
@@ -210,6 +211,7 @@ async fn finalize_one_third_full_flow_e2e() {
             vote_threshold_den: 3,
             registration_merkle_root_snapshot,
             registration_vote_weight_snapshot,
+            vote_options_root: Bytes32::default(),
             proving_key: &proving_key,
         })
         .await
@@ -282,6 +284,7 @@ async fn finalize_two_third_full_flow_e2e() {
             vote_threshold_den: 3,
             registration_merkle_root_snapshot,
             registration_vote_weight_snapshot,
+            vote_options_root: Bytes32::default(),
             proving_key: &proving_key,
         })
         .await
@@ -328,14 +331,18 @@ async fn build_two_voter_setup(
         GenesisByCoinIdTailArgs::curry_tree_hash(cat_genesis.coin.coin_id()).into();
 
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(seed);
-    // The on-chain puzzles now expect a circuit_v2-shaped VK
-    // (336 base + (PUBLIC_INPUT_COUNT + 1) IC entries * 48 = 624 bytes).
-    // `generate_test_setup` still produces the legacy `proving_key` the
-    // (ignored) on-chain proving sub-tests carry, but its VK no longer
-    // matches the on-chain shape, so deploy with a v2-sized dummy VK to
-    // get the non-proving pre-check sub-test past `launch_ballot`.
-    let (proving_key, _vk) = generate_test_setup(32, &mut rng).expect("generate_test_setup");
-    let vk_bytes = vec![0u8; 336 + (chip_voting_sdk::config::PUBLIC_INPUT_COUNT + 1) * 48];
+    // SEC-F1/F3/F5: a REAL circuit_v2 trusted setup at a small max_signers so
+    // the full on-chain finalize (Groth16 verify + attest_ballot binding)
+    // actually executes. The one_third full_flow finalizes with ONE signer, so
+    // max_signers = 1 (the aggregator pads to config.max_signers). vk_hash =
+    // sha256(chia_chunked VK bytes) so ElectionState.vk_hash == ELECTION_VK_HASH
+    // the ballot curries (= config.vk_hash()).
+    const MAX_SIGNERS: usize = 1;
+    let (proving_key, vk) =
+        generate_test_setup_v2(chip_voting_sdk::config::TREE_DEPTH as usize, MAX_SIGNERS, &mut rng)
+            .expect("generate_test_setup_v2");
+    let vk_bytes = vk.chia_chunked_bytes().expect("vk chia_chunked_bytes");
+    let vk_hash = Bytes32::new(Sha256::digest(&vk_bytes).into());
 
     let collateral_amount: u64 = 1_000;
     let params = DeployParams {
@@ -345,9 +352,9 @@ async fn build_two_voter_setup(
         cat_tail_hash,
         collateral_amount,
         tree_depth: chip_voting_sdk::config::TREE_DEPTH,
-        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        max_signers: MAX_SIGNERS,
         ceremony_launcher_id: Bytes32::default(),
-        vk_hash: Bytes32::default(),
+        vk_hash,
         vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         election_start_height: 0,
         label: None,
@@ -551,7 +558,7 @@ async fn cast_one_of_two(
         registration_coin_id: registration_coin_1_id,
         ballot_launcher_id: created.ballot_launcher_id,
         voting_coin_id: cast_v1.voting_coin_id,
-        jubjub_vote: Some(mk_jv(&voter1_keys.secret)),
+        jubjub_vote: Some(mk_jv(&voter1_keys.secret, canonical_msg)),
     }];
 
     (votes, launched.eve_ballot_puzzle_hash, vote_close_height)
@@ -641,15 +648,20 @@ fn test_voter_keys(seed: u8) -> VoterKeys {
     VoterKeys::new(sk)
 }
 
-/// SEC-F1: build a well-formed Jubjub Schnorr `JubjubVoteWitness` for the
-/// weighted-threshold pre-check sub-tests. `prepare_finalize_witness*` does
-/// NOT verify the signature — it only needs `pubkey` to match the SMT leaf
-/// so `smt.locked_amount(pubkey)` returns the voter's weight — so any
-/// well-formed Schnorr witness over a dummy message is fine here.
-fn mk_jv(sk: &chia_bls::SecretKey) -> chip_voting_sdk::state::JubjubVoteWitness {
+/// SEC-F1: build the voter's Jubjub Schnorr `JubjubVoteWitness` over the REAL
+/// canonical `vote_message`. For the full on-chain finalize, `VotingCircuitV2`
+/// verifies this signature in-circuit, so it MUST be over the same message the
+/// aggregator binds — `Fr::from_be_bytes_mod_order(canonical_vote_message)`.
+/// (The non-proving pre-check sub-tests don't verify the sig, so this is also
+/// fine there.)
+fn mk_jv(
+    sk: &chia_bls::SecretKey,
+    vote_message: Bytes32,
+) -> chip_voting_sdk::state::JubjubVoteWitness {
+    use ark_ff::PrimeField;
     let keys = chip_voting_sdk::VoterKeys::new(sk.clone());
     let cfg = chip_voting_sdk::prover::circuit_v2::poseidon_config();
-    let m = ark_bls12_381::Fr::from(1u64);
+    let m = ark_bls12_381::Fr::from_be_bytes_mod_order(vote_message.as_ref());
     let (sig_r, sig_s) = chip_voting_sdk::prover::circuit_v2::schnorr_sign(
         &cfg,
         keys.jubjub_secret,
@@ -994,7 +1006,7 @@ async fn cast_two_of_three(
             registration_coin_id: registration_coin_1_id,
             ballot_launcher_id: created.ballot_launcher_id,
             voting_coin_id: cast_v1.voting_coin_id,
-            jubjub_vote: Some(mk_jv(&voter1_keys.secret)),
+            jubjub_vote: Some(mk_jv(&voter1_keys.secret, canonical_msg)),
         },
         chip_voting_sdk::state::VoteRecord {
             voter_pubkey: voter2_pk,
@@ -1003,7 +1015,7 @@ async fn cast_two_of_three(
             registration_coin_id: registration_coin_2_id,
             ballot_launcher_id: created.ballot_launcher_id,
             voting_coin_id: cast_v2.voting_coin_id,
-            jubjub_vote: Some(mk_jv(&voter2_keys.secret)),
+            jubjub_vote: Some(mk_jv(&voter2_keys.secret, canonical_msg)),
         },
     ];
 

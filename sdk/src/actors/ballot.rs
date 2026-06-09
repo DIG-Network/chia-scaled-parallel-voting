@@ -674,6 +674,9 @@ impl BallotIssuer {
         // on the last. Cons shape: (false . (zero . zero)) — i.e.,
         // last cons's cdr IS `agg_signers` directly (no NIL terminator).
         // Rust encoding mirrors that with `((), (vote_outcome, agg_signers))`.
+        // SEC-F1: BallotState = (finalized . (vote_outcome . agg_signers));
+        // `finalized` MUST be nil (Rue `false`), not Bytes32::default() — else
+        // finalize.rue's `assert State.finalized == false` raises.
         let fresh_state_value: ((), (Bytes32, Bytes32)) =
             ((), (Bytes32::default(), Bytes32::default()));
         let initial_state_node = fresh_state_value

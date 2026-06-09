@@ -103,6 +103,20 @@ impl SimulatedBackend {
     pub fn with_tree_depth(tree_depth: usize) -> Self {
         Self { tree_depth, max_signers: 1 }
     }
+
+    /// SEC-F1: construct with both the SPT tree depth AND the
+    /// `VotingCircuitV2` signer-slot count (`max_signers`). The aggregator
+    /// MUST prove finalize with this same `max_signers` (it pads up to it),
+    /// and the deployed `ElectionConfig.max_signers` MUST match — otherwise
+    /// the Groth16 proof shape won't match the curried VK. Use the election's
+    /// actual signer cap (small for tests/operator runs; the in-circuit
+    /// per-signer verification does not scale to very large caps).
+    pub fn with_tree_depth_and_max_signers(tree_depth: usize, max_signers: usize) -> Self {
+        Self {
+            tree_depth,
+            max_signers: max_signers.max(1),
+        }
+    }
 }
 
 #[async_trait::async_trait]

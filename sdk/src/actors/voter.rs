@@ -938,6 +938,8 @@ impl Voter {
         // ── 4. Verify Ballot Coin's on-chain ph matches our prediction ─
         let ballot_finalizer_node =
             crate::action_spends::build_ballot_finalizer_full(&mut ctx, params.ballot_launcher_id)?;
+        // SEC-F1: BallotState = (finalized . (vote_outcome . agg_signers));
+        // `finalized` MUST be nil (Rue `false`), not Bytes32::default().
         let fresh_ballot_state_value: ((), (Bytes32, Bytes32)) =
             ((), (Bytes32::default(), Bytes32::default()));
         let ballot_state_node = fresh_ballot_state_value
@@ -1461,6 +1463,8 @@ impl Voter {
         // inner ph is the same as what launch_ballot computed.
         let ballot_finalizer_node =
             crate::action_spends::build_ballot_finalizer_full(&mut ctx, params.ballot_launcher_id)?;
+        // SEC-F1: BallotState = (finalized . (vote_outcome . agg_signers));
+        // `finalized` MUST be nil (Rue `false`), not Bytes32::default().
         let fresh_ballot_state_value: ((), (Bytes32, Bytes32)) =
             ((), (Bytes32::default(), Bytes32::default()));
         let ballot_state_node = fresh_ballot_state_value

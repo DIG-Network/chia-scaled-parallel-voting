@@ -381,6 +381,7 @@ async fn chip_live_orchestration_simulator_full_flow() {
             vote_threshold_den,
             registration_merkle_root_snapshot,
             registration_vote_weight_snapshot,
+            vote_options_root: Bytes32::default(),
             proving_key: &proving_key,
         })
         .await
