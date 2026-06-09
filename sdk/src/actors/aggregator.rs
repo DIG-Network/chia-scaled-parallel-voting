@@ -764,6 +764,7 @@ impl<C: ChainReader> Aggregator<C> {
             params.vote_threshold_den = m.vote_threshold_den;
             params.registration_merkle_root_snapshot = m.registration_merkle_root_snapshot;
             params.registration_vote_weight_snapshot = m.registration_vote_weight_snapshot;
+            params.vote_options_root = m.vote_options_root;
         }
         let witness = self.prepare_finalize_witness_with_threshold(
             params.vote_outcome,
@@ -802,6 +803,110 @@ impl<C: ChainReader> Aggregator<C> {
         .await
     }
 
+    /// FN: build_attest_ballot_election_spend (SEC-F3+F5)
+    /// WHAT: build the Election Singleton spend that runs the read-only
+    ///       `attest_ballot` action, emitting the CHIP-0025 SEND_MESSAGE that
+    ///       the Ballot Coin's finalize RECEIVE_MESSAGE pairs with (in the
+    ///       same bundle). Returns `(election_spend, election_inner_ph)`; the
+    ///       inner ph is what finalize's `election_inner_puzzle_hash` solution
+    ///       arg must equal so its genuine-election-ph re-derivation matches
+    ///       the spent election coin.
+    /// NOTE: the election state is UNCHANGED (read-only action). The snapshot
+    ///       in the solution must equal the election's CURRENT registration
+    ///       state (attest_ballot asserts this — see the snapshot residual in
+    ///       docs/F3-F5-binding-design.md).
+    async fn build_attest_ballot_election_spend(
+        &self,
+        ctx: &mut chia_sdk_driver::SpendContext,
+        params: &BuildFinalizeForBallotParams<'_>,
+    ) -> VotingResult<(CoinSpend, Bytes32)> {
+        use clvm_traits::{clvm_curried_args, ToClvm};
+        use clvm_utils::{tree_hash, CurriedProgram};
+
+        let election_id = self
+            .config
+            .election_launcher_id()
+            .map_err(|e| anyhow_other(format!("election_launcher_id: {e}")))?;
+        let current = wait_for_current_singleton(
+            &self.chain,
+            &self.config,
+            self.election_start_height,
+            "Election Singleton (attest_ballot co-spend)",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(300),
+        )
+        .await?;
+        let CurrentSingleton {
+            coin: election_coin,
+            lineage_proof,
+            state,
+            ..
+        } = current;
+
+        // Election inner puzzle = finalizer + 4-leaf action root + CURRENT state.
+        let elect_finalizer =
+            crate::action_spends::build_election_finalizer_full(ctx, election_id)?;
+        let merkle_root = election_actions_merkle_root_for_config(&self.config);
+        let state_node = election_state_node(ctx, &state)?;
+        let election_inner_node = crate::action_spends::build_action_layer_puzzle(
+            ctx,
+            elect_finalizer,
+            merkle_root,
+            state_node,
+        )?;
+        let election_inner_ph = Bytes32::new(tree_hash(ctx, election_inner_node).to_bytes());
+
+        // attest_ballot curried (ELECTION_LAUNCHER_ID, NO_VOTE_MODE_LOCK).
+        let attest_program =
+            crate::action_spends::load_action_puzzle(ctx, puzzles::ELECTION_ATTEST_BALLOT_HEX)?;
+        let attest_curried = CurriedProgram {
+            program: attest_program,
+            args: clvm_curried_args!(election_id, crate::vote_mode::VOTE_MODE_LOCK_NONE),
+        }
+        .to_clvm(&mut **ctx)
+        .map_err(|e| anyhow_other(format!("currying attest_ballot: {e}")))?;
+        // Solution AFTER the action layer prepends Truth:
+        //   (ballot_launcher_id, snap_root, snap_weight, num, den, ...vote_options_root)
+        let attest_solution_value = (
+            params.ballot_launcher_id,
+            (
+                params.registration_merkle_root_snapshot,
+                (
+                    params.registration_vote_weight_snapshot,
+                    (
+                        params.vote_threshold_num,
+                        (params.vote_threshold_den, params.vote_options_root),
+                    ),
+                ),
+            ),
+        );
+        let attest_solution = attest_solution_value
+            .to_clvm(&mut **ctx)
+            .map_err(|e| anyhow_other(format!("attest_ballot solution to_clvm: {e}")))?;
+        let action_spends = vec![crate::action_spends::ActionSpend {
+            puzzle: attest_curried,
+            solution: attest_solution,
+        }];
+        let elect_finalizer_solution = ()
+            .to_clvm(&mut **ctx)
+            .map_err(|e| anyhow_other(format!("election finalizer solution: {e}")))?;
+        let action_layer_solution = crate::action_spends::build_action_layer_solution(
+            ctx,
+            &compute_election_action_root_leaves(&self.config),
+            &action_spends,
+            elect_finalizer_solution,
+        )?;
+        let election_spend = crate::action_spends::build_singleton_spend(
+            ctx,
+            election_coin,
+            election_id,
+            election_inner_node,
+            action_layer_solution,
+            lineage_proof,
+        )?;
+        Ok((election_spend, election_inner_ph))
+    }
+
     /// FN: build_finalize_with_proof_for_ballot
     /// WHAT: variant of [`build_finalize_for_ballot`] that takes a
     ///       pre-computed `Groth16Proof` (e.g. produced by a
@@ -832,6 +937,7 @@ impl<C: ChainReader> Aggregator<C> {
             params.vote_threshold_den = m.vote_threshold_den;
             params.registration_merkle_root_snapshot = m.registration_merkle_root_snapshot;
             params.registration_vote_weight_snapshot = m.registration_vote_weight_snapshot;
+            params.vote_options_root = m.vote_options_root;
         }
         let witness = self.prepare_finalize_witness_with_threshold(
             params.vote_outcome,
@@ -884,6 +990,9 @@ impl<C: ChainReader> Aggregator<C> {
                 params.vote_threshold_den,
                 params.registration_merkle_root_snapshot,
                 params.registration_vote_weight_snapshot,
+                // SEC-F3+F5: MUST match launch_ballot + the voter predictors.
+                self.config.vk_hash(),
+                params.vote_options_root,
             ),
         }
         .to_clvm(&mut *ctx)
@@ -892,9 +1001,11 @@ impl<C: ChainReader> Aggregator<C> {
             Bytes32::new(tree_hash(&ctx, finalize_curried).to_bytes());
 
         // M4-revised oracle curry: (BALLOT_LAUNCHER_ID, VOTE_CLOSE_HEIGHT,
-        // VOTE_OPTIONS_ROOT). Aggregator defaults to Mode1Free sentinel
-        // until M7e wires the chain-walked vote_options_root through.
-        let vote_options_root_curry: Bytes32 = Bytes32::default();
+        // VOTE_OPTIONS_ROOT). SEC-F5: use the ballot's REAL options root (from
+        // the launcher memo, plumbed via params) — NOT a hardcoded default —
+        // so the predicted ballot ph matches the on-chain ballot for
+        // mode-restricted ballots too.
+        let vote_options_root_curry: Bytes32 = params.vote_options_root;
         let oracle_program_node = crate::action_spends::load_action_puzzle(
             &mut ctx,
             crate::puzzles::BALLOT_COIN_ORACLE_HEX,
@@ -982,6 +1093,15 @@ impl<C: ChainReader> Aggregator<C> {
             }),
         };
 
+        // ── 2b. Build the Election Singleton attest_ballot co-spend ──
+        // SEC-F3+F5: finalize emits a RECEIVE_MESSAGE that pairs (in this same
+        // bundle) with the SEND_MESSAGE this election spend emits — binding the
+        // ballot's curried VK / snapshots / vote_options_root to the genuine
+        // election's unforgeable state. `election_inner_ph` is what finalize's
+        // `election_inner_puzzle_hash` solution arg must equal.
+        let (election_attest_spend, election_inner_ph) =
+            self.build_attest_ballot_election_spend(&mut ctx, params).await?;
+
         // ── 3. Build the finalize action solution ─────────────
         // Per `puzzles/ballot_coin/finalize.rue`:
         //   `(proof, vote_outcome_data, agg_signers, agg_sig, ...scalars)`
@@ -1016,11 +1136,11 @@ impl<C: ChainReader> Aggregator<C> {
         // Scalars rest-arg: (s1 . (s2 . (s3 . (s4 . (s5 . ())))))
         let scalars_value = (s1, (s2, (s3, (s4, (s5, ())))));
 
-        // Top-level finalize solution (per ballot_coin/finalize.rue):
-        //   (proof . (vote_outcome . (s1 . (s2 . (s3 . (s4 . (s5 . ())))))))
+        // Top-level finalize solution (per ballot_coin/finalize.rue, SEC-F3+F5):
+        //   (proof . (vote_outcome . (election_inner_ph . (s1 . (s2 . (s3 . (s4 . (s5 . ()))))))))
         let finalize_solution_value = (
             proof_value,
-            (params.vote_outcome, scalars_value),
+            (params.vote_outcome, (election_inner_ph, scalars_value)),
         );
         let finalize_solution = finalize_solution_value
             .to_clvm(&mut *ctx)
@@ -1051,7 +1171,9 @@ impl<C: ChainReader> Aggregator<C> {
         )?;
 
         // ── 4. Sign + bundle ──────────────────────────────────
-        let coin_spends = vec![ballot_singleton_spend];
+        // SEC-F3+F5: the election attest_ballot spend MUST be in the same
+        // bundle so its SEND_MESSAGE pairs with finalize's RECEIVE_MESSAGE.
+        let coin_spends = vec![ballot_singleton_spend, election_attest_spend];
         if let Err(e) = crate::dry_run_coin_spends(&coin_spends) {
             if let Ok(dir) = std::env::var("CHIP_VOTING_DUMP_DIR") {
                 let path = std::path::Path::new(&dir).join(format!(
@@ -2314,6 +2436,11 @@ pub struct BuildFinalizeForBallotParams<'a> {
     pub vote_threshold_den: u64,
     pub registration_merkle_root_snapshot: Bytes32,
     pub registration_vote_weight_snapshot: u64,
+    /// SEC-F3+F5: the ballot's curried `VOTE_OPTIONS_ROOT` (Mode1Free =
+    /// `Bytes32::default()`). MUST equal what `launch_ballot` curried so the
+    /// predicted ballot ph matches on-chain AND the attest_ballot binding
+    /// message pairs. Sourced from the ballot launcher memo.
+    pub vote_options_root: Bytes32,
     pub proving_key: &'a crate::prover::circuit::ArkProvingKey,
 }
 
@@ -2885,6 +3012,41 @@ fn compute_election_actions_merkle_root(
     // `puzzles::election_actions_merkle_root` sorts internally before
     // composing the root, so the order here matches the deployer.
     puzzles::election_actions_merkle_root(leaves[0], leaves[1], leaves[2], leaves[3])
+}
+
+/// FN: election_state_node (file-private)
+/// WHAT: serialise an `ElectionState` into the 8-field cons tree the action
+///       layer curries as `STATE`:
+///   `(root . (count . (weight . (start . (cer . (max . (vk . lock)))))))`.
+/// Mirrors `Voter::election_state_node`; both MUST match
+/// `compute_election_inner_puzzle_hash_for_state`.
+fn election_state_node(
+    ctx: &mut chia_sdk_driver::SpendContext,
+    state: &ElectionState,
+) -> VotingResult<clvmr::NodePtr> {
+    use clvm_traits::ToClvm;
+    let value = (
+        state.registration_merkle_root,
+        (
+            state.registration_count,
+            (
+                state.registration_vote_weight,
+                (
+                    state.election_start_height,
+                    (
+                        state.ceremony_launcher_id,
+                        (
+                            state.max_voters,
+                            (state.vk_hash, state.vote_mode_lock),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    );
+    value
+        .to_clvm(&mut **ctx)
+        .map_err(|e| anyhow_other(format!("election_state_node to_clvm: {e}")))
 }
 
 /// FN: election_action_leaves (file-private)
