@@ -2655,6 +2655,10 @@ fn vote_record_wire_to_sdk(
         registration_coin_id: parse_hex32(&w.registration_coin_id_hex)?,
         ballot_launcher_id: parse_hex32(&w.ballot_launcher_id_hex)?,
         voting_coin_id: parse_hex32(&w.voting_coin_id_hex)?,
+        // SEC-F1: the VoteRecordWire JSON view does not carry the Jubjub
+        // Schnorr witness (it's an in-memory, finalize-only artifact). The
+        // dApp finalize path reconstructs it separately; None here.
+        jubjub_vote: None,
     })
 }
 
@@ -2742,7 +2746,7 @@ async fn sync_smt_via_chain(
     cfg: chip_voting_sdk::ElectionConfig,
     network: chip_voting_sdk::NetworkType,
     election_start_height: u64,
-) -> VotingResult<chip_voting_sdk::merkle::SparseMerkleTree> {
+) -> VotingResult<chip_voting_sdk::merkle::PoseidonSmt> {
     let mut aggregator = chip_voting_sdk::actors::aggregator::Aggregator::new(
         cfg,
         chain.clone(),
@@ -3766,6 +3770,9 @@ pub async fn list_registered_voters_js(
         .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
     cfg.validate()
         .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
+    // Capture the curried collateral floor before `cfg` is moved into the
+    // aggregator (see lockedAmount note below).
+    let per_voter_floor = cfg.collateral_amount;
     let chain = JsChainReader::new(backend);
     let mut aggregator = chip_voting_sdk::actors::aggregator::Aggregator::new(
         cfg,
@@ -3780,17 +3787,20 @@ pub async fn list_registered_voters_js(
     let voter_set = aggregator
         .voter_set()
         .map_err(|e| JsError::new(&format!("voter_set: {e:?}")))?;
-    let smt = aggregator
-        .merkle_tree()
-        .map_err(|e| JsError::new(&format!("merkle_tree: {e:?}")))?;
+    // SEC-F1: the registration accumulator is now a Poseidon tree keyed by
+    // each voter's JUBJUB pubkey, and this BLS-keyed roster does not carry the
+    // BLS->Jubjub mapping, so an exact per-voter weight cannot be looked up
+    // here. Report the curried collateral floor (the minimum every voter
+    // locks); exact weighted amounts are recovered via the finalize witness
+    // (which holds the Jubjub keys). The integration test consumes only
+    // `pubkeyHex`.
     let entries: Vec<serde_json::Value> = voter_set
         .voters
         .iter()
         .map(|pk| {
-            let amount = smt.locked_amount(pk).unwrap_or(0);
             serde_json::json!({
                 "pubkeyHex": format!("0x{}", hex::encode(pk.to_bytes())),
-                "lockedAmount": amount,
+                "lockedAmount": per_voter_floor,
             })
         })
         .collect();
@@ -3799,15 +3809,22 @@ pub async fn list_registered_voters_js(
 }
 
 /// Look up a specific voter's `locked_cat_mojos` from the on-chain SMT.
-/// Returns `null` if the voter isn't currently registered (not in the
-/// SMT). Drives the dApp's "Your weight = N CAT" stat without exposing
-/// the full per-voter mapping (which would require listing every
-/// registered voter on-chain — possible but heavier).
+/// Returns `null` if the voter isn't currently registered (not in the SMT).
+/// Drives the dApp's "Your weight = N CAT" stat.
+///
+/// SEC-F1: the registration accumulator is now a Poseidon tree keyed by each
+/// voter's JUBJUB pubkey (not their BLS key), so the lookup key is the
+/// voter's Jubjub pubkey coordinates (`voterJubjubXHex` / `voterJubjubYHex`,
+/// 32-byte big-endian each). The voter's dApp derives these from its signing
+/// key (`VoterKeys::jubjub_pubkey`); they are NOT recoverable from a BLS
+/// pubkey alone. Returns `null` for an invalid/off-curve point or an
+/// unregistered voter.
 #[wasm_bindgen(js_name = "getVoterLockedAmount")]
 pub async fn get_voter_locked_amount_js(
     backend: JsChainBackend,
     election_config_json: String,
-    voter_pk_hex: String,
+    voter_jubjub_x_hex: String,
+    voter_jubjub_y_hex: String,
     network: WasmNetwork,
     election_start_height: u64,
 ) -> Result<JsValue, JsError> {
@@ -3815,8 +3832,10 @@ pub async fn get_voter_locked_amount_js(
         .map_err(|e| JsError::new(&format!("ElectionConfig parse: {e}")))?;
     cfg.validate()
         .map_err(|e| JsError::new(&format!("ElectionConfig.validate(): {e:?}")))?;
-    let voter_pk = parse_pubkey_hex(&voter_pk_hex, "voter_pk_hex")
-        .map_err(|e| JsError::new(&format!("{e}")))?;
+    let jub_x = parse_hex32(&voter_jubjub_x_hex)
+        .map_err(|e| JsError::new(&format!("voter_jubjub_x_hex: {e:?}")))?;
+    let jub_y = parse_hex32(&voter_jubjub_y_hex)
+        .map_err(|e| JsError::new(&format!("voter_jubjub_y_hex: {e:?}")))?;
 
     let chain = JsChainReader::new(backend);
     let smt = sync_smt_via_chain(
@@ -3828,7 +3847,7 @@ pub async fn get_voter_locked_amount_js(
     .await
     .map_err(|e| JsError::new(&format!("sync_smt_via_chain: {e}")))?;
 
-    Ok(match smt.locked_amount(&voter_pk) {
+    Ok(match smt.locked_amount_by_coords(&jub_x.to_bytes(), &jub_y.to_bytes()) {
         Some(amount) => JsValue::from_f64(amount as f64),
         None => JsValue::NULL,
     })

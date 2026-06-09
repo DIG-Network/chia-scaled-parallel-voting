@@ -638,6 +638,25 @@ impl PoseidonSmt {
         self.weights.get(&slot).copied()
     }
 
+    /// SEC-F1: look up a voter's locked weight by their Jubjub pubkey COORDS
+    /// (32-byte big-endian `x`, `y`), reconstructing + validating the
+    /// on-curve, prime-order point. Returns `None` if the coords don't form a
+    /// valid point or the voter isn't registered. Lets non-ark callers (e.g.
+    /// the wasm/JS bindings) query weights without an arkworks dependency —
+    /// the registration accumulator is Jubjub-keyed, so a voter's weight
+    /// cannot be looked up from their BLS pubkey alone.
+    pub fn locked_amount_by_coords(&self, x_be32: &[u8; 32], y_be32: &[u8; 32]) -> Option<u64> {
+        use ark_ff::PrimeField;
+        type Fq = ark_ed_on_bls12_381::Fq;
+        let px = Fq::from_be_bytes_mod_order(x_be32);
+        let py = Fq::from_be_bytes_mod_order(y_be32);
+        let p = JubAffine::new_unchecked(px, py);
+        if !(p.is_on_curve() && p.is_in_correct_subgroup_assuming_on_curve()) {
+            return None;
+        }
+        self.locked_amount(p)
+    }
+
     /// The locked weight at a given slot.
     pub fn locked_amount_at_slot(&self, slot: u32) -> Option<u64> {
         self.weights.get(&slot).copied()
