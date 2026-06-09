@@ -350,15 +350,10 @@ fn mk_jv(
     sk: &chia_bls::SecretKey,
     vote_message: Bytes32,
 ) -> chip_voting_sdk::state::JubjubVoteWitness {
-    use ark_ff::PrimeField;
-    let keys = chip_voting_sdk::VoterKeys::new(sk.clone());
-    let cfg = chip_voting_sdk::prover::circuit_v2::poseidon_config();
-    // Sign the SAME message the circuit verifies in-circuit:
-    // Fr::from_be_bytes_mod_order(canonical_vote_message(outcome||ballot||election)).
-    let m = ark_bls12_381::Fr::from_be_bytes_mod_order(vote_message.as_ref());
-    let (sig_r, sig_s) = chip_voting_sdk::prover::circuit_v2::schnorr_sign(
-        &cfg, keys.jubjub_secret, ark_ed_on_bls12_381::Fr::from(7u64), m);
-    chip_voting_sdk::state::JubjubVoteWitness { pubkey: keys.jubjub_pubkey, sig_r, sig_s }
+    // Delegate to the public SDK helper (same one the cli + wasm dApp finalize
+    // paths use), which signs the canonical finalize message with a secure
+    // message-bound nonce.
+    chip_voting_sdk::prover::circuit_v2::jubjub_vote_witness(sk, vote_message)
 }
 
 fn walk_to_unspent(sim: &Simulator, launcher_id: Bytes32) -> chia_protocol::CoinState {

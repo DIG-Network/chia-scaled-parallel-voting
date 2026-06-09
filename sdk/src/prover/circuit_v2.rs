@@ -355,6 +355,49 @@ pub fn schnorr_sign(
     (r, s)
 }
 
+/// FN: jubjub_vote_witness (SEC-F1, public)
+/// WHAT: build the circuit_v2 Jubjub Schnorr witness `(P, R, s)` over
+///       `vote_message` that a voter contributes to finalize. This is the
+///       off-chain artifact `Aggregator::collect_votes_for_ballot` CANNOT
+///       recover from chain (only the on-chain vote data is observable); the
+///       cli live test, the wasm dApp finalize path, and the SDK e2e tests
+///       use it to attach a `JubjubVoteWitness` to each `VoteRecord` before
+///       calling `build_finalize_for_ballot`.
+/// MESSAGE: pass the SAME 32-byte message the aggregator derives —
+///          `canonical_vote_message(vote_outcome, ballot_launcher_id,
+///          election_launcher_id)`. It is reduced into `Fr` exactly as the
+///          circuit consumes it (`Fr::from_be_bytes_mod_order`), so the
+///          in-circuit Schnorr check `s·G == R + c·P` is satisfied.
+/// NONCE: derived deterministically and message-bound
+///        (`k = H("chip-jubjub-nonce-v1" || x || m) mod r_jub`). This keeps
+///        signing reproducible while guaranteeing a different `k` per
+///        (key, message) — reusing `k` across two messages with one key would
+///        leak the secret. (The circuit accepts any well-formed signature, so
+///        the nonce-derivation choice does not affect verification.)
+pub fn jubjub_vote_witness(
+    secret: &chia_bls::SecretKey,
+    vote_message: chia_protocol::Bytes32,
+) -> crate::state::JubjubVoteWitness {
+    use sha2::{Digest, Sha256};
+    let keys = crate::VoterKeys::new(secret.clone());
+    let cfg = poseidon_config();
+    let m = Fr::from_be_bytes_mod_order(vote_message.as_ref());
+
+    let mut h = Sha256::new();
+    h.update(b"chip-jubjub-nonce-v1");
+    h.update(keys.jubjub_secret.into_bigint().to_bytes_be());
+    h.update(vote_message.as_ref());
+    let nonce_digest: [u8; 32] = h.finalize().into();
+    let k = JubScalar::from_be_bytes_mod_order(&nonce_digest);
+
+    let (sig_r, sig_s) = schnorr_sign(&cfg, keys.jubjub_secret, k, m);
+    crate::state::JubjubVoteWitness {
+        pubkey: keys.jubjub_pubkey,
+        sig_r,
+        sig_s,
+    }
+}
+
 // ── Groth16 prove / verify / setup for circuit_v2 ────────────────────────
 
 impl VotingCircuitV2 {

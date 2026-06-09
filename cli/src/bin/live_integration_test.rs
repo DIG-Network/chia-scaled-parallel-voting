@@ -1046,10 +1046,21 @@ struct CeremonyArtifacts {
     wire_vk: VerificationKey,
 }
 
+/// SEC-F1: the number of signers the local-ceremony Groth16 setup is
+/// shaped for. circuit_v2's constraint count scales with this, so the
+/// VK it produces ONLY verifies proofs whose signer-padding matches.
+/// It MUST therefore equal the `max_signers` curried at deploy (see
+/// `phase_deploy`'s no-ceremony fallback) AND be >= the number of voters
+/// that actually finalize. This live test registers + finalizes two
+/// voters, so 2. (At config::MAX_SIGNERS=20000 the depth-32 setup is
+/// infeasible to run locally — that scale is for the real on-chain MPC
+/// ceremony path, not this SimulatedBackend bootstrap.)
+const LIVE_TEST_MAX_SIGNERS: usize = 2;
+
 /// Run a single-participant trusted-setup ceremony using
-/// `SimulatedBackend`. The backend produces FUNCTIONAL Groth16 keys
-/// for the `VotingCircuit` shape — derived deterministically from
-/// the (single) contributor's entropy.
+/// `SimulatedBackend`. The backend produces FUNCTIONAL circuit_v2 Groth16
+/// keys (shaped for `LIVE_TEST_MAX_SIGNERS` signers at `config::TREE_DEPTH`)
+/// — derived deterministically from the (single) contributor's entropy.
 ///
 /// PRODUCTION CONTRAST: real elections MUST run a multi-party MPC
 /// ceremony with toxic-waste destruction. For this integration test
@@ -1058,15 +1069,25 @@ struct CeremonyArtifacts {
 /// ceremony's output, so the deploy / finalize plumbing is
 /// validated on a real chain.
 fn run_local_ceremony() -> Result<CeremonyArtifacts> {
+    let make_backend = || {
+        SimulatedBackend::with_tree_depth_and_max_signers(
+            chip_voting_sdk::config::TREE_DEPTH as usize,
+            LIVE_TEST_MAX_SIGNERS,
+        )
+    };
     use ark_serialize::CanonicalDeserialize;
 
-    info!("running single-participant SimulatedBackend ceremony");
-    let mut coord = CeremonyCoordinator::new(Box::new(SimulatedBackend::default()));
+    info!(
+        max_signers = LIVE_TEST_MAX_SIGNERS,
+        tree_depth = chip_voting_sdk::config::TREE_DEPTH,
+        "running single-participant SimulatedBackend circuit_v2 ceremony"
+    );
+    let mut coord = CeremonyCoordinator::new(Box::new(make_backend()));
     coord
         .start("chip-voting-v1".into())
         .map_err(|e| anyhow::anyhow!("ceremony start: {e:?}"))?;
     let alice = CeremonyParticipant::new(
-        Box::new(SimulatedBackend::default()),
+        Box::new(make_backend()),
         "live-test-alice".into(),
         Some("live integration test ceremony".into()),
     );
@@ -1083,7 +1104,7 @@ fn run_local_ceremony() -> Result<CeremonyArtifacts> {
         .accept_contribution(contribution.transcript)
         .map_err(|e| anyhow::anyhow!("accept_contribution: {e:?}"))?;
 
-    let backend = SimulatedBackend::default();
+    let backend = make_backend();
     let final_transcript = coord
         .current_transcript()
         .map_err(|e| anyhow::anyhow!("current_transcript: {e:?}"))?;
@@ -1719,7 +1740,11 @@ async fn phase_deploy(
         if let Some(c) = ceremony.as_ref() {
             (c.launcher_id, c.params.max_voters as usize)
         } else {
-            (Bytes32::default(), chip_voting_sdk::config::MAX_SIGNERS)
+            // SEC-F1: the no-ceremony path's VK comes from `run_local_ceremony`,
+            // which shapes circuit_v2 for `LIVE_TEST_MAX_SIGNERS`. Deploy MUST
+            // curry the SAME max_signers or the prover (which pads to
+            // config.max_signers) produces a proof the VK can't verify.
+            (Bytes32::default(), LIVE_TEST_MAX_SIGNERS)
         };
     let deployer = ElectionDeployer::new(DeployParams {
         verification_key: vk.clone(),
@@ -2712,6 +2737,12 @@ async fn phase_finalize(
     args: &Args,
     deploy: &DeployArtifacts,
     ballot: &BallotArtifacts,
+    // SEC-F1: the test voters' keys, used to reconstruct each collected
+    // vote's Jubjub Schnorr witness (circuit_v2's per-signer proof input).
+    // `collect_votes_for_ballot` recovers the on-chain vote data but NOT the
+    // off-chain Jubjub witness; in a real deployment each voter submits it to
+    // the aggregator out-of-band. Here we re-derive it from the known secrets.
+    voter_keys: &[VoterKeys],
     vote_outcome: Bytes32,
     proving_key: &ArkProvingKey,
 ) -> Result<()> {
@@ -2756,7 +2787,7 @@ async fn phase_finalize(
     // the latest Voting Coin per `(registration_coin_id,
     // ballot_launcher_id)` pair). The legacy `collect_votes` returns
     // an empty vec by design.
-    let votes = collect_votes_for_ballot_with_retry(
+    let mut votes = collect_votes_for_ballot_with_retry(
         &mut agg,
         ballot.ballot_launcher_id,
         expected_votes,
@@ -2767,6 +2798,39 @@ async fn phase_finalize(
     info!(votes_collected = votes.len(), "votes harvested from chain");
     if votes.is_empty() {
         bail!("no votes collected — finalize would fail BelowThreshold");
+    }
+
+    // SEC-F1: re-attach each collected vote's Jubjub Schnorr witness. The chain
+    // carries only the vote data, not the off-chain circuit_v2 witness; in a
+    // real deployment voters submit it to the aggregator out-of-band. Here we
+    // re-derive it from the known test-voter secrets over the canonical finalize
+    // message (the SAME message build_finalize_for_ballot's witness uses).
+    let election_launcher_id = deploy
+        .config
+        .election_launcher_id()
+        .map_err(|e| anyhow::anyhow!("phase_finalize election_launcher_id: {e}"))?;
+    for v in votes.iter_mut() {
+        if v.jubjub_vote.is_some() {
+            continue;
+        }
+        let canonical_msg = chip_voting_sdk::actors::aggregator::canonical_vote_message(
+            vote_outcome,
+            v.ballot_launcher_id,
+            election_launcher_id,
+        );
+        let keys = voter_keys
+            .iter()
+            .find(|k| k.pubkey == v.voter_pubkey)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no known VoterKeys for collected vote pubkey 0x{}",
+                    hex::encode(v.voter_pubkey.to_bytes())
+                )
+            })?;
+        v.jubjub_vote = Some(chip_voting_sdk::prover::circuit_v2::jubjub_vote_witness(
+            &keys.secret,
+            canonical_msg,
+        ));
     }
 
     let ballot_bundle = agg
@@ -3723,6 +3787,7 @@ async fn main() -> Result<()> {
         &args,
         &deploy,
         &ballot,
+        &[clone_voter_keys(&voter1_keys), clone_voter_keys(&voter2_keys)],
         vote_outcome,
         &ceremony.proving_key,
     )
