@@ -30,8 +30,9 @@ use chip_voting_sdk::actors::deployer::ElectionDeployer;
 use chip_voting_sdk::actors::voter::CastVoteParams;
 use chip_voting_sdk::ceremony::VerificationKey;
 use chip_voting_sdk::merkle::PoseidonSmt;
-use chip_voting_sdk::prover::circuit::generate_test_setup;
+use chip_voting_sdk::prover::circuit_v2::generate_test_setup_v2;
 use chip_voting_sdk::{Aggregator, DeployParams, NetworkType, Voter, VoterKeys};
+use sha2::{Digest as _, Sha256};
 use clvm_traits::ToClvm;
 use clvm_utils::tree_hash;
 
@@ -50,7 +51,6 @@ use clvm_utils::tree_hash;
 /// so the on-chain assertion would CLVM-raise. Resolved by threading
 /// `registration_vote_weight_snapshot` through
 /// `prepare_finalize_witness_with_threshold`.
-#[ignore = "SEC-F1: needs a small-max_signers circuit_v2 deploy variant; Option-B in-circuit signer verification can't set up at config::MAX_SIGNERS=20000 (go-live scaling). Forgery closure is pinned by exploit_finalize_forgery_e2e + finalize_v2_groth16_e2e."]
 #[tokio::test(flavor = "current_thread")]
 async fn finalize_per_ballot_full_simulator_flow() {
     let vote_close_height: u64 = 5;
@@ -65,8 +65,17 @@ async fn finalize_per_ballot_full_simulator_flow() {
         GenesisByCoinIdTailArgs::curry_tree_hash(cat_genesis.coin.coin_id()).into();
 
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
-    let (proving_key, vk) = generate_test_setup(32, &mut rng).expect("generate_test_setup");
+    // SEC-F1/F3/F5: a REAL circuit_v2 trusted setup at a small max_signers so
+    // the full on-chain finalize (Groth16 verify + attest_ballot binding)
+    // actually executes — no dummy VK. One voter finalizes, so MAX_SIGNERS = 1.
+    // vk_hash = sha256(chia_chunked VK bytes) so ElectionState.vk_hash equals
+    // the ELECTION_VK_HASH the ballot curries (= config.vk_hash()).
+    const MAX_SIGNERS: usize = 1;
+    let (proving_key, vk) =
+        generate_test_setup_v2(chip_voting_sdk::config::TREE_DEPTH as usize, MAX_SIGNERS, &mut rng)
+            .expect("generate_test_setup_v2");
     let vk_bytes = vk.chia_chunked_bytes().expect("vk chunked bytes");
+    let vk_hash = Bytes32::new(Sha256::digest(&vk_bytes).into());
     let collateral_amount: u64 = 1_000;
     let params = DeployParams {
         verification_key: VerificationKey {
@@ -75,9 +84,9 @@ async fn finalize_per_ballot_full_simulator_flow() {
         cat_tail_hash,
         collateral_amount,
         tree_depth: chip_voting_sdk::config::TREE_DEPTH,
-        max_signers: chip_voting_sdk::config::MAX_SIGNERS,
+        max_signers: MAX_SIGNERS,
         ceremony_launcher_id: Bytes32::default(),
-        vk_hash: Bytes32::default(),
+        vk_hash,
         vote_mode_lock: chip_voting_sdk::vote_mode::VOTE_MODE_LOCK_NONE,
         election_start_height: 0,
         label: None,
@@ -285,7 +294,7 @@ async fn finalize_per_ballot_full_simulator_flow() {
         registration_coin_id,
         ballot_launcher_id: created.ballot_launcher_id,
         voting_coin_id: cast_result.voting_coin_id,
-        jubjub_vote: Some(mk_jv(&voter.keys.secret)),
+        jubjub_vote: Some(mk_jv(&voter.keys.secret, canonical_msg)),
     };
     let votes = vec![canonical_vote_record];
 
@@ -337,13 +346,16 @@ async fn finalize_per_ballot_full_simulator_flow() {
     );
 }
 
-fn mk_jv(sk: &chia_bls::SecretKey) -> chip_voting_sdk::state::JubjubVoteWitness {
+fn mk_jv(
+    sk: &chia_bls::SecretKey,
+    vote_message: Bytes32,
+) -> chip_voting_sdk::state::JubjubVoteWitness {
+    use ark_ff::PrimeField;
     let keys = chip_voting_sdk::VoterKeys::new(sk.clone());
     let cfg = chip_voting_sdk::prover::circuit_v2::poseidon_config();
-    // The threshold pre-check does not verify the signature, so any
-    // well-formed Schnorr witness over a dummy message is fine here;
-    // the voter's jubjub pubkey just has to match the SMT leaf.
-    let m = ark_bls12_381::Fr::from(1u64);
+    // Sign the SAME message the circuit verifies in-circuit:
+    // Fr::from_be_bytes_mod_order(canonical_vote_message(outcome||ballot||election)).
+    let m = ark_bls12_381::Fr::from_be_bytes_mod_order(vote_message.as_ref());
     let (sig_r, sig_s) = chip_voting_sdk::prover::circuit_v2::schnorr_sign(
         &cfg, keys.jubjub_secret, ark_ed_on_bls12_381::Fr::from(7u64), m);
     chip_voting_sdk::state::JubjubVoteWitness { pubkey: keys.jubjub_pubkey, sig_r, sig_s }
