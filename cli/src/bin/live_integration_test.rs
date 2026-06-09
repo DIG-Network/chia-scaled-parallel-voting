@@ -2780,6 +2780,11 @@ async fn phase_finalize(
                 vote_threshold_den: ballot.vote_threshold_den,
                 registration_merkle_root_snapshot: ballot.registration_merkle_root_snapshot,
                 registration_vote_weight_snapshot: ballot.registration_vote_weight_snapshot,
+                // SEC-F5: MUST match the value curried at create/launch_ballot
+                // (the same CLI flag) or the ballot finalize coin's puzzle hash
+                // diverges and the action-layer merkle proof fails.
+                vote_options_root: parse_b32_str(&args.ballot_vote_options_root)
+                    .context("--ballot-vote-options-root")?,
                 proving_key,
             },
         )

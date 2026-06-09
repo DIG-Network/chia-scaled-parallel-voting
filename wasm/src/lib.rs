@@ -2638,6 +2638,12 @@ pub struct WasmFinalizeParams {
     pub vote_threshold_den: u64,
     pub registration_merkle_root_snapshot_hex: String,
     pub registration_vote_weight_snapshot: u64,
+    /// SEC-F5: the Ballot Coin's curried `vote_options_root` — MUST match
+    /// the value passed at create/launch_ballot, or the ballot finalize
+    /// coin's puzzle hash diverges and the action-layer merkle proof fails.
+    /// Empty / None / "0x00…00" = Mode1Free.
+    #[serde(default)]
+    pub vote_options_root_hex: Option<String>,
 }
 
 /// Lift a [`VoteRecordWire`](chip_voting_sdk::state::VoteRecordWire)
@@ -3508,6 +3514,16 @@ pub async fn build_ballot_finalize_bundle_js(
         .await
         .map_err(|e| JsError::new(&format!("Aggregator::sync: {e}")))?;
 
+    // SEC-F5: parse the ballot's vote_options_root (empty/None = Mode1Free).
+    let vote_options_root = match wasm_params
+        .vote_options_root_hex
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => parse_hex32(s).map_err(|e| JsError::new(&format!("vote_options_root: {e}")))?,
+        None => chia_protocol::Bytes32::default(),
+    };
     let params = chip_voting_sdk::actors::aggregator::BuildFinalizeForBallotParams {
         ballot_launcher_id,
         vote_outcome,
@@ -3517,6 +3533,7 @@ pub async fn build_ballot_finalize_bundle_js(
         vote_threshold_den: wasm_params.vote_threshold_den,
         registration_merkle_root_snapshot,
         registration_vote_weight_snapshot: wasm_params.registration_vote_weight_snapshot,
+        vote_options_root,
         proving_key: &proving_key,
     };
     let bundle = aggregator
